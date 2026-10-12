@@ -45,6 +45,8 @@ export type AgentIntegrationTurn = {
   requestKey: string;
   turnId: string;
   segmentId: string;
+  /** Active execution that published this segment; terminal cleanup cannot discard a newer one. */
+  continuationId?: string;
   state: "running" | "suspended" | "finished";
   entry: AgentTurnEvent;
   closing?: AgentTurnEvent;
@@ -63,6 +65,8 @@ export type AgentIntegrationParticipantRecord = {
   turnId: string;
   chatId: number;
   participant: Fetcher<AgentTurnParticipant>;
+  /** Registration-time replica selection; lifecycle retries must not acquire later bindings. */
+  worktrees?: WorktreeBase[];
   pending: AgentTurnEvent[];
   retryAt?: number;
 };
@@ -813,6 +817,8 @@ export type ActiveAgentRecord = {
   callbackInitiated: boolean;
   /** Fences deferred recovery against a different execution of this chat after a DO restart. */
   continuationId?: string;
+  /** Initiating request, captured before async startup; fences cleanup from an older prompt. */
+  requestKey?: string;
 };
 
 /** Approved intent only for integrations explicitly granted durable effect recovery. */
