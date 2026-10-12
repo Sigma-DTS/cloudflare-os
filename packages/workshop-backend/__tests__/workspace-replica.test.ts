@@ -1,5 +1,5 @@
 import {describe, expect, it} from "vitest";
-import {applyCodeChange, diffFiles} from "@gadgets/workshop-shared/code-change";
+import {applyCodeChange, diffFiles, type FileChange} from "@gadgets/workshop-shared/code-change";
 import {mergeReplicaBatch} from "../src/workspace-replica";
 import {workspaceCollisionCases} from "./workspace-collision-cases";
 
@@ -52,6 +52,18 @@ describe("DO-authoritative replica reconciliation", () => {
     expect(ack.changes).not.toEqual([]);
     expect(ack.operations).not.toEqual([]);
     expect(ack.accepted).toEqual([["a.txt", "from DO\n"]]);
+  });
+
+  it("accepts a tiny delta against text beyond the former file-size limit without expanding the OT", async () => {
+    const before = "a".repeat(512 * 1024 + 1);
+    const edit: FileChange = {edit: [before.length, [0, "!"]]};
+    const {change, ack} = await mergeReplicaBatch(7, {batchId: "large-anchor", files: [
+      {path: "a.txt", before, change: edit},
+    ]}, {});
+    expect(change).toEqual({7: [["a.txt", edit]]});
+    expect(ack.operations).toEqual([["a.txt", edit]]);
+    expect(ack.accepted[0][1]?.length).toBe(before.length + 1);
+    expect(ack.accepted[0][1]?.endsWith("!")).toBe(true);
   });
 
   it("accepts new container files without requiring git add", async () => {

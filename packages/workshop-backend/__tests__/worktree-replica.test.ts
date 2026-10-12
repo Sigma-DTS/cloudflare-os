@@ -89,7 +89,7 @@ describe("kernel replica capability over native RPC", () => {
           resolveBase: oid => impl.gitCache.readLocalObject(oid),
         })) imported.push(object);
         expect(imported.some(object => object.oid === accepted.pinBase)).toBe(true);
-        expect(imported.some(object => object.oid === commit)).toBe(false);
+        expect(imported.some(object => object.oid === commit)).toBe(true);
         if (compact) expect(imported.some(object => object.oid === explicitHead)).toBe(true);
         // The native clone already contains unchanged upstream blobs; never retransmit them.
         const untouched = await impl.gitCache.pathEntryAtCommit(commit, "untouched.txt");

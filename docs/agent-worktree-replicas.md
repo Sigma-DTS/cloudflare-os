@@ -57,6 +57,9 @@ Only cards inside the current initiating request's history boundary can schedule
 accepting an older card may connect a resource but cannot resume a newer undecided turn. Approval
 decisions use the same durable marker during cleanup independently of the `recoverableActions`
 grant, which controls external effect redelivery, not remembering that the user approved a pause.
+The decisions authorizing a suspension's wake-up are consumed atomically with that marker, separately
+from the chat note. Browser and recovery calls cannot re-arm the marker after its consumption;
+integration decisions also fence against their submitting segment, not just the logical turn.
 If model recovery fails, terminal callbacks are journalled before active state is cleared and the alarm
 retries failed cleanup. Malformed model transforms are rejected before buffering and logged with only
 stage/count diagnostics, preserving their tool-error transcript instead of aborting at persistence.
@@ -74,8 +77,9 @@ barrier from a dispatched model request; stream creation is not receipt of provi
 3. Enumerate and stream base bytes separately from the transform overlay. `readCommitPack()`
    streams the original local commit/tree/blob objects above that base, rooted only at the
    checkpoint's captured accepted and explicit heads. It omits unchanged base objects and
-   bounds content buffering by an object, not a repository or pack. A streamed non-repository base also
-   receives its original commit header, rather than leaving a synthetic commit as its identity.
+   bounds content buffering by an object, not a repository or pack. Every scoped base also receives
+   its original commit header: even a repository worktree may require byte hydration when its local
+   base has no provider provenance. This neither sends base blobs nor walks beyond the shallow base.
    `readOverlay()` then exports only pending operations above the accepted commit. The complete
    original composed prefix stays in the kernel checkpoint for OT anchors; exporting commits
    must not replace canonical operations with diffs of flattened files. No whole-repository
@@ -115,14 +119,15 @@ Ordinary model steps drain their buffers inside the same queue, so a concurrent 
 detach replica edits between append and persistence. ACKs therefore retain both durable edits and
 their lease-local echo provenance even while the ordinary transcript commit is still waiting.
 
-UTF-8 text attachments within the OT text-size limit become ordinary worktree files; BOMs are
+UTF-8 text attachments become ordinary worktree files; BOMs are
 preserved as content, and downloads read the original Git blob bytes. Upload names reserve existing
 base and accepted/pending overlay root names, including directories, without reading their contents.
 The message's transaction rechecks allocated names against newly touched paths: a replica can
 write while attachment preparation awaits. A collision rejects the send and leaves the upload
 staged; retry allocates a free suffix without overwriting acknowledged replica edits.
-Rev 0 leaves non-UTF-8 and oversized text attachments in the byte-preserving attachment store rather
-than creating lossy text or rejecting an otherwise valid upload at the OT persistence barrier.
+Rev 0 leaves non-UTF-8 attachments in the byte-preserving attachment store rather than creating
+lossy text. File contents no longer have a separate uncompressed text-size cap; ordinary Git storage
+and change-message limits apply, as on the kernel's other file paths.
 Attachment bytes and tree metadata are prefetched, but worktree projection, attachment references
 and the validated user message commit together. A rejected send leaves the upload staged and no
 new workspace path; retry does not allocate a suffix for a file the failed send never committed.

@@ -41,9 +41,9 @@ export async function replicaCommitPack(cache: WorkspaceGitCache, tree: Worktree
     await trees(commit.tree, baseTree);
     commits.push(...commit.parents);
   }
-  // Streamed checkouts have the base tree/blobs, but synthesized only a placeholder commit.
-  // Import the real base header too, retaining the same shallow boundary as a native fetch.
-  if (tree.source !== "repository" && tree.baseCommit) add(tree.baseCommit, "commit");
+  // Any source can fall back to byte hydration, with only a placeholder base commit. Export
+  // the real header too, retaining the shallow boundary without retransmitting base files.
+  if (tree.baseCommit) add(tree.baseCommit, "commit");
   async function* contents() {
     for (const [oid, hint] of objects) yield await read(oid, hint.type, hint.referencedBy);
     requireLive();

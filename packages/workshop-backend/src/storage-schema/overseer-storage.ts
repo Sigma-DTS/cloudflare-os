@@ -508,6 +508,8 @@ export type ActionRecord = {
   contextualApply?: boolean;
   /** Recovery must not append the same action-decision note twice. */
   decisionNotified?: boolean;
+  /** Consumed with the submitting continuation's durable wake-up, not with its chat note. */
+  decisionResumed?: boolean;
   /** Child approval IDs, persisted with submission for lost-ACK deduplication. */
   followupActionIds?: number[];
 } | {

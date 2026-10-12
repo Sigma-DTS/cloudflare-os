@@ -3,7 +3,7 @@ import {env} from "cloudflare:workers";
 import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
-import {applyCodeChange, codeChangeSerializedSize, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/workshop-shared/code-change";
+import {applyCodeChange, codeChangeSerializedSize, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
 import {decodePackStream} from "../src/git-codec";
 import {runAgent, type WorktreeTurnAccess} from "../src/agent";
@@ -55,12 +55,45 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it.each([false, true])("exports the actual base header for a byte-hydrated repository (migrated pin: %s)", migrated => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    let base = tree.baseCommit;
+    if (migrated) {
+      base = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "accepted locally"]]), {
+        parents: [base], author: {name: "Test", email: "test@example.com"}, message: "Accepted before migration", timestamp: new Date(1),
+      });
+      // A v5 worktree had no stored baseCommit: migration pinned its local accepted commit.
+      const record = impl.storage.gadgets.get(tree.id)!;
+      if (record.type !== "worktree") throw new Error("Expected worktree");
+      impl.storage.gadgets.put({...record, baseCommit: base, pinBase: base, headCommit: base});
+    }
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    expect(checkpoint.worktrees[0]).toMatchObject({source: "repository", baseCommit: base, acceptedCommit: base, headCommit: base});
+    await expect((async () => { await replica.readGitPack(checkpoint.checkpointId, tree.id, new Uint8Array()); })())
+      .rejects.toThrow(/No authorized source/);
+    const entries = await replica.listBaseEntries(checkpoint.checkpointId, tree.id);
+    expect((await entries.next())?.map(entry => entry.path)).toEqual(["a.txt"]);
+    expect(await entries.next()).toBeNull();
+    expect(await new Response(await replica.readBaseFile(checkpoint.checkpointId, tree.id, "a.txt")).text())
+      .toBe(migrated ? "accepted locally" : "aaa");
+    const objects = [];
+    for await (const object of decodePackStream(await replica.readCommitPack(checkpoint.checkpointId, tree.id), {
+      maxPackSize: 1024 * 1024, maxObjectSize: 1024 * 1024, resolveBase: oid => impl.gitCache.readLocalObject(oid),
+    })) objects.push(object);
+    expect(objects.map(object => [object.oid, object.type])).toEqual([[base, "commit"]]);
+    expect(objects[0].payload).toEqual((await impl.gitCache.readLocalObject(base))!.payload);
+  }));
+
   it("pages a large non-Latin-1 canonical backlog within a byte budget, without losing revisions", () => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl);
     await impl.beginAgentIntegrationTurn(1);
     const replica = await open(impl), checkpoint = await replica.checkpoint();
-    for (let i = 0; i < 80; ++i) {
-      await step(impl, 1, {[tree.id]: [["a.txt", {set: "\u0100".repeat(220_000) + i}]]});
+    // Still exceed the native RPC's 32 MiB response limit, with fewer expensive step barriers.
+    const text = "\u0100".repeat(1_800_000), count = 10;
+    expect(count * codeChangeSerializedSize({[tree.id]: [["a.txt", {set: text}]]})).toBeGreaterThan(32 * 1024 * 1024);
+    for (let i = 0; i < count; ++i) {
+      await step(impl, 1, {[tree.id]: [["a.txt", {set: text + i}]]});
     }
     let cursor = checkpoint.cursor, revisions: number[] = [], pages = 0;
     for (;;) {
@@ -76,9 +109,9 @@ describe("replica review regressions over durable kernel storage", () => {
       expect(page.events.length).toBeGreaterThan(0);
     }
     expect(pages).toBeGreaterThan(1);
-    expect(revisions).toEqual(Array.from({length: 80}, (_, i) => i + 1));
+    expect(revisions).toEqual(Array.from({length: count}, (_, i) => i + 1));
     expect(await replica.changesSince(cursor, 128)).toEqual({events: [], cursor, hasMore: false});
-  }));
+  }), 30_000); // A real >32 MiB native transport test needs headroom on cold CI workers.
 
   it.each(["file", "directory"] as const)("rejects an upload whose allocated root becomes a replica %s before the message commits", mode => inKernel(crypto.randomUUID(), async impl => {
     const user = env.TEST_USER.getByName(crypto.randomUUID());
@@ -620,7 +653,7 @@ describe("replica review regressions over durable kernel storage", () => {
     }),
   );
 
-  it.each([false, true])("keeps an oversized text upload byte-backed (existing worktree: %s)", existing => inKernel(crypto.randomUUID(), async impl => {
+  it.each([false, true])("projects text uploads beyond the former file-size cap (existing worktree: %s)", existing => inKernel(crypto.randomUUID(), async impl => {
     const user = env.TEST_USER.getByName(crypto.randomUUID());
     const stage = (data: Uint8Array, name: string) => {
       const id = crypto.randomUUID();
@@ -629,7 +662,7 @@ describe("replica review regressions over durable kernel storage", () => {
       }});
       return {id};
     };
-    const bytes = new TextEncoder().encode("x".repeat(MAX_FILE_TEXT_LENGTH + 1));
+    const bytes = new TextEncoder().encode("x".repeat(512 * 1024 + 1));
     const upload = stage(bytes, "large.txt");
     const chatId = existing
       ? await impl.newChat(user, {profile: USER}, "Initial", undefined, [stage(new TextEncoder().encode("small"), "small.txt")])
@@ -637,12 +670,11 @@ describe("replica review regressions over durable kernel storage", () => {
     if (existing) await impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, [upload]);
     const returned = await impl.getChatAttachmentData(chatId, upload.id);
     expect(returned.byteLength).toBe(bytes.byteLength);
-    // A half-megabyte element-by-element matcher dominates this regression on CI. Verify
-    // byte identity in native crypto instead, without weakening the byte-backed round trip.
+    // Verify byte identity without an element-by-element matcher over a large upload.
     expect(await crypto.subtle.digest("SHA-256", returned)).toEqual(await crypto.subtle.digest("SHA-256", bytes));
     expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).toMatchObject({type: "committed", chatId});
-    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).not.toHaveProperty("workspacePath");
-    if (!existing) expect(impl.getChatAgentContext(chatId).attachments).toBeUndefined();
+    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).toHaveProperty("workspacePath", "large.txt");
+    expect(impl.getChatAgentContext(chatId).attachments).toBeDefined();
     expect([...impl.storage.chats.list()].some(message => message.type === "message" &&
       message.attachments?.some(attachment => attachment.id === upload.id))).toBe(true);
   }));

@@ -5064,8 +5064,7 @@ class OverseerImpl implements AgentHooks {
     const record = this.storage.actions.get(application.id);
     if (record?.type === "action" && record.caller.from === "agent" && record.description.awaitDecision) {
       if (!await this.resumeAfterActionDecision(record.caller.chatId, record.id, application.resolvedBy,
-          () => this.resumePausedAgent(record.caller.from === "agent" ? record.caller.chatId : -1,
-            application.resumeUserId, application.resolvedBy))) {
+          application.resumeUserId)) {
         this.storage.actionApplications.put({ ...application, phase: "resume", retryAt: Date.now() + 1_000 });
         return;
       }
@@ -5073,9 +5072,9 @@ class OverseerImpl implements AgentHooks {
     this.storage.actionApplications.delete(application.id);
   }
 
-  // Recovery and the live client share the same current-turn decision gate and deduplicated note.
+  // Recovery and the live client share the same segment-scoped decision and durable wake-up.
   async resumeAfterActionDecision(chatId: number, approvedId: number, author: AiChatAuthorInfo,
-      resume: () => Promise<void>): Promise<boolean> {
+      fallbackUserId?: string): Promise<boolean> {
     const awaited: (ActionRecord & { type: "action" })[] = [];
     for (const msg of this.storage.chats.list({ prefix: `${keyString(chatId)}.`, reverse: true })) {
       if (msg.type === "agentCallback" || msg.type === "message" &&
@@ -5087,10 +5086,11 @@ class OverseerImpl implements AgentHooks {
     }
     if (!awaited.some(record => record.id === approvedId) || awaited.some(record => record.state !== "approved")) return true;
     const approved = awaited.find(record => record.id === approvedId)!;
+    if (approved.decisionResumed) return true;
     const origin = approved.integrationOrigin;
     if (origin) {
       const turn = this.storage.agentIntegrationTurns.get(chatId);
-      if (turn?.turnId !== origin.turnId || turn.state === "finished") return true;
+      if (turn?.turnId !== origin.turnId || turn.segmentId !== origin.segmentId || turn.state === "finished") return true;
     }
     const record = this.storage.actions.get(approvedId);
     if (record?.type === "action" && !record.decisionNotified) this.storage.transaction(() => {
@@ -5100,25 +5100,22 @@ class OverseerImpl implements AgentHooks {
     });
     // The resumer journals the wake-up on the submitting continuation before checking busy
     // state. This decision must survive suspension cleanup even without effect redelivery.
-    await resume();
+    await this.resumePausedAgent(chatId, fallbackUserId, author, awaited.map(record => record.id));
     return true;
   }
 
   // Persist active resumption before starting async model resolution, so another reset or
   // concurrent approval neither loses this wake-up nor starts a duplicate agent loop.
-  async resumePausedAgent(chatId: number, fallbackUserId?: string, author?: AiChatAuthorInfo): Promise<void> {
+  async resumePausedAgent(chatId: number, fallbackUserId?: string, author?: AiChatAuthorInfo,
+      decisionIds?: number[]): Promise<void> {
+    const decisions = decisionIds?.map(id => this.storage.actions.get(id))
+      .filter((record): record is ActionRecord & {type: "action"} => record?.type === "action");
+    if (decisions?.every(record => record.decisionResumed)) return;
     // Accepting a connection during a suspended callback is still an authorized wake-up.
     // Persist it before yielding; teardown (or constructor recovery) consumes this exact pause.
     const paused = this.storage.pausedAgents.get(chatId);
-    if (paused) this.storage.pausedAgents.put({...paused, resumeRequested: true});
-    else {
-      const active = this.storage.activeAgents.get(chatId);
-      if (active) this.storage.activeAgents.put({...active, resumeRequested: true});
-    }
-    await this.waitForChatMessagePreparation(chatId);
-    const meta = this.storage.chatMeta.get(chatId);
-    if (!meta || meta.activeAgent || this.#runningAgents.has(chatId)) return;
-    let record = this.storage.pausedAgents.get(chatId);
+    const active = this.storage.activeAgents.get(chatId);
+    let record = paused ?? active;
     if (!record && fallbackUserId && author) {
       const message = [...this.storage.chats.list({ prefix: `${keyString(chatId)}.`, reverse: true })]
         .find(msg => msg.author.type === "agent");
@@ -5126,6 +5123,17 @@ class OverseerImpl implements AgentHooks {
         initiator: author, callbackInitiated: false };
     }
     if (!record) throw new Error("Paused agent origin unavailable; manual resumption is required.");
+    this.storage.transaction(() => {
+      (paused || !active ? this.storage.pausedAgents : this.storage.activeAgents).put({...record!, resumeRequested: true});
+      // Consume every decision in this suspension together: another browser/recovery call
+      // must not re-arm this marker after the next segment has removed it.
+      for (const decision of decisions ?? []) this.storage.actions.put({...decision, decisionResumed: true});
+    });
+    await this.waitForChatMessagePreparation(chatId);
+    const meta = this.storage.chatMeta.get(chatId);
+    if (!meta || meta.activeAgent || this.#runningAgents.has(chatId)) return;
+    record = this.storage.pausedAgents.get(chatId);
+    if (!record?.resumeRequested) return;
     delete record.resumeRequested;
     this.storage.activeAgents.put(record);
     this.storage.pausedAgents.delete(chatId);
@@ -5586,7 +5594,6 @@ class OverseerImpl implements AgentHooks {
       let text: string;
       try { text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(content.data); }
       catch { continue; }
-      if (text.length > MAX_FILE_TEXT_LENGTH) continue;
       let path = this.#attachmentWorkspaceFilename(attachment, used);
       attachment.workspacePath = path;
       files.set(path, text);
@@ -12164,7 +12171,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // one can't block future resumes, and approving one can't restart a newer turn.
   async #maybeResumeAfterActionDecision(chatId: number, approvedId: number): Promise<void> {
     await this.impl.resumeAfterActionDecision(chatId, approvedId, await this.#getClientProfile(),
-      () => this.#resumeSuspendedAgent(chatId));
+      this.#clientUser.id.toString());
   }
 
   async rejectAction(id: number): Promise<void> {

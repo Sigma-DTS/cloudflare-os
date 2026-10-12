@@ -1,6 +1,6 @@
 import {
   applyCodeChange, composeCodeChange, transformCodeChange, validateCodeChangeSchema,
-  validateCodeChangeContent, MAX_FILE_TEXT_LENGTH, MAX_FILE_PATH_LENGTH,
+  validateCodeChangeContent, MAX_FILE_PATH_LENGTH,
   type CodeChange, type FileChange,
 } from "@gadgets/workshop-shared/code-change";
 
@@ -46,8 +46,7 @@ export async function mergeReplicaBatch(
       throw new Error("Invalid replica path.");
     }
     for (let text of [file.before]) {
-      if (text !== null && (typeof text !== "string" ||
-          text.length > MAX_FILE_TEXT_LENGTH || text.includes("\0"))) {
+      if (text !== null && (typeof text !== "string" || text.includes("\0"))) {
         throw new Error("Invalid replica text.");
       }
     }

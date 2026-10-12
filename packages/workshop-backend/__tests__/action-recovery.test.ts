@@ -189,7 +189,8 @@ describe("durable approved-action recovery", () => {
         expect([...impl.storage.actions.list()]).toHaveLength(2);
         expect([...impl.storage.chats.list()].filter(message => message.type === "action")).toHaveLength(2);
         let resumed = 0;
-        await impl.resumeAfterActionDecision(1, parent.followupActionIds![0]!, APPROVER, async () => { ++resumed; });
+        impl.resumePausedAgent = async () => { ++resumed; };
+        await impl.resumeAfterActionDecision(1, parent.followupActionIds![0]!, APPROVER);
         // The shell's pending parent still blocks inference; a destination grant isn't completion.
         expect(resumed).toBe(0);
       } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
@@ -299,9 +300,11 @@ describe("durable approved-action recovery", () => {
         const record = action(impl);
         impl.storage.actions.put({ ...record, state: "approved", description: { ...record.description, awaitDecision: true } });
         let resumed = 0;
-        await expect(impl.resumeAfterActionDecision(1, record.id, APPROVER, async () => { throw reset(); }))
+        impl.resumePausedAgent = async () => { throw reset(); };
+        await expect(impl.resumeAfterActionDecision(1, record.id, APPROVER))
           .rejects.toThrow("lost reply");
-        await impl.resumeAfterActionDecision(1, record.id, APPROVER, async () => { ++resumed; });
+        impl.resumePausedAgent = async () => { ++resumed; };
+        await impl.resumeAfterActionDecision(1, record.id, APPROVER);
         expect(resumed).toBe(1);
         expect([...impl.storage.chats.list()].filter(message => message.type === "agentNudge")).toHaveLength(1);
         expect(action(impl).decisionNotified).toBe(true);
@@ -325,7 +328,8 @@ describe("durable approved-action recovery", () => {
           impl.addChatMessages(1, APPROVER, [{type: "action", actionId: record.id + 1}]);
         }
         let resumed = 0;
-        await impl.resumeAfterActionDecision(1, record.id, APPROVER, async () => { ++resumed; });
+        impl.resumePausedAgent = async () => { ++resumed; };
+        await impl.resumeAfterActionDecision(1, record.id, APPROVER);
         expect(resumed).toBe(0);
         expect([...impl.storage.chats.list()].filter(message => message.type === "agentNudge")).toHaveLength(0);
       } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }

@@ -55,6 +55,100 @@ function providerReply(): Response {
 describe("integration cleanup at agent recovery boundaries", () => {
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
+  it.each([
+    {boundary: "lookup", recover: false, siblings: false}, {boundary: "lookup", recover: true, siblings: false},
+    {boundary: "entry", recover: false, siblings: false}, {boundary: "entry", recover: true, siblings: false},
+    {boundary: "lookup", recover: true, siblings: true},
+  ])("consumes a browser approval once during $boundary, with overlapping recovery $recover and sibling actions $siblings, without waking the next undecided segment", async ({boundary, recover, siblings}) => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    await runInDurableObject(user, instance => {
+      instance["storage"].profile.put(USER);
+      instance["storage"].aiModels.put(MODEL);
+    });
+    let requests = 0, submit!: (action: number) => Promise<void>;
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin !== MODEL.config.apiUrl) return realFetch(input, init);
+      if (++requests <= 2) {
+        await submit(41 + requests);
+        if (requests === 1 && siblings) await submit(44);
+      }
+      return providerReply();
+    });
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl, participant = await prepare(impl, name);
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"lifecycle":true,"contextualActions":true,"recoverableActions":true}}';
+      const handler = impl.ctx.facets.get<IntegrationTestActionGatekeeper>("decision-actions", () => ({
+        class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({props: {}}),
+      }));
+      await handler.setRecoverable();
+      impl.getGatekeeperFacet = async () => handler;
+      submit = action => impl.submitAction(31, action, {title: `Run ${action}`, description: "Command", implementsRevert: false, awaitDecision: true},
+        {from: "agent", chatId: 1}, impl.captureIntegrationOrigin({from: "agent", chatId: 1}));
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(1)!, activeAgent: MODEL.profile});
+      impl.startAgent(1, MODEL, USER, user.id.toString());
+      await impl.waitForAllAgentsToComplete();
+      expect(requests).toBe(1);
+      const action = [...impl.storage.actions.list()].find(record => record.type === "action")!;
+      await participant.block("resumed");
+      let lookupEntered = false, releaseLookup = () => {};
+      if (boundary === "lookup") {
+        const getContext = UserDurableObject.prototype.getChatContext;
+        const lookupBarrier = new Promise<void>(resolve => { releaseLookup = resolve; });
+        vi.spyOn(UserDurableObject.prototype, "getChatContext").mockImplementation(async function(modelId) {
+          lookupEntered = true;
+          await lookupBarrier;
+          return getContext.call(this, modelId);
+        });
+      }
+      try {
+        using client = new RpcStub(await openFakeOverseer({actions: impl.storage.actions, chats: impl.storage.chats,
+          chatMeta: impl.storage.chatMeta, gatekeepers: impl.storage.gatekeepers,
+          pausedAgents: impl.storage.pausedAgents, activeAgents: impl.storage.activeAgents}, {impl: {
+          ctx: impl.ctx, users: {idFromString: () => user.id, get: () => impl.users.get(impl.users.idFromString(user.id.toString()))},
+          applyPendingAction: impl.applyPendingAction.bind(impl),
+          resumeAfterActionDecision: impl.resumeAfterActionDecision.bind(impl),
+          drainAutoApprovals: impl.drainAutoApprovals.bind(impl),
+          resumePausedAgent: impl.resumePausedAgent.bind(impl),
+        }}));
+        await client.approveAction(action.id);
+        if (siblings) {
+          expect(requests).toBe(1);
+          expect(impl.storage.pausedAgents.get(1)).not.toHaveProperty("resumeRequested");
+          const sibling = [...impl.storage.actions.list()].find(record => record.state === "pending")!;
+          await client.approveAction(sibling.id);
+        }
+        if (boundary === "lookup") await vi.waitFor(() => expect(lookupEntered).toBe(true));
+        else await vi.waitFor(async () => expect((await participant.calls()).some(call => call.event.kind === "resumed")).toBe(true));
+        if (recover) {
+          // Recovery and a browser decision can both finish the same durable application.
+          impl.storage.actionApplications.put({id: action.id, resolvedBy: USER, autoApproved: false,
+            phase: "resume", retryAt: Date.now()});
+          await Promise.all([impl.recoverActionApplications(),
+            expect((async () => { await client.approveAction(action.id); })()).rejects.toThrow(/not pending/)]);
+        }
+        expect(impl.storage.actions.get(action.id)).toMatchObject({decisionResumed: true});
+        expect(impl.storage.activeAgents.get(1)).not.toHaveProperty("resumeRequested");
+        releaseLookup();
+        await participant.releaseBlock();
+        await impl.waitForAllAgentsToComplete();
+        expect(requests).toBe(2);
+        expect(impl.storage.pausedAgents.get(1)).not.toHaveProperty("resumeRequested");
+        expect([...impl.storage.actions.list()].filter(record => record.type === "action").map(record => record.state))
+          .toEqual(siblings ? ["approved", "approved", "pending"] : ["approved", "pending"]);
+        expect(await handler.calls()).toHaveLength(siblings ? 2 : 1);
+        expect([...impl.storage.chats.list()].filter(message => message.type === "agentNudge")).toHaveLength(1);
+      } finally {
+        releaseLookup();
+        await participant.releaseBlock();
+        await impl.waitForAllAgentsToComplete();
+        delete impl.env.AGENT_INTEGRATION_GRANTS;
+      }
+    });
+  });
+
   it("retains a decision during real suspension cleanup across eviction without effect-recovery permission", async () => {
     const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
     const user = env.TEST_USER.getByName(crypto.randomUUID());
@@ -92,9 +186,9 @@ describe("integration cleanup at agent recovery boundaries", () => {
         const action = [...impl.storage.actions.list()].find(record => record.type === "action")!;
         if (action.type !== "action") throw new Error("Missing action");
         await impl.applyPendingAction(action, USER, false);
-        expect(await impl.resumeAfterActionDecision(1, action.id, USER, () => impl.resumePausedAgent(1))).toBe(true);
+        expect(await impl.resumeAfterActionDecision(1, action.id, USER)).toBe(true);
         expect(impl.storage.pausedAgents.get(1)).toMatchObject({resumeRequested: true});
-        expect(impl.storage.actions.get(action.id)).toMatchObject({state: "approved", decisionNotified: true});
+        expect(impl.storage.actions.get(action.id)).toMatchObject({state: "approved", decisionNotified: true, decisionResumed: true});
         expect([...impl.storage.actionApplications.list()]).toEqual([]);
         expect(await handler.calls()).toHaveLength(1);
         expect(requests).toBe(1);
