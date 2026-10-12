@@ -5,6 +5,7 @@
 // OAuth access token. All real operations are read-only. Dry-runs use jobs.insert with
 // `dryRun: true`; BigQuery's parser metadata is the authority for read-only and scope checks.
 
+import { readTextPrefix } from "@gadgets/gatekeeper-kit/response-body";
 import type {
   BigQueryDataset, BigQueryDryRunResult, BigQueryField, BigQueryParam, BigQueryProject,
   BigQueryQueryOptions, BigQueryQueryResult, BigQueryTable,
@@ -261,8 +262,7 @@ async function callRest<T>(
       rawBody = (await response.json().catch(() => ({}))) as GoogleErrorResponse;
       detail = rawBody.error?.message ?? `${response.status} ${response.statusText}`;
     } else {
-      detail = (await response.text().catch(() => "")).slice(0, 500)
-          || `${response.status} ${response.statusText}`;
+      detail = await readTextPrefix(response, 500) || `${response.status} ${response.statusText}`;
     }
     detail += ` [http=${response.status}]`;
     if (rawBody.error?.status) {

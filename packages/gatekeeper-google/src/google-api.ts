@@ -2,6 +2,7 @@
 //
 // This file was largely vibe-coded based on an interface spec.
 
+import { readTextPrefix } from "@gadgets/gatekeeper-kit/response-body";
 import { AccountDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
   EmailAddress, GmailAttachmentInfo, GmailComposeOptions, GmailHeader, GmailReplyOptions,
@@ -188,7 +189,7 @@ export async function getAccessToken(
           `Failed to refresh access token: ${body.error} ${body.error_description}`);
     }
 
-    let errorText = await readErrorText(response);
+    let errorText = await readTextPrefix(response, 4096) || response.statusText;
     throw new Error(`Failed to refresh access token: ${response.status} ${errorText}`);
   }
 
@@ -1737,31 +1738,6 @@ export function shouldIncludeSpamTrash(query?: string, labelIds?: string[]): boo
     escaped = char === "\\" && !escaped;
   }
   return flushToken();
-}
-
-// Read a bounded prefix of an error response body for inclusion in thrown errors.
-async function readErrorText(response: Response, maxBytes = 4096): Promise<string> {
-  if (!response.body) return response.statusText;
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (total < maxBytes) {
-    const {done, value} = await reader.read();
-    if (done) break;
-    const remaining = maxBytes - total;
-    const chunk = value.subarray(0, remaining);
-    chunks.push(chunk);
-    total += chunk.byteLength;
-    if (chunk.byteLength < value.byteLength) break;
-  }
-  await reader.cancel();
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(bytes);
 }
 
 /** A status-only provider error that is safe to use for retry decisions and server logs. */

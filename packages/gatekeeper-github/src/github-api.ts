@@ -3,6 +3,7 @@ import { validateBranchName } from "@gadgets/gatekeeper-kit/git-transport";
 import {
   isInvalidGrant, mergeOAuthTokens, OAuthClient, oauthRefresh,
 } from "@gadgets/gatekeeper-kit/oauth-client";
+import { readTextPrefix } from "@gadgets/gatekeeper-kit/response-body";
 import type { UserAccount } from "./github";
 
 /**
@@ -1540,9 +1541,9 @@ export class GitHubApi {
       signal: AbortSignal.timeout(GIT_UPLOAD_PACK_TIMEOUT_MS),
     });
     if (!response.ok) {
-      // The error body is short prose (e.g. "Repository not found"); a truncated copy makes the
-      // failure actionable without trusting its size.
-      const detail = (await response.text().catch(() => "")).trim().slice(0, 200);
+      // The error body is short prose (e.g. "Repository not found"); a prefix makes the failure
+      // actionable without trusting its size.
+      const detail = (await readTextPrefix(response, 200)).trim();
       throw new GitHubApiError(
         response.status,
         `git fetch failed: ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
@@ -1575,7 +1576,7 @@ export class GitHubApi {
       signal: AbortSignal.timeout(GIT_UPLOAD_PACK_TIMEOUT_MS),
     });
     if (!response.ok) {
-      const detail = (await response.text().catch(() => "")).trim().slice(0, 200);
+      const detail = (await readTextPrefix(response, 200)).trim();
       throw new GitHubApiError(
         response.status,
         `git push failed: ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,

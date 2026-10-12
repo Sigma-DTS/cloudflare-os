@@ -481,7 +481,8 @@ bump, stub removal, config, secrets). See [Commit sequence](#commit-sequence).
   reads `nextPage`, not the length; only a response carrying no `x-next-page` at all falls back
   to the short-page rule. `x-total`/`x-total-pages` are no help: the docs omit them above 10,000
   results and on the Commits API always. Every body is read through the kit's byte cap
-  (`readTextCapped`), error bodies included.
+  (`readTextCapped`), except an error body, read as a capped prefix (`readTextPrefix`) so an
+  oversized error page still yields an excerpt.
 - **OAuth helpers**: `buildAuthorizeUrl(instanceUrl, {clientId, redirectUri, scopes, state,
   codeChallenge})`, `exchangeAuthCode(apiOrigin, headers, {code, clientId, clientSecret,
   redirectUri, codeVerifier})` → `GitLabOAuthGrant { accessToken, refreshToken, expiresAt }`

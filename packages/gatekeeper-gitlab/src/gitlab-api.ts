@@ -9,7 +9,8 @@
 
 import { CredentialsExpiredError } from "@gadgets/gatekeeper-kit/credentials";
 import { hexEncode } from "@gadgets/gatekeeper-kit/connect-nonce";
-import { readBytesCapped, readTextCapped, ResponseTooLargeError } from "@gadgets/gatekeeper-kit/response-body";
+import { pathSegments } from "@gadgets/gatekeeper-kit/endpoint";
+import { readBytesCapped, readTextCapped, readTextPrefix, ResponseTooLargeError } from "@gadgets/gatekeeper-kit/response-body";
 
 /** A grant returned by the token endpoint. GitLab's documented response carries no `scope`. */
 export type GitLabOAuthGrant = {
@@ -390,12 +391,12 @@ async function parseBody(response: Response): Promise<unknown> {
 }
 
 /**
- * An error body, for its message: parsed when it is the JSON it claims to be, otherwise an excerpt
- * of its text (an HTML error page quoted whole would bury the reason). Never throws: a body that
- * is too large or malformed must not mask the status it came with.
+ * An error body, for its message: parsed when it is the JSON it claims to be and fits the read,
+ * otherwise an excerpt of its text (an HTML error page quoted whole would bury the reason). Never
+ * throws: a body that is too large or malformed must not mask the status it came with.
  */
 async function parseErrorBody(response: Response): Promise<unknown> {
-  const text = await readTextCapped(response, MAX_ERROR_BODY_BYTES).catch(() => "");
+  const text = await readTextPrefix(response, MAX_ERROR_BODY_BYTES);
   if (isJson(response)) {
     try {
       return JSON.parse(text);
@@ -1179,7 +1180,7 @@ export class GitLabApi {
     headers: Record<string, string>,
     verb: "fetch" | "push",
   ): Promise<Response> {
-    const url = `${this.#instance.apiOrigin}/${gitRepoPath(projectPath)}.git/${service}`;
+    const url = `${this.#instance.apiOrigin}/${pathSegments(projectPath)}.git/${service}`;
     const token = await this.#credentials();
     const response = await fetch(url, {
       method: "POST",
@@ -1217,11 +1218,6 @@ export class GitLabApi {
     }
     return response;
   }
-}
-
-/** The project path as it appears in a git URL: segments individually encoded, slashes kept. */
-export function gitRepoPath(projectPath: string): string {
-  return projectPath.split("/").map(encodeURIComponent).join("/");
 }
 
 /**

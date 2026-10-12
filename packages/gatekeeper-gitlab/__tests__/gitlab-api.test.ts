@@ -14,7 +14,6 @@ import {
   encodeRefName,
   errorMessageFromBody,
   exchangeAuthCode,
-  gitRepoPath,
   lineCode,
   refreshAccessToken,
   revokeToken,
@@ -68,10 +67,6 @@ describe("path encoding", () => {
   it("encodes a branch name with slashes as one segment (GitLab's my%2Fbranch rule)", () => {
     expect(encodeRefName("feature/x")).toBe("feature%2Fx");
     expect(encodeRefName("release/2026.09")).toBe("release%2F2026.09");
-  });
-
-  it("keeps slashes in the git URL path but encodes each segment", () => {
-    expect(gitRepoPath("group/sub/pro ject")).toBe("group/sub/pro%20ject");
   });
 });
 
@@ -202,21 +197,23 @@ describe("error bodies", () => {
     const jsonType = { "content-type": "application/json" };
     fakeFetch([
       new Response(`"${"x".repeat(10 * 1024 * 1024)}"`, { headers: jsonType }),
-      new Response(JSON.stringify({ message: "y".repeat(70 * 1024) }), { status: 422, statusText: "Unprocessable Entity", headers: jsonType }),
+      new Response(JSON.stringify({ message: "y".repeat(70 * 1024) }), { status: 422, headers: jsonType }),
       new Response("{not json", { status: 500, headers: jsonType }),
-      new Response(`<html>${"z".repeat(5000)}</html>`, { status: 502, headers: { "content-type": "text/html" } }),
+      new Response(`<html>${"z".repeat(70 * 1024)}</html>`, { status: 502, headers: { "content-type": "text/html" } }),
     ]);
     const oversized = await api().getProject("g/p").catch(e => e);
     expect(oversized).toBeInstanceOf(GitLabApiError);
     expect(oversized.status).toBe(502);
     expect(oversized.message).toMatch(/larger than the 10 MiB/);
-    // Too large to be a message worth reading: the status speaks instead.
+    // Too large to parse whole: excerpted like any other text rather than dropped.
     const longError = await api().getProject("g/p").catch(e => e);
-    expect([longError.status, longError.message]).toEqual([422, "422 Unprocessable Entity"]);
+    expect(longError.status).toBe(422);
+    expect(longError.message).toMatch(/^\{"message":"y+$/);
+    expect(longError.message).toHaveLength(200);
     // Not the JSON it claims to be: quoted as text, not thrown as a SyntaxError.
     const malformed = await api().getProject("g/p").catch(e => e);
     expect([malformed.status, malformed.message]).toEqual([500, "{not json"]);
-    // An HTML error page is excerpted rather than quoted whole.
+    // An HTML error page past the read cap is still excerpted rather than quoted whole or dropped.
     const page = await api().getProject("g/p").catch(e => e);
     expect(page.status).toBe(502);
     expect(page.message).toMatch(/^<html>z+$/);

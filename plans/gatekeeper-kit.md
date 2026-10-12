@@ -2001,8 +2001,8 @@ prefix it was placed in. They refuse `""`, `.` and `..` and encode everything el
 splits a `/`-separated name (a GitLab project path, a Chat media resource) and applies the same per
 segment, so a leading, trailing or doubled slash is refused as an empty segment. The id grammar
 (charset, length) stays the gatekeeper's, and the error echoes only the refused segment, at most
-two characters. Three internal copies disagreed (sentry refused any `..` substring, firstbase only
-exact dots, zip encoded `%2e`).
+two characters. Consumers: gitlab's git endpoints and google chat's media download; three internal
+copies disagreed (sentry refused any `..` substring, firstbase only exact dots, zip encoded `%2e`).
 
 ### 4.15 `./response-body`
 
@@ -2047,7 +2047,9 @@ so the strict reader keeps its all-or-nothing contract. It decorates an error al
 with the first `maxBytes` of the body — an HTML error page past the strict cap otherwise yields no
 excerpt at all — so it truncates, ignores `Content-Length`, cancels the rest, and never throws on
 the body: a used, locked or failing body returns what decoded, possibly `""`, because a read failure
-must not replace the provider error it was decorating.
+must not replace the provider error it was decorating. Consumers: gitlab's error parser, github's
+git endpoints, bigquery, and the google token refresh (replacing its hand-written `readErrorText`).
+Home Assistant is not one: it redacts its token from the excerpt, which a prefix can cut in half.
 
 ### 4.16 `./preview-oauth`
 
