@@ -54,6 +54,26 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it.each(["set", "edit"] as const)("rejects NUL-bearing %s before ACK without wedging the path or consuming its batch ID", mode => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    const path = mode === "set" ? "new.txt" : "a.txt";
+    const baseHash = await replicaTextHash(mode === "set" ? null : "aaa");
+    await expect((async () => replica.submitBatch({batchId: "nul", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path, baseHash, change: mode === "set" ? {set: "first\0last"} : {edit: [3, [0, "\0"]]}},
+    ]}))()).rejects.toThrow(/Invalid replica text/);
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toEqual([]);
+    expect([...impl.storage.chatChanges.list()]).toEqual([]);
+    const accepted = await replica.submitBatch({batchId: "nul", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path, baseHash, change: mode === "set" ? {set: "valid"} : {edit: [3, [0, "valid"]]}},
+    ]});
+    await replica.submitBatch({batchId: "remove", baseCursor: (await replica.changesSince(checkpoint.cursor, 128)).cursor, files: [
+      {checkoutId: tree.id, path, baseHash: accepted.accepted[0]!.hash, change: {remove: true}},
+    ]});
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toHaveLength(2);
+  }));
+
   it.each(["set", "remove"] as const)("rejects a base-directory %s before ACK and permits a valid retry", mode => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl, 1, new Map([["src/a.txt", "aaa"]]));
     await impl.beginAgentIntegrationTurn(1);

@@ -65,6 +65,15 @@ export async function mergeReplicaBatch(
   }
   validateCodeChangeSchema(remoteChange);
   validateCodeChangeSchema(localChange);
+  // The replica bridge only supports non-NUL text anchors. Check the submitted payload, not a
+  // full-file diff, before an ACK can make an unsupported file part of its next anchor.
+  for (const [, change] of localChange[checkoutId] ?? []) {
+    if ("set" in change ? change.set.includes("\0") : "edit" in change &&
+        change.edit.some(section => Array.isArray(section) && section.some((part, index) =>
+          index > 0 && typeof part === "string" && part.includes("\0")))) {
+      throw new Error("Invalid replica text.");
+    }
+  }
   validateCodeChangeContent(remoteChange, base);
   validateCodeChangeContent(localChange, base);
   const doContent = applyCodeChange(base, remoteChange);

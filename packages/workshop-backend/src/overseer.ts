@@ -4967,8 +4967,14 @@ class OverseerImpl implements AgentHooks {
           Required<Pick<Gatekeeper<any>, "applyCreation">>>)
           .applyCreation(creation.creator, creation.configuration);
     } else if (record.contextualApply) {
-      if (!this.integrationGrant(id).contextualActions) {
+      const grant = this.integrationGrant(id);
+      if (!grant.contextualActions) {
         throw new Error("Contextual action permission was revoked. This action cannot be applied.");
+      }
+      // Every redelivery path (including active-agent restoration before retryAt) reaches this
+      // effect boundary. A durable approval is not permission to bypass a revoked recovery grant.
+      if (this.storage.actionApplications.get(record.id) && !grant.recoverableActions) {
+        throw new Error("Automatic action recovery permission was revoked.");
       }
       // Trusted configuration selects this optional dispatch; never fall back after an effect.
       await (gatekeeper as unknown as Fetcher<Gatekeeper<any> &
@@ -5031,10 +5037,6 @@ class OverseerImpl implements AgentHooks {
         } else if (record.state === "approved" || application.phase === "resume") {
           await this.#finishActionApplication(application);
         } else {
-          if (!this.integrationGrant(record.gatekeeperId).recoverableActions) {
-            this.storage.actionApplications.delete(application.id);
-            throw new Error("Automatic action recovery permission was revoked.");
-          }
           await this.applyPendingAction(record, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
         }
       } catch (error) {

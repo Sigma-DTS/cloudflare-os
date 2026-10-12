@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OverseerDurableObject } from "../src/overseer";
 import type { ActionRecord } from "../src/storage-schema/overseer-storage";
 import type { IntegrationTestActionGatekeeper } from "./test-worker";
@@ -45,6 +45,77 @@ async function prepare(impl: Impl, recoverable = true, awaited = false) {
 const reset = () => Object.assign(new Error("Injected lost reply"), { durableObjectReset: true });
 
 describe("durable approved-action recovery", () => {
+  it.each([false, true])("auto-approves an awaited follow-up while its auto-approved=%s parent is still applying", async autoParent => {
+    await runInDurableObject(env.TEST_OVERSEER.getByName(crypto.randomUUID()), async instance => {
+      const impl = instance.impl, handler = await prepare(impl, true, true);
+      let release!: () => void;
+      const childApplied = new Promise<void>(resolve => { release = resolve; });
+      let childStarted = false;
+      try {
+        // This test owns the approval/effect barrier, not model inference after the decision.
+        impl.resumePausedAgent = async () => {};
+        impl.storage.autoApproveTags.put({gatekeeperId: 31, actionKind: {tag: "network", label: "Network"}, enabledBy: APPROVER});
+        await handler.setFollowup({title: "Allow network", description: "Exact destination", implementsRevert: false,
+          autoApprovable: true, actionKind: {tag: "network", label: "Network"}, awaitDecision: true});
+        impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+          if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+            await target.applyActionInContext(...args);
+            if (args[0] === 42) await childApplied;
+            else {
+              expect(action(impl).state).toBe("pending");
+              childStarted = true;
+              release();
+            }
+          };
+          return Reflect.get(target, key);
+        }});
+        const parent = action(impl);
+        if (autoParent) {
+          impl.storage.autoApproveTags.put({gatekeeperId: 31, actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+          impl.storage.actions.put({...parent, description: {...parent.description, autoApprovable: true,
+            actionKind: {tag: "run", label: "Run"}}});
+        }
+        const applying = autoParent ? impl.drainAutoApprovals(31) : impl.applyPendingAction(parent, APPROVER, false);
+        try { await vi.waitFor(() => expect(childStarted).toBe(true), {timeout: 500}); }
+        finally { release(); await applying; }
+        expect((await handler.calls()).map(call => call.action)).toEqual([42, 43]);
+        expect([...impl.storage.actions.list()].filter(record => record.type === "action").map(record => record.state))
+          .toEqual(["approved", "approved"]);
+      } finally { release(); delete impl.env.AGENT_INTEGRATION_GRANTS; }
+    });
+  });
+
+  it("rechecks recovery permission during active-agent restoration even before retryAt", async () => {
+    const stub = env.TEST_OVERSEER.getByName(crypto.randomUUID());
+    let grantSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await runInDurableObject(stub, async instance => {
+        const impl = instance.impl;
+        await prepare(impl);
+        const parent = action(impl);
+        impl.storage.gatekeepers.put({...impl.storage.gatekeepers.get(31)!,
+          class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({props: {}})});
+        impl.storage.actionApplications.put({id: parent.id, resolvedBy: APPROVER, autoApproved: false,
+          phase: "apply", retryAt: Date.now() + 60_000});
+        impl.storage.activeAgents.put({chatId: 1, initiatorUserId: "invalid-do-id", modelId: "missing",
+          initiator: APPROVER, callbackInitiated: false, continuationId: crypto.randomUUID()});
+        grantSpy = vi.spyOn(Object.getPrototypeOf(impl), "integrationGrant").mockReturnValue({
+          lifecycle: true, contextualActions: true, recoverableActions: false, worktreeReplica: false,
+        });
+        await impl.ctx.storage.sync();
+      });
+      await evictDurableObject(stub);
+      await runInDurableObject(stub, async instance => {
+        const impl = instance.impl;
+        await impl.waitForAllAgentsToComplete();
+        const handler = await impl.getGatekeeperFacet(31) as Fetcher<IntegrationTestActionGatekeeper>;
+        expect(await handler.calls()).toEqual([]);
+        expect(action(impl).state).toBe("pending");
+        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+      });
+    } finally { grantSpy?.mockRestore(); delete env.AGENT_INTEGRATION_GRANTS; }
+  });
+
   it("publishes an in-flight follow-up through the real context, with durable deduplication and original scope", async () => {
     await runInDurableObject(env.TEST_OVERSEER.getByName(crypto.randomUUID()), async instance => {
       const impl = instance.impl, handler = await prepare(impl, true, true);
