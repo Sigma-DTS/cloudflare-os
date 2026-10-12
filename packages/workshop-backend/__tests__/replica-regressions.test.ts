@@ -3,13 +3,15 @@ import {env} from "cloudflare:workers";
 import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
-import {applyCodeChange, codeChangeSerializedSize, type CodeChange} from "@gadgets/workshop-shared/code-change";
+import {applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
 import {decodePackStream} from "../src/git-codec";
 import {runAgent, type WorktreeTurnAccess} from "../src/agent";
 import type {WorktreeReplicaCommit} from "../src/worktree-replica";
 import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall} from "@earendil-works/pi-ai";
 import type {IntegrationTestParticipant} from "./test-worker";
+import {composeWorktreeBaseChanges} from "../src/worktree-base-changes";
+import {buildCompactionState} from "../src/agent-compaction";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -113,7 +115,7 @@ describe("replica review regressions over durable kernel storage", () => {
     expect(await replica.changesSince(cursor, 128)).toEqual({events: [], cursor, hasMore: false});
   }), 30_000); // A real >32 MiB native transport test needs headroom on cold CI workers.
 
-  it.each(["file", "directory"] as const)("rejects an upload whose allocated root becomes a replica %s before the message commits", mode => inKernel(crypto.randomUUID(), async impl => {
+  it.each(["file", "directory", "second upload"] as const)("rejects an upload whose allocated root becomes a replica %s before the message commits", mode => inKernel(crypto.randomUUID(), async impl => {
     const user = env.TEST_USER.getByName(crypto.randomUUID());
     const stage = (text: string, name: string) => {
       const id = crypto.randomUUID();
@@ -129,6 +131,12 @@ describe("replica review regressions over durable kernel storage", () => {
     const replica = await open(impl, chatId), checkpoint = await replica.checkpoint();
     await impl.closeAgentIntegrationTurn(chatId, "approval");
     const upload = stage("uploaded", "report.csv");
+    const earlier = mode === "second upload" ? stage("earlier", "earlier.csv") : undefined;
+    const observed: {type: string, attachments?: {id: string}[]}[] = [];
+    const subscriber = {add: (message: (typeof observed)[number]) => { observed.push(message); },
+      update: () => {}, remove: () => {}};
+    impl.storage.chats.subscribe(subscriber);
+    const emittedRows = vi.spyOn(impl, "emitChatChangeApplied");
     let arrived!: () => void, release!: () => void;
     const entered = new Promise<void>(resolve => { arrived = resolve; });
     const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -139,8 +147,8 @@ describe("replica review regressions over durable kernel storage", () => {
       await barrier;
       return commit;
     };
-    const sending = impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, [upload]);
-    const path = mode === "file" ? "report.csv" : "report.csv/part.txt";
+    const sending = impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, earlier ? [earlier, upload] : [upload]);
+    const path = mode === "directory" ? "report.csv/part.txt" : "report.csv";
     try {
       await entered;
       await replica.submitBatch({batchId: "concurrent-upload", baseCursor: checkpoint.cursor, files: [
@@ -151,6 +159,11 @@ describe("replica review regressions over durable kernel storage", () => {
     expect(impl.storage.chatAttachmentContent.get(upload.id)?.state.type).toBe("staged");
     expect([...impl.storage.chats.list()].some(message => message.type === "message" &&
       message.attachments?.some(attachment => attachment.id === upload.id))).toBe(false);
+    expect(observed.some(message => message.attachments?.some(attachment => attachment.id === upload.id))).toBe(false);
+    expect(emittedRows.mock.calls.some(([row]) => row.change[treeId]?.some(([entryPath]) => entryPath === "earlier.csv"))).toBe(false);
+    if (earlier) expect(impl.storage.chatAttachmentContent.get(earlier.id)?.state.type).toBe("staged");
+    impl.storage.chats.unsubscribe(subscriber);
+    emittedRows.mockRestore();
     expect((await impl.getCurrentChatContent(chatId, impl.storage.chatMeta.get(chatId)!)).get(treeId)?.get(path))
       .toBe("replica-created");
     expect([...impl.storage.worktreeReplicaCommits.list()]).toHaveLength(1);
@@ -160,6 +173,108 @@ describe("replica review regressions over durable kernel storage", () => {
     expect(content.get(treeId)?.get(path)).toBe("replica-created");
     expect(content.get(treeId)?.get("report-2.csv")).toBe("uploaded");
   }));
+
+  it.each([0, 1])("retains the proposal and original prefix when accepted-prefix storage fails after %s writes", faultAfter => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    await step(impl, 1, {[tree.id]: [["a.txt", {edit: [3, [0, "first"]]}], ["b.txt", {set: "b"}]]});
+    await impl.mergeChanges(1, {profile: USER}, USER.id);
+    await step(impl, 1, {[tree.id]: [["a.txt", {edit: [8, [0, "second"]]}], ["b.txt", {edit: [1, [0, "!"]]}]]});
+    const pin = impl.storage.gadgets.get(tree.id), base = impl.chatCodeBase(impl.storage.chatMeta.get(1)!);
+    const prefix = [...impl.storage.worktreeBaseChanges.list()];
+    const merges = [...impl.storage.chats.list()].filter(message => message.type === "merge");
+    const persist = impl.storage.worktreeBaseChanges.put.bind(impl.storage.worktreeBaseChanges);
+    let written = 0;
+    const put = vi.spyOn(impl.storage.worktreeBaseChanges, "put").mockImplementation(record => {
+      if (written++ === faultAfter) throw new Error("Injected prefix storage failure");
+      persist(record);
+    });
+    await expect(impl.mergeChanges(1, {profile: USER}, USER.id)).rejects.toThrow("Injected prefix storage failure");
+    put.mockRestore();
+    expect(impl.storage.gadgets.get(tree.id)).toEqual(pin);
+    expect(impl.chatCodeBase(impl.storage.chatMeta.get(1)!)).toEqual(base);
+    expect([...impl.storage.worktreeBaseChanges.list()]).toEqual(prefix);
+    expect([...impl.storage.chats.list()].filter(message => message.type === "merge")).toEqual(merges);
+    expect((await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(tree.id)?.get("a.txt")).toBe("aaafirstsecond");
+    expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+  }));
+
+  it.each([false, true])("bounds cumulative accepted set prefixes without flattening subsequent edits (one epoch: %s)", async oneEpoch => {
+    const name = crypto.randomUUID(), chunk = "界".repeat(600_000);
+    const treeId = await inKernel(name, async impl => {
+      delete impl.env.AGENT_INTEGRATION_GRANTS; // Ordinary worktrees must work without replica grants.
+      const tree = await worktree(impl);
+      for (let i = 0; i < 8; ++i) {
+        await step(impl, 1, {[tree.id]: [["large.txt", i === 0 ? {set: chunk} : {edit: [i * chunk.length, [0, chunk]]}]]});
+        if (!oneEpoch) expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+      }
+      if (oneEpoch) expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+      await impl.ctx.storage.sync();
+      return tree.id;
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      const records = [...impl.storage.worktreeBaseChanges.byWorkpiece.get(treeId)];
+      expect(records).toHaveLength(2);
+      expect(records.filter(record => "set" in record.change)).toHaveLength(1);
+      expect(records.filter(record => "edit" in record.change)).toHaveLength(1);
+      for (const record of records) expect(codeChangeSerializedSize({[treeId]: [[record.path, record.change]]}))
+        .toBeLessThanOrEqual(MAX_CODE_CHANGE_SIZE);
+      const original = composeWorktreeBaseChanges(treeId, records);
+      expect(codeChangeSerializedSize(original)).toBeGreaterThan(MAX_CODE_CHANGE_SIZE);
+      const text = applyCodeChange(new Map([[treeId, new Map()]]), original).get(treeId)!.get("large.txt")!;
+      expect(text.length).toBe(8 * chunk.length);
+      expect(text).toBe(chunk.repeat(8));
+      const tree = impl.storage.gadgets.get(treeId)!;
+      if (tree.type !== "worktree") throw new Error("Expected worktree");
+      expect(await impl.gitCache.readFileAtCommitIfExists(tree.pinBase, "large.txt")).toBe(text);
+    });
+  }, 30_000);
+
+  it.each([false, true])("retains a pasted gadget outside the frozen seed after suspension and reset (compacted: %s)", async compact => {
+    const name = crypto.randomUUID();
+    const saved = await inKernel(name, async impl => {
+      const tree = await worktree(impl);
+      const commit = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "pasted"]]), {
+        parents: [], author: {name: "Test", email: "test@example.com"}, message: "Late gadget", timestamp: new Date(0),
+      });
+      const gadgetId = 100;
+      impl.storage.gadgets.put({type: "gadget", id: gadgetId, title: "Late board", bindingName: "LATE",
+        bindings: {}, created: new Date(0), commitId: commit});
+      impl.addChatMessages(1, USER, [{type: "message", message: "Read [board]", capsules: [{
+        position: 5, length: 7, gatekeeperId: gadgetId,
+        description: {url: "test://board", title: "Late board", suggestedBindingName: "LATE", tsType: "object"},
+      }]}]);
+      const faux = createFauxCore({models: [{id: "faux-model"}]});
+      faux.setResponses([fauxAssistantMessage(fauxText("Done."))]);
+      await impl.beginAgentIntegrationTurn(1);
+      await runAgent(impl, {model: faux.getModel(), stream: faux.stream}, 1, AUTHOR,
+        new AbortController().signal, USER, {provider: "cloudflare", model: "faux-model", apiToken: ""});
+      expect(Object.values(impl.getChatAgentContext(1).bindings!)).not.toContain(gadgetId);
+      const selection = impl.replicaSelection(1);
+      expect(selection.map(entry => entry.checkoutId)).toEqual([tree.id, gadgetId]);
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      await impl.closeAgentIntegrationTurn(1, "approval");
+      if (compact) {
+        const history = impl.loadChatHistory(1), compactedTo = impl.nextChatSequencePeek(1);
+        impl.commitChatCompaction(1, {chatId: 1, compactedTo, summary: "Retain pasted board",
+          ...buildCompactionState(history.chatMessages, compactedTo,
+            Object.entries(impl.getChatAgentContext(1).bindings!).map(([binding, id]) => [binding, {type: "workpiece", id}]), history.checkpoint)});
+      }
+      await impl.ctx.storage.sync();
+      return {selection, cursor: checkpoint.cursor, gadgetId};
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      expect(impl.replicaSelection(1)).toEqual(saved.selection);
+      const replica = impl.getWorkspaceReplicaSession(saved.cursor.split(":")[0]);
+      expect(await replica.changesSince(saved.cursor, 1)).toMatchObject({events: [], cursor: saved.cursor});
+      await replica.submitBatch({batchId: "pasted-after-reset", baseCursor: saved.cursor, files: [
+        {checkoutId: saved.gadgetId, path: "a.txt", baseHash: await replicaTextHash("pasted"), change: {edit: [6, [0, "!"]]}},
+      ]});
+      expect((await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(saved.gadgetId)?.get("a.txt"))
+        .toBe("pasted!");
+    });
+  });
 
   it.each(["set", "edit"] as const)("rejects NUL-bearing %s before ACK without wedging the path or consuming its batch ID", mode => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl);

@@ -370,11 +370,13 @@ export type WorktreeRecord = {
  */
 export type WorkpieceRecord = GadgetRecord | WorktreeRecord;
 
-/** Accepted transforms from a worktree's immutable hydration anchor to its current pinBase. */
+/** One bounded, ordered chunk of the accepted transforms from the hydration anchor to pinBase. */
 export type WorktreeBaseChangeRecord = {
   workpieceId: WorkpieceId;
   path: string;
   change: FileChange;
+  /** Subsequent chunks for this path; absent on the first chunk and on pre-chunking records. */
+  part?: number;
 };
 
 // =======================================================================================
@@ -1332,7 +1334,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
     collections: {
       worktreeBaseChanges: collection<WorktreeBaseChangeRecord>()({
-        primaryKey: record => `${keyString(record.workpieceId)}.${record.path}`,
+        // Keep first-chunk keys compatible; subsequent keys cannot collide with numeric old keys.
+        primaryKey: record => record.part === undefined ? `${keyString(record.workpieceId)}.${record.path}` :
+          `chunk.${keyString(record.workpieceId)}.${keyString(record.part)}.${record.path}`,
         nonUniqueIndexes: {byWorkpiece: (record: WorktreeBaseChangeRecord) => record.workpieceId},
       }),
       pausedAgents: collection<ActiveAgentRecord>()({primaryKey: "chatId"}),

@@ -50,7 +50,8 @@ import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
-import { chatChangeStatuses, foldCompactedCode } from "./agent-compaction";
+import { chatChangeStatuses, foldCompactedCode, foldProposedChanges, replayChatBindings } from "./agent-compaction";
+import {composeWorktreeBaseChanges, prepareWorktreeBaseChanges} from "./worktree-base-changes";
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import {
   blueprintContentKey, deleteBlueprintContent, readBlueprintRelease, sanitizeBlueprintOutput,
@@ -3795,7 +3796,9 @@ class OverseerImpl implements AgentHooks {
     let revisionToken = entryCodeBase.revision;
     // Preserve the actual transforms before the accept closes this epoch. Re-diffing its
     // flattened Git tree would lose positional intent in repeated text.
-    const acceptedOverlay = this.#replicaOverlay(chatId);
+    const history = this.loadChatHistory(chatId);
+    const acceptedBatches = foldProposedChanges(history.chatMessages,
+      history.checkpoint?.proposedChange ? [{sequence: -1, change: history.checkpoint.proposedChange}] : []);
 
     // Message statuses drive excluding reverted creations from coverage below. The map stays
     // valid through the whole accept: the sequence-token revalidation after the awaits
@@ -4029,6 +4032,15 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
+    // Prepare and bound every prefix before any merge notification or epoch reset can escape.
+    const prefixUpdates = [...worktreeAccepts].flatMap(([worktreeId, pinBase]) => {
+      const record = this.storage.gadgets.get(worktreeId);
+      if (record?.type !== "worktree" || record.pinBase === pinBase) return [];
+      const previous = [...this.storage.worktreeBaseChanges.byWorkpiece.get(worktreeId)];
+      return [{record, pinBase, previous,
+        changes: prepareWorktreeBaseChanges(worktreeId, previous, acceptedBatches)}];
+    });
+
     // Everything above this point awaited, so the chat and workspace may have moved in the
     // meantime; re-validate before mutating. The chat lock excludes sibling merge/revert/
     // update-from-mainline calls, but an accept from *another* chat can advance a head, an agent
@@ -4068,159 +4080,159 @@ class OverseerImpl implements AgentHooks {
     // to a vendorless connection, is in nobody's verification scope.
     let useScopeBefore = this.#accountRequiringUseScope();
 
-    // Promote provisional gadgets whose creation is covered by this merge: accepting the chat's
-    // changes through `mergeThrough` makes them permanent workspace members. Each covered
-    // creation sits on an unmerged, unreverted "changes" message at `pending.sequence` (a
-    // merged one's gadget is already promoted, and a reverted one's is excluded here exactly as
-    // the toCommit loop excluded it), and is in `commits`, so every promoted gadget gets a head
-    // in the fast-forward step below -- possibly an empty tree.
-    for (let gadget of this.listPendingGadgets(chatId)) {
-      if (gadget.pending!.sequence !== undefined && gadget.pending!.sequence <= mergeThrough &&
-          !revertedStamp(gadget.pending)) {
-        delete gadget.pending;
-        this.storage.gadgets.put(gadget);
-        this.recordGadgetAnalytics({
-          event_name: "workpiece_created",
-          user_id: clientUserId,
-          workpiece_id: gadget.id,
-          source: "chat",
+    try {
+      this.ctx.storage.transactionSync(() => {
+        // Prefix writes have no external subscribers. Complete all of them before publishing
+        // pins or messages, and roll the whole accept back if any bounded write still fails.
+        for (const {previous, changes} of prefixUpdates) {
+          for (const item of previous) this.storage.worktreeBaseChanges.deleteRecord(item);
+          for (const item of changes) this.storage.worktreeBaseChanges.put(item);
+        }
+        // Promote provisional gadgets whose creation is covered by this merge: accepting the chat's
+        // changes through `mergeThrough` makes them permanent workspace members. Each covered
+        // creation sits on an unmerged, unreverted "changes" message at `pending.sequence` (a
+        // merged one's gadget is already promoted, and a reverted one's is excluded here exactly as
+        // the toCommit loop excluded it), and is in `commits`, so every promoted gadget gets a head
+        // in the fast-forward step below -- possibly an empty tree.
+        for (let gadget of this.listPendingGadgets(chatId)) {
+          if (gadget.pending!.sequence !== undefined && gadget.pending!.sequence <= mergeThrough &&
+              !revertedStamp(gadget.pending)) {
+            delete gadget.pending;
+            this.storage.gadgets.put(gadget);
+            this.recordGadgetAnalytics({
+              event_name: "workpiece_created",
+              user_id: clientUserId,
+              workpiece_id: gadget.id,
+              source: "chat",
+            });
+          }
+        }
+
+        // Likewise promote provisional binding edges covered by this merge; this is also the moment
+        // an edge becomes visible to mainline loads and the derived workspace default binding list.
+        // (Reverted additions only survive on a reverted creation's record -- the revert deletes
+        // covered edges synchronously otherwise -- but exclude them the same way for coherence.)
+        for (let gadget of this.storage.gadgets.list()) {
+          if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
+          let promoted = false;
+          for (let edge of Object.values(gadget.bindings)) {
+            if (edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
+                edge.pending.sequence <= mergeThrough && !revertedStamp(edge.pending)) {
+              delete edge.pending;
+              promoted = true;
+            }
+          }
+          if (promoted) {
+            this.storage.gadgets.put(gadget);
+          }
+        }
+
+        // Fast-forward each committed gadget's head.
+        for (let {gadgetId, commitId} of commits) {
+          let record = this.storage.gadgets.get(gadgetId)!;
+          if (record.type !== "gadget") continue;  // unreachable: only gadgets are committed
+          record.commitId = commitId;
+          this.storage.gadgets.put(record);
+        }
+
+        // Each gadget the chat proposed merging a blueprint release into now follows that
+        // blueprint, at that release, which its head's history holds: from just above, or from
+        // before. (A gadget whose creation this merge did not cover is no part of it.)
+        for (let [gadgetId, {blueprintId, commitId}] of blueprintMerges) {
+          let record = this.storage.gadgets.get(gadgetId);
+          if (record?.type !== "gadget" || record.pending) continue;
+          record.upstream = {blueprintId, commitId};
+          this.storage.gadgets.put(record);
+        }
+
+        // Bump the loader-cache counter so cached workers reload with the new heads (and promoted
+        // records) visible.
+        this.bumpVersion();
+        let timestamp = this.getChatTimestamp();
+
+        let mergeSequence = this.nextChatSequence(chatId);
+        this.storage.chats.put({
+          chatId,
+          sequence: mergeSequence,
+          timestamp,
+          author: userMeta.profile,
+
+          type: "merge",
+          mergeThrough,
+          commits,
+          // The merge closes the chat's epoch (see the reset below); content reconstruction
+          // restarts here. Historical (pre-git) merges lack this, which is how replay tells them
+          // apart. (Merges from before worktrees pinned on modification also carry `worktreePins`,
+          // which readers still honor; nothing writes it anymore.)
+          epochBoundary: true,
         });
-      }
-    }
 
-    // Likewise promote provisional binding edges covered by this merge; this is also the moment
-    // an edge becomes visible to mainline loads and the derived workspace default binding list.
-    // (Reverted additions only survive on a reverted creation's record -- the revert deletes
-    // covered edges synchronously otherwise -- but exclude them the same way for coherence.)
-    for (let gadget of this.storage.gadgets.list()) {
-      if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
-      let promoted = false;
-      for (let edge of Object.values(gadget.bindings)) {
-        if (edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
-            edge.pending.sequence <= mergeThrough && !revertedStamp(edge.pending)) {
-          delete edge.pending;
-          promoted = true;
+        // The boundary map for the straggler bridge: per gadget, the commit whose tree equals the
+        // chat's content at this reset. A committed gadget's is the commit just written; an
+        // uncommitted pin had no net change relative to its mergedCommit (that's why it wasn't
+        // committed), so its content equals head exactly when mergedCommit == head -- otherwise the
+        // reset visibly changes the gadget's content (the pin evaporates and the chat snaps to a
+        // head it never merged), making it bridge-ineligible and reported in
+        // `prior.discontinuousGadgets` so clients rebuild it from head.
+        let boundaries: ChatChangeBoundaryRecord["boundaries"] =
+            commits.map(({gadgetId, commitId}) => ({gadgetId, commitId}));
+        let committedIds = new Set(commits.map(commit => commit.gadgetId));
+        let discontinuousGadgets: WorkpieceId[] = [];
+        for (let pin of freshCodeBase.pins) {
+          if (committedIds.has(pin.gadgetId)) continue;
+          // A worktree's new accepted commit is by construction the commit whose tree equals the
+          // chat's content at this reset, so it is bridge-eligible and never discontinuous: a
+          // bridged row re-pins the worktree at it (the base submitCodeChange requires). (A
+          // worktree pin whose record has vanished -- a reverted creation surviving a failed reap
+          // -- falls through to the null branch.)
+          let accepted = worktreeAccepts.get(pin.gadgetId);
+          if (accepted !== undefined) {
+            boundaries.push({gadgetId: pin.gadgetId, commitId: accepted});
+            continue;
+          }
+          let record = this.storage.gadgets.get(pin.gadgetId);
+          let head = record?.type === "gadget" ? record.commitId : undefined;
+          if (head !== undefined && head === pin.mergedCommit) {
+            boundaries.push({gadgetId: pin.gadgetId, commitId: head});
+          } else {
+            boundaries.push({gadgetId: pin.gadgetId, commitId: null});
+            discontinuousGadgets.push(pin.gadgetId);
+          }
         }
-      }
-      if (promoted) {
-        this.storage.gadgets.put(gadget);
-      }
-    }
 
-    // Fast-forward each committed gadget's head.
-    for (let {gadgetId, commitId} of commits) {
-      let record = this.storage.gadgets.get(gadgetId)!;
-      if (record.type !== "gadget") continue;  // unreachable: only gadgets are committed
-      record.commitId = commitId;
-      this.storage.gadgets.put(record);
-    }
-
-    // Each gadget the chat proposed merging a blueprint release into now follows that
-    // blueprint, at that release, which its head's history holds: from just above, or from
-    // before. (A gadget whose creation this merge did not cover is no part of it.)
-    for (let [gadgetId, {blueprintId, commitId}] of blueprintMerges) {
-      let record = this.storage.gadgets.get(gadgetId);
-      if (record?.type !== "gadget" || record.pending) continue;
-      record.upstream = {blueprintId, commitId};
-      this.storage.gadgets.put(record);
-    }
-
-    // Bump the loader-cache counter so cached workers reload with the new heads (and promoted
-    // records) visible.
-    this.bumpVersion();
-    let timestamp = this.getChatTimestamp();
-
-    let mergeSequence = this.nextChatSequence(chatId);
-    this.storage.chats.put({
-      chatId,
-      sequence: mergeSequence,
-      timestamp,
-      author: userMeta.profile,
-
-      type: "merge",
-      mergeThrough,
-      commits,
-      // The merge closes the chat's epoch (see the reset below); content reconstruction
-      // restarts here. Historical (pre-git) merges lack this, which is how replay tells them
-      // apart. (Merges from before worktrees pinned on modification also carry `worktreePins`,
-      // which readers still honor; nothing writes it anymore.)
-      epochBoundary: true,
-    });
-
-    // The boundary map for the straggler bridge: per gadget, the commit whose tree equals the
-    // chat's content at this reset. A committed gadget's is the commit just written; an
-    // uncommitted pin had no net change relative to its mergedCommit (that's why it wasn't
-    // committed), so its content equals head exactly when mergedCommit == head -- otherwise the
-    // reset visibly changes the gadget's content (the pin evaporates and the chat snaps to a
-    // head it never merged), making it bridge-ineligible and reported in
-    // `prior.discontinuousGadgets` so clients rebuild it from head.
-    let boundaries: ChatChangeBoundaryRecord["boundaries"] =
-        commits.map(({gadgetId, commitId}) => ({gadgetId, commitId}));
-    let committedIds = new Set(commits.map(commit => commit.gadgetId));
-    let discontinuousGadgets: WorkpieceId[] = [];
-    for (let pin of freshCodeBase.pins) {
-      if (committedIds.has(pin.gadgetId)) continue;
-      // A worktree's new accepted commit is by construction the commit whose tree equals the
-      // chat's content at this reset, so it is bridge-eligible and never discontinuous: a
-      // bridged row re-pins the worktree at it (the base submitCodeChange requires). (A
-      // worktree pin whose record has vanished -- a reverted creation surviving a failed reap
-      // -- falls through to the null branch.)
-      let accepted = worktreeAccepts.get(pin.gadgetId);
-      if (accepted !== undefined) {
-        boundaries.push({gadgetId: pin.gadgetId, commitId: accepted});
-        continue;
-      }
-      let record = this.storage.gadgets.get(pin.gadgetId);
-      let head = record?.type === "gadget" ? record.commitId : undefined;
-      if (head !== undefined && head === pin.mergedCommit) {
-        boundaries.push({gadgetId: pin.gadgetId, commitId: head});
-      } else {
-        boundaries.push({gadgetId: pin.gadgetId, commitId: null});
-        discontinuousGadgets.push(pin.gadgetId);
-      }
-    }
-
-    // Close the epoch: everything the chat proposed now lives in commits, so the chat's code
-    // base resets to empty -- every pin evaporates, the change stream restarts at revision 0 under
-    // a new generation, and subsequent edits re-pin lazily against the new heads -- for a
-    // worktree, against its accepted commit, advanced here to the commit planned above. The
-    // bump is content-preserving: the closed generation's rows are retired (not deleted) as the
-    // transform window, the boundary record above opens the straggler bridge, and `prior` tells
-    // clients how to hand off (see ChatCodeBase.prior). The reset lands on the freshly-read
-    // meta so concurrent changes to other fields (e.g. a title rename during the awaits)
-    // survive.
-    this.#retireChatChanges(this.listLiveChatChanges(chatId, generationToken));
-    this.#pruneRetiredChatChanges(chatId);
-    this.storage.chatChangeBoundaries.put(
-        {chatId, generation: generationToken, finalRevision: revisionToken, boundaries});
-    this.#chatContentCache.delete(chatId);
-    freshMeta.codeBase = {
-      pins: [],
-      generation: generationToken + 1,
-      revision: 0,
-      epoch: mergeSequence,
-      prior: {generation: generationToken, finalRevision: revisionToken, discontinuousGadgets},
-    };
-    freshMeta.lastActive = timestamp;
-    this.storage.chatMeta.put(freshMeta);
-    for (let [worktreeId, newPinBase] of worktreeAccepts) {
-      let record = this.storage.gadgets.get(worktreeId);
-      if (record?.type === "worktree" && record.pinBase !== newPinBase) {
-        record.replicaBaseCommit ??= record.pinBase;
-        const prefix: CodeChange = {[worktreeId]: [...this.storage.worktreeBaseChanges
-          .byWorkpiece.get(worktreeId)].map(item => [item.path, item.change])};
-        const composed = composeCodeChange(prefix,
-          {[worktreeId]: acceptedOverlay[worktreeId] ?? []});
-        const previousPrefix = [...this.storage.worktreeBaseChanges.byWorkpiece.get(worktreeId)];
-        for (const item of previousPrefix) {
-          this.storage.worktreeBaseChanges.deleteRecord(item);
+        // Close the epoch: everything the chat proposed now lives in commits, so the chat's code
+        // base resets to empty -- every pin evaporates, the change stream restarts at revision 0 under
+        // a new generation, and subsequent edits re-pin lazily against the new heads -- for a
+        // worktree, against its accepted commit, advanced here to the commit planned above. The
+        // bump is content-preserving: the closed generation's rows are retired (not deleted) as the
+        // transform window, the boundary record above opens the straggler bridge, and `prior` tells
+        // clients how to hand off (see ChatCodeBase.prior). The reset lands on the freshly-read
+        // meta so concurrent changes to other fields (e.g. a title rename during the awaits)
+        // survive.
+        this.#retireChatChanges(this.listLiveChatChanges(chatId, generationToken));
+        this.#pruneRetiredChatChanges(chatId);
+        this.storage.chatChangeBoundaries.put(
+            {chatId, generation: generationToken, finalRevision: revisionToken, boundaries});
+        this.#chatContentCache.delete(chatId);
+        freshMeta.codeBase = {
+          pins: [],
+          generation: generationToken + 1,
+          revision: 0,
+          epoch: mergeSequence,
+          prior: {generation: generationToken, finalRevision: revisionToken, discontinuousGadgets},
+        };
+        freshMeta.lastActive = timestamp;
+        this.storage.chatMeta.put(freshMeta);
+        for (const {record, pinBase} of prefixUpdates) {
+          record.replicaBaseCommit ??= record.pinBase;
+          record.pinBase = pinBase;
+          this.storage.gadgets.put(record);
         }
-        for (const [path, change] of composed[worktreeId] ?? []) {
-          this.storage.worktreeBaseChanges.put({workpieceId: worktreeId, path, change});
-        }
-        record.pinBase = newPinBase;
-        this.storage.gadgets.put(record);
-      }
+      });
+    } catch (error) {
+      this.invalidateChatContent(chatId);
+      this.#liveWindowCache.delete(chatId);
+      throw error;
     }
 
     // Maybe generate gadget title if this was the first accepted code. (A merge covering only
@@ -5655,32 +5667,46 @@ class OverseerImpl implements AgentHooks {
     return record;
   }
 
-  #appendWorkspaceAttachments(
-      chatId: number, worktree: WorktreeRecord, files: ReadonlyMap<string, string>,
-      author: AiChatAuthorInfo): void {
+  // Validate the entire batch before any subscriber sees its message or first change row.
+  #prepareWorkspaceAttachmentChanges(
+      chatId: number, worktree: WorktreeRecord, files: ReadonlyMap<string, string>)
+      : {change: CodeChange, content: CodeContent}[] {
     const current = this.storage.gadgets.get(worktree.id);
     if (current?.type !== "worktree" || current.chatId !== chatId || current.pinBase !== worktree.pinBase) {
       throw new Error("Attachment worktree changed while preparing the message; retry.");
     }
+    const meta = this.getChatMetaOrThrow(chatId), base = this.chatCodeBase(meta);
+    const cached = this.#chatContentCache.get(chatId);
+    if (!cached || cached.generation !== base.generation || cached.revision !== base.revision) {
+      throw new Error("Attachment workspace changed while preparing the message; retry.");
+    }
+    let content = cached.content;
+    const prepared: {change: CodeChange, content: CodeContent}[] = [];
     for (let [path, text] of files) {
-      const meta = this.getChatMetaOrThrow(chatId), base = this.chatCodeBase(meta);
-      const cached = this.#chatContentCache.get(chatId);
-      if (!cached || cached.generation !== base.generation || cached.revision !== base.revision) {
-        throw new Error("Attachment workspace changed while preparing the message; retry.");
-      }
       // Replica ingestion can advance the namespace during the preparation awaits. The
       // current cache includes those touched paths; its freshness alone doesn't reserve names.
-      for (const existing of cached.content.get(worktree.id)?.keys() ?? []) {
+      for (const existing of content.get(worktree.id)?.keys() ?? []) {
         if (existing === path || existing.startsWith(path + "/")) {
           throw new Error("Attachment workspace changed while preparing the message; retry.");
         }
       }
       const change: CodeChange = {[worktree.id]: [[path, {set: text}]]};
       validateCodeChangeSchema(change);
-      validateCodeChangeContent(change, cached.content);
+      validateCodeChangeContent(change, content);
+      content = applyCodeChange(content, change);
+      prepared.push({change, content});
+    }
+    return prepared;
+  }
+
+  #appendWorkspaceAttachments(
+      chatId: number, worktree: WorktreeRecord,
+      prepared: {change: CodeChange, content: CodeContent}[], author: AiChatAuthorInfo): void {
+    for (const {change, content} of prepared) {
+      const meta = this.getChatMetaOrThrow(chatId), base = this.chatCodeBase(meta);
       const pins = base.pins.some(pin => pin.gadgetId === worktree.id) ? [] :
         [{gadgetId: worktree.id, baseCommit: worktree.pinBase, mergedCommit: worktree.pinBase}];
-      this.#appendChatChangeRow(chatId, meta, author, change, pins, applyCodeChange(cached.content, change));
+      this.#appendChatChangeRow(chatId, meta, author, change, pins, content);
       this.materializeChatChanges(chatId, undefined, {author, allowDuringTurn: true});
     }
   }
@@ -6412,21 +6438,15 @@ class OverseerImpl implements AgentHooks {
         if (entry.type === "workpiece" && !names.has(entry.id)) names.set(entry.id, name);
       }
     } else {
-      for (const [name, id] of Object.entries(this.getChatAgentContext(chatId).bindings ?? {})) {
-        if (!names.has(id)) names.set(id, name);
+      const checkpoint = this.getActiveChatCompaction(chatId);
+      const initial = new Map<string, ChatBindingEntry>(checkpoint?.chatBindings ?? []);
+      for (const [name, id] of Object.entries(context.bindings ?? {})) {
+        if (!initial.has(name)) initial.set(name, {type: "workpiece", id});
       }
-      for (const [name, entry] of this.getActiveChatCompaction(chatId)?.chatBindings ?? []) {
+      const messages = this.storage.chats.list({prefix: chatKeyPrefix(chatId),
+        start: checkpoint && chatKey(chatId, checkpoint.compactedTo)});
+      for (const [name, entry] of replayChatBindings(messages, initial)) {
         if (entry.type === "workpiece" && !names.has(entry.id)) names.set(entry.id, name);
-      }
-      for (const message of this.storage.chats.list({ prefix: `${keyString(chatId)}.` })) {
-        if (message.type === "message") for (const call of message.toolCalls ?? []) {
-          if (call.toolName === "createWorktree" && call.output) names.set(call.output.worktreeId, call.input.bindingName);
-          if (call.toolName === "createGadget" && call.output) names.set(call.output.gadgetId, call.input.bindingName);
-        }
-        if (message.type === "changes") {
-          for (const tree of message.createdWorktrees ?? []) names.set(tree.worktreeId, tree.bindingName);
-          for (const gadget of message.createdGadgets ?? []) names.set(gadget.gadgetId, gadget.bindingName);
-        }
       }
     }
     const meta = this.storage.chatMeta.get(chatId);
@@ -6626,8 +6646,8 @@ class OverseerImpl implements AgentHooks {
           tree.headCommit = piece?.type === "worktree" ? piece.headCommit : tree.baseCommit;
           const root = tree.baseCommit && await this.gitCache.pathEntryAtCommit(tree.baseCommit, "");
           tree.baseTree = root ? root.oid : null;
-          const prefix: CodeChange = {[tree.checkoutId]: [...this.storage.worktreeBaseChanges
-            .byWorkpiece.get(tree.checkoutId)].map(item => [item.path, item.change])};
+          const prefix = composeWorktreeBaseChanges(tree.checkoutId,
+            this.storage.worktreeBaseChanges.byWorkpiece.get(tree.checkoutId));
           const composed = composeCodeChange(prefix,
             {[tree.checkoutId]: pending[tree.checkoutId] ?? []});
           // Bound the stored transforms, not their resulting full files or a JSON copy.
@@ -7308,6 +7328,8 @@ class OverseerImpl implements AgentHooks {
     let meta = this.assertChatNotActive(chatId, true);
     let result = this.materializeChatChanges(chatId, meta);
     if (result) meta = result.meta;
+    const attachmentChanges = attachmentsWorktree && attachmentFiles.size
+      ? this.#prepareWorkspaceAttachmentChanges(chatId, attachmentsWorktree, attachmentFiles) : [];
     meta.lastActive = this.getChatTimestamp();
     // A built-in command runs a turn without a prompt: `/compact` compacts and ends.
     let runsAgentTurn = prepared.message !== undefined ||
@@ -7322,7 +7344,7 @@ class OverseerImpl implements AgentHooks {
             chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
             formats, preparedAttachmentsWorktree, attachmentSourceCommit);
         if (attachmentsWorktree && attachmentFiles.size) {
-          this.#appendWorkspaceAttachments(chatId, attachmentsWorktree, attachmentFiles, userMeta.profile);
+          this.#appendWorkspaceAttachments(chatId, attachmentsWorktree, attachmentChanges, userMeta.profile);
         }
         if (responseTargetRegistration) {
           if (promptSequence === undefined) {

@@ -122,9 +122,12 @@ their lease-local echo provenance even while the ordinary transcript commit is s
 UTF-8 text attachments become ordinary worktree files; BOMs are
 preserved as content, and downloads read the original Git blob bytes. Upload names reserve existing
 base and accepted/pending overlay root names, including directories, without reading their contents.
-The message's transaction rechecks allocated names against newly touched paths: a replica can
+Immediately before the message's transaction, preflight every allocated name and OT against the
+current namespace and content: a replica can
 write while attachment preparation awaits. A collision rejects the send and leaves the upload
 staged; retry allocates a free suffix without overwriting acknowledged replica edits.
+This preflight must finish before publishing the user message or any attachment row. Collection
+subscribers are synchronous, so database rollback cannot retract an already queued notification.
 Rev 0 leaves non-UTF-8 attachments in the byte-preserving attachment store rather than creating
 lossy text. File contents no longer have a separate uncompressed text-size cap; ordinary Git storage
 and change-message limits apply, as on the kernel's other file paths.
@@ -155,12 +158,20 @@ Integration journals, leases, receipts, accepted OT prefixes, and attachment ref
 eagerly fetching repository contents. Checkout IDs are existing workpiece IDs; source provenance
 remains in worktree records and the OID store, without a separate filesystem/repository catalog.
 Replica overlays use the same compacted-history fold as agent replay, followed by live OT rows.
-At accept, the original operations compose into a per-path durable prefix relative to a stable
-hydration commit. Reconciliation therefore retains positional intent and small deltas across accepts,
+At accept, the original operations compose into bounded per-path storage chunks relative to a stable
+hydration commit. A chunk that would exceed the ordinary change-record budget starts a new chunk
+with the next original operation, rather than re-diffing a flattened file or rejecting a growing
+file. Chunks are prepared and validated before publication; their replacement, pin advancement and
+epoch reset share one storage transaction. Failure retains the previous prefix and the proposal.
+First-chunk keys remain compatible with pre-chunking version-6 records.
+Reconciliation therefore retains positional intent and small deltas across accepts,
 compaction and eviction without expanding edits to full-file sets. Bootstrap materializes accepted
 contents from real Git objects and applies only pending OTs; it does not fetch untouched blobs
 through the DO. Captured heads survive eviction and do not follow a later moving worktree head.
 Every object read during enumeration and streaming rechecks lease/revocation/bootstrap closure.
+Stored replica selection replays the same stamped binding layer as compaction, including pasted
+gadgets added after the chat's frozen seed. Suspension and eviction must not shrink an existing
+lease solely because its live binding map is gone.
 Pre-prototype worktrees without that prefix start from their current accepted commit; if it is
 local-only, the integration uses binary base streaming rather than fetching it from a provider.
 
