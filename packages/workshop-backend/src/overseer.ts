@@ -68,6 +68,7 @@ import type { AgentContext, AgentTurnInfo, AgentTurnParticipant, GatekeeperActio
   WorktreeReplicaReceipt, WorkspaceCheckpoint } from "@gadgets/workshop-shared/agent-integration";
 import { WorktreeReplicaSession, requireReplicaPath, type WorktreeReplicaHost,
   type WorktreeReplicaLease, type WorktreeReplicaCommit } from "./worktree-replica";
+import { replicaCommitPack } from "./replica-git";
 import type { Cursor } from "@gadgets/workshop-shared/gatekeeper";
 import { agentIntegrationGrant, beginIntegrationTurn, closeIntegrationTurn, requireIntegrationTurn,
   deliverIntegrationEvent, type AgentIntegrationOrigin } from "./agent-integration";
@@ -6421,7 +6422,8 @@ class OverseerImpl implements AgentHooks {
         context.attachments?.worktreeId === id ? "attachments" as const : "repository" as const;
       return [{ checkoutId: id, binding,
         // Accepted auto-commits exist only in the DO. Git hydration must keep the original
-        // source commit; accepted changes, like pending changes, belong in the replica overlay.
+        // source commit as the immutable lower; captured local commits and pending changes
+        // are materialized above it during bootstrap.
         baseCommit: piece.type === "worktree" ? piece.replicaBaseCommit ?? piece.pinBase :
           active?.access.getBaseCommit(id) ?? pins.get(id) ??
           piece.commitId ?? null,
@@ -6586,6 +6588,10 @@ class OverseerImpl implements AgentHooks {
         }
         throw new Error("No authorized source can hydrate this immutable Git commit.");
       },
+      commitPack: (lease, checkoutId) => replicaCommitPack(this.gitCache,
+        lease.checkpoint!.worktrees.find(tree => tree.checkoutId === checkoutId)!, () => {
+          if (this.requireReplicaLease(lease.id).gitBootstrapClosed) throw new Error("Git bootstrap is closed.");
+        }),
       capture: async lease => {
         const active = this.#worktreeReplicaTurns.get(lease.chatId)?.access;
         if (active?.flushReplica && !await active.flushReplica({}, active.getRevision?.() ?? 0)) {
@@ -6595,8 +6601,12 @@ class OverseerImpl implements AgentHooks {
         const pending = this.#replicaOverlay(lease.chatId);
         if (this.replicaCursor(lease) !== cursor) throw new Error("Workspace changed during checkpoint capture; retry.");
         const changes: WorktreeChange[] = [];
+        const pendingOverlay: WorktreeChange[] = [];
         let overlayBytes = 0;
         for (const tree of lease.worktrees) {
+          const piece = this.storage.gadgets.get(tree.checkoutId);
+          tree.acceptedCommit = piece?.type === "worktree" ? piece.pinBase : tree.baseCommit;
+          tree.headCommit = piece?.type === "worktree" ? piece.headCommit : tree.baseCommit;
           const root = tree.baseCommit && await this.gitCache.pathEntryAtCommit(tree.baseCommit, "");
           tree.baseTree = root ? root.oid : null;
           const prefix: CodeChange = {[tree.checkoutId]: [...this.storage.worktreeBaseChanges
@@ -6610,11 +6620,24 @@ class OverseerImpl implements AgentHooks {
             requireReplicaPath(path);
             changes.push({checkoutId: tree.checkoutId, path, change});
           }
+          for (const [path, change] of pending[tree.checkoutId] ?? []) {
+            requireReplicaPath(path);
+            pendingOverlay.push({checkoutId: tree.checkoutId, path, change});
+            overlayBytes += codeChangeSerializedSize({[tree.checkoutId]: [[path, change]]}) + 256;
+          }
         }
+        if (overlayBytes > 1024 * 1024) throw new Error("Replica checkpoint transforms exceed their storage budget.");
         if (this.replicaCursor(lease) !== cursor) throw new Error("Workspace changed during checkpoint capture; retry.");
+        for (const tree of lease.worktrees) {
+          const piece = this.storage.gadgets.get(tree.checkoutId);
+          if (piece?.type === "worktree" &&
+              (piece.pinBase !== tree.acceptedCommit || piece.headCommit !== tree.headCommit)) {
+            throw new Error("Workspace heads changed during checkpoint capture; retry.");
+          }
+        }
         const refreshed = this.requireReplicaLease(lease.id);
         this.storage.worktreeReplicaLeases.put({ ...refreshed, worktrees: lease.worktrees });
-        return { cursor, overlay: changes };
+        return { cursor, overlay: changes, pendingOverlay };
       },
       events: (lease, cursor, limit) => {
         this.requireReplicaLease(lease.id);
@@ -13950,6 +13973,9 @@ export class WorkspaceReplicaEndpoint extends WorkerEntrypoint<Cloudflare.Env,
   }
   async readGitPack(id: string, checkoutId: number, request: Uint8Array): Promise<ReadableStream<Uint8Array>> {
     using session = await this.#session(); return await session.readGitPack(id, checkoutId, request);
+  }
+  async readCommitPack(id: string, checkoutId: number): Promise<ReadableStream<Uint8Array>> {
+    using session = await this.#session(); return await session.readCommitPack(id, checkoutId);
   }
   async closeGitBootstrap(id: string): Promise<void> {
     using session = await this.#session(); await session.closeGitBootstrap(id);

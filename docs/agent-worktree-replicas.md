@@ -62,16 +62,24 @@ barrier from a dispatched model request; stream creation is not receipt of provi
 
 1. Acquire a revocable, expiring lease for the captured worktree selection.
 2. Capture a checkpoint containing binding/source metadata, immutable base identities,
-   composed transforms, and an exact canonical cursor. The integration chooses collision-free
-   paths for repository, gadget and attachment worktrees and retains those paths in snapshots.
-3. Enumerate and stream base bytes separately from the transform overlay. No whole-repository
+   accepted and explicit Git heads, pending transforms, and an exact canonical cursor. The
+   integration chooses collision-free paths for repository, gadget and attachment worktrees
+   and retains those paths in snapshots.
+3. Enumerate and stream base bytes separately from the transform overlay. `readCommitPack()`
+   streams the original local commit/tree/blob objects above that base, rooted only at the
+   checkpoint's captured accepted and explicit heads. It omits unchanged base objects and
+   bounds content buffering by an object, not a repository or pack. A streamed non-repository base also
+   receives its original commit header, rather than leaving a synthetic commit as its identity.
+   `readOverlay()` then exports only pending operations above the accepted commit. The complete
+   original composed prefix stays in the kernel checkpoint for OT anchors; exporting commits
+   must not replace canonical operations with diffs of flattened files. No whole-repository
    content buffer or base64 transfer is introduced. A provider may alternatively serve a
    validated native Git v2 pack for the already-advertised exact base commit. GitHub and GitLab
    implement this through the shared gatekeeper-kit validator and their authenticated
    upload-pack transports, including configured Access credentials for self-hosted GitLab.
    Source credentials
-   and unrelated repository grants never enter the replica; Git bootstrap is explicitly closed
-   before exposing it for agent commands.
+   and unrelated repository grants never enter the replica; provider and local-object bootstrap
+   is explicitly closed before exposing it for agent commands.
 4. Replay ordered canonical events through `changesSince()`. A receipt's acceptance marker is
    not a replay cursor: clients must consume every intervening event before advancing.
 5. Submit frozen, bounded text transforms anchored by canonical cursor and SHA-256. The kernel
@@ -131,8 +139,11 @@ eagerly fetching repository contents. Checkout IDs are existing workpiece IDs; s
 remains in worktree records and the OID store, without a separate filesystem/repository catalog.
 Replica overlays use the same compacted-history fold as agent replay, followed by live OT rows.
 At accept, the original operations compose into a per-path durable prefix relative to a stable
-hydration commit. Bootstrap therefore retains positional intent and small deltas across accepts,
-compaction and eviction without loading untouched file contents or expanding edits to full-file sets.
+hydration commit. Reconciliation therefore retains positional intent and small deltas across accepts,
+compaction and eviction without expanding edits to full-file sets. Bootstrap materializes accepted
+contents from real Git objects and applies only pending OTs; it does not fetch untouched blobs
+through the DO. Captured heads survive eviction and do not follow a later moving worktree head.
+Every object read during enumeration and streaming rechecks lease/revocation/bootstrap closure.
 Pre-prototype worktrees without that prefix start from their current accepted commit; if it is
 local-only, the integration uses binary base streaming rather than fetching it from a provider.
 

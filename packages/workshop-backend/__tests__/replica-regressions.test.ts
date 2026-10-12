@@ -5,6 +5,7 @@ import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
 import {applyCodeChange, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
+import {decodePackStream} from "../src/git-codec";
 import {runAgent, type WorktreeTurnAccess} from "../src/agent";
 import type {WorktreeReplicaCommit} from "../src/worktree-replica";
 import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall} from "@earendil-works/pi-ai";
@@ -364,15 +365,58 @@ describe("replica review regressions over durable kernel storage", () => {
       impl.getCurrentChatContent = async () => { throw new Error("Checkpoint flattened file contents"); };
       const replica = await open(impl), checkpoint = await replica.checkpoint();
       const cursor = await replica.readOverlay(checkpoint.checkpointId), overlay = await cursor.next();
-      expect(overlay).toHaveLength(3);
+      expect(overlay).toHaveLength(1);
       expect(overlay!.every(item => "edit" in item.change)).toBe(true);
       expect(JSON.stringify(overlay).length).toBeLessThan(1000);
       const change: CodeChange = {[id]: overlay!.map(item => [item.path, item.change])};
-      const content = applyCodeChange(new Map([[id, new Map(["a", "b", "c"].map(path => [path, text]))]]), change);
+      const accepted = checkpoint.worktrees[0].acceptedCommit!;
+      const content = applyCodeChange(new Map([[id, new Map(await Promise.all(["a", "b", "c"].map(async path =>
+        [path, (await impl.gitCache.readFileAtCommitIfExists(accepted, path))!] as const)))]]), change);
       expect(content.get(id)?.get("a")).toBe("z" + text.slice(1, -1) + "x");
       expect(content.get(id)?.get("b")).toBe("z" + text.slice(1));
+      // The complete original operations still anchor reconciliation, never a flattened re-diff.
+      const prefix = impl.storage.worktreeReplicaLeases.get(checkpoint.cursor.split(":")[0])!.checkpoint!.overlay;
+      expect(prefix).toHaveLength(3);
+      expect(prefix.every(item => "edit" in item.change)).toBe(true);
+      expect(JSON.stringify(prefix).length).toBeLessThan(1000);
       expect(await cursor.next()).toBeNull();
       expect(impl.storage.gadgets.get(id)?.type).toBe("worktree");
+    });
+  });
+
+  it("keeps captured Git heads across eviction and moving HEAD, and fences an in-flight export on revocation", async () => {
+    const name = crypto.randomUUID();
+    const saved = await inKernel(name, async impl => {
+      const tree = await worktree(impl);
+      await step(impl, 1, {[tree.id]: [["a.txt", {edit: [3, [0, "accepted"]]}]]});
+      expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+      await impl.beginAgentIntegrationTurn(1);
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      const record = impl.storage.gadgets.get(tree.id)!;
+      if (record.type !== "worktree") throw new Error("Expected worktree");
+      const laterHead = await impl.gitStore.writeCommitForTree(await impl.gitStore.commitTree(record.pinBase), {
+        parents: [record.headCommit], author: {name: "Test", email: "test@example.com"},
+        message: "Explicit commit after capture", timestamp: new Date(1),
+      });
+      impl.storage.gadgets.put({...record, headCommit: laterHead});
+      await impl.ctx.storage.sync();
+      return {id: tree.id, leaseId: checkpoint.cursor.split(":")[0], checkpoint, laterHead};
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      const replica = impl.getWorkspaceReplicaSession(saved.leaseId);
+      expect(await replica.checkpoint()).toEqual(saved.checkpoint);
+      const imported = [];
+      for await (const object of decodePackStream(await replica.readCommitPack(saved.checkpoint.checkpointId, saved.id), {
+        maxPackSize: 1024 * 1024, maxObjectSize: 1024 * 1024, resolveBase: oid => impl.gitCache.readLocalObject(oid),
+      })) imported.push(object.oid);
+      expect(imported).toContain(saved.checkpoint.worktrees[0].acceptedCommit);
+      expect(imported).not.toContain(saved.laterHead);
+      const reader = (await replica.readCommitPack(saved.checkpoint.checkpointId, saved.id)).getReader();
+      expect(new TextDecoder().decode((await reader.read()).value!.subarray(0, 4))).toBe("PACK");
+      impl.env.AGENT_INTEGRATION_GRANTS = '{}';
+      await expect(reader.read()).rejects.toThrow(/revoked/);
+      reader.releaseLock();
     });
   });
 
@@ -474,8 +518,10 @@ describe("replica review regressions over durable kernel storage", () => {
     const fresh = await next.checkpoint();
     expect(fresh.checkpointId).not.toBe(checkpoint.checkpointId);
     expect(fresh.worktrees[0].baseCommit).toBe(checkpoint.worktrees[0].baseCommit);
+    expect(fresh.worktrees[0].acceptedCommit).not.toBe(fresh.worktrees[0].baseCommit);
+    expect(await impl.gitCache.readFileAtCommitIfExists(fresh.worktrees[0].acceptedCommit!, "a.txt")).toBe("aaaa");
     const cursor = await next.readOverlay(fresh.checkpointId);
-    expect(await cursor.next()).toEqual([{checkoutId: tree.id, path: "a.txt", change: {edit: [[0, "a"], 3]}}]);
+    expect(await cursor.next()).toBeNull();
   }));
 
   it.each([Uint8Array.of(239, 187, 191, 65), Uint8Array.of(255, 65)])(

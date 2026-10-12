@@ -10,6 +10,7 @@ import { workspaceCollisionCases } from "./workspace-collision-cases";
 import { replicaTextHash } from "../src/workspace-replica";
 import type { IntegrationTestActionGatekeeper } from "./test-worker";
 import { foldCompactedCode } from "../src/agent-compaction";
+import { decodePackStream } from "../src/git-codec";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv { TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>; }
@@ -50,6 +51,13 @@ describe("kernel replica capability over native RPC", () => {
         expect(accepted.pinBase).not.toBe(commit);
         expect(accepted.headCommit).toBe(commit);
         expect(impl.storage.gitObjectMetadata.get(accepted.pinBase)?.onRemote ?? []).toEqual([]);
+        let explicitHead = commit;
+        if (compact) {
+          explicitHead = await impl.gitStore.writeCommitForTree(await impl.gitStore.commitTree(accepted.pinBase), {
+            parents: [commit], author: {name: "Test", email: "test@example.com"}, message: "Explicit commit", timestamp: new Date(1),
+          });
+          impl.storage.gadgets.put({...accepted, headCommit: explicitHead});
+        }
         if (pending) await step(diffFiles(new Map([[tree.id, new Map([["a.txt", "accepted\n"]])]]),
           new Map([[tree.id, new Map([["a.txt", "accepted\npending\n"]])]])));
         if (compact) {
@@ -66,18 +74,28 @@ describe("kernel replica capability over native RPC", () => {
         const replica = await impl.getIntegrationContext(31, origin)!.openWorktreeReplica();
         const checkpoint = await replica.checkpoint();
         expect(checkpoint.worktrees[0].baseCommit).toBe(commit);
+        expect(checkpoint.worktrees[0].acceptedCommit).toBe(accepted.pinBase);
+        expect(checkpoint.worktrees[0].headCommit).toBe(explicitHead);
         expect(await new Response(await replica.readGitPack(checkpoint.checkpointId, tree.id, Uint8Array.of(1, 255))).arrayBuffer())
           .toEqual(Uint8Array.of(1, 255).buffer);
         expect(await new Response(await replica.readBaseFile(checkpoint.checkpointId, tree.id, "a.txt")).text()).toBe("base\n");
         const cursor = await replica.readOverlay(checkpoint.checkpointId);
         const expected = pending ? "accepted\npending\n" : "accepted\n";
         const overlay = await cursor.next();
-        expect(overlay).toHaveLength(3);
-        expect(overlay).toEqual(expect.arrayContaining([
-          {checkoutId: tree.id, path: "a.txt", change: {set: expected}},
-          {checkoutId: tree.id, path: "new.txt", change: {set: "accepted new\n"}},
-          {checkoutId: tree.id, path: "gone.txt", change: {remove: true}},
-        ]));
+        expect(overlay ?? []).toHaveLength(pending ? 1 : 0);
+        const imported = [];
+        for await (const object of decodePackStream(await replica.readCommitPack(checkpoint.checkpointId, tree.id), {
+          maxPackSize: 1024 * 1024, maxObjectSize: 1024 * 1024,
+          resolveBase: oid => impl.gitCache.readLocalObject(oid),
+        })) imported.push(object);
+        expect(imported.some(object => object.oid === accepted.pinBase)).toBe(true);
+        expect(imported.some(object => object.oid === commit)).toBe(false);
+        if (compact) expect(imported.some(object => object.oid === explicitHead)).toBe(true);
+        // The native clone already contains unchanged upstream blobs; never retransmit them.
+        const untouched = await impl.gitCache.pathEntryAtCommit(commit, "untouched.txt");
+        expect(imported.some(object => object.oid === untouched!.oid)).toBe(false);
+        await expect((async () => { await replica.readCommitPack(checkpoint.checkpointId, tree.id + 100); })())
+          .rejects.toThrow(/outside/);
         expect(await cursor.next()).toBeNull();
         const receipt = await replica.submitBatch({batchId: "after-accept", baseCursor: checkpoint.cursor, files: [
           {checkoutId: tree.id, path: "a.txt", baseHash: await replicaTextHash(expected),
@@ -94,6 +112,9 @@ describe("kernel replica capability over native RPC", () => {
         // Capturing and reconciling never materializes unrelated base blobs in the chat map.
         const content = await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!);
         expect(content.get(tree.id)?.has("untouched.txt")).toBe(false);
+        await replica.closeGitBootstrap(checkpoint.checkpointId);
+        await expect((async () => { await replica.readCommitPack(checkpoint.checkpointId, tree.id); })())
+          .rejects.toThrow(/closed/);
       } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
     });
   });

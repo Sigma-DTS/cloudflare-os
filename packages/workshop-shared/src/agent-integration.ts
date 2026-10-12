@@ -77,9 +77,11 @@ export interface WorkspaceReplica extends WorkerEntrypoint {
   readBaseFile(checkpointId: string, checkoutId: number, path: string): Promise<ReadableStream<Uint8Array>>;
   /** Bootstrap-only, commit-scoped Git v2 fetch; streams the provider pack without caching it. */
   readGitPack(checkpointId: string, checkoutId: number, request: Uint8Array): Promise<ReadableStream<Uint8Array>>;
+  /** Bootstrap-only pack of the captured local heads above the base; no arbitrary OID requests. */
+  readCommitPack(checkpointId: string, checkoutId: number): Promise<ReadableStream<Uint8Array>>;
   /** Irreversibly close Git bootstrap for this lease before exposing the guest to agent commands. */
   closeGitBootstrap(checkpointId: string): Promise<void>;
-  /** Enumerate transforms captured by the checkpoint, not a moving HEAD. */
+  /** Enumerate pending transforms above the captured accepted commit, not a moving HEAD. */
   readOverlay(checkpointId: string): Promise<Cursor<WorktreeChange>>;
   /** Page canonical OTs. An invalidated epoch requires a new lease/checkpoint, never an empty success. */
   changesSince(cursor: string, limit: number): Promise<WorktreeChangesPage>;
@@ -111,6 +113,10 @@ export interface WorktreeBase {
   baseCommit: string | null;
   /** Immutable root tree, or null for an empty worktree. */
   baseTree: string | null;
+  /** Accepted content checkpoint, absent on legacy checkpoints; not necessarily explicit Git history. */
+  acceptedCommit?: string | null;
+  /** Last explicit Git commit, absent on legacy checkpoints; may differ from accepted content. */
+  headCommit?: string | null;
   /** Source category; private source URLs and credentials are not exported. */
   source: "repository" | "attachments" | "gadget";
 }

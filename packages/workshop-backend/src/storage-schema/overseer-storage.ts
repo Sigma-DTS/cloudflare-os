@@ -84,7 +84,12 @@ export type WorktreeReplicaLease = {
   /** Bootstrap authority is one-shot even if the replica remains live for synchronization. */
   gitBootstrapClosed?: boolean;
   worktrees: WorktreeBase[];
-  checkpoint?: WorkspaceCheckpoint & { overlay: WorktreeChange[] };
+  checkpoint?: WorkspaceCheckpoint & {
+    /** Original composed operations over the upstream base, retained for OT anchors. */
+    overlay: WorktreeChange[];
+    /** Bootstrap operations above the accepted commit; absent on legacy checkpoints. */
+    pendingOverlay?: WorktreeChange[];
+  };
 };
 
 /** Written in the same transaction as canonical OTs, never in a subsequent RPC. */

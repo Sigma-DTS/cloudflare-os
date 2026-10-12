@@ -15,13 +15,15 @@ export type { WorktreeReplicaLease, WorktreeReplicaCommit } from "./storage-sche
 export interface WorktreeReplicaHost {
   requireLease(id: string): WorktreeReplicaLease;
   saveLease(lease: WorktreeReplicaLease): void;
-  capture(lease: WorktreeReplicaLease): Promise<{ cursor: string; overlay: WorktreeChange[] }>;
+  capture(lease: WorktreeReplicaLease): Promise<{ cursor: string; overlay: WorktreeChange[]; pendingOverlay?: WorktreeChange[] }>;
   entries(lease: WorktreeReplicaLease, checkoutId: number): Promise<WorktreeBaseEntry[]>;
   baseFile(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<Uint8Array>;
   /** Reuse ordinary file-tool checks against the immutable tree, including directory entries. */
   assertPathWritable(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<void>;
   /** Fetch only a lease-selected immutable repository commit, without storing its blobs. */
   gitPack?(lease: WorktreeReplicaLease, checkoutId: number, request: Uint8Array): Promise<ReadableStream<Uint8Array>>;
+  /** Export only local commit identities captured by this checkpoint. */
+  commitPack?(lease: WorktreeReplicaLease, checkoutId: number): Promise<ReadableStream<Uint8Array>>;
   events(lease: WorktreeReplicaLease, cursor: string, limit: number): WorktreeChangesPage;
   /** Publish buffered DO operations through the ordinary step barrier before reconciliation. */
   flush(lease: WorktreeReplicaLease): Promise<boolean>;
@@ -43,7 +45,7 @@ export function requireReplicaPath(path: string): void {
 @validateRpc()
 export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceReplica,
   "checkpoint" | "listBaseEntries" | "readBaseFile" | "readOverlay" | "changesSince" |
-  "readGitPack" | "closeGitBootstrap" | "submitBatch" | "renew" | "release"> {
+  "readGitPack" | "readCommitPack" | "closeGitBootstrap" | "submitBatch" | "renew" | "release"> {
   constructor(private host: WorktreeReplicaHost, private leaseId: string) { super(); }
 
   async checkpoint(): Promise<WorkspaceCheckpoint> {
@@ -53,10 +55,10 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
       // Capture awaits source pulls. Revocation/expiry must still win at the publication barrier.
       lease = this.host.requireLease(this.leaseId);
       lease.checkpoint ??= { checkpointId: crypto.randomUUID(), cursor: captured.cursor,
-        worktrees: lease.worktrees, overlay: captured.overlay };
+        worktrees: lease.worktrees, overlay: captured.overlay, pendingOverlay: captured.pendingOverlay };
       this.host.saveLease(lease);
     }
-    const { overlay: _overlay, ...checkpoint } = lease.checkpoint;
+    const { overlay: _overlay, pendingOverlay: _pendingOverlay, ...checkpoint } = lease.checkpoint;
     return checkpoint;
   }
 
@@ -78,7 +80,15 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
 
   async readOverlay(checkpointId: string): Promise<Cursor<WorktreeChange>> {
     const lease = this.#checkpoint(checkpointId);
-    return new ReplicaCursor(lease.checkpoint!.overlay, () => this.host.requireLease(this.leaseId));
+    return new ReplicaCursor(lease.checkpoint!.pendingOverlay ?? lease.checkpoint!.overlay,
+      () => this.host.requireLease(this.leaseId));
+  }
+
+  async readCommitPack(checkpointId: string, checkoutId: number): Promise<ReadableStream<Uint8Array>> {
+    const lease = this.#checkpoint(checkpointId, checkoutId);
+    if (lease.gitBootstrapClosed) throw new Error("Git bootstrap is closed.");
+    if (!this.host.commitPack) throw new Error("Local commit export is unsupported.");
+    return this.host.commitPack(lease, checkoutId);
   }
 
   async readGitPack(checkpointId: string, checkoutId: number, request: Uint8Array): Promise<ReadableStream<Uint8Array>> {
