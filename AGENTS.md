@@ -28,6 +28,12 @@ This project is building a platform for "vibe coded" personal applications and A
   a replica append can yield before its commit, and an ordinary step must never take those edits.
 - Journal authorized connection wake-ups on their original continuation before yielding, including
   before the pause is recorded and during lifecycle cleanup; consume them after teardown or reset.
+- Approval wake-ups do not require effect-redelivery permission. Recheck the active continuation
+  and terminal journal after lifecycle awaits; accepting an old card cannot wake a newer prompt.
+- Cache freshness does not reserve an upload filename. Recheck allocated roots at the message
+  transaction against replica writes that can arrive during preparation.
+- Bound canonical RPC pages by serialized bytes as well as rows, using the existing OT estimator
+  without copying text. Advance cursor/hasMore only over events actually returned.
 - Replica leaf enumeration excludes directories. Reuse file-tool tree-entry writability checks
   before accepting mutations, rather than treating an absent leaf as proof of an absent path.
 - Compare large upload round trips with byte length plus native hashes, not element-by-element

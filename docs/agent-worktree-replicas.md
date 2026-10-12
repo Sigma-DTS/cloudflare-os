@@ -47,10 +47,16 @@ Interrupted suspension cleanup retains the paused continuation without inferring
 decision wake-up removes that marker. Cancellation during recovery's awaited reconciliation/model
 lookup clears running/visible busy state, fenced by continuation and live context so old cleanup
 cannot clear a newer execution.
+Segment startup rechecks the active continuation and rereads the lifecycle journal after draining
+callbacks, so cancellation during delivery cannot publish another running segment of that turn.
 Connection acceptance journals a wake-up on that continuation even before suspension is recorded
 or while its callback is still running. Teardown consumes the marker after clearing busy state;
 constructor recovery also consumes it if reset interrupts that hand-off. Cancellation or a new
 execution removes the old marker, and an undecided/denied connection does not request a wake-up.
+Only cards inside the current initiating request's history boundary can schedule that wake-up;
+accepting an older card may connect a resource but cannot resume a newer undecided turn. Approval
+decisions use the same durable marker during cleanup independently of the `recoverableActions`
+grant, which controls external effect redelivery, not remembering that the user approved a pause.
 If model recovery fails, terminal callbacks are journalled before active state is cleared and the alarm
 retries failed cleanup. Malformed model transforms are rejected before buffering and logged with only
 stage/count diagnostics, preserving their tool-error transcript instead of aborting at persistence.
@@ -82,6 +88,9 @@ barrier from a dispatched model request; stream creation is not receipt of provi
    is explicitly closed before exposing it for agent commands.
 4. Replay ordered canonical events through `changesSince()`. A receipt's acceptance marker is
    not a replay cursor: clients must consume every intervening event before advancing.
+   Pages are limited by both row count and an 8 MiB conservative serialized-byte budget, using
+   the existing OT size estimator plus event framing. Rows are read incrementally and the returned
+   cursor/`hasMore` reflect only emitted events, including empty scoped or echo-marker events.
 5. Submit frozen, bounded text transforms anchored by canonical cursor and SHA-256. The kernel
    checks path/checkout scope and base anchors, applies the existing OT resolution rules, and
    atomically stores a payload-bound batch receipt. Identical retries return the same receipt;
@@ -109,6 +118,9 @@ their lease-local echo provenance even while the ordinary transcript commit is s
 UTF-8 text attachments within the OT text-size limit become ordinary worktree files; BOMs are
 preserved as content, and downloads read the original Git blob bytes. Upload names reserve existing
 base and accepted/pending overlay root names, including directories, without reading their contents.
+The message's transaction rechecks allocated names against newly touched paths: a replica can
+write while attachment preparation awaits. A collision rejects the send and leaves the upload
+staged; retry allocates a free suffix without overwriting acknowledged replica edits.
 Rev 0 leaves non-UTF-8 and oversized text attachments in the byte-preserving attachment store rather
 than creating lossy text or rejecting an otherwise valid upload at the OT persistence barrier.
 Attachment bytes and tree metadata are prefetched, but worktree projection, attachment references

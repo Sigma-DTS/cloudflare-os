@@ -3,7 +3,7 @@ import {evictDurableObject, runInDurableObject} from "cloudflare:test";
 import {afterEach, describe, expect, it, vi} from "vitest";
 import type {OverseerDurableObject} from "../src/overseer";
 import {UserDurableObject} from "../src/user";
-import type {IntegrationTestParticipant} from "./test-worker";
+import type {IntegrationTestActionGatekeeper, IntegrationTestParticipant} from "./test-worker";
 import {openFakeOverseer} from "./fixtures";
 
 declare module "cloudflare:workers" {
@@ -15,6 +15,7 @@ declare module "cloudflare:workers" {
 type Impl = OverseerDurableObject["impl"];
 type TestExports = Cloudflare.Exports & {
   IntegrationTestParticipant(options: {props: {name: string}}): Fetcher<IntegrationTestParticipant>;
+  IntegrationTestActionGatekeeper(options: {props: Record<string, never>}): DurableObjectClass<IntegrationTestActionGatekeeper>;
 };
 const GRANT = '{"container":{"lifecycle":true}}';
 const USER = {type: "user" as const, id: "test-user", name: "Test"};
@@ -53,6 +54,160 @@ function providerReply(): Response {
 
 describe("integration cleanup at agent recovery boundaries", () => {
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it("retains a decision during real suspension cleanup across eviction without effect-recovery permission", async () => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    await runInDurableObject(user, instance => {
+      instance["storage"].profile.put(USER);
+      instance["storage"].aiModels.put(MODEL);
+    });
+    let requests = 0, submit!: () => Promise<void>;
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin !== MODEL.config.apiUrl) return realFetch(input, init);
+      if (++requests === 1) await submit();
+      return providerReply();
+    });
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl, participant = await prepare(impl, name);
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"lifecycle":true,"contextualActions":true}}';
+      const handler = impl.ctx.facets.get<IntegrationTestActionGatekeeper>("decision-actions", () => ({
+        class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({props: {}}),
+      }));
+      impl.getGatekeeperFacet = async () => handler;
+      const resume = impl.resumePausedAgent.bind(impl);
+      impl.resumePausedAgent = async (...args) => {
+        if (impl.storage.chatMeta.get(args[0])?.activeAgent) await resume(...args);
+        // Fault the queued hand-off after cleanup, before it consumes the durable wake-up.
+      };
+      submit = () => impl.submitAction(31, 42, {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true},
+        {from: "agent", chatId: 1}, impl.captureIntegrationOrigin({from: "agent", chatId: 1}));
+      await participant.block("suspended");
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(1)!, activeAgent: MODEL.profile});
+      impl.startAgent(1, MODEL, USER, user.id.toString());
+      try {
+        await vi.waitFor(async () => expect((await participant.calls()).some(call => call.event.kind === "suspended")).toBe(true));
+        const action = [...impl.storage.actions.list()].find(record => record.type === "action")!;
+        if (action.type !== "action") throw new Error("Missing action");
+        await impl.applyPendingAction(action, USER, false);
+        expect(await impl.resumeAfterActionDecision(1, action.id, USER, () => impl.resumePausedAgent(1))).toBe(true);
+        expect(impl.storage.pausedAgents.get(1)).toMatchObject({resumeRequested: true});
+        expect(impl.storage.actions.get(action.id)).toMatchObject({state: "approved", decisionNotified: true});
+        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+        expect(await handler.calls()).toHaveLength(1);
+        expect(requests).toBe(1);
+        await participant.releaseBlock();
+        await impl.waitForAllAgentsToComplete();
+        expect(impl.storage.activeAgents.get(1)).toBeUndefined();
+        expect(impl.storage.pausedAgents.get(1)).toMatchObject({resumeRequested: true});
+        await impl.ctx.storage.sync();
+      } catch (error) {
+        await participant.releaseBlock();
+        await impl.waitForAllAgentsToComplete();
+        delete impl.env.AGENT_INTEGRATION_GRANTS;
+        throw error;
+      }
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl;
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"lifecycle":true,"contextualActions":true}}';
+      try {
+        const participant = (impl.ctx.exports as TestExports).IntegrationTestParticipant({props: {name}});
+        await participant.releaseBlock();
+        await impl.waitForAllAgentsToComplete();
+        expect(requests).toBe(2);
+        expect(impl.storage.activeAgents.get(1)).toBeUndefined();
+        expect(impl.storage.pausedAgents.get(1)).toBeUndefined();
+        expect([...impl.storage.chats.list()].filter(message => message.type === "agentNudge")).toHaveLength(1);
+        const handler = impl.ctx.facets.get<IntegrationTestActionGatekeeper>("decision-actions", () => ({
+          class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({props: {}}),
+        }));
+        expect(await handler.calls()).toHaveLength(1);
+        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+      } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
+    });
+  });
+
+  it("does not resurrect a canceled segment after waiting for the suspended callback", async () => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl, participant = await prepare(impl, name);
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"lifecycle":true,"worktreeReplica":true}}';
+      const commit = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "base"]]), {
+        parents: [], author: {name: "Test", email: "test@example.com"}, message: "Base", timestamp: new Date(0),
+      });
+      const tree = await impl.createWorktree("Repo", 1, commit);
+      impl.storage.chatContext.put({chatId: 1, bindings: {REPO: tree.id}, alwaysAvailableCapsuleIds: []});
+      const origin = impl.captureIntegrationOrigin({from: "agent", chatId: 1})!;
+      const replica = await impl.getIntegrationContext(31, origin)!.openWorktreeReplica();
+      const leaseId = (await replica.checkpoint()).cursor.split(":")[0];
+      const turn = impl.storage.agentIntegrationTurns.get(1)!;
+      const turnId = turn.turnId;
+      impl.storage.activeAgents.put({chatId: 1, initiatorUserId: "unused", modelId: MODEL.profile.id,
+        initiator: USER, callbackInitiated: false, continuationId: crypto.randomUUID(), requestKey: turn.requestKey});
+      await participant.block("suspended");
+      const closing = impl.closeAgentIntegrationTurn(1, "approval");
+      await vi.waitFor(async () => expect((await participant.calls()).some(call => call.event.kind === "suspended")).toBe(true));
+      const beginning = expect(impl.beginAgentIntegrationTurn(1, turn.requestKey)).rejects.toThrow(/canceled|superseded/);
+      impl.cancelAgent(1);
+      await participant.releaseBlock();
+      await closing;
+      await beginning;
+      await impl.closeAgentIntegrationTurn(1, "canceled");
+      expect(impl.storage.agentIntegrationTurns.get(1)).toMatchObject({turnId, state: "finished", closing: {reason: "canceled"}});
+      await expect(impl.getWorkspaceReplicaSession(leaseId).renew()).rejects.toThrow(/expired|termination/);
+      expect((await participant.calls()).filter(call => call.event.kind === "resumed")).toEqual([]);
+      expect([...impl.storage.agentIntegrationParticipants.list()]).toEqual([]);
+      await impl.ctx.storage.sync();
+      delete impl.env.AGENT_INTEGRATION_GRANTS;
+    });
+  });
+
+  it("accepts an older connection card without waking a newer undecided continuation", async () => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    let continuationId: string;
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl;
+      await prepare(impl, name);
+      impl.addChatMessages(1, MODEL.profile, [{type: "connectionRequest", requestId: "1:old",
+        vendorId: "github", vendorName: "GitHub", reason: "Earlier repo", state: "pending"}]);
+      impl.addChatMessages(1, USER, [{type: "message", message: "Second request"}]);
+      await impl.beginAgentIntegrationTurn(1);
+      const turn = impl.storage.agentIntegrationTurns.get(1)!;
+      continuationId = crypto.randomUUID();
+      const record = {chatId: 1, initiatorUserId: "unused", modelId: MODEL.profile.id,
+        initiator: USER, callbackInitiated: false, continuationId, requestKey: turn.requestKey};
+      impl.storage.activeAgents.put(record);
+      impl.storage.pausedAgents.put(record);
+      impl.storage.agentIntegrationTurns.put({...turn, continuationId});
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(1)!, activeAgent: MODEL.profile});
+      impl.storage.actions.put({id: 900, type: "action", action: 42, gatekeeperId: 31, createdAt: new Date(), state: "pending",
+        caller: {from: "agent", chatId: 1}, description: {title: "New command", description: "Pending", implementsRevert: false, awaitDecision: true}});
+      impl.addChatMessages(1, MODEL.profile, [{type: "action", actionId: 900}]);
+      await impl.closeAgentIntegrationTurn(1, "approval");
+      using client = new RpcStub(await openFakeOverseer({chats: impl.storage.chats, chatMeta: impl.storage.chatMeta,
+        pausedAgents: impl.storage.pausedAgents, activeAgents: impl.storage.activeAgents}, {impl: {
+          resumePausedAgent: impl.resumePausedAgent.bind(impl), getChatTimestamp: impl.getChatTimestamp.bind(impl)}}));
+      await client.acceptConnectionRequest("1:old", {gatekeeperId: 31});
+      expect([...impl.storage.chats.list()].find(message => message.type === "connectionRequest"))
+        .toMatchObject({state: "accepted"});
+      expect(impl.storage.pausedAgents.get(1)).not.toHaveProperty("resumeRequested");
+      expect(impl.storage.activeAgents.get(1)).not.toHaveProperty("resumeRequested");
+      expect(impl.storage.actions.get(900)?.state).toBe("pending");
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, async instance => {
+      await instance.impl.waitForAllAgentsToComplete();
+      expect(instance.impl.storage.pausedAgents.get(1)).toMatchObject({continuationId});
+      expect(instance.impl.storage.pausedAgents.get(1)).not.toHaveProperty("resumeRequested");
+      expect(instance.impl.storage.actions.get(900)?.state).toBe("pending");
+      delete instance.impl.env.AGENT_INTEGRATION_GRANTS;
+    });
+  });
 
   it.each(["before suspension", "during cleanup", "after teardown"] as const)("recovers an accepted connection wake-up %s across eviction", async boundary => {
     const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);

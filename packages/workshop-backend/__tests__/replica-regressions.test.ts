@@ -3,7 +3,7 @@ import {env} from "cloudflare:workers";
 import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
-import {applyCodeChange, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/workshop-shared/code-change";
+import {applyCodeChange, codeChangeSerializedSize, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
 import {decodePackStream} from "../src/git-codec";
 import {runAgent, type WorktreeTurnAccess} from "../src/agent";
@@ -55,6 +55,79 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it("pages a large non-Latin-1 canonical backlog within a byte budget, without losing revisions", () => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    for (let i = 0; i < 80; ++i) {
+      await step(impl, 1, {[tree.id]: [["a.txt", {set: "\u0100".repeat(220_000) + i}]]});
+    }
+    let cursor = checkpoint.cursor, revisions: number[] = [], pages = 0;
+    for (;;) {
+      const page = await replica.changesSince(cursor, 128);
+      const bytes = page.events.reduce((sum, event) => sum + codeChangeSerializedSize({[tree.id]:
+        event.changes.map(change => [change.path, change.change])}) + 256, 0);
+      expect(bytes).toBeLessThanOrEqual(8 * 1024 * 1024);
+      expect(page.cursor).toBe(page.events.at(-1)?.cursor ?? cursor);
+      revisions.push(...page.events.map(event => Number(event.cursor.split(":").at(-1))));
+      ++pages;
+      cursor = page.cursor;
+      if (!page.hasMore) break;
+      expect(page.events.length).toBeGreaterThan(0);
+    }
+    expect(pages).toBeGreaterThan(1);
+    expect(revisions).toEqual(Array.from({length: 80}, (_, i) => i + 1));
+    expect(await replica.changesSince(cursor, 128)).toEqual({events: [], cursor, hasMore: false});
+  }));
+
+  it.each(["file", "directory"] as const)("rejects an upload whose allocated root becomes a replica %s before the message commits", mode => inKernel(crypto.randomUUID(), async impl => {
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    const stage = (text: string, name: string) => {
+      const id = crypto.randomUUID();
+      impl.storage.chatAttachmentContent.put({fileId: id, data: new TextEncoder().encode(text), state: {
+        type: "staged", uploadedAt: Date.now(), mimeType: "text/csv", name,
+      }});
+      return {id};
+    };
+    const chatId = await impl.newChat(user, {profile: USER}, "Initial", undefined, [stage("input", "input.csv")]);
+    const treeId = impl.getChatAgentContext(chatId).attachments!.worktreeId;
+    impl.storage.chatContext.put({...impl.getChatAgentContext(chatId), bindings: {ATTACHMENTS: treeId}});
+    await impl.beginAgentIntegrationTurn(chatId);
+    const replica = await open(impl, chatId), checkpoint = await replica.checkpoint();
+    await impl.closeAgentIntegrationTurn(chatId, "approval");
+    const upload = stage("uploaded", "report.csv");
+    let arrived!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { arrived = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const write = impl.gitStore.writeFilesAsCommit.bind(impl.gitStore);
+    impl.gitStore.writeFilesAsCommit = async (...args) => {
+      const commit = await write(...args);
+      arrived();
+      await barrier;
+      return commit;
+    };
+    const sending = impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, [upload]);
+    const path = mode === "file" ? "report.csv" : "report.csv/part.txt";
+    try {
+      await entered;
+      await replica.submitBatch({batchId: "concurrent-upload", baseCursor: checkpoint.cursor, files: [
+        {checkoutId: treeId, path, baseHash: null, change: {set: "replica-created"}},
+      ]});
+    } finally { release(); impl.gitStore.writeFilesAsCommit = write; }
+    await expect(sending).rejects.toThrow(/Attachment workspace changed.*retry/);
+    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state.type).toBe("staged");
+    expect([...impl.storage.chats.list()].some(message => message.type === "message" &&
+      message.attachments?.some(attachment => attachment.id === upload.id))).toBe(false);
+    expect((await impl.getCurrentChatContent(chatId, impl.storage.chatMeta.get(chatId)!)).get(treeId)?.get(path))
+      .toBe("replica-created");
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toHaveLength(1);
+    await impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, [upload]);
+    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).toMatchObject({workspacePath: "report-2.csv"});
+    const content = await impl.getCurrentChatContent(chatId, impl.storage.chatMeta.get(chatId)!);
+    expect(content.get(treeId)?.get(path)).toBe("replica-created");
+    expect(content.get(treeId)?.get("report-2.csv")).toBe("uploaded");
+  }));
+
   it.each(["set", "edit"] as const)("rejects NUL-bearing %s before ACK without wedging the path or consuming its batch ID", mode => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl);
     await impl.beginAgentIntegrationTurn(1);

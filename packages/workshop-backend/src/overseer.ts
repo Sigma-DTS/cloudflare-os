@@ -386,6 +386,9 @@ function validateBlueprintScreenshotUpload(screenshot: BlueprintScreenshotUpload
 
 const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
+
+// Leave ample framing headroom below Workers RPC's 32 MiB serialized-value ceiling.
+const REPLICA_EVENTS_BYTE_BUDGET = 8 * 1024 * 1024;
 const CHAT_ATTACHMENT_EXTENSION_BY_MIME = new Map([
   ["text/csv", ".csv"],
   ["application/json", ".json"],
@@ -5089,14 +5092,14 @@ class OverseerImpl implements AgentHooks {
       const turn = this.storage.agentIntegrationTurns.get(chatId);
       if (turn?.turnId !== origin.turnId || turn.state === "finished") return true;
     }
-    // An approval can finish while the submitting turn is still persisting its suspension.
-    if (this.#runningAgents.has(chatId)) return false;
     const record = this.storage.actions.get(approvedId);
     if (record?.type === "action" && !record.decisionNotified) this.storage.transaction(() => {
       this.addChatMessages(chatId, author, [{ type: "agentNudge", text:
         `The changes you submitted have been approved and applied: ${awaited.toReversed().map(r => `"${r.description.title}"`).join(", ")}. Reads now reflect them.` }]);
       this.storage.actions.put({ ...record, decisionNotified: true });
     });
+    // The resumer journals the wake-up on the submitting continuation before checking busy
+    // state. This decision must survive suspension cleanup even without effect redelivery.
     await resume();
     return true;
   }
@@ -5657,6 +5660,13 @@ class OverseerImpl implements AgentHooks {
       const cached = this.#chatContentCache.get(chatId);
       if (!cached || cached.generation !== base.generation || cached.revision !== base.revision) {
         throw new Error("Attachment workspace changed while preparing the message; retry.");
+      }
+      // Replica ingestion can advance the namespace during the preparation awaits. The
+      // current cache includes those touched paths; its freshness alone doesn't reserve names.
+      for (const existing of cached.content.get(worktree.id)?.keys() ?? []) {
+        if (existing === path || existing.startsWith(path + "/")) {
+          throw new Error("Attachment workspace changed while preparing the message; retry.");
+        }
       }
       const change: CodeChange = {[worktree.id]: [[path, {set: text}]]};
       validateCodeChangeSchema(change);
@@ -6648,16 +6658,30 @@ class OverseerImpl implements AgentHooks {
         if (!match || !Number.isSafeInteger(Number(match[2])) || Number(match[1]) !== base.generation ||
             Number(match[2]) < checkpointRevision || Number(match[2]) > base.revision) throw new Error("Replica cursor expired.");
         const after = Number(match[2]), through = Math.min(base.revision, after + limit);
-        const rows = this.listChatChangesSince(lease.chatId, base.generation, after, through);
-        if (!rows) throw new Error("Replica cursor history expired; acquire a new lease and checkpoint.");
-        const events = rows.map(row => {
-          const cursor = `${lease.id}:${row.generation}:${row.revision}`;
-          return { cursor, ...(row.sourceReplica?.leaseId === lease.id
+        const events: WorktreeChangesPage["events"] = [];
+        let bytes = 256, returnedThrough = after;
+        for (let revision = after + 1; revision <= through; ++revision) {
+          const row = this.storage.chatChanges.get(chatKey(lease.chatId, base.generation, revision));
+          if (!row) throw new Error("Replica cursor history expired; acquire a new lease and checkpoint.");
+          const scoped: CodeChange = {};
+          for (const tree of lease.worktrees) {
+            if (row.change[tree.checkoutId]?.length) scoped[tree.checkoutId] = row.change[tree.checkoutId];
+          }
+          const event = { cursor: `${lease.id}:${row.generation}:${row.revision}`, ...(row.sourceReplica?.leaseId === lease.id
             ? {sourceBatchId: row.sourceReplica.batchId} : {}),
             changes: lease.worktrees.flatMap(tree => (row.change[tree.checkoutId] ?? []).map(([path, change]) =>
               ({ checkoutId: tree.checkoutId, path, change }))) };
-        });
-        return { events, cursor: events.at(-1)?.cursor ?? cursor, hasMore: through < base.revision };
+          const size = codeChangeSerializedSize(scoped) + 128 * event.changes.length +
+            256 + 2 * (event.cursor.length + (event.sourceBatchId?.length ?? 0));
+          if (bytes + size > REPLICA_EVENTS_BYTE_BUDGET) {
+            if (!events.length) throw new Error("Replica event exceeds its transfer budget.");
+            break;
+          }
+          bytes += size;
+          events.push(event);
+          returnedThrough = row.revision;
+        }
+        return { events, cursor: events.at(-1)?.cursor ?? cursor, hasMore: returnedThrough < base.revision };
       },
       flush: async lease => {
         const active = this.#worktreeReplicaTurns.get(lease.chatId)?.access;
@@ -6833,6 +6857,7 @@ class OverseerImpl implements AgentHooks {
 
   async beginAgentIntegrationTurn(chatId: number, requestKey = this.#agentRequestKey(chatId)): Promise<void> {
     if (!this.env.AGENT_INTEGRATION_GRANTS) return;
+    const active = this.storage.activeAgents.get(chatId);
     let previous = this.storage.agentIntegrationTurns.get(chatId);
     if (previous && previous.state !== "finished" && previous.requestKey !== requestKey) {
       // Superseding a paused prompt terminates it; its suspended event has already been delivered.
@@ -6845,8 +6870,14 @@ class OverseerImpl implements AgentHooks {
       await Promise.all([...this.storage.agentIntegrationParticipants.byTurn.get(previous.turnId)]
         .map(record => this.#deliverIntegrationParticipant(record.id)));
     }
+    const current = this.storage.activeAgents.get(chatId);
+    if (current?.continuationId !== active?.continuationId || active && !current) {
+      throw new Error("Agent continuation canceled or superseded during lifecycle startup.");
+    }
+    // Cancellation and other terminal delivery can replace this journal while the outbox awaits.
+    previous = this.storage.agentIntegrationTurns.get(chatId);
     const next = beginIntegrationTurn(previous, chatId, requestKey);
-    next.continuationId = this.storage.activeAgents.get(chatId)?.continuationId;
+    next.continuationId = current?.continuationId;
     const participants = [...this.storage.agentIntegrationParticipants.byTurn.get(next.turnId)];
     this.storage.transaction(() => {
       this.storage.agentIntegrationTurns.put(next);
@@ -12388,15 +12419,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Don't resume until every connection request from this turn was accepted. Scanning newest
     // first bounds the lookup to the current turn and usually finds a pending sibling immediately.
+    let currentRequest = false;
     for (let sibling of this.impl.storage.chats.list(
         {prefix: chatKeyPrefix(msg.chatId), reverse: true})) {
-      if (sibling.type === "connectionRequest" && sibling.state !== "accepted") return;
+      if (sibling.type === "connectionRequest") {
+        if (sibling.requestId === requestId) currentRequest = true;
+        if (sibling.state !== "accepted") return;
+      }
       if (sibling.type === "agentCallback" ||
           (sibling.type === "message" &&
            (sibling.author.type === "user" || sibling.author.type === "gadget"))) {
         break;
       }
     }
+    // Accepting an earlier card connects the resource, but never authorizes a newer prompt.
+    if (!currentRequest) return;
     await this.#resumeSuspendedAgent(msg.chatId);
   }
 
