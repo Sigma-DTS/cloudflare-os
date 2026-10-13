@@ -15,13 +15,15 @@
 // and writes only its own directory, and results are reassembled in package order.
 //
 // Usage: node scripts/release/build-release.ts --out <dir> [--release-id <id>] [--concurrency <n>]
+//        [--extra-package-dir <dir>] [--preinstall-gatekeeper <package>]
+//        [--singleton-gatekeeper <package>]
 
 import {
   execFile, execFileSync, type ChildProcess, type ExecFileOptions,
 } from "node:child_process";
 import { setMaxListeners } from "node:events";
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { basename, join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
@@ -88,15 +90,34 @@ function parseArgs(argv: string[]): {
   out: string;
   releaseId: string | undefined;
   concurrency: number;
+  extraPackageDirs: string[];
+  preinstallGatekeepers: string[];
+  singletonGatekeepers: string[];
 } {
   let out: string | undefined;
   let releaseId: string | undefined;
+  const extraPackageDirs: string[] = [];
+  const preinstallGatekeepers: string[] = [];
+  const singletonGatekeepers: string[] = [];
   // Each bundle is one mostly CPU-bound esbuild process. Lower it on a runner that cannot afford
   // that many at once; raise it on one whose cores this undercounts.
   let concurrency = availableParallelism();
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--out") out = resolve(argv[++i]);
     else if (argv[i] === "--release-id") releaseId = argv[++i];
+    else if (argv[i] === "--extra-package-dir") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--extra-package-dir requires a directory");
+      extraPackageDirs.push(resolve(value));
+    } else if (argv[i] === "--preinstall-gatekeeper") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--preinstall-gatekeeper requires a package name");
+      preinstallGatekeepers.push(value);
+    } else if (argv[i] === "--singleton-gatekeeper") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--singleton-gatekeeper requires a package name");
+      singletonGatekeepers.push(value);
+    }
     else if (argv[i] === "--concurrency") {
       concurrency = Number(argv[++i]);
       if (!Number.isInteger(concurrency) || concurrency < 1) {
@@ -105,7 +126,49 @@ function parseArgs(argv: string[]): {
     } else throw new Error(`unknown argument: ${argv[i]}`);
   }
   if (!out) throw new Error("--out <dir> is required");
-  return { out, releaseId, concurrency };
+  return { out, releaseId, concurrency, extraPackageDirs,
+    preinstallGatekeepers, singletonGatekeepers };
+}
+
+function releasePackages(extraPackageDirs: string[]): DeployablePackage[] {
+  const extraPackages = extraPackageDirs.map((directory) => {
+    const pkg = readDeployablePackages(dirname(directory))
+        .find((candidate) => candidate.name === basename(directory));
+    if (!pkg) throw new Error(`${directory} is not a deployable package directory`);
+    return pkg;
+  });
+  const packages = [...readDeployablePackages(PACKAGES_DIR), ...extraPackages]
+      .toSorted((a, b) => a.name.localeCompare(b.name));
+  for (let i = 1; i < packages.length; i++) {
+    if (packages[i - 1].name === packages[i].name) {
+      throw new Error(`deployable package ${packages[i].name} exists in more than one package directory`);
+    }
+  }
+  return packages;
+}
+
+function applyGatekeeperPolicy(
+  manifest: ReturnType<typeof generateManifest>,
+  preinstallGatekeepers: string[],
+  singletonGatekeepers: string[],
+): void {
+  const gatekeeper = (packageName: string) => {
+    const worker = manifest.workers[packageName];
+    if (!worker || worker.kind !== "gatekeeper" || !worker.installable) {
+      throw new Error(`${packageName} is not an installable gatekeeper in this release`);
+    }
+    return worker;
+  };
+  for (const packageName of new Set(preinstallGatekeepers)) {
+    const worker = gatekeeper(packageName);
+    if ((worker.inputs ?? []).length > 0) {
+      throw new Error(`${packageName} cannot be preinstalled because it declares installer inputs`);
+    }
+    worker.preinstall = true;
+  }
+  for (const packageName of new Set(singletonGatekeepers)) {
+    gatekeeper(packageName).singleton = true;
+  }
 }
 
 // Runs a command to completion and prints its output as one block once it finishes.
@@ -358,7 +421,7 @@ async function main() {
   mkdirSync(join(args.out, "modules"), { recursive: true });
   mkdirSync(join(args.out, "assets"), { recursive: true });
 
-  const packages = readDeployablePackages(PACKAGES_DIR);
+  const packages = releasePackages(args.extraPackageDirs);
 
   // 1. Every bundle, overlapping.
   const { bundles, assets } = await buildAll(packages, args.concurrency);
@@ -396,6 +459,7 @@ async function main() {
     workers,
     assetVariants,
   });
+  applyGatekeeperPolicy(manifest, args.preinstallGatekeepers, args.singletonGatekeepers);
   writeFileSync(join(args.out, "manifest.json"), stableStringify(manifest) + "\n");
 
   const moduleCount = workers.reduce((n, w) => n + w.modules.length, 0);
