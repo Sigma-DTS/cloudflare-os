@@ -151,4 +151,34 @@ describe("transient model failures", () => {
     }]);
     expect(toolResultImages(contexts[2])).toEqual(toolResultImages(contexts[1]));
   }));
+
+  it("bounds image bytes across all executeCode calls in one persisted step",
+      () => withImpl(async impl => {
+    seedChat(impl);
+    impl.executeCodeMode = async () => ({
+      output: "captured screenshot",
+      images: [{
+        data: new Uint8Array(7 * 1024 * 1024 / 2),
+        mimeType: "image/png",
+      }],
+    });
+
+    let {contexts} = await runScriptedTurn(impl, [
+      fauxAssistantMessage([
+        fauxToolCall("executeCode", {code: "captureFirst()"}),
+        fauxToolCall("executeCode", {code: "captureSecond()"}),
+      ], {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxText("Done.")),
+    ]);
+
+    let results = contexts[1].messages.filter(message => message.role === "toolResult");
+    expect(results).toHaveLength(2);
+    expect(results[0].isError).toBe(false);
+    expect(results[0].content.filter(part => part.type === "image")).toHaveLength(1);
+    expect(results[1].isError).toBe(true);
+    expect(results[1].content).toContainEqual({
+      type: "text",
+      text: "Image output exceeds 6 MiB for this agent step.",
+    });
+  }));
 });

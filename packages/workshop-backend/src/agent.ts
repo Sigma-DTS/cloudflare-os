@@ -48,6 +48,12 @@ const logger = createWorkshopLogger("workshop.agent");
  */
 export const MAX_TOOL_RESULT_CHARS = 32 * 1024;
 
+/** Maximum number of images all executeCode calls in one persisted agent step may emit. */
+export const MAX_CODE_MODE_IMAGES_PER_STEP = 4;
+
+/** Maximum image bytes all executeCode calls in one persisted agent step may emit. */
+export const MAX_CODE_MODE_IMAGE_BYTES_PER_STEP = 6 * 1024 * 1024;
+
 /**
  * One buffered agent tool edit: an entry of the step buffer, which the step's persistence
  * barrier appends as one chat change row (see AgentHooks.commitAgentStep). One row per tool
@@ -2777,6 +2783,8 @@ async function runAgentPass(
   // client-visible AiToolCall record. This map lives only until the same step's persistence
   // barrier; after that, replay reads the durable copy from chatModelData.
   let pendingToolResultImages = new Map<string, StoredToolResultImage[]>();
+  let pendingToolResultImageCount = 0;
+  let pendingToolResultImageBytes = 0;
 
   // Renders a thrown tool error exactly the way pi renders it into the live error tool result
   // (an Error contributes its message, anything else is stringified), so the persisted `error`
@@ -3767,6 +3775,18 @@ async function runAgentPass(
               worktreeTurnAccess);
           let output = result.output;
           if (result.images.length > 0) {
+            let imageBytes = result.images.reduce((total, image) => total + image.data.byteLength, 0);
+            if (pendingToolResultImageCount + result.images.length >
+                MAX_CODE_MODE_IMAGES_PER_STEP) {
+              throw new Error(
+                  `An agent step can emit at most ${MAX_CODE_MODE_IMAGES_PER_STEP} images.`);
+            }
+            if (pendingToolResultImageBytes + imageBytes >
+                MAX_CODE_MODE_IMAGE_BYTES_PER_STEP) {
+              throw new Error("Image output exceeds 6 MiB for this agent step.");
+            }
+            pendingToolResultImageCount += result.images.length;
+            pendingToolResultImageBytes += imageBytes;
             output += `\n\n(${result.images.length} image${result.images.length === 1 ? "" : "s"} ` +
                 "emitted to the model for this turn.)";
             pendingToolResultImages.set(toolCallId, result.images);
@@ -4133,6 +4153,8 @@ async function runAgentPass(
         // Reset per-step streaming state.
         toolCallNotes.clear();
         pendingToolResultImages.clear();
+        pendingToolResultImageCount = 0;
+        pendingToolResultImageBytes = 0;
         executeCodeStreamManager.clear();
         break;
       }

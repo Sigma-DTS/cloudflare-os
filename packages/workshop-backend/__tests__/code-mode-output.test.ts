@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RpcStub } from "cloudflare:workers";
 import { CodeModeOutputImpl } from "../src/overseer.js";
 
 const PNG = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
@@ -25,6 +26,22 @@ describe("code mode image output", () => {
     expect(images[0].data).toEqual(PNG);
     images.length = 0;
     expect(output.takeImages()).toHaveLength(3);
+  });
+
+  it("does not expose the host image accessor over RPC", async () => {
+    const output = new CodeModeOutputImpl();
+    output.image(PNG, "image/png");
+    using stub = new RpcStub(output);
+
+    let error: unknown;
+    try {
+      await (stub as unknown as {takeImages(): Promise<unknown>}).takeImages();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("does not implement the method \"takeImages\"");
+    expect(output.takeImages()).toHaveLength(1);
   });
 
   it("rejects an image whose bytes do not match its declared type", () => {

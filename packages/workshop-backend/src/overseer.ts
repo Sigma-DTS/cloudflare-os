@@ -44,7 +44,12 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
+import {
+  AgentGadgetInfo, AgentHooks, formatMissingBlueprintBindings, GIT_BINDING_NAME,
+  MAX_CODE_MODE_IMAGE_BYTES_PER_STEP, MAX_CODE_MODE_IMAGES_PER_STEP, runAgent, SeedBindingInfo,
+  summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory,
+  type WorktreeTurnAccess,
+} from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
@@ -229,9 +234,6 @@ class RestoreForgerImpl extends NativeRpcTarget {
   }
 }
 
-const MAX_CODE_MODE_IMAGES = 4;
-const MAX_CODE_MODE_IMAGE_BYTES = 6 * 1024 * 1024;
-
 /** One image emitted explicitly by executed code for the current model turn. */
 export type CodeModeImage = {
   data: Uint8Array;
@@ -244,8 +246,9 @@ export class CodeModeOutputImpl extends NativeRpcTarget {
   #bytes = 0;
 
   image(data: Uint8Array, mimeType: string): void {
-    if (this.#images.length >= MAX_CODE_MODE_IMAGES) {
-      throw new Error(`executeCode can emit at most ${MAX_CODE_MODE_IMAGES} images.`);
+    if (this.#images.length >= MAX_CODE_MODE_IMAGES_PER_STEP) {
+      throw new Error(
+          `executeCode can emit at most ${MAX_CODE_MODE_IMAGES_PER_STEP} images per agent step.`);
     }
     if (mimeType !== "image/png" && mimeType !== "image/jpeg" && mimeType !== "image/webp") {
       throw new Error("executeCode emitted an unsupported image type.");
@@ -253,9 +256,9 @@ export class CodeModeOutputImpl extends NativeRpcTarget {
     if (!(data instanceof Uint8Array)) {
       throw new Error("executeCode image data must be a Uint8Array.");
     }
-    if (data.byteLength <= 0 || data.byteLength > MAX_CODE_MODE_IMAGE_BYTES ||
-        this.#bytes + data.byteLength > MAX_CODE_MODE_IMAGE_BYTES) {
-      throw new Error("executeCode image output exceeds 6 MiB.");
+    if (data.byteLength <= 0 || data.byteLength > MAX_CODE_MODE_IMAGE_BYTES_PER_STEP ||
+        this.#bytes + data.byteLength > MAX_CODE_MODE_IMAGE_BYTES_PER_STEP) {
+      throw new Error("executeCode image output exceeds 6 MiB per agent step.");
     }
     const matches = mimeType === "image/png"
       ? data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 &&
@@ -269,9 +272,13 @@ export class CodeModeOutputImpl extends NativeRpcTarget {
     this.#images.push({data: data.slice(), mimeType});
   }
 
-  takeImages(): CodeModeImage[] {
+  /**
+   * Return the collected images to the host. Native Workers RPC exposes prototype methods, so
+   * keeping this as an instance function makes the sink write-only to remote holders.
+   */
+  readonly takeImages = (): CodeModeImage[] => {
     return [...this.#images];
-  }
+  };
 }
 
 // =======================================================================================
