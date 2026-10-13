@@ -479,7 +479,10 @@ export interface AgentHooks {
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void,
-                   worktreeTurn?: WorktreeTurnAccess): Promise<string>;
+                   worktreeTurn?: WorktreeTurnAccess): Promise<{
+                     output: string;
+                     images: {data: string; mimeType: "image/png" | "image/jpeg" | "image/webp"}[];
+                   }>;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
@@ -1198,6 +1201,8 @@ NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` 
 
 let EXECUTE_CODE_INTRO = `
 Executes one-off JavaScript code, returning the output it logs to the console. The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.
+
+The fourth function parameter is an output sink. Call \`output.image(base64Data, mimeType)\` to show a PNG, JPEG, or WebP image to the model in this turn. For example, a binding that returns \`{data, mimeType}\` from a screenshot can be forwarded with \`output.image(screenshot.data, screenshot.mimeType)\`.
 `.trim();
 
 let EXECUTE_CODE_SELF_PARAM = `
@@ -3709,7 +3714,7 @@ async function runAgentPass(
               "which exports a single async function, like so:\n" +
               "\n" +
               "```\n" +
-              "export default async function(self, env, ctx) {\n" +
+              "export default async function(self, env, ctx, output) {\n" +
               "  // ... code to execute ...\n" +
               "}\n" +
               "```\n" +
@@ -3733,7 +3738,7 @@ async function runAgentPass(
                 "step ends. End this response and call executeCode again in your next step.");
           }
 
-          let output = await hooks.executeCodeMode(
+          let result = await hooks.executeCodeMode(
               chatId, code, initiator, author.id, Object.fromEntries(chatBindings),
               delta => emitStreamEvent({
                 type: "toolOutputDelta",
@@ -3741,7 +3746,18 @@ async function runAgentPass(
                 delta,
               }),
               worktreeTurnAccess);
-          return toolResult(`${output}`, {output: `${output}`} as Partial<AiToolCall>);
+          let output = result.output;
+          if (result.images.length > 0) {
+            output += `\n\n(${result.images.length} image${result.images.length === 1 ? "" : "s"} ` +
+                "emitted to the model for this turn.)";
+          }
+          return {
+            content: [
+              {type: "text" as const, text: output},
+              ...result.images.map(image => ({type: "image" as const, ...image})),
+            ],
+            details: {output} as Partial<AiToolCall>,
+          };
         } catch (error) {
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)

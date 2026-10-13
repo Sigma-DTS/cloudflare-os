@@ -103,7 +103,7 @@ import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
   verify() {}
-  async run(self, restoreForger) {
+  async run(self, restoreForger, output) {
     let env = this.env;
     if (restoreForger) {
       // Graft the well-known \`restore\` symbol onto each service-binding stub in env, so the
@@ -122,7 +122,7 @@ export default class extends WorkerEntrypoint {
         }
       }
     }
-    let result = await agent(self, env, this.ctx);
+    let result = await agent(self, env, this.ctx, output);
     if (result !== undefined) console.log("Return value:", result);
   }
 }
@@ -195,7 +195,8 @@ let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
 
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
-  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>,
+      output?: NativeRpcStub<CodeModeOutputImpl>): Promise<void>;
 }
 
 interface RestoreForgerEntrypoint extends WorkerEntrypoint {
@@ -225,6 +226,77 @@ class RestoreForgerImpl extends NativeRpcTarget {
   forge(bindingName: string, params: unknown): Promise<unknown> {
     return this.#impl.forgeRestoreStubForBinding(
         this.#chatId, this.#bindings, bindingName, params);
+  }
+}
+
+const MAX_CODE_MODE_IMAGES = 4;
+const MAX_CODE_MODE_IMAGE_BYTES = 6 * 1024 * 1024;
+const MAX_CODE_MODE_IMAGE_BASE64_CHARS = Math.ceil(MAX_CODE_MODE_IMAGE_BYTES / 3) * 4;
+
+function base64Value(code: number): number {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 97 + 26;
+  if (code >= 48 && code <= 57) return code - 48 + 52;
+  if (code === 43) return 62;
+  if (code === 47) return 63;
+  return -1;
+}
+
+/** Return whether a value is canonical padded base64 without recursing over its contents. */
+export function isCanonicalBase64ImageData(data: unknown): data is string {
+  if (typeof data !== "string" || data.length % 4 !== 0) return false;
+
+  let padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  let contentLength = data.length - padding;
+  for (let i = 0; i < contentLength; i++) {
+    if (base64Value(data.charCodeAt(i)) < 0) return false;
+  }
+  if (data.slice(contentLength) !== "=".repeat(padding)) return false;
+  let finalValue = base64Value(data.charCodeAt(contentLength - 1));
+  return padding === 2 ? finalValue % 16 === 0 : padding === 1 ? finalValue % 4 === 0 : true;
+}
+
+/** One image emitted explicitly by executed code for the current model turn. */
+export type CodeModeImage = {
+  data: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp";
+};
+
+/** Host-owned sink passed to executeCode; it can emit pixels but conveys no new authority. */
+export class CodeModeOutputImpl extends NativeRpcTarget {
+  readonly #images: CodeModeImage[] = [];
+  #bytes = 0;
+
+  image(data: string, mimeType: string): void {
+    if (this.#images.length >= MAX_CODE_MODE_IMAGES) {
+      throw new Error(`executeCode can emit at most ${MAX_CODE_MODE_IMAGES} images.`);
+    }
+    if (mimeType !== "image/png" && mimeType !== "image/jpeg" && mimeType !== "image/webp") {
+      throw new Error("executeCode emitted an unsupported image type.");
+    }
+    if (typeof data !== "string" || data.length > MAX_CODE_MODE_IMAGE_BASE64_CHARS ||
+        !isCanonicalBase64ImageData(data)) {
+      throw new Error("executeCode image data must be canonical base64.");
+    }
+    const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+    const bytes = (data.length / 4) * 3 - padding;
+    if (bytes <= 0 || bytes > MAX_CODE_MODE_IMAGE_BYTES ||
+        this.#bytes + bytes > MAX_CODE_MODE_IMAGE_BYTES) {
+      throw new Error("executeCode image output exceeds 6 MiB.");
+    }
+    const prefix = atob(data.slice(0, Math.min(data.length, 32)));
+    const matches = mimeType === "image/png"
+      ? prefix.startsWith("\x89PNG\r\n\x1a\n")
+      : mimeType === "image/jpeg"
+        ? prefix.startsWith("\xff\xd8\xff")
+        : prefix.startsWith("RIFF") && prefix.slice(8, 12) === "WEBP";
+    if (!matches) throw new Error("executeCode image bytes do not match their MIME type.");
+    this.#bytes += bytes;
+    this.#images.push({data, mimeType});
+  }
+
+  takeImages(): CodeModeImage[] {
+    return [...this.#images];
   }
 }
 
@@ -8218,7 +8290,7 @@ class OverseerImpl implements AgentHooks {
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
                         worktreeTurn?: WorktreeTurnAccess)
-      : Promise<string> {
+      : Promise<{output: string, images: CodeModeImage[]}> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     let executionId: string = bytes.toBase64();
@@ -8281,10 +8353,12 @@ class OverseerImpl implements AgentHooks {
       }});
 
       let error: string | undefined;
+      const output = new CodeModeOutputImpl();
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        await entrypoint.run(
+            selfStub, new RestoreForgerImpl(this, chatId, bindings), output);
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -8315,7 +8389,7 @@ class OverseerImpl implements AgentHooks {
         log = "(function succeeded with no output)";
       }
 
-      return log;
+      return {output: log, images: output.takeImages()};
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
       if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {
