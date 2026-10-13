@@ -1,8 +1,8 @@
 // Issue and pull request listings and searches, driven against the real `GitHubGatekeeperImpl`
 // Durable Object (via the TestHooks facet) with GitHub faked at the `fetch` boundary: walks that
 // must not end on a page the overlay thinned out, a bounded PR text search, structured filters
-// re-checked after the overlay, case-insensitive logins, the read cache's generation fence, and
-// the session's page-size check.
+// re-checked after the overlay, case-insensitive logins, the read cache's generation fence, the
+// session's page-size check, and a pull request discussion that survives a failed fetch.
 
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import { env, runInDurableObject } from "cloudflare:test";
@@ -117,9 +117,9 @@ class FakeGitHub {
     const pullMatch = /^\/pulls\/(\d+)$/.exec(path);
     if (pullMatch) {
       return Response.json({
-        ...this.pulls.get(Number(pullMatch[1])),
         comments: 0, commits: 1, additions: 0, deletions: 0, changed_files: 0,
         requested_reviewers: [], mergeable: null,
+        ...this.pulls.get(Number(pullMatch[1])),
       });
     }
     throw new Error(`test: unexpected fetch ${request.method} ${request.url}`);
@@ -155,6 +155,8 @@ async function repoGatekeeper() {
   return {
     pages: async <T>(method: ListingMethod, query: unknown, pageSize = 100, calls?: number) =>
       await unwrap(hooks.listingPages(scenario, props, method, query, pageSize, calls)) as (T[] | null | string)[],
+    concurrentPages: async <T>(method: ListingMethod, query: unknown, pageSize: number, calls: number) =>
+      await unwrap(hooks.listingPagesConcurrently(scenario, props, method, query, pageSize, calls)) as (T[] | null)[],
     all: async <T>(method: ListingMethod, query: unknown) =>
       (await unwrap(hooks.listingPages(scenario, props, method, query, 100)) as (T[] | null)[])
         .flatMap(page => page ?? []),
@@ -163,6 +165,8 @@ async function repoGatekeeper() {
     applyAction: (actionId: number) =>
       unwrap(hooks.applyAction(scenario, props, actionId, new RpcStub(new UnusedGitCache()) as never)),
     openIssue: (id: string) => unwrap(hooks.openIssue(scenario, props, id)),
+    discussionPages: async <T>(kind: "issue" | "pull", id: string) =>
+      await unwrap(hooks.discussionPages(scenario, props, kind, id, 100)) as (T[] | null | string)[],
   };
 }
 
@@ -211,6 +215,61 @@ describe("listing walks", () => {
     expect(pages[1]).toContain("Bad Gateway");
     expect(pages.flatMap(page => Array.isArray(page) ? page.map(item => item.id) : []))
       .toEqual(range(1, 200).map(String));
+  });
+
+  it("serves concurrent next() calls consecutive pages, not one page twice", async () => {
+    const github = new FakeGitHub();
+    github.pages.set("/issues", [range(1, 100).map(n => issue(n)), range(101, 100).map(n => issue(n))]);
+    const gk = await repoGatekeeper();
+
+    const pages = await gk.concurrentPages<{ id: string }>("listIssues", undefined, 100, 2);
+
+    expect(pages.map(page => page?.map(item => item.id)))
+      .toEqual([range(1, 100).map(String), range(101, 100).map(String)]);
+  });
+});
+
+describe("pull request discussion", () => {
+  /**
+   * Pull request 7 with one comment (id 1) made at `commentMinute`, and review pages listing the
+   * minute each review was made; a review's id is 1000 plus its minute.
+   */
+  function pullDiscussion(commentMinute: number, reviewPages: number[][]): FakeGitHub {
+    const at = (minute: number) => new Date(Date.UTC(2026, 0, 1, 0, minute)).toISOString();
+    const user = { login: "someone" };
+    const github = new FakeGitHub();
+    github.pulls.set(7, { ...pull(7), comments: 1 });
+    github.pages.set("/issues/7/comments", [[
+      { id: 1, user, body: "", created_at: at(commentMinute), updated_at: at(commentMinute), html_url: "" },
+    ]]);
+    github.pages.set("/pulls/7/comments", []);
+    github.pages.set("/pulls/7/reviews", reviewPages.map(page => page.map(minute => ({
+      id: 1000 + minute, user, body: "", submitted_at: at(minute), html_url: "", state: "COMMENTED",
+    }))));
+    return github;
+  }
+
+  async function discussionIds() {
+    const pages = await (await repoGatekeeper()).discussionPages<{ id: string }>("pull", "7");
+    return {
+      failures: pages.filter(page => typeof page === "string").length,
+      ids: pages.flatMap(page => Array.isArray(page) ? page.map(entry => entry.id) : []),
+    };
+  }
+
+  it("merges by time, a comment before a review made with it, and loses no review when a review page fails", async () => {
+    pullDiscussion(2, [[1, 2, 3]]).failing.add("/pulls/7/reviews p1");
+
+    expect(await discussionIds()).toEqual({ failures: 1, ids: ["1001", "1", "1002", "1003"] });
+  });
+
+  it("loses no review it had merged when a later review page fails", async () => {
+    // The first page stops one review short of review page 1's end, so the second holds that
+    // review when review page 2 fails.
+    pullDiscussion(0, [range(1, 100), range(101, 50)]).failing.add("/pulls/7/reviews p2");
+
+    expect(await discussionIds())
+      .toEqual({ failures: 1, ids: ["1", ...range(1001, 150).map(String)] });
   });
 });
 

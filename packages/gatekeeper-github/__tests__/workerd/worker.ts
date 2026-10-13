@@ -200,6 +200,7 @@ type GatekeeperFacet = {
   prepareSetTitle(kind: "issue" | "pull", id: string, title: string): Promise<IssueEditActionData>;
   prepareChangeState(kind: "issue" | "pull", id: string, state: "open" | "closed")
     : Promise<IssueEditActionData>;
+  issueDiscussion(kind: "issue" | "pull", id: string, pageSize: number): Promise<Cursor<unknown>>;
 } & Record<ListingMethod, (query: never, pageSize: number) => Promise<Cursor<unknown>>>;
 
 async function drain<T>(cursor: { next(): Promise<T[] | null> }): Promise<T[]> {
@@ -208,6 +209,24 @@ async function drain<T>(cursor: { next(): Promise<T[] | null> }): Promise<T[]> {
     items.push(...page);
   }
   return items;
+}
+
+/**
+ * A cursor's `next()` results, for up to `calls` calls or through its `null`. A call that throws
+ * is recorded as its message and retried on the same cursor; a second throw in a row ends the
+ * drain with it.
+ */
+async function pagesOf(cursor: Cursor<unknown>, calls = Infinity): Promise<(unknown[] | null | string)[]> {
+  const pages: (unknown[] | null | string)[] = [];
+  while (pages.length < calls && pages.at(-1) !== null) {
+    try {
+      pages.push(await cursor.next());
+    } catch (error) {
+      if (typeof pages.at(-1) === "string") throw error;
+      pages.push(String(error));
+    }
+  }
+  return pages;
 }
 
 /**
@@ -469,27 +488,31 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  /**
-   * One listing cursor's `next()` results, for up to `calls` calls or through its `null`. A call
-   * that throws is recorded as its message and retried on the same cursor; a second throw in a
-   * row ends the drain with it.
-   */
+  /** One listing cursor's pages, as `pagesOf` drains them. */
   async listingPages(
     facetName: string, props: GatekeeperProps,
     method: ListingMethod, query: unknown, pageSize: number, calls = Infinity,
   ): Promise<Outcome<(unknown[] | null | string)[]>> {
+    return await outcome(async () =>
+      await pagesOf(await this.#gatekeeper(facetName, props)[method](query as never, pageSize), calls));
+  }
+
+  /** An issue's or pull request's discussion pages, as `pagesOf` drains them. */
+  async discussionPages(
+    facetName: string, props: GatekeeperProps, kind: "issue" | "pull", id: string, pageSize: number,
+  ): Promise<Outcome<(unknown[] | null | string)[]>> {
+    return await outcome(async () =>
+      await pagesOf(await this.#gatekeeper(facetName, props).issueDiscussion(kind, id, pageSize)));
+  }
+
+  /** `calls` concurrent `next()` calls on one listing cursor, without awaiting between them. */
+  async listingPagesConcurrently(
+    facetName: string, props: GatekeeperProps,
+    method: ListingMethod, query: unknown, pageSize: number, calls: number,
+  ): Promise<Outcome<(unknown[] | null)[]>> {
     return await outcome(async () => {
       const cursor = await this.#gatekeeper(facetName, props)[method](query as never, pageSize);
-      const pages: (unknown[] | null | string)[] = [];
-      while (pages.length < calls && pages.at(-1) !== null) {
-        try {
-          pages.push(await cursor.next());
-        } catch (error) {
-          if (typeof pages.at(-1) === "string") throw error;
-          pages.push(String(error));
-        }
-      }
-      return pages;
+      return await Promise.all(Array.from({ length: calls }, () => cursor.next()));
     });
   }
 

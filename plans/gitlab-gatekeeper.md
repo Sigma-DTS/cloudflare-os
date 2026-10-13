@@ -477,9 +477,10 @@ bump, stub removal, config, secrets). See [Commit sequence](#commit-sequence).
   included, per the docs' `my%2Fbranch` rule. Pagination follows GitLab's `x-next-page` (empty
   on the last page), not GitHub's "short page means exhausted" rule: listings that filter after
   paginating — notes and discussions drop what the reader may not see — return short pages with
-  more behind them, so listings answer `GitLabPage {items, nextPage}` and the `StreamingCursor`
-  reads `nextPage`, not the length; only a response carrying no `x-next-page` at all falls back
-  to the short-page rule. `x-total`/`x-total-pages` are no help: the docs omit them above 10,000
+  more behind them, so listings answer `GitLabPage {items, nextPage}` and `gitlabCursor` (the
+  kit's `TokenCursor`) reads `nextPage`, not the length; only a response carrying no
+  `x-next-page` at all falls back to the short-page rule. `x-total`/`x-total-pages` are no help:
+  the docs omit them above 10,000
   results and on the Commits API always. Every body is read through the kit's byte cap
   (`readTextCapped`), except an error body, read as a capped prefix (`readTextPrefix`) so an
   oversized error page still yields an excerpt.
@@ -780,9 +781,9 @@ in `github.ts` is the checklist. Divergences:
   GitLab's list endpoint *is* the search endpoint (`search=`) — as do the MR pair. The GitHub
   client-side PR scan (`#searchPullSummaries`' buffered upstream walk) is deleted; so is
   `github-search.ts`'s scope-assertion, since a project-scoped endpoint can't leak another
-  project's rows. Rows already served as overlaid injected items are dropped by the cursor's
-  `filter`, not inside `fetchPage`, so a page is counted as GitLab sent it (as GitHub's walk now
-  counts its pages too), and each item is served once (`StreamingCursor`'s `identity`, a
+  project's rows. Rows already served as injected items are dropped inside `fetchPage`, which
+  cannot end a walk early, since `nextPage` rather than a page's length says whether it
+  continues, and each item is served once (the kit cursor's `inject.identity`, a
   provisional's real id once it has one): a queued create applied while a cursor is drained
   would otherwise list both its injected `~N` and, on a later page, the real row. The injected
   rows already served are re-keyed at every check, since `~N` served before its create landed
@@ -857,7 +858,7 @@ substitutes transport endpoints and REST lookups:
   `#treeDiffSource` (`getTree`: cache only, else `null`; `getBlob`: cache, else
   `/repository/blobs/:sha` under `MAX_DIFF_BLOB_BYTES`), `#overlaySimulatedMergeRequestHead`,
   `#overlayMergeRequestSummaryHead`, injected created branches in `listBranches` with
-  `revalidateInjected`, `#filterPendingCommitsForListing`. `#servedSimulatedCommitIds` and the
+  `inject.revalidate`, `#filterPendingCommitsForListing`. `#servedSimulatedCommitIds` and the
   `MAX_PENDING_CHAIN_COMMITS` cap carry over, and the stored simulated comparison keeps every
   commit the walk withheld, a local merge's side branches included (`pendingCommitIds`), since a
   restarted instance serving it refills the in-memory set from it alone. Two rules keep injected

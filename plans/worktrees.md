@@ -753,7 +753,7 @@ agent-facing `Worktree` binding API).
   - `GitHubPullRequest.listCommits() → Cursor<CommitSummary>`.
   - **Cursor methods advertise per page.** The existing cursor pattern authorizes
     once up front and then fetches pages lazily (`github.ts`'s session methods
-    authorize, then return a lazy `StreamingCursor`), so at method-call time no
+    authorize, then return a lazy kit `TokenCursor`), so at method-call time no
     commit ids exist to advertise. The up-front `authorizeObservation` still
     gates the read exactly as today; the commit ids are
     advertised by the *pages*: the session wraps the returned cursor in an

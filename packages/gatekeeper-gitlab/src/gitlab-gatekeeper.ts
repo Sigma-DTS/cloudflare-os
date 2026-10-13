@@ -126,7 +126,7 @@ import {
   textSnippet,
   type GitLabDiscussionCommentEntry,
 } from "./gitlab-normalize";
-import { StreamingCursor, mapPage } from "./gitlab-cursors";
+import { gitlabCursor, mapPage } from "./gitlab-cursors";
 import type { GitLabVerifierApi } from "./gitlab";
 import { GitLabIssueImpl, GitLabMergeRequestImpl, GitLabProjectSessionImpl } from "./gitlab-sessions";
 import type {
@@ -831,9 +831,9 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     const { orderBy, sort } = issueOrder(filter);
     const projectPath = this.#projectPath();
     const key = stableKey({ ...filter, search });
-    return new StreamingCursor<GitLabIssueSummary>({
-      fetchPage: async (page, perPage) =>
-        await this.#cached(this.#cacheKey("list-issues", key, `p${page}`), LIST_CACHE_TTL_MS, async () => {
+    return gitlabCursor<GitLabIssueSummary>({
+      fetchPage: async (page, perPage) => {
+        const { items, nextPage } = await this.#cached(this.#cacheKey("list-issues", key, `p${page}`), LIST_CACHE_TTL_MS, async () => {
           const raw = await this.#withApi(api => api.listIssues(projectPath, {
             state: filter?.state,
             labels: filter?.labels,
@@ -846,17 +846,23 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
             page,
           }));
           return mapPage(raw, item => normalizeIssueSummary(this.#instanceUrl(), projectPath, item));
-        }),
-      overlay: item => this.#overlayIssueLike(item, "issue", item.id),
-      // Search scope is the project's own endpoint, so remote rows need no re-check; the local
-      // filter re-applies the structured filter after the overlay may have changed labels/state,
-      // and drops the rows already served as injected items (a touched issue sorts by its
-      // overlaid state, not its remote one).
-      filter: item => !touched.ids.has(item.id) && issueMatchesFilter(item, filter),
-      comparator: compare,
-      injectedItems,
-      revalidateInjected: this.#injectedRowStanding("issue"),
-      identity: item => this.#currentId(item.id),
+        });
+        // Search scope is the project's own endpoint, so remote rows need no re-check; the filter
+        // re-applies the structured filter after the overlay may have changed labels/state, and
+        // drops the rows already served as injected items (a touched issue sorts by its overlaid
+        // state, not its remote one).
+        return {
+          items: items.map(item => this.#overlayIssueLike(item, "issue", item.id))
+            .filter(item => !touched.ids.has(item.id) && issueMatchesFilter(item, filter)),
+          nextPage,
+        };
+      },
+      inject: {
+        items: injectedItems,
+        compare,
+        revalidate: this.#injectedRowStanding("issue"),
+        identity: item => this.#currentId(item.id),
+      },
       pageSize,
     });
   }
@@ -880,9 +886,9 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     const { orderBy, sort } = mergeRequestOrder(filter);
     const projectPath = this.#projectPath();
     const key = stableKey({ ...filter, search });
-    return new StreamingCursor<GitLabMergeRequestSummary>({
-      fetchPage: async (page, perPage) =>
-        await this.#cached(this.#cacheKey("list-mrs", key, `p${page}`), LIST_CACHE_TTL_MS, async () => {
+    return gitlabCursor<GitLabMergeRequestSummary>({
+      fetchPage: async (page, perPage) => {
+        const { items, nextPage } = await this.#cached(this.#cacheKey("list-mrs", key, `p${page}`), LIST_CACHE_TTL_MS, async () => {
           const raw = await this.#withApi(api => api.listMergeRequests(projectPath, {
             state: filter?.state,
             sourceBranch: filter?.sourceBranch,
@@ -905,14 +911,21 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
             [...forkIds].map(async id => [id, await this.#projectRefById(id)] as const)));
           return mapPage(raw, item =>
             normalizeMergeRequestSummary(this.#instanceUrl(), projectPath, item, forkRefs.get(item.source_project_id)));
-        }),
-      overlay: item => this.#overlayMergeRequestSummaryHead(this.#overlayIssueLike(item, "mergeRequest", item.id)),
-      // As for issues: touched rows are dropped, since they are served as injected items.
-      filter: item => !touched.ids.has(item.id) && mergeRequestMatchesFilter(item, filter),
-      comparator: compare,
-      injectedItems,
-      revalidateInjected: this.#injectedRowStanding("mergeRequest"),
-      identity: item => this.#currentId(item.id),
+        });
+        // As for issues: touched rows are dropped, since they are served as injected items.
+        return {
+          items: items
+            .map(item => this.#overlayMergeRequestSummaryHead(this.#overlayIssueLike(item, "mergeRequest", item.id)))
+            .filter(item => !touched.ids.has(item.id) && mergeRequestMatchesFilter(item, filter)),
+          nextPage,
+        };
+      },
+      inject: {
+        items: injectedItems,
+        compare,
+        revalidate: this.#injectedRowStanding("mergeRequest"),
+        identity: item => this.#currentId(item.id),
+      },
       pageSize,
     });
   }
@@ -1182,7 +1195,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     const revisionKey = [revision.baseSha, revision.mergeBaseSha ?? "", revision.headSha];
     return {
       revision,
-      files: new StreamingCursor<GitLabDiffFile>({
+      files: gitlabCursor<GitLabDiffFile>({
         fetchPage: async (page, perPage) =>
           await this.#cached(this.#cacheKey("mr-diffs", realId, ...revisionKey, `p${page}`), ENTITY_CACHE_TTL_MS, async () =>
             mapPage(await this.#withApi(api => api.listMergeRequestDiffs(projectPath, Number(realId), page, perPage)),
@@ -1417,27 +1430,32 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       injectedItems.push({ name: branch, headCommit: head, protected: false, default: false });
     }
 
-    return new StreamingCursor<GitLabBranchSummary>({
-      fetchPage: async (page, perPage) =>
-        await this.#cached(this.#cacheKey("list-branches", stableKey(filter ?? {}), `p${page}`), LIST_CACHE_TTL_MS, async () =>
+    return gitlabCursor<GitLabBranchSummary>({
+      fetchPage: async (page, perPage) => {
+        const { items, nextPage } = await this.#cached(this.#cacheKey("list-branches", stableKey(filter ?? {}), `p${page}`), LIST_CACHE_TTL_MS, async () =>
           mapPage(await this.#withApi(api => api.listBranches(projectPath, { search: filter?.search, page, perPage })),
-            normalizeBranchSummary)),
-      // A branch a queued push moves reads at the pushed head; the simulated head is recorded as
-      // served so the advertising callback withholds it even if the push is rejected later.
-      overlay: item => {
-        const head = this.#simulateBranchHead(item.name, item.headCommit) ?? item.headCommit;
-        if (head === item.headCommit) return item;
-        this.#servedSimulatedCommitIds.add(head);
-        return { ...item, headCommit: head };
+            normalizeBranchSummary));
+        // A branch a queued push moves reads at the pushed head; the simulated head is recorded as
+        // served so the advertising callback withholds it even if the push is rejected later.
+        return {
+          items: items.filter(item => !injectedNames.has(item.name)).map(item => {
+            const head = this.#simulateBranchHead(item.name, item.headCommit) ?? item.headCommit;
+            if (head === item.headCommit) return item;
+            this.#servedSimulatedCommitIds.add(head);
+            return { ...item, headCommit: head };
+          }),
+          nextPage,
+        };
       },
-      filter: item => !injectedNames.has(item.name),
-      comparator: () => 0,
-      injectedItems,
-      revalidateInjected: item => {
-        const head = this.#simulateBranchHead(item.name, null);
-        if (head === null) return null;
-        this.#servedSimulatedCommitIds.add(head);
-        return head === item.headCommit ? item : { ...item, headCommit: head };
+      inject: {
+        items: injectedItems,
+        compare: () => 0,
+        revalidate: item => {
+          const head = this.#simulateBranchHead(item.name, null);
+          if (head === null) return null;
+          this.#servedSimulatedCommitIds.add(head);
+          return head === item.headCommit ? item : { ...item, headCommit: head };
+        },
       },
       pageSize,
     });
@@ -1445,7 +1463,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
 
   async listTags(pageSize: number): Promise<Cursor<GitLabTagSummary>> {
     const projectPath = this.#projectPath();
-    return new StreamingCursor<GitLabTagSummary>({
+    return gitlabCursor<GitLabTagSummary>({
       fetchPage: async (page, perPage) =>
         await this.#cached(this.#cacheKey("list-tags", `p${page}`), LIST_CACHE_TTL_MS, async () =>
           mapPage(await this.#withApi(api => api.listTags(projectPath, page, perPage)), normalizeTagSummary)),
@@ -1544,7 +1562,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
         }
       }
     }
-    return new StreamingCursor<GitLabCommitSummary>({
+    return gitlabCursor<GitLabCommitSummary>({
       fetchPage: async (page, perPage) =>
         await this.#cached(this.#cacheKey("list-commits", stableKey({ ...filter, ref: refName }), `p${page}`), LIST_CACHE_TTL_MS, async () =>
           mapPage(await this.#withApi(api => api.listCommits(projectPath, {
@@ -1557,8 +1575,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
             perPage,
           })), c => normalizeCommitSummary(this.#instanceUrl(), projectPath, c))),
       // Injected pending commits are newer than everything the remote lists (newest-first).
-      comparator: () => -1,
-      injectedItems: injected,
+      inject: { items: injected, compare: () => -1 },
       pageSize,
     });
   }

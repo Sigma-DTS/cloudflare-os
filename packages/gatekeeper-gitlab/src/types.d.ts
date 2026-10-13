@@ -476,8 +476,9 @@ export type GitLabCommitDetails = GitLabCommitSummary & {
  * A pagination cursor.
  *
  * This is an RPC object. Call `next()` repeatedly on the same cursor to fetch
- * subsequent batches of results. `next()` returns `null` once exhausted. Dispose the
- * cursor when finished.
+ * subsequent batches of results. `next()` returns `null` once exhausted. A batch may be
+ * empty when one call scanned many upstream rows without a match; that is not the end, so
+ * keep calling until `null`. Dispose the cursor when finished.
  */
 export interface Cursor<T> {
   next(): Promise<T[] | null>;

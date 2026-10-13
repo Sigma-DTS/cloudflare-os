@@ -65,7 +65,7 @@ import {
   parseUnifiedPatch,
   type TreeDiffSource,
 } from "@gadgets/gatekeeper-kit/git-diff";
-import { SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
+import { PageNumberCursor, SessionGitCache, TokenCursor, type CursorInjection } from "@gadgets/gatekeeper-kit/cursors";
 import {
   commitIdsOfSummary,
   isCommitOid,
@@ -1068,142 +1068,41 @@ class ArrayCursor<T> extends RpcTarget implements Cursor<T> {
   }
 }
 
-/** Upstream page size for StreamingCursor walks: GitHub's maximum `per_page`. */
+/** GitHub's maximum `per_page`. */
 const REMOTE_PAGE_SIZE = 100;
 
-/**
- * Bound on upstream fetches per `StreamingCursor.next()` (the kit's provider-cursor bound): a
- * selective overlay may drop page after page, and one call must not walk a whole history.
- */
-const MAX_REMOTE_PAGES_PER_NEXT = 10;
+// GitHub sessions authorize each listing's observation up front, before the facet builds its
+// cursor, so the cursor's per-page authorization has nothing left to do.
+const authorizedUpFront = async () => {};
 
 /**
- * A cursor that lazily fetches pages from a remote API, overlays (and possibly drops) each row,
- * and merges in pre-computed provisional items at their correct sort positions.
- *
- * This avoids the need to fetch ALL pages upfront before returning any results, which is
- * critical for repos with large issue/PR histories.
+ * Walks a GitHub listing page by page, merging `inject`ed simulated rows at their sort positions,
+ * so a large listing never has to be fetched whole.
  */
-@validateRpc()
-class StreamingCursor<T, R = T> extends RpcTarget implements Cursor<T> {
+function githubCursor<T>(options: {
   /**
-   * Fetches one page from the remote API (or cache), one row per upstream row: a short page is
-   * what ends the walk, so rows are dropped in #overlay, never here.
+   * One page from GitHub (or the cache), overlaid: one entry per upstream row, `null` for a row
+   * the listing drops. A page shorter than `perPage` ends the walk, so drops must not shorten it.
    */
-  #fetchPage: (page: number, perPage: number) => Promise<R[]>;
-  /** Applies the simulation overlay to a fetched row: the item to serve, or null to drop it. */
-  #overlay: (row: R) => T | null;
-  /**
-   * Comparator consistent with the remote API's sort order.
-   * Returns negative if a should come before b.
-   */
-  #comparator: (a: T, b: T) => number;
-  /** Pre-computed injected items, already overlaid and filtered, sorted by #comparator. */
-  #injectedItems: T[];
-  #injectedIndex = 0;
-  /**
-   * Re-validates an injected item at the moment `next()` serves it (a page may be drained long
-   * after the cursor -- and its injected snapshot -- was built): returns the item to serve,
-   * possibly refreshed, or null to drop it. Must not change the item's sort position. Defaults
-   * to serving the snapshot as-is.
-   */
-  #revalidateInjected: (item: T) => T | null;
-
-  /** Rows buffered ahead of what next() has returned; injected ones re-validate when served. */
-  #buffer: {item: T, injected: boolean}[] = [];
-  #remotePage = 1;
-  #remoteExhausted = false;
-  #pageSize: number;
-
-  constructor(options: {
-    fetchPage: (page: number, perPage: number) => Promise<R[]>;
-    overlay: (row: R) => T | null;
-    comparator: (a: T, b: T) => number;
-    injectedItems: T[];
-    revalidateInjected?: (item: T) => T | null;
-    pageSize: number;
-  }) {
-    super();
-    this.#fetchPage = options.fetchPage;
-    this.#overlay = options.overlay;
-    this.#comparator = options.comparator;
-    this.#injectedItems = options.injectedItems;
-    this.#revalidateInjected = options.revalidateInjected ?? (item => item);
-    this.#pageSize = options.pageSize;
-  }
-
-  /** @returns The next page, `[]` when the fetch window ran out before a match, or `null` at the end. */
-  async next(): Promise<T[] | null> {
-    // Fill the page from the buffer, loading more when it runs dry. Injected rows re-validate
-    // at the moment they are *served*, not when they were buffered: #loadMore buffers a whole
-    // remote page at once, so with a small page size a row can sit in the buffer across many
-    // next() calls -- plenty of time for the state that justified it to change underneath.
-    // Consumed rows leave the buffer only once the page is returned, so a fetch that throws
-    // leaves them for the retry.
-    const page: T[] = [];
-    let consumed = 0;
-    let fetches = 0;
-    while (page.length < this.#pageSize) {
-      const entry = this.#buffer[consumed];
-      if (entry === undefined) {
-        if (this.#fullyExhausted()) break;
-        if (!this.#remoteExhausted && fetches++ === MAX_REMOTE_PAGES_PER_NEXT) break;
-        await this.#loadMore();
-        continue;
-      }
-      consumed++;
-      const item = entry.injected ? this.#revalidateInjected(entry.item) : entry.item;
-      if (item !== null) page.push(item);
-    }
-    this.#buffer.splice(0, consumed);
-    return page.length === 0 && this.#fullyExhausted() ? null : page;
-  }
-
-  #fullyExhausted(): boolean {
-    return this.#remoteExhausted && this.#injectedIndex >= this.#injectedItems.length;
-  }
-
-  async #loadMore(): Promise<void> {
-    if (this.#remoteExhausted) {
-      // Remote is done; flush remaining injected items into the buffer.
-      this.#flushInjectedBefore(undefined);
-      return;
-    }
-
-    const rows = await this.#fetchPage(this.#remotePage, REMOTE_PAGE_SIZE);
-    this.#remotePage++;
-    if (rows.length < REMOTE_PAGE_SIZE) {
-      this.#remoteExhausted = true;
-    }
-
-    for (const row of rows) {
-      const item = this.#overlay(row);
-      if (item === null) continue;
-
-      // Before appending this remote item, merge in any injected items that sort before it.
-      this.#flushInjectedBefore(item);
-      this.#buffer.push({item, injected: false});
-    }
-
-    // If remote just became exhausted, flush remaining injected items.
-    if (this.#remoteExhausted) {
-      this.#flushInjectedBefore(undefined);
-    }
-  }
-
-  /**
-   * Buffer the injected items that sort at or before `limit` (all remaining, when `limit` is
-   * undefined). Re-validation happens later, when next() serves them from the buffer.
-   */
-  #flushInjectedBefore(limit: T | undefined): void {
-    while (this.#injectedIndex < this.#injectedItems.length) {
-      if (limit !== undefined &&
-          this.#comparator(this.#injectedItems[this.#injectedIndex], limit) > 0) {
-        return;
-      }
-      this.#buffer.push({item: this.#injectedItems[this.#injectedIndex++], injected: true});
-    }
-  }
+  fetchPage(page: number, perPage: number): Promise<readonly (T | null)[]>;
+  inject?: CursorInjection<T>;
+  pageSize: number;
+}): Cursor<T> {
+  return new TokenCursor<T>({
+    pageSize: options.pageSize,
+    remotePageSize: REMOTE_PAGE_SIZE,
+    fetchPage: async (token, perPage) => {
+      const page = Number(token ?? 1);
+      const rows = await options.fetchPage(page, perPage);
+      return {
+        items: rows.filter((row): row is T => row !== null),
+        // GitHub's short page is the end; stopping there saves asking for the empty one after it.
+        nextToken: rows.length < perPage ? undefined : String(page + 1),
+      };
+    },
+    inject: options.inject,
+    authorizePage: authorizedUpFront,
+  });
 }
 
 export default {
@@ -3028,10 +2927,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const repo = this.ctx.props.repo;
     // Pull request rows stay as null placeholders so a page keeps its upstream length, which is
     // what ends the walk. "-v2": the previous entries held filtered (short) pages.
-    return new StreamingCursor<GitHubIssueSummary, GitHubIssueSummary | null>({
+    return githubCursor<GitHubIssueSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("list-issues-v2", stableKey(filter ?? {}), `p${page}`);
-        return await this.#loadCachedWithEtag<(GitHubIssueSummary | null)[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
+        const rows = await this.#loadCachedWithEtag<(GitHubIssueSummary | null)[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api => api.listIssuesConditional(owner, repo, {
             state: filter?.state,
             labels: filter?.labels?.join(","),
@@ -3052,14 +2951,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             data: raw.data.map(item => item.pull_request ? null : normalizeIssueSummary(owner, repo, item)),
           };
         });
+        return rows.map(row => {
+          if (row === null || touched.ids.has(row.id)) return null;
+          const item = this.#overlayIssueLike(row, "issue", row.id);
+          return issueMatchesFilter(item, filter) ? item : null;
+        });
       },
-      overlay: row => {
-        if (row === null || touched.ids.has(row.id)) return null;
-        const item = this.#overlayIssueLike(row, "issue", row.id);
-        return issueMatchesFilter(item, filter) ? item : null;
-      },
-      comparator: compare,
-      injectedItems,
+      inject: { items: injectedItems, compare },
       pageSize,
     });
   }
@@ -3088,7 +2986,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         throw error;
       }
     };
-    return new StreamingCursor<GitHubIssueSummary>({
+    return githubCursor<GitHubIssueSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("search-issues-scoped-v1", stableKey(query), `p${page}`);
         const results = await this.#loadCachedWithEtag<CachedIssueSearchResult[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
@@ -3110,17 +3008,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           };
         });
         assertSearchScope(results);
-        return results.map(item => item.summary);
+        // Search scope was validated before results entered the cursor. Re-check the structured
+        // predicates after the overlay (a queued close leaves a `state: open` search), but never
+        // the text: GitHub's search also matches comments.
+        return results.map(({ summary }) => {
+          const item = this.#overlayIssueLike(summary, "issue", summary.id);
+          return issueMatchesFilter(item, query) ? item : null;
+        });
       },
-      // Search scope was validated before results entered the cursor. Re-check the structured
-      // predicates after the overlay (a queued close leaves a `state: open` search), but never
-      // the text: GitHub's search also matches comments.
-      overlay: row => {
-        const item = this.#overlayIssueLike(row, "issue", row.id);
-        return issueMatchesFilter(item, query) ? item : null;
-      },
-      comparator: compare,
-      injectedItems: provisionals,
+      inject: { items: provisionals, compare },
       pageSize,
     });
   }
@@ -3143,11 +3039,11 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     const owner = this.ctx.props.owner;
     const repo = this.ctx.props.repo;
-    return new StreamingCursor<GitHubPullRequestSummary>({
+    return githubCursor<GitHubPullRequestSummary>({
       fetchPage: async (page, perPage) => {
         // "-v2": the previous entries held pages with touched rows filtered out.
         const cacheKey = this.#cacheKey("list-pulls-v2", stableKey(filter ?? {}), `p${page}`);
-        return await this.#loadCachedWithEtag<GitHubPullRequestSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
+        const rows = await this.#loadCachedWithEtag<GitHubPullRequestSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api => api.listPullRequestsConditional(owner, repo, {
             state: filter?.state,
             head: filter?.head
@@ -3169,14 +3065,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             data: raw.data.map(item => normalizePullSummary(owner, repo, item)),
           };
         });
+        return rows.map(row => {
+          if (touched.ids.has(row.id)) return null;
+          const item = this.#overlayPullSummaryHead(this.#overlayIssueLike(row, "pull", row.id));
+          return pullMatchesFilter(item, filter) ? item : null;
+        });
       },
-      overlay: row => {
-        if (touched.ids.has(row.id)) return null;
-        const item = this.#overlayPullSummaryHead(this.#overlayIssueLike(row, "pull", row.id));
-        return pullMatchesFilter(item, filter) ? item : null;
-      },
-      comparator: compare,
-      injectedItems,
+      inject: { items: injectedItems, compare },
       pageSize,
     });
   }
@@ -3199,10 +3094,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const state = query.state ?? "all";
     // A walk of the `/pulls` listing, newest-updated first, matched after the overlay. Rows keep
     // their body for the text match; keyed by state alone, so every search shares the pages.
-    return new StreamingCursor<GitHubPullRequestSummary, PullSearchRow>({
+    return githubCursor<GitHubPullRequestSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("search-pulls-v2", state, `p${page}`);
-        return await this.#loadCachedWithEtag<PullSearchRow[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
+        const rows = await this.#loadCachedWithEtag<PullSearchRow[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api => api.listPullRequestsConditional(owner, repo, {
             state,
             sort: "updated",
@@ -3220,15 +3115,14 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             data: raw.data.map(item => ({ ...normalizePullSummary(owner, repo, item), bodyMarkdown: item.body ?? "" })),
           };
         });
+        return rows.map(row => {
+          const item = this.#overlayPullSummaryHead(this.#overlayIssueLike(row, "pull", row.id));
+          if (!pullMatchesSearch(item, query)) return null;
+          const { bodyMarkdown: _bodyMarkdown, ...summary } = item;
+          return summary;
+        });
       },
-      overlay: row => {
-        const item = this.#overlayPullSummaryHead(this.#overlayIssueLike(row, "pull", row.id));
-        if (!pullMatchesSearch(item, query)) return null;
-        const { bodyMarkdown: _bodyMarkdown, ...summary } = item;
-        return summary;
-      },
-      comparator: compare,
-      injectedItems: provisionals,
+      inject: { items: provisionals, compare },
       pageSize,
     });
   }
@@ -3349,70 +3243,44 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     await this.#syncDiscussionComments(realId, commentCount);
 
     if (kind === "issue") {
-      return new StreamingCursor<GitHubDiscussionEntry>({
+      return githubCursor<GitHubDiscussionEntry>({
         fetchPage: async (page, perPage) => await this.#getDiscussionCommentPage(realId, page, perPage),
-        overlay: item => item,
-        comparator: compare,
-        injectedItems: provisionals,
+        inject: { items: provisionals, compare },
         pageSize,
       });
     }
 
-    // Cache miss: stream discussion entries by merging comment pages and review pages.
-    // Stateful closure that merges two sorted streams: comments and reviews.
-    let commentPage = 1;
-    let reviewPage = 1;
-    let commentsDone = false;
-    let reviewsDone = false;
-    let commentBuf: GitHubDiscussionEntry[] = [];
-    let reviewBuf: GitHubDiscussionEntry[] = [];
-
-    const fetchPage = async (_virtualPage: number, perPage: number): Promise<GitHubDiscussionEntry[]> => {
-      const result: GitHubDiscussionEntry[] = [];
-
-      while (result.length < perPage) {
-        // Refill comment buffer if needed.
-        if (commentBuf.length === 0 && !commentsDone) {
-          commentBuf = await this.#getDiscussionCommentPage(realId, commentPage, 100);
-          commentPage += 1;
-          if (commentBuf.length < 100) commentsDone = true;
-        }
-
-        // Refill review buffer if needed.
-        if (reviewBuf.length === 0 && !reviewsDone) {
-          reviewBuf = await this.#getDiscussionReviewPage(realId, reviewPage++);
-          if (reviewBuf.length < 100) reviewsDone = true;
-        }
-
-        // Both sources empty → done.
-        if (commentBuf.length === 0 && reviewBuf.length === 0) break;
-
-        // Take the entry with the earlier createdAt.
-        let next: GitHubDiscussionEntry | undefined;
-        if (commentBuf.length === 0) {
-          next = reviewBuf.shift();
-        } else if (reviewBuf.length === 0) {
-          next = commentBuf.shift();
-        } else if (commentBuf[0].createdAt.getTime() <= reviewBuf[0].createdAt.getTime()) {
-          next = commentBuf.shift();
-        } else {
-          next = reviewBuf.shift();
-        }
-
-        if (!next) {
-          break;
-        }
-        result.push(next);
-      }
-      return result;
-    };
-
-    return new StreamingCursor<GitHubDiscussionEntry>({
-      fetchPage,
-      overlay: item => item, // No per-entry simulation overlay for discussion entries.
-      comparator: compare,
-      injectedItems: provisionals,
+    // Merges the comment and review streams by time. A call fetches before it takes anything, and
+    // a stream's page advances only once fetched, so a throw takes nothing and the kit's retry
+    // finds every row where it was. A call merges until an unfinished stream runs dry, so only the
+    // last is empty, which is how `PageNumberCursor` ends.
+    const [comments, reviews] = [
+      (page: number) => this.#getDiscussionCommentPage(realId, page, REMOTE_PAGE_SIZE),
+      (page: number) => this.#getDiscussionReviewPage(realId, page),
+    ].map(fetch => ({ fetch, page: 1, done: false, rows: [] as GitHubDiscussionEntry[] }));
+    const streams = [comments, reviews];
+    return new PageNumberCursor<GitHubDiscussionEntry>({
       pageSize,
+      fetchPage: async () => {
+        for (const stream of streams) {
+          if (stream.done || stream.rows.length > 0) continue;
+          stream.rows = await stream.fetch(stream.page);
+          stream.done = stream.rows.length < REMOTE_PAGE_SIZE;
+          stream.page++;
+        }
+        const merged: GitHubDiscussionEntry[] = [];
+        // A dry unfinished stream may hold an earlier row, so nothing is taken past it.
+        while (streams.every(stream => stream.done || stream.rows.length > 0)) {
+          const comment = comments.rows[0];
+          const review = reviews.rows[0];
+          if (!comment && !review) break;
+          // A comment goes first when both were made at the same instant.
+          merged.push((review && (!comment || compare(review, comment) < 0) ? reviews : comments).rows.shift()!);
+        }
+        return merged;
+      },
+      inject: { items: provisionals, compare },
+      authorizePage: authorizedUpFront,
     });
   }
 
@@ -3473,7 +3341,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     return {
       revision,
-      files: new StreamingCursor<GitHubPullRequestDiffFile>({
+      files: githubCursor<GitHubPullRequestDiffFile>({
         fetchPage: async (page, perPage) => {
           const pageCacheKey = this.#cacheKey("diff-files", realId, revision.baseSha || "pending", revision.headSha || "pending", `p${page}`);
           const normalized = await this.#loadCachedWithEtag<GitHubPullRequestDiffFile[]>(
@@ -3507,9 +3375,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           }
           return normalized;
         },
-        overlay: item => item,
-        comparator: () => 0,
-        injectedItems: [],
         pageSize,
       }),
     };
@@ -4898,10 +4763,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
     }
 
-    return new StreamingCursor<GitHubBranchSummary>({
+    return githubCursor<GitHubBranchSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("list-branches", stableKey(filter ?? {}), `p${page}`);
-        return await this.#loadCachedWithEtag<GitHubBranchSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
+        const rows = await this.#loadCachedWithEtag<GitHubBranchSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api => api.listBranchesConditional(owner, repo, {
             protected: filter?.protected,
             page,
@@ -4917,29 +4782,31 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             data: raw.data.map(normalizeBranchSummary),
           };
         });
+        // A branch a queued push moves reads at the pushed head (see #simulateBranchHead). The
+        // simulated head is recorded as served so the advertising callback withholds it even if
+        // the push is rejected between this overlay and the page's advertisement.
+        return rows.map(item => {
+          if (injectedNames.has(item.name)) return null;
+          const head = this.#simulateBranchHead(item.name, item.headCommit) ?? item.headCommit;
+          if (head === item.headCommit) return item;
+          this.#servedSimulatedCommitIds.add(head);
+          return { ...item, headCommit: head };
+        });
       },
-      // A branch a queued push moves reads at the pushed head (see #simulateBranchHead). The
-      // simulated head is recorded as served so the advertising callback withholds it even if
-      // the push is rejected between this overlay and the page's advertisement.
-      overlay: item => {
-        if (injectedNames.has(item.name)) return null;
-        const head = this.#simulateBranchHead(item.name, item.headCommit) ?? item.headCommit;
-        if (head === item.headCommit) return item;
-        this.#servedSimulatedCommitIds.add(head);
-        return { ...item, headCommit: head };
-      },
-      comparator: () => 0,
-      injectedItems,
-      // Injected rows are snapshots from cursor-build time, but a queued creation can be
-      // rejected (or superseded) before the page carrying its row is drained -- re-simulate from
-      // the live queue at serve time, dropping the row when no queued creation remains, so a
-      // rejected push's branch stops being listed. (The eager loop above already verified the
-      // branch is absent remotely; a branch appearing mid-drain is the documented filter race.)
-      revalidateInjected: item => {
-        const head = this.#simulateBranchHead(item.name, null);
-        if (head === null) return null;
-        this.#servedSimulatedCommitIds.add(head);
-        return head === item.headCommit ? item : { ...item, headCommit: head };
+      inject: {
+        items: injectedItems,
+        compare: () => 0,
+        // Injected rows are snapshots from cursor-build time, but a queued creation can be
+        // rejected (or superseded) before the page carrying its row is drained -- re-simulate from
+        // the live queue at serve time, dropping the row when no queued creation remains, so a
+        // rejected push's branch stops being listed. (The eager loop above already verified the
+        // branch is absent remotely; a branch appearing mid-drain is the documented filter race.)
+        revalidate: item => {
+          const head = this.#simulateBranchHead(item.name, null);
+          if (head === null) return null;
+          this.#servedSimulatedCommitIds.add(head);
+          return head === item.headCommit ? item : { ...item, headCommit: head };
+        },
       },
       pageSize,
     });
@@ -4948,7 +4815,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async listTags(pageSize: number): Promise<Cursor<GitHubTagSummary>> {
     const owner = this.ctx.props.owner;
     const repo = this.ctx.props.repo;
-    return new StreamingCursor<GitHubTagSummary>({
+    return githubCursor<GitHubTagSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("list-tags", `p${page}`);
         return await this.#loadCachedWithEtag<GitHubTagSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
@@ -4967,9 +4834,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           };
         });
       },
-      overlay: item => item,
-      comparator: () => 0,
-      injectedItems: [],
       pageSize,
     });
   }
@@ -5156,7 +5020,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
     }
 
-    return new StreamingCursor<GitHubCommitSummary>({
+    return githubCursor<GitHubCommitSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("list-commits", stableKey({ ...filter, ref: startRef }), `p${page}`);
         return await this.#loadCachedWithEtag<GitHubCommitSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
@@ -5180,10 +5044,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           };
         });
       },
-      overlay: item => item,
       // Injected pending commits are newer than everything the remote lists (newest-first).
-      comparator: () => -1,
-      injectedItems: injected,
+      inject: { items: injected, compare: () => -1 },
       pageSize,
     });
   }
@@ -5266,7 +5128,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         }
       }
     }
-    return new StreamingCursor<GitHubCommitSummary>({
+    return githubCursor<GitHubCommitSummary>({
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("pull-commits", realId, `p${page}`);
         return await this.#loadCachedWithEtag<GitHubCommitSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
@@ -5284,9 +5146,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           };
         });
       },
-      overlay: item => item,
-      comparator: () => 0,
-      injectedItems: [],
       pageSize,
     });
   }
