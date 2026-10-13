@@ -976,15 +976,12 @@ export class WorkspaceGitCache {
       let local = this.readLocalObject(oid);
       if (local === undefined) {
         throw new Error(
-            `Cannot push: commit ${oid} in the pushed history is not available in the ` +
-            `workspace's git cache, so the history cannot be verified against the destination. ` +
-            `A push requires the commit chain from each pushed head down to a commit pulled ` +
-            `through (or already pushed through) the pushing connection to be locally ` +
-            `available -- in practice, commits authored here on top of a base looked up through ` +
-            `that connection. A base looked up through another connection does not count, even ` +
-            `one to the same repository: if that is where this work's base came from, push ` +
-            `through that connection instead. Pushing a pre-existing branch whose intermediate ` +
-            `history was never pulled is not supported yet.`);
+            `Cannot push: unable to find common ancestry between the pushed commit and commits ` +
+            `already known to be present on this remote. This suggests you may be pushing to an ` +
+            `unrelated repository by mistake. The local history may also be incomplete: try ` +
+            `reading the missing commit ${oid} through this connection, then push again. If you ` +
+            `read the commits you built on through a different connection, push through that ` +
+            `one instead, even if both connections point at the same repository.`);
       }
       if (local.type !== "commit") {
         throw new Error(`Cannot push ${oid}: it is a ${local.type}, not a commit.`);
