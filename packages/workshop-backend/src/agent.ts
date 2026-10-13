@@ -40,6 +40,7 @@ import {
 } from "./agent-compaction";
 import { formatGrep, type GrepScan } from "./grep";
 import type { WorktreeReplicaCommit } from "./worktree-replica";
+import { requireTextContent, type FileContent } from "@gadgets/workshop-shared/code-change";
 
 const logger = createWorkshopLogger("workshop.agent");
 
@@ -125,7 +126,9 @@ export interface WorktreeTurnAccess {
    * the tree -- worktree content is never materialized whole). Also exactly the overlay an
    * explicit commit()'s tree build applies over the pin base, together with getRemovedPaths().
    */
-  getOverlayFiles(worktreeId: WorkpieceId): ReadonlyMap<string, string>;
+  getOverlayFiles(worktreeId: WorkpieceId): ReadonlyMap<string, FileContent>;
+  /** Fault a path-authorized immutable binary base without clobbering concurrent edits/deletes. */
+  seedBytes?(worktreeId: WorkpieceId, path: string, value: import("@gadgets/workshop-shared/byte-change").ByteValue): void;
 
   /** Paths whose latest change is a removal: absent from the overlay, but not from the base. */
   getRemovedPaths(worktreeId: WorkpieceId): ReadonlySet<string>;
@@ -460,6 +463,8 @@ export interface AgentHooks {
    * target), oversized or binary content, and pull failures.
    */
   readFileAtCommit(commit: string, path: string): Promise<string | undefined>;
+  /** Byte-mode lazy reads resolve only the touched blob into immutable chunk storage. */
+  readByteFileAtCommit?(commit: string, path: string): Promise<import("@gadgets/workshop-shared/byte-change").ByteValue | undefined>;
 
   /**
    * readFileAtCommit that also reports the blob's oid: the file's content address, which an
@@ -1662,7 +1667,7 @@ async function runAgentPass(
     // Do not let the completed lazy read overwrite that newer session content.
     if (worktreeRemovedPaths.get(worktreeId)?.has(filename)) return undefined;
     let current = sessionContent.get(worktreeId)?.get(filename);
-    if (current !== undefined) return current;
+    if (current !== undefined) return requireTextContent(current);
     sessionContent = new Map(sessionContent);
     let files = new Map(sessionContent.get(worktreeId));
     files.set(filename, text);
@@ -1694,7 +1699,7 @@ async function runAgentPass(
       let base = observeHead(id) ?? hooks.getWorktreePinBase(id);
       if (base !== undefined) return await hooks.readFileAtCommitWithOid(base, filename);
     }
-    let text = sessionContent.get(id)?.get(filename) ?? await readWorktreeBase(id, filename);
+    let text = requireTextContent(sessionContent.get(id)?.get(filename)) ?? await readWorktreeBase(id, filename);
     return text === undefined ? undefined : {text};
   };
 
@@ -1707,8 +1712,14 @@ async function runAgentPass(
       let worktreeId = Number(key);
       if (!worktreePinBases.has(worktreeId)) continue;
       for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || sessionContent.get(worktreeId)?.has(path)) continue;
-        await faultWorktreeBase(worktreeId, path);
+        if (!("edit" in fileChange || "editBytes" in fileChange) || sessionContent.get(worktreeId)?.has(path)) continue;
+        if ("editBytes" in fileChange) {
+          const value = await hooks.readByteFileAtCommit?.(worktreeBase(worktreeId)!, path);
+          if (value && !sessionContent.get(worktreeId)?.has(path)) {
+            sessionContent = new Map(sessionContent);
+            sessionContent.set(worktreeId, new Map(sessionContent.get(worktreeId)).set(path, value));
+          }
+        } else await faultWorktreeBase(worktreeId, path);
       }
     }
   };
@@ -1783,6 +1794,10 @@ async function runAgentPass(
         }
         let newContent = sessionContent.get(id)?.get(filename);
         if (oldContent === newContent) continue;
+        if ((newContent !== undefined && typeof newContent !== "string") ||
+            (oldContent !== undefined && typeof oldContent !== "string")) {
+          fileDiffParts.push(`${filename}: binary content changed`); continue;
+        }
         let diff = formatUnifiedDiff(
             filename, oldContent ?? "", newContent ?? "", oldContent !== undefined, true);
         if (diff) {
@@ -1938,7 +1953,7 @@ async function runAgentPass(
       let removed = worktreeRemovedPaths.get(workpieceId);
       for (let [filename, stamp] of files) {
         let text = content?.get(filename);
-        if (text !== undefined) {
+        if (typeof text === "string") {
           files.set(filename, await blobOid(text));
         } else if (stamp === undefined || removed?.has(filename)) {
           files.delete(filename);
@@ -2342,7 +2357,7 @@ async function runAgentPass(
                       await ensureReplayContentForWrite(workpieceId, msg.sequence);
                     }
                     let value: string | null =
-                        sessionContent.get(workpieceId)?.get(toolCall.input.filename) ??
+                        requireTextContent(sessionContent.get(workpieceId)?.get(toolCall.input.filename)) ??
                         await faultWorktreeBase(workpieceId, toolCall.input.filename) ?? null;
                     for (let edit of pendingReplayEdits) {
                       if (edit.workpieceId === workpieceId &&
@@ -3000,9 +3015,15 @@ async function runAgentPass(
     getBufferedHead: id =>
         pendingWorktreeCommits.findLast(entry => entry.worktreeId === id)?.commit,
     getOverlayFiles: id => sessionContent.get(id) ?? new Map(),
+    seedBytes: (id, path, value) => {
+      if (!sessionContent.get(id)?.has(path) && !worktreeRemovedPaths.get(id)?.has(path)) {
+        sessionContent = new Map(sessionContent);
+        sessionContent.set(id, new Map(sessionContent.get(id)).set(path, value));
+      }
+    },
     getRemovedPaths: id => worktreeRemovedPaths.get(id) ?? new Set(),
     readFile: async (id, path) => hooks.isWorktree(id)
-        ? sessionContent.get(id)?.get(path) ?? await readWorktreeBase(id, path)
+        ? requireTextContent(sessionContent.get(id)?.get(path)) ?? await readWorktreeBase(id, path)
         : (await readToolFile(id, path))?.text,
     appendChange: (id, path, change) => {
       appendAgentEdit(id, {[id]: [[path, change]]});
@@ -3544,6 +3565,7 @@ async function runAgentPass(
           if (before === undefined) {
             throw new Error("File does not exist.");
           }
+          if (typeof before !== "string") throw new Error("Binary content requires byte operations.");
           let pos = findEditPos(before, textToReplace);
           if (replacement !== textToReplace) {
             let edit = replaceSpanChange(before.length, pos, textToReplace, replacement);

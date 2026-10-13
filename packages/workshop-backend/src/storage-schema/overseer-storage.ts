@@ -28,6 +28,31 @@ import {
   type GatekeeperCreationSpec, type PermissionEdge, type WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { CodeChange, FileChange } from "@gadgets/workshop-shared/code-change";
+import type { BytesRef } from "@gadgets/workshop-shared/byte-change";
+
+/** Immutable byte rope node; leaves refer to bounded raw chunks, branches retain subtrees. */
+export interface ByteNodeRecord {
+  id: string;
+  byteLength: number;
+  height: number;
+  chunk?: {id: string; offset: number};
+  children?: [BytesRef, BytesRef];
+}
+/** Raw immutable bytes, never base64 in storage or transport. */
+export interface ByteChunkRecord { id: string; data: Uint8Array; }
+/** Locally authored Git blob with streamed SHA-1 identity and chunk-backed immutable contents. */
+export interface GitByteBlobRecord { oid: string; bytes: BytesRef; }
+/** Explicit scoped authority for an immutable byte root delivered through a worktree read. */
+export interface ByteGrantRecord { id: string; scope: string; bytes: BytesRef; }
+/** Durable staging/finish receipt, scoped to the original writer capability. */
+export interface ByteUploadRecord {
+  id: string;
+  byteLength: number;
+  sha256: string;
+  offset: number;
+  root: BytesRef;
+  finished?: boolean;
+}
 import type { ChatGatewayRpcTarget } from "@gadgets/workshop-shared/external-message-gateway";
 import type {
   ActionDescription, ActionKind, Gatekeeper, GitObjectType, GitOid, HookController,
@@ -1384,6 +1409,11 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       gitObjects: collection<GitObjectRecord>()({
         primaryKey: "oid",
       }),
+      byteNodes: collection<ByteNodeRecord>()({primaryKey: "id"}),
+      byteChunks: collection<ByteChunkRecord>()({primaryKey: "id"}),
+      byteUploads: collection<ByteUploadRecord>()({primaryKey: "id"}),
+      gitByteBlobs: collection<GitByteBlobRecord>()({primaryKey: "oid"}),
+      byteGrants: collection<ByteGrantRecord>()({primaryKey: "id"}),
 
       // Per-oid provenance and push-authorization metadata over `gitObjects`: which gatekeepers'
       // remotes provably hold each object, which claim to (pull routing), and which queued

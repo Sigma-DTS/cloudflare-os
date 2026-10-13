@@ -116,6 +116,21 @@ export interface Worktree {
    */
   writeFile(path: string, text: string): Promise<void>;
 
+  /** Begin/resume immutable raw-byte staging. Uploads alone do not change a file. */
+  beginUpload(uploadId: string, description: import("@gadgets/workshop-shared/agent-integration").ByteUploadDescription): Promise<import("@gadgets/workshop-shared/agent-integration").ByteUploadStatus>;
+  /** Append/replay raw bytes; acknowledged offset survives DO reset. */
+  writeUpload(uploadId: string, offset: number, stream: ReadableStream<Uint8Array>): Promise<number>;
+  /** Return a durable staging/finish receipt. */
+  getUploadStatus(uploadId: string): Promise<import("@gadgets/workshop-shared/agent-integration").ByteUploadStatus>;
+  /** Verify length/digest and return an immutable reference. */
+  finishUpload(uploadId: string): Promise<import("@gadgets/workshop-shared/byte-change").BytesRef>;
+  /** Stream current file bytes, preserving binary contents; absence is an error. */
+  readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>>;
+  /** Create/replace opaque binary content with a staged postimage (whole-file replacement semantics). */
+  writeBytes(path: string, value: import("@gadgets/workshop-shared/byte-change").ByteValue): Promise<void>;
+  /** Explicit mergeable byte-coordinate edit. Use only when the file format tolerates splice merging. */
+  editBytes(path: string, change: import("@gadgets/workshop-shared/byte-change").ByteChange): Promise<void>;
+
   /** Delete a file. */
   deleteFile(path: string): Promise<void>;
 

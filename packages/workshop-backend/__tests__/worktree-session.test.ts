@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
-import { applyCodeChange, type CodeChange, type CodeContent }
+import { applyCodeChange, requireTextContent, type CodeChange, type CodeContent, type FileContent }
   from "@gadgets/workshop-shared/code-change";
 import type { GitOid, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import type { OverseerDurableObject } from "../src/overseer.js";
@@ -69,7 +69,7 @@ async function loadFixtureRepo(impl: any): Promise<void> {
 // barrier will in the chat), and buffered commit advancements, all drained through the real
 // barrier (impl.commitAgentStep).
 function makeTurn(impl: any, chatId: number) {
-  let content = new Map<number, Map<string, string>>();
+  let content = new Map<number, Map<string, FileContent>>();
   let removed = new Map<number, Set<string>>();
   let pins = new Map<number, string>();
   let changes: { change: CodeChange }[] = [];
@@ -87,7 +87,7 @@ function makeTurn(impl: any, chatId: number) {
     getRemovedPaths: id => removed.get(id) ?? new Set(),
     readFile: async (id, path) => {
       let existing = content.get(id)?.get(path);
-      if (existing !== undefined) return existing;
+      if (existing !== undefined) return requireTextContent(existing);
       if (removed.get(id)?.has(path)) return undefined;
       let base = baseCommit(id);
       if (base === undefined) return undefined;
@@ -97,6 +97,11 @@ function makeTurn(impl: any, chatId: number) {
       files.set(path, text);
       content.set(id, files);
       return text;
+    },
+    seedBytes: (id, path, value) => {
+      if (!content.get(id)?.has(path) && !removed.get(id)?.has(path)) {
+        content.set(id, new Map(content.get(id)).set(path, value));
+      }
     },
     appendChange: (id, path, change) => {
       let one: CodeChange = { [id]: [[path, change]] };
@@ -188,6 +193,34 @@ function makeLocalHarness(
 }
 
 describe("listFiles", () => {
+  it("stages, splices, commits and deletes bytes through the DO worktree API", () => withImpl(async impl => {
+    addChat(impl, 1);
+    const base = await commitFiles(impl, {});
+    const {session, turn, id} = await createWorktreeSession(impl, 1, base);
+    const stage = async (uploadId: string, data: Uint8Array) => {
+      const sha = new Uint8Array(await crypto.subtle.digest("SHA-256", data)).toHex();
+      await session.beginUpload(uploadId, {byteLength: data.length, sha256: sha});
+      await session.writeUpload(uploadId, 0, new Response(data).body!);
+      return session.finishUpload(uploadId);
+    };
+    const original = await stage("original", Uint8Array.of(0, 255, 3, 4));
+    await session.writeBytes("image.bin", {base: original});
+    const inserted = await stage("insert", Uint8Array.of(5, 0));
+    await session.editBytes("image.bin", {beforeBytes: 4, sections: [1, [1, {source: inserted, offset: 0, length: 2}], 2]});
+    expect(new Uint8Array(await new Response(await session.readBytes("image.bin")).arrayBuffer())).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
+    const commit = await session.commit("binary splice");
+    await turn.barrier();
+    expect(impl.getWorktreeRecord(id).headCommit).toBe(commit);
+    const value = await impl.readByteFileAtCommit(commit, "image.bin");
+    expect(new Uint8Array(await new Response(impl.byteStore.read(value.base)).arrayBuffer())).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
+    await expect(session.readFile("image.bin")).rejects.toThrow(/Binary/);
+    const outside = await impl.byteStore.import("unrelated", Uint8Array.of(8));
+    await expect(session.writeBytes("outside.bin", {base: outside})).rejects.toThrow(/outside/);
+    await session.deleteFile("image.bin");
+    const deleted = await session.commit("delete binary");
+    await turn.barrier();
+    expect(await impl.readByteFileAtCommit(deleted, "image.bin")).toBeUndefined();
+  }));
   it("surfaces all five entry kinds, non-recursively and recursively",
       () => withImpl(async impl => {
     addChat(impl, 1);
