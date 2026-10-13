@@ -25,8 +25,8 @@ import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./
 import type { ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
 import type {
-  AiChatAgentContext, ChatBindingEntry, CompactionCheckpoint, StoredAssistantMessage,
-  StoredChatMessage, StoredToolCall,
+  AiChatAgentContext, ChatBindingEntry, CompactionCheckpoint, StoredAgentStepModelData,
+  StoredAssistantMessage, StoredChatMessage, StoredToolCall, StoredToolResultImage,
 } from "./storage-schema/overseer-storage";
 import {
   buildCompactionState, buildSummaryPrompt, chatChangeStatuses, COMPACTION_SYSTEM_PROMPT,
@@ -239,7 +239,7 @@ async function describeBinding(
  * The overseer strips `modelData` into separate storage; it must never reach clients.
  */
 export type AiChatMessageBodyWithModelData = AiChatMessageBody & {
-  modelData?: StoredAssistantMessage;
+  modelData?: StoredAgentStepModelData;
 };
 
 /**
@@ -481,18 +481,21 @@ export interface AgentHooks {
                    onOutputText?: (delta: string) => void,
                    worktreeTurn?: WorktreeTurnAccess): Promise<{
                      output: string;
-                     images: {data: string; mimeType: "image/png" | "image/jpeg" | "image/webp"}[];
+                     images: {
+                       data: Uint8Array;
+                       mimeType: "image/png" | "image/jpeg" | "image/webp";
+                     }[];
                    }>;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
 
   /**
-   * Fetch the model-facing snapshot persisted for an agent step's "message" record, if any (see
-   * StoredAssistantMessage). Absent for messages persisted before snapshots existed; replay then
-   * falls back to reconstructing the message from the client-visible record.
+   * Fetch the server-only model data persisted for an agent step's "message" record, if any (see
+   * StoredAgentStepModelData). Absent for messages persisted before snapshots existed; replay
+   * then falls back to reconstructing the message from the client-visible record.
    */
-  getChatModelData(chatId: number, sequence: number): StoredAssistantMessage | undefined;
+  getChatModelData(chatId: number, sequence: number): StoredAgentStepModelData | undefined;
 
   /**
    * Record an observation in the Overseer audit log on behalf of a built-in agent tool
@@ -1202,7 +1205,7 @@ NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` 
 let EXECUTE_CODE_INTRO = `
 Executes one-off JavaScript code, returning the output it logs to the console. The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.
 
-The fourth function parameter is an output sink. Call \`output.image(base64Data, mimeType)\` to show a PNG, JPEG, or WebP image to the model in this turn. For example, a binding that returns \`{data, mimeType}\` from a screenshot can be forwarded with \`output.image(screenshot.data, screenshot.mimeType)\`.
+The fourth function parameter is an output sink. Call \`await output.image(bytes, mimeType)\` to show a PNG, JPEG, or WebP image to the model in this turn. \`bytes\` must be a \`Uint8Array\`; for example, a binding that returns \`{data, mimeType}\` from a screenshot can be forwarded with \`await output.image(screenshot.data, screenshot.mimeType)\`.
 `.trim();
 
 let EXECUTE_CODE_SELF_PARAM = `
@@ -2068,7 +2071,8 @@ async function runAgentPass(
         // as absent so the check can still drop the message.
         let storedModelData = msg.author.type === "agent"
             ? hooks.getChatModelData(chatId, msg.sequence) : undefined;
-        if (storedModelData && storedModelData.content.length === 0) {
+        if (storedModelData && storedModelData.message.content.length === 0 &&
+            !storedModelData.toolResultImages?.length) {
           storedModelData = undefined;
         }
 
@@ -2146,7 +2150,7 @@ async function runAgentPass(
             // persisted before snapshots existed (which never carried reasoning), stamped with
             // the current model so pi treats them as same-model -- their historical behavior.
             let rehydrated = storedModelData &&
-                rehydrateStoredAssistantMessage(storedModelData, msg.toolCalls, chatId,
+                rehydrateStoredAssistantMessage(storedModelData.message, msg.toolCalls, chatId,
                     msg.sequence);
             if (rehydrated) {
               modelMessage = rehydrated;
@@ -2168,6 +2172,9 @@ async function runAgentPass(
 
         if (msg.toolCalls) {
           let modelToolCalls: ToolCall[] = [];
+          let storedImagesByToolCall = new Map(
+              (storedModelData?.toolResultImages ?? []).map(stored =>
+                [stored.toolCallId, stored.images] as const));
 
           for (let toolCall of msg.toolCalls) {
             // Recreate the tool output: the exact text the model sees, plus the error flag.
@@ -2420,7 +2427,14 @@ async function runAgentPass(
               role: "toolResult",
               toolCallId: toolCall.toolCallId,
               toolName: toolCall.toolName,
-              content: [{type: "text", text: toolOutput.text}],
+              content: [
+                {type: "text", text: toolOutput.text},
+                ...(storedImagesByToolCall.get(toolCall.toolCallId) ?? []).map(image => ({
+                  type: "image" as const,
+                  data: image.data.toBase64(),
+                  mimeType: image.mimeType,
+                })),
+              ],
               isError: toolOutput.isError ?? false,
               timestamp: msgTimestamp,
             });
@@ -2758,6 +2772,11 @@ async function runAgentPass(
   // needs (the error text, plus e.g. observedCodeVersion) here before rethrowing.
   // Success-path notes ride the tool result's `details` instead.
   let toolCallNotes = new Map<string, Partial<AiToolCall>>();
+
+  // Binary tool-result content rides the step's server-only model snapshot rather than the
+  // client-visible AiToolCall record. This map lives only until the same step's persistence
+  // barrier; after that, replay reads the durable copy from chatModelData.
+  let pendingToolResultImages = new Map<string, StoredToolResultImage[]>();
 
   // Renders a thrown tool error exactly the way pi renders it into the live error tool result
   // (an Error contributes its message, anything else is stringified), so the persisted `error`
@@ -3750,11 +3769,16 @@ async function runAgentPass(
           if (result.images.length > 0) {
             output += `\n\n(${result.images.length} image${result.images.length === 1 ? "" : "s"} ` +
                 "emitted to the model for this turn.)";
+            pendingToolResultImages.set(toolCallId, result.images);
           }
           return {
             content: [
               {type: "text" as const, text: output},
-              ...result.images.map(image => ({type: "image" as const, ...image})),
+              ...result.images.map(image => ({
+                type: "image" as const,
+                data: image.data.toBase64(),
+                mimeType: image.mimeType,
+              })),
             ],
             details: {output} as Partial<AiToolCall>,
           };
@@ -4054,7 +4078,13 @@ async function runAgentPass(
 
           // The model-facing snapshot rides along for the overseer to persist beside the display
           // record.
-          msg.modelData = makeStoredAssistantMessage(message);
+          let toolResultImages = Array.from(
+              pendingToolResultImages,
+              ([toolCallId, images]) => ({toolCallId, images}));
+          msg.modelData = {
+            message: makeStoredAssistantMessage(message),
+            ...(toolResultImages.length > 0 ? {toolResultImages} : {}),
+          };
           msgs.push(msg);
         }
 
@@ -4102,6 +4132,7 @@ async function runAgentPass(
 
         // Reset per-step streaming state.
         toolCallNotes.clear();
+        pendingToolResultImages.clear();
         executeCodeStreamManager.clear();
         break;
       }

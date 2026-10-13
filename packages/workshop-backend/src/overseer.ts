@@ -19,7 +19,7 @@ import {
   type ChatChangeBoundaryRecord, type ChatChangeRecord, type CompactionCheckpoint,
   type ExternalChatRecord, type ExternalMessageRecord, type GadgetRecord, type GatekeeperCaller,
   type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
-  type StoredAssistantMessage, type StoredChatMessage, type StoredChatMetadata,
+  type StoredAgentStepModelData, type StoredChatMessage, type StoredChatMetadata,
   type WorkpieceRecord, type WorktreeRecord,
 } from "./storage-schema/overseer-storage";
 import type { UserAiModelRecord, WorkspaceOutputEntry } from "./storage-schema/user-storage";
@@ -231,34 +231,10 @@ class RestoreForgerImpl extends NativeRpcTarget {
 
 const MAX_CODE_MODE_IMAGES = 4;
 const MAX_CODE_MODE_IMAGE_BYTES = 6 * 1024 * 1024;
-const MAX_CODE_MODE_IMAGE_BASE64_CHARS = Math.ceil(MAX_CODE_MODE_IMAGE_BYTES / 3) * 4;
-
-function base64Value(code: number): number {
-  if (code >= 65 && code <= 90) return code - 65;
-  if (code >= 97 && code <= 122) return code - 97 + 26;
-  if (code >= 48 && code <= 57) return code - 48 + 52;
-  if (code === 43) return 62;
-  if (code === 47) return 63;
-  return -1;
-}
-
-/** Return whether a value is canonical padded base64 without recursing over its contents. */
-export function isCanonicalBase64ImageData(data: unknown): data is string {
-  if (typeof data !== "string" || data.length % 4 !== 0) return false;
-
-  let padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-  let contentLength = data.length - padding;
-  for (let i = 0; i < contentLength; i++) {
-    if (base64Value(data.charCodeAt(i)) < 0) return false;
-  }
-  if (data.slice(contentLength) !== "=".repeat(padding)) return false;
-  let finalValue = base64Value(data.charCodeAt(contentLength - 1));
-  return padding === 2 ? finalValue % 16 === 0 : padding === 1 ? finalValue % 4 === 0 : true;
-}
 
 /** One image emitted explicitly by executed code for the current model turn. */
 export type CodeModeImage = {
-  data: string;
+  data: Uint8Array;
   mimeType: "image/png" | "image/jpeg" | "image/webp";
 };
 
@@ -267,32 +243,30 @@ export class CodeModeOutputImpl extends NativeRpcTarget {
   readonly #images: CodeModeImage[] = [];
   #bytes = 0;
 
-  image(data: string, mimeType: string): void {
+  image(data: Uint8Array, mimeType: string): void {
     if (this.#images.length >= MAX_CODE_MODE_IMAGES) {
       throw new Error(`executeCode can emit at most ${MAX_CODE_MODE_IMAGES} images.`);
     }
     if (mimeType !== "image/png" && mimeType !== "image/jpeg" && mimeType !== "image/webp") {
       throw new Error("executeCode emitted an unsupported image type.");
     }
-    if (typeof data !== "string" || data.length > MAX_CODE_MODE_IMAGE_BASE64_CHARS ||
-        !isCanonicalBase64ImageData(data)) {
-      throw new Error("executeCode image data must be canonical base64.");
+    if (!(data instanceof Uint8Array)) {
+      throw new Error("executeCode image data must be a Uint8Array.");
     }
-    const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-    const bytes = (data.length / 4) * 3 - padding;
-    if (bytes <= 0 || bytes > MAX_CODE_MODE_IMAGE_BYTES ||
-        this.#bytes + bytes > MAX_CODE_MODE_IMAGE_BYTES) {
+    if (data.byteLength <= 0 || data.byteLength > MAX_CODE_MODE_IMAGE_BYTES ||
+        this.#bytes + data.byteLength > MAX_CODE_MODE_IMAGE_BYTES) {
       throw new Error("executeCode image output exceeds 6 MiB.");
     }
-    const prefix = atob(data.slice(0, Math.min(data.length, 32)));
     const matches = mimeType === "image/png"
-      ? prefix.startsWith("\x89PNG\r\n\x1a\n")
+      ? data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 &&
+          data[4] === 0x0d && data[5] === 0x0a && data[6] === 0x1a && data[7] === 0x0a
       : mimeType === "image/jpeg"
-        ? prefix.startsWith("\xff\xd8\xff")
-        : prefix.startsWith("RIFF") && prefix.slice(8, 12) === "WEBP";
+        ? data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff
+        : data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46 &&
+            data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50;
     if (!matches) throw new Error("executeCode image bytes do not match their MIME type.");
-    this.#bytes += bytes;
-    this.#images.push({data, mimeType});
+    this.#bytes += data.byteLength;
+    this.#images.push({data: data.slice(), mimeType});
   }
 
   takeImages(): CodeModeImage[] {
@@ -8198,7 +8172,7 @@ class OverseerImpl implements AgentHooks {
       // (atomic under the output gate), so the two can never disagree. Destructured off `msg`
       // above so it can't leak into the client-visible record.
       if (modelData) {
-        this.storage.chatModelData.put({chatId, sequence, message: modelData});
+        this.storage.chatModelData.put({chatId, sequence, ...modelData});
       }
     }
 
@@ -8224,8 +8198,9 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  getChatModelData(chatId: number, sequence: number): StoredAssistantMessage | undefined {
-    return this.storage.chatModelData.get(chatKey(chatId, sequence))?.message;
+  getChatModelData(chatId: number, sequence: number): StoredAgentStepModelData | undefined {
+    let record = this.storage.chatModelData.get(chatKey(chatId, sequence));
+    return record && {message: record.message, toolResultImages: record.toolResultImages};
   }
 
   // Adds an inference cost (in dollars) to a chat's running total and the workspace-wide total.

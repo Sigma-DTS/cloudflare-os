@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import {
-  createFauxCore, fauxAssistantMessage, fauxText, fauxThinking, type AssistantMessage,
+  createFauxCore, fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall,
+  type AssistantMessage, type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type {
   AiChatAuthorInfo, AiChatMessage, AiChatMetadata, AiChatStreamEvent,
@@ -59,19 +60,31 @@ function seedChat(impl: OverseerInternals): void {
 // Runs one agent turn whose model answers each request with the next scripted response,
 // returning the stream events sent to clients.
 async function runScriptedTurn(
-    impl: OverseerInternals, steps: AssistantMessage[]): Promise<AiChatStreamEvent[]> {
+    impl: OverseerInternals,
+    steps: AssistantMessage[],
+): Promise<{events: AiChatStreamEvent[]; contexts: TranscriptContext[]}> {
   let events: AiChatStreamEvent[] = [];
+  let contexts: TranscriptContext[] = [];
   impl.emitChatStreamEvent = (_chatId, event) => events.push(event);
   let faux = createFauxCore({ models: [{ id: "faux-model" }] });
-  faux.setResponses(steps);
+  faux.setResponses(steps.map(step => (context: TranscriptContext) => {
+    contexts.push(structuredClone(context));
+    return step;
+  }));
   await runAgent(impl, { model: faux.getModel(), stream: faux.stream }, CHAT_ID,
       { type: "agent", id: "faux-model", name: "Faux" }, new AbortController().signal, OWNER,
       { provider: "cloudflare", model: "faux-model", apiToken: "" });
-  return events;
+  return {events, contexts};
 }
 
 function streamedText(events: AiChatStreamEvent[]): string {
   return events.flatMap(event => event.type === "textDelta" ? [event.delta] : []).join("");
+}
+
+function toolResultImages(context: TranscriptContext) {
+  return context.messages.flatMap(message => message.role === "toolResult"
+    ? message.content.flatMap(part => part.type === "image" ? [part] : [])
+    : []);
 }
 
 describe("transient model failures", () => {
@@ -79,7 +92,7 @@ describe("transient model failures", () => {
       () => withImpl(async impl => {
     seedChat(impl);
 
-    let events = await runScriptedTurn(impl, [
+    let {events} = await runScriptedTurn(impl, [
       fauxAssistantMessage([fauxThinking("Planning the answer"), fauxText("A partial ans")],
           { stopReason: "error", errorMessage: "503 Service Unavailable" }),
       fauxAssistantMessage(fauxText("The full answer.")),
@@ -108,5 +121,34 @@ describe("transient model failures", () => {
           { stopReason: "error", errorMessage: "400 Invalid request" }),
       fauxAssistantMessage(fauxText("Never requested.")),
     ])).rejects.toThrow("400 Invalid request");
+  }));
+
+  it("replays executeCode images after a transient failure reload", () => withImpl(async impl => {
+    seedChat(impl);
+    impl.executeCodeMode = async () => ({
+      output: "captured screenshot",
+      images: [{
+        data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+        mimeType: "image/png",
+      }],
+    });
+
+    let {contexts} = await runScriptedTurn(impl, [
+      fauxAssistantMessage([
+        fauxToolCall("executeCode", {code: "capture()"}),
+      ], {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxText("Retry me"), {
+        stopReason: "error",
+        errorMessage: "503 Service Unavailable",
+      }),
+      fauxAssistantMessage(fauxText("Screenshot received.")),
+    ]);
+
+    expect(toolResultImages(contexts[1])).toEqual([{
+      type: "image",
+      data: "iVBORw0KGgo=",
+      mimeType: "image/png",
+    }]);
+    expect(toolResultImages(contexts[2])).toEqual(toolResultImages(contexts[1]));
   }));
 });
