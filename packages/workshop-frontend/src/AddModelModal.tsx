@@ -393,263 +393,265 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
   return (
     <Dialog.Root open={visible} onOpenChange={(open) => { if (!open) onCancel() }}>
-      <Dialog className="responsive-dialog overflow-y-auto p-6" size="lg">
-        <Dialog.Title className="text-lg font-semibold mb-4">
+      <Dialog className="responsive-dialog !top-[clamp(24px,10vh,80px)] !flex !max-h-[calc(100vh-clamp(24px,10vh,80px)-24px)] !-translate-y-0 flex-col overflow-hidden p-0" size="lg">
+        <Dialog.Title className="shrink-0 px-6 pt-6 pb-4 text-lg font-semibold">
           {title}
         </Dialog.Title>
 
-        <div className="space-y-4">
-          {/* Model / Provider selection */}
-          {source ? (
-            <Input
-              label="Provider"
-              value={PROVIDER_LABELS[source.config.provider] || source.config.provider}
-              disabled
-            />
-          ) : (
-          <Select
-            label={gatewayMode ? 'Select Provider' : 'Select Model'}
-            className="w-full text-sm"
-            placeholder={gatewayMode ? 'Choose a provider...' : 'Choose an AI model...'}
-            value={selectValue}
-            onValueChange={(v) => handleModelSelect(v as string)}
-            error={errors.selection}
-            renderValue={(v) => {
-              const opt = options.find(o => o.value === v)
-              return opt?.label ?? String(v)
-            }}
-          >
-            {groupedOptions.map((group, groupIndex) => (
-              <div key={group.provider}>
-                {groupIndex > 0 && (
-                  <div className="h-px bg-kumo-line my-1 mx-2" />
-                )}
-                <div className="px-3 py-1.5 text-xs font-medium text-kumo-subtle select-none">
-                  {PROVIDER_LABELS[group.provider as AiModelProvider] || group.provider}
-                </div>
-                {group.items.map(opt => (
-                  <Select.Option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </Select.Option>
-                ))}
-              </div>
-            ))}
-          </Select>
-          )}
-
-          {/* Custom model fields */}
-          {showCustomFields && (
-            <>
-              {suggestions && !editing ? (
-                <ModelSuggestionInput
-                  label="Provider Model ID"
-                  description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
-                  provider={selection.provider}
-                  value={modelId}
-                  error={errors.modelId || undefined}
-                  suggestions={suggestions}
-                  onValueChange={(value) => { setModelId(value); setErrors(prev => ({ ...prev, modelId: '' })) }}
-                  onPick={(picked) => {
-                    setDisplayName(picked.name)
-                    setContextWindow(String(picked.contextWindow))
-                    setOutputLimit(String(picked.outputLimit ?? ''))
-                    setCapabilities(picked.capabilities ?? {})
-                  }}
-                />
-              ) : (
-                <Input
-                  label="Provider Model ID"
-                  placeholder={`e.g., ${example!.modelId}`}
-                  description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
-                  value={modelId}
-                  disabled={editing}
-                  onChange={(e) => { setModelId(e.target.value); setErrors(prev => ({ ...prev, modelId: '' })) }}
-                  error={errors.modelId}
-                  variant={errors.modelId ? 'error' : 'default'}
-                />
-              )}
-
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
+          <div className="space-y-4">
+            {/* Model / Provider selection */}
+            {source ? (
               <Input
-                label="ID"
-                placeholder={`e.g., ${example!.modelId}`}
-                description="How chats and settings refer to this model. It follows the provider model ID until you change it, which lets you add your own version of a model under another ID. It can't be changed later."
-                value={id}
-                disabled={editing}
-                onChange={(e) => { setOwnId(e.target.value); setErrors(prev => ({ ...prev, id: '' })) }}
-                error={errors.id}
-                variant={errors.id ? 'error' : 'default'}
+                label="Provider"
+                value={PROVIDER_LABELS[source.config.provider] || source.config.provider}
+                disabled
               />
-
-              <Input
-                label="Display Name"
-                placeholder={`e.g., ${example!.name}`}
-                description="Human-readable name shown in the UI"
-                value={displayName}
-                onChange={(e) => { setDisplayName(e.target.value); setErrors(prev => ({ ...prev, displayName: '' })) }}
-                error={errors.displayName}
-                variant={errors.displayName ? 'error' : 'default'}
-              />
-            </>
-          )}
-
-          {/* Cloudflare account ID (the Workers AI REST endpoint is account-scoped) */}
-          {showCredentials && isCloudflare && (
-            <Input
-              label="Cloudflare Account ID"
-              placeholder="e.g., 0123456789abcdef0123456789abcdef"
-              description="The Cloudflare account to bill for Workers AI usage"
-              value={accountId}
-              onChange={(e) => { setAccountId(e.target.value); setErrors(prev => ({ ...prev, accountId: '' })) }}
-              error={errors.accountId}
-              variant={errors.accountId ? 'error' : 'default'}
-            />
-          )}
-
-          {/* API Token */}
-          {showCredentials && selection && (
-            <StoredSecretInput
-              label="API Token"
-              stored={storedSecretsUsable && source!.config.apiToken === null}
-              placeholder={tokenRequired ? API_TOKEN_PLACEHOLDERS[selection.provider] : '(optional)'}
-              description={
-                isOllama
-                  ? 'Optional for local Ollama access'
-                  : isCloudflare
-                  ? 'An API token with Workers AI Read + Edit permissions (in the dashboard: Workers AI > Use REST API > Create a Workers AI API Token)'
-                  : TOKEN_OPTIONAL_WITH_HEADERS.has(selection.provider)
-                  ? `Your ${PROVIDER_LABELS[selection.provider]} API token for billing. Leave blank if the extra headers under Advanced Settings authenticate you to a proxy that supplies its own key.`
-                  : `Your ${PROVIDER_LABELS[selection.provider]} API token for billing`
-              }
-              value={effectiveApiToken}
-              onValueChange={(v) => { setApiToken(v); setErrors(prev => ({ ...prev, apiToken: '' })) }}
-              error={errors.apiToken}
-            />
-          )}
-
-          {/* Ollama API URL (always visible for Ollama) */}
-          {showCredentials && isOllama && (
-            <Input
-              label="API URL"
-              placeholder="http://localhost:11434"
-              description="URL of your Ollama server"
-              value={apiUrl}
-              onChange={(e) => { setApiUrl(e.target.value); setErrors(prev => ({ ...prev, apiUrl: '' })) }}
-              error={errors.apiUrl}
-              variant={errors.apiUrl ? 'error' : 'default'}
-            />
-          )}
-
-          {selection && (
-            <Collapsible.Root
-              open={advancedOpen}
-              onOpenChange={setAdvancedOpen}
+            ) : (
+            <Select
+              label={gatewayMode ? 'Select Provider' : 'Select Model'}
+              className="w-full text-sm"
+              placeholder={gatewayMode ? 'Choose a provider...' : 'Choose an AI model...'}
+              value={selectValue}
+              onValueChange={(v) => handleModelSelect(v as string)}
+              error={errors.selection}
+              renderValue={(v) => {
+                const opt = options.find(o => o.value === v)
+                return opt?.label ?? String(v)
+              }}
             >
-              <Collapsible.DefaultTrigger>Advanced Settings</Collapsible.DefaultTrigger>
-              <Collapsible.DefaultPanel>
-                <div className="space-y-4">
-                  {/* Ollama shows its API URL above; Workers AI's endpoint is derived from the account ID. */}
-                  {showCredentials && !isOllama && !isCloudflare && (
-                    <Input
-                      label="API URL"
-                      placeholder="https://..."
-                      description="Override the default API endpoint (useful for proxies like Cloudflare AI Gateway)"
-                      value={apiUrl}
-                      onChange={(e) => setApiUrl(e.target.value)}
-                    />
+              {groupedOptions.map((group, groupIndex) => (
+                <div key={group.provider}>
+                  {groupIndex > 0 && (
+                    <div className="h-px bg-kumo-line my-1 mx-2" />
                   )}
-                  {showCredentials && (
-                    <ExtraHeadersEditor
-                      rows={headerRows}
-                      storedValuesUsable={storedSecretsUsable}
-                      errors={headerErrors}
-                      onRowsChange={(rows) => {
-                        setHeaderRows(rows)
-                        setHeaderErrors({})
-                        // Adding a header can make the token optional.
-                        setErrors(prev => ({ ...prev, apiToken: '' }))
-                      }}
-                    />
-                  )}
-                  <Input
-                    label="Context Window"
-                    inputMode="numeric"
-                    placeholder="(default)"
-                    description="The maximum tokens one request may total. Leave blank to use the model's built-in default."
-                    value={contextWindow}
-                    onChange={(e) => { setContextWindow(e.target.value); setErrors(prev => ({ ...prev, contextWindow: '' })) }}
-                    error={errors.contextWindow}
-                    variant={errors.contextWindow ? 'error' : 'default'}
-                  />
-                  <Input
-                    label="Output Limit"
-                    inputMode="numeric"
-                    placeholder="(default)"
-                    description="The maximum tokens in one response, also reserved out of the context window. Leave blank to use the model's built-in default."
-                    value={outputLimit}
-                    onChange={(e) => { setOutputLimit(e.target.value); setErrors(prev => ({ ...prev, outputLimit: '' })) }}
-                    error={errors.outputLimit}
-                    variant={errors.outputLimit ? 'error' : 'default'}
-                  />
-                  {/* These take effect only through AI Gateway, and are offered once the server has
-                      described the model. */}
-                  {gatewayMode && description && (
-                    <>
-                      <ReasoningLevelSelect
-                        levels={description.reasoningLevels}
-                        value={reasoning}
-                        defaultReasoning={aiConfig.defaultReasoning}
-                        builtInReasoning={description.builtInReasoning}
-                        onValueChange={setReasoning}
-                      />
-                      {description.maxCompactionInputBudget > 0 && (
-                        <div className="grid gap-2">
-                          <Input
-                            label="Compaction Budget"
-                            inputMode="numeric"
-                            placeholder={`${description.builtInCompactionInputBudget.toLocaleString()} (built-in)`}
-                            value={compactionBudget}
-                            onChange={(e) => { setCompactionBudget(e.target.value); setErrors(prev => ({ ...prev, compactionBudget: '' })) }}
-                            error={errors.compactionBudget}
-                            variant={errors.compactionBudget ? 'error' : 'default'}
-                            aria-describedby={budgetFacts}
-                          />
-                          <CompactionBudgetHelp
-                            id={budgetFacts}
-                            builtIn={description.builtInCompactionInputBudget}
-                            max={description.maxCompactionInputBudget}
-                            inEffect={Math.min(budgetTokens || description.builtInCompactionInputBudget, description.maxCompactionInputBudget)}
-                            typed={budgetTokens && budgetTokens <= description.maxCompactionInputBudget ? budgetTokens : undefined}
-                          />
-                        </div>
-                      )}
-                      {!description.runtimeKnown && (
-                        <CapabilityFields capabilities={capabilities} onCapabilitiesChange={setCapabilities} />
-                      )}
-                    </>
-                  )}
+                  <div className="px-3 py-1.5 text-xs font-medium text-kumo-subtle select-none">
+                    {PROVIDER_LABELS[group.provider as AiModelProvider] || group.provider}
+                  </div>
+                  {group.items.map(opt => (
+                    <Select.Option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </Select.Option>
+                  ))}
                 </div>
-              </Collapsible.DefaultPanel>
-            </Collapsible.Root>
+              ))}
+            </Select>
+            )}
+
+            {/* Custom model fields */}
+            {showCustomFields && (
+              <>
+                {suggestions && !editing ? (
+                  <ModelSuggestionInput
+                    label="Provider Model ID"
+                    description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
+                    provider={selection.provider}
+                    value={modelId}
+                    error={errors.modelId || undefined}
+                    suggestions={suggestions}
+                    onValueChange={(value) => { setModelId(value); setErrors(prev => ({ ...prev, modelId: '' })) }}
+                    onPick={(picked) => {
+                      setDisplayName(picked.name)
+                      setContextWindow(String(picked.contextWindow))
+                      setOutputLimit(String(picked.outputLimit ?? ''))
+                      setCapabilities(picked.capabilities ?? {})
+                    }}
+                  />
+                ) : (
+                  <Input
+                    label="Provider Model ID"
+                    placeholder={`e.g., ${example!.modelId}`}
+                    description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
+                    value={modelId}
+                    disabled={editing}
+                    onChange={(e) => { setModelId(e.target.value); setErrors(prev => ({ ...prev, modelId: '' })) }}
+                    error={errors.modelId}
+                    variant={errors.modelId ? 'error' : 'default'}
+                  />
+                )}
+
+                <Input
+                  label="ID"
+                  placeholder={`e.g., ${example!.modelId}`}
+                  description="How chats and settings refer to this model. It follows the provider model ID until you change it, which lets you add your own version of a model under another ID. It can't be changed later."
+                  value={id}
+                  disabled={editing}
+                  onChange={(e) => { setOwnId(e.target.value); setErrors(prev => ({ ...prev, id: '' })) }}
+                  error={errors.id}
+                  variant={errors.id ? 'error' : 'default'}
+                />
+
+                <Input
+                  label="Display Name"
+                  placeholder={`e.g., ${example!.name}`}
+                  description="Human-readable name shown in the UI"
+                  value={displayName}
+                  onChange={(e) => { setDisplayName(e.target.value); setErrors(prev => ({ ...prev, displayName: '' })) }}
+                  error={errors.displayName}
+                  variant={errors.displayName ? 'error' : 'default'}
+                />
+              </>
+            )}
+
+            {/* Cloudflare account ID (the Workers AI REST endpoint is account-scoped) */}
+            {showCredentials && isCloudflare && (
+              <Input
+                label="Cloudflare Account ID"
+                placeholder="e.g., 0123456789abcdef0123456789abcdef"
+                description="The Cloudflare account to bill for Workers AI usage"
+                value={accountId}
+                onChange={(e) => { setAccountId(e.target.value); setErrors(prev => ({ ...prev, accountId: '' })) }}
+                error={errors.accountId}
+                variant={errors.accountId ? 'error' : 'default'}
+              />
+            )}
+
+            {/* API Token */}
+            {showCredentials && selection && (
+              <StoredSecretInput
+                label="API Token"
+                stored={storedSecretsUsable && source!.config.apiToken === null}
+                placeholder={tokenRequired ? API_TOKEN_PLACEHOLDERS[selection.provider] : '(optional)'}
+                description={
+                  isOllama
+                    ? 'Optional for local Ollama access'
+                    : isCloudflare
+                    ? 'An API token with Workers AI Read + Edit permissions (in the dashboard: Workers AI > Use REST API > Create a Workers AI API Token)'
+                    : TOKEN_OPTIONAL_WITH_HEADERS.has(selection.provider)
+                    ? `Your ${PROVIDER_LABELS[selection.provider]} API token for billing. Leave blank if the extra headers under Advanced Settings authenticate you to a proxy that supplies its own key.`
+                    : `Your ${PROVIDER_LABELS[selection.provider]} API token for billing`
+                }
+                value={effectiveApiToken}
+                onValueChange={(v) => { setApiToken(v); setErrors(prev => ({ ...prev, apiToken: '' })) }}
+                error={errors.apiToken}
+              />
+            )}
+
+            {/* Ollama API URL (always visible for Ollama) */}
+            {showCredentials && isOllama && (
+              <Input
+                label="API URL"
+                placeholder="http://localhost:11434"
+                description="URL of your Ollama server"
+                value={apiUrl}
+                onChange={(e) => { setApiUrl(e.target.value); setErrors(prev => ({ ...prev, apiUrl: '' })) }}
+                error={errors.apiUrl}
+                variant={errors.apiUrl ? 'error' : 'default'}
+              />
+            )}
+
+            {selection && (
+              <Collapsible.Root
+                open={advancedOpen}
+                onOpenChange={setAdvancedOpen}
+              >
+                <Collapsible.DefaultTrigger>Advanced Settings</Collapsible.DefaultTrigger>
+                <Collapsible.DefaultPanel>
+                  <div className="space-y-4">
+                    {/* Ollama shows its API URL above; Workers AI's endpoint is derived from the account ID. */}
+                    {showCredentials && !isOllama && !isCloudflare && (
+                      <Input
+                        label="API URL"
+                        placeholder="https://..."
+                        description="Override the default API endpoint (useful for proxies like Cloudflare AI Gateway)"
+                        value={apiUrl}
+                        onChange={(e) => setApiUrl(e.target.value)}
+                      />
+                    )}
+                    {showCredentials && (
+                      <ExtraHeadersEditor
+                        rows={headerRows}
+                        storedValuesUsable={storedSecretsUsable}
+                        errors={headerErrors}
+                        onRowsChange={(rows) => {
+                          setHeaderRows(rows)
+                          setHeaderErrors({})
+                          // Adding a header can make the token optional.
+                          setErrors(prev => ({ ...prev, apiToken: '' }))
+                        }}
+                      />
+                    )}
+                    <Input
+                      label="Context Window"
+                      inputMode="numeric"
+                      placeholder="(default)"
+                      description="The maximum tokens one request may total. Leave blank to use the model's built-in default."
+                      value={contextWindow}
+                      onChange={(e) => { setContextWindow(e.target.value); setErrors(prev => ({ ...prev, contextWindow: '' })) }}
+                      error={errors.contextWindow}
+                      variant={errors.contextWindow ? 'error' : 'default'}
+                    />
+                    <Input
+                      label="Output Limit"
+                      inputMode="numeric"
+                      placeholder="(default)"
+                      description="The maximum tokens in one response, also reserved out of the context window. Leave blank to use the model's built-in default."
+                      value={outputLimit}
+                      onChange={(e) => { setOutputLimit(e.target.value); setErrors(prev => ({ ...prev, outputLimit: '' })) }}
+                      error={errors.outputLimit}
+                      variant={errors.outputLimit ? 'error' : 'default'}
+                    />
+                    {/* These take effect only through AI Gateway, and are offered once the server has
+                        described the model. */}
+                    {gatewayMode && description && (
+                      <>
+                        <ReasoningLevelSelect
+                          levels={description.reasoningLevels}
+                          value={reasoning}
+                          defaultReasoning={aiConfig.defaultReasoning}
+                          builtInReasoning={description.builtInReasoning}
+                          onValueChange={setReasoning}
+                        />
+                        {description.maxCompactionInputBudget > 0 && (
+                          <div className="grid gap-2">
+                            <Input
+                              label="Compaction Budget"
+                              inputMode="numeric"
+                              placeholder={`${description.builtInCompactionInputBudget.toLocaleString()} (built-in)`}
+                              value={compactionBudget}
+                              onChange={(e) => { setCompactionBudget(e.target.value); setErrors(prev => ({ ...prev, compactionBudget: '' })) }}
+                              error={errors.compactionBudget}
+                              variant={errors.compactionBudget ? 'error' : 'default'}
+                              aria-describedby={budgetFacts}
+                            />
+                            <CompactionBudgetHelp
+                              id={budgetFacts}
+                              builtIn={description.builtInCompactionInputBudget}
+                              max={description.maxCompactionInputBudget}
+                              inEffect={Math.min(budgetTokens || description.builtInCompactionInputBudget, description.maxCompactionInputBudget)}
+                              typed={budgetTokens && budgetTokens <= description.maxCompactionInputBudget ? budgetTokens : undefined}
+                            />
+                          </div>
+                        )}
+                        {!description.runtimeKnown && (
+                          <CapabilityFields capabilities={capabilities} onCapabilitiesChange={setCapabilities} />
+                        )}
+                      </>
+                    )}
+                  </div>
+                </Collapsible.DefaultPanel>
+              </Collapsible.Root>
+            )}
+          </div>
+
+          {gatewayMode && selection && (
+            <div className="mt-4 flex flex-col items-start gap-2">
+              <GatewayTestButton
+                name="this model"
+                size="base"
+                testing={test?.state === 'testing'}
+                onTest={handleTest}
+              />
+              <div className="self-stretch">
+                <p className="text-xs leading-4 text-kumo-subtle">{TEST_HELP}</p>
+                <GatewayLevelTestsStatus test={test} noLevelLabel="As chats ask" deploymentHints={false} />
+              </div>
+            </div>
           )}
         </div>
 
-        {gatewayMode && selection && (
-          <div className="mt-4 flex flex-col items-start gap-2">
-            <GatewayTestButton
-              name="this model"
-              size="base"
-              testing={test?.state === 'testing'}
-              onTest={handleTest}
-            />
-            <div className="self-stretch">
-              <p className="text-xs leading-4 text-kumo-subtle">{TEST_HELP}</p>
-              <GatewayLevelTestsStatus test={test} noLevelLabel="As chats ask" deploymentHints={false} />
-            </div>
-          </div>
-        )}
-
         {/* Footer */}
-        <div className="mt-6 flex justify-end gap-2">
+        <div className="flex shrink-0 justify-end gap-2 border-t border-kumo-line px-6 py-4">
           <Dialog.Close render={(props) => (
             <Button variant="secondary" {...props} disabled={loading}>
               Cancel
