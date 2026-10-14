@@ -962,6 +962,21 @@ describe("replica review regressions over durable kernel storage", () => {
     }),
   );
 
+  it("retains bounded image bytes for synchronous client hydration", () => inKernel(crypto.randomUUID(), async impl => {
+    const bytes = Uint8Array.of(137, 80, 78, 71), id = crypto.randomUUID();
+    impl.storage.chatAttachmentContent.put({fileId: id, data: bytes, state: {
+      type: "staged", uploadedAt: Date.now(), mimeType: "image/png", name: "image.png",
+    }});
+    const chatId = await impl.newChat(env.TEST_USER.getByName(crypto.randomUUID()),
+      {profile: USER}, "Inspect this image", undefined, [{id}]);
+    const content = impl.storage.chatAttachmentContent.get(id)!;
+    expect(content.state).toMatchObject({type: "committed", chatId, workspacePath: "image.png"});
+    expect(content.data).toEqual(bytes);
+    const message = [...impl.storage.chats.list()].find(message => message.type === "message" &&
+      message.attachments?.some(attachment => attachment.id === id))!;
+    expect(impl.hydrateChatMessageForClient(message).attachments?.[0].content).toEqual(bytes);
+  }));
+
   it.each([false, true])("projects text uploads beyond the former file-size cap (existing worktree: %s)", existing => inKernel(crypto.randomUUID(), async impl => {
     const user = env.TEST_USER.getByName(crypto.randomUUID());
     const stage = (data: Uint8Array, name: string) => {

@@ -76,14 +76,12 @@ export interface WorkspaceReplica extends WorkerEntrypoint {
   writeUpload(uploadId: string, offset: number, stream: ReadableStream<Uint8Array>): Promise<number>;
   /** Read a durable offset/finish receipt after eviction or a lost response. */
   getUploadStatus(uploadId: string): Promise<ByteUploadStatus>;
-  /** Verify frozen payload and persist its immutable reference before any batch can publish it. */
+  /** Verify the frozen payload, publish its Git blob, and return the OID before any batch uses it. */
   finishUpload(uploadId: string): Promise<BytesRef>;
   /** Stream only references staged by this lease or visible in its selected canonical worktrees. */
   readBytes(ref: BytesRef, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>>;
   /** Resolve a byte-coordinate anchor at a consumed cursor; authority remains path/lease scoped. */
   readByteAnchor(checkoutId: number, path: string, cursor: string): Promise<{value: ByteValue | null; version: string | null}>;
-  /** Cache staged immutable base bytes only after verifying their Git blob identity at this path. */
-  adoptByteBase(checkoutId: number, path: string, bytes: BytesRef): Promise<void>;
   /** Capture immutable bases and a consistent pending-transform overlay for granted mounts. */
   checkpoint(): Promise<WorkspaceCheckpoint>;
   /** Enumerate only this checkpoint's immutable base entries. */

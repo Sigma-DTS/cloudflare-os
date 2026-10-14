@@ -1,12 +1,12 @@
 # Byte worktree mutations
 
 Text keeps the existing UTF-16 OT algebra. Worktrees (including attachments), not gadget
-source, additionally accept opaque bytes. A byte reference is a workspace-local immutable
-identity, **not** read authority. Bulk payloads never travel inside a `CodeChange` or its logs.
+source, additionally accept opaque bytes. A byte reference names an immutable Git blob,
+but is **not** read authority. Bulk payloads never travel inside a `CodeChange` or its logs.
 
 ## Data and operations
 
-`BytesRef = {id, byteLength}` names an immutable whole-file payload.
+`BytesRef = {oid, byteLength}` names an immutable whole-file Git blob.
 `ByteValue = {base: BytesRef}` represents that file without fetching it. Binary mutations
 are whole-file replacements only; byte diffs/splices are deferred until measurements justify
 them. The existing serialized change budget covers reference metadata, not embedded payloads.
@@ -30,7 +30,8 @@ Text/text edits retain the existing UTF-16 OT algebra. Binary formats are never 
    offset after each bounded chunk. Matching retransmissions are permitted; changed retries,
    gaps, inconsistent IDs or simultaneous conflicting writers are refused.
 3. `getUploadStatus(id)` recovers the durable offset/receipt after a lost response or DO reset.
-4. `finishUpload(id)` verifies exact length and SHA-256 and persists an immutable reference.
+4. `finishUpload(id)` verifies exact length and SHA-256, streams the Git blob SHA-1, publishes
+   the chunk-backed blob into the workspace Git cache, and returns its OID reference.
 5. Publish `writeBytes` or a replica `setBytes` batch only after staging finishes.
 
 Upload IDs are scoped to a worktree or the original replica lease. Ephemeral `env.GIT`
@@ -41,21 +42,22 @@ the original authorized upload/batch; it never borrows a new turn's authority.
 
 `Worktree.readBytes(path, range?)` streams the current postimage. The replica equivalent reads
 a scoped immutable reference; `readByteAnchor` supplies a byte postimage and opaque version
-at a consumed cursor. Guest-supplied immutable Git base bytes may be cached via
-`adoptByteBase` only after streaming verification against the selected path's Git blob OID.
+at a consumed cursor. Hydrating and finishing a Git base produces the same OID already named by
+the selected tree; no separate base-adoption operation or second hashing pass is needed.
 
 ## Persistence and Git
 
-The DO stores payload blocks of at most 256 KiB, indexed by payload identity and block number.
+The DO stages payload blocks of at most 256 KiB under an internal upload identity and block number.
 Partial blocks and append offsets persist during staging; only verified finished uploads become
 immutable objects. Replacements upload a new complete payload, leaving old references intact.
 Change application/composition handle only metadata; range reads stream indexed blocks with
 bounded buffers and backpressure. There is no piece tree or base64 encoding.
 
-Binary Git blobs are stored as OID-to-byte-reference mappings. Commit writes stream SHA-1
-over Git's `blob <length>\0` header and payload; tree and commit identities remain real Git
-identities. A blob's first byte-reference mapping stays stable across identical uploads,
-imports and base adoption, so an unrelated commit cannot invalidate a replica anchor.
+Finished uploads are promoted into the Git cache as OID-to-chunk-root mappings. The OID is
+streamed over Git's `blob <length>\0` header and payload before the OT can reference it; commits
+therefore reuse the already-verified blob OID without reading the payload again. Tree and commit
+identities remain real Git identities. A blob's first chunk-root mapping stays stable across
+identical uploads and imports, so an unrelated commit cannot invalidate a replica anchor.
 Raw reads never seed the worktree overlay or change a text file's representation; text
 readers classify bounded payloads by their contents, not their storage format.
 Pack export streams compression and the pack trailer. Existing small loose

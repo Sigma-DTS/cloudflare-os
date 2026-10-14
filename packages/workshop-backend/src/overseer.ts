@@ -6,7 +6,6 @@ import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeC
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import { requireTextFiles, type FileContent } from "@gadgets/workshop-shared/code-change";
 import { ByteStore } from "./byte-store";
-import { createHash } from "node:crypto";
 import type { ByteValue, BytesRef } from "@gadgets/workshop-shared/byte-change";
 import type { ByteUploadDescription, ByteUploadStatus } from "@gadgets/workshop-shared/agent-integration";
 import { type AgentCatalog, Gatekeeper, GatekeeperUserVerifier, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
@@ -1194,7 +1193,7 @@ class OverseerImpl implements AgentHooks {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.byteStore = new ByteStore(this.storage.byteObjects, this.storage.byteChunks, this.storage.byteUploads,
-      () => ctx.storage.sync(), this.storage.byteGrants);
+      () => ctx.storage.sync(), this.storage.byteGrants, this.storage.gitByteBlobs);
     this.gitStore = new GitStore(this.storage.gitObjects, this.byteStore, this.storage.gitByteBlobs);
     this.gitCache = new WorkspaceGitCache(this.storage, {
       pull: (gatekeeperId, oids, hints) => this.#pullGitObjects(gatekeeperId, oids, hints),
@@ -2011,14 +2010,14 @@ class OverseerImpl implements AgentHooks {
     const entry = await this.gitCache.pathEntryAtCommit(commit, path);
     if (!entry) return undefined;
     const stored = this.storage.gitByteBlobs.get(entry.oid);
-    if (stored) { await this.byteStore.grant(scope, stored.bytes); return {base: stored.bytes}; }
+    if (stored) {
+      const ref = this.byteStore.reference(entry.oid);
+      await this.byteStore.grant(scope, ref); return {base: ref};
+    }
     const object = await this.gitCache.ensureObject(entry.oid, {type: "blob", referencedBy: entry.referencedBy});
     const bytes = await this.byteStore.import(scope, object.payload);
-    // Import awaited I/O: another reader/writer may already have fixed this OID's identity.
-    const canonical = this.storage.gitByteBlobs.get(entry.oid)?.bytes ?? bytes;
-    if (canonical === bytes) this.storage.gitByteBlobs.put({oid: entry.oid, bytes});
-    await this.byteStore.grant(scope, canonical);
-    return {base: canonical};
+    if (bytes.oid !== entry.oid) throw new Error("Git blob payload does not match its object ID.");
+    return {base: bytes};
   }
 
   // AgentHooks implementation: the same read, plus the blob's oid for the read's stamp.
@@ -5564,7 +5563,8 @@ class OverseerImpl implements AgentHooks {
       throw new Error("Chat attachment content is missing from Git.");
     }
     const blob = this.storage.gitByteBlobs.get(entry.oid);
-    if (blob) return this.byteStore.readSmall(blob.bytes, MAX_CHAT_ATTACHMENT_TOTAL_BYTES);
+    if (blob) return this.byteStore.readSmall(
+      this.byteStore.reference(entry.oid), MAX_CHAT_ATTACHMENT_TOTAL_BYTES);
     return (await this.gitCache.ensureObject(entry.oid,
       {type: "blob", referencedBy: entry.referencedBy})).payload;
   }
@@ -5807,6 +5807,10 @@ class OverseerImpl implements AgentHooks {
         }
         this.storage.chatAttachmentContent.put({
           fileId: id,
+          // Client message hydration is synchronous. Retain bounded image bytes for previews
+          // until that API can stream the immutable Git-backed attachment instead.
+          ...(isAllowedChatAttachmentImageMimeType(attachment.mimeType)
+            ? {data: content.data} : {}),
           state: {
             type: "committed",
             chatId,
@@ -6676,17 +6680,6 @@ class OverseerImpl implements AgentHooks {
         const tree = lease.checkpoint!.worktrees.find(tree => tree.checkoutId === checkoutId)!;
         const commit = tree.acceptedCommit ?? tree.baseCommit;
         return commit ? await this.readByteFileAtCommit(commit, path, lease.id) ?? null : null;
-      },
-      adoptByteBase: async (lease, checkoutId, path, bytes) => {
-        const tree = requireTree(lease, checkoutId);
-        const entry = tree.baseCommit && await this.gitCache.pathEntryAtCommit(tree.baseCommit, path);
-        if (!entry || entry.kind !== "file") throw new Error("No regular immutable base file at this path.");
-        const hash = createHash("sha1").update(`blob ${bytes.byteLength}\0`);
-        for await (const chunk of this.byteStore.read(bytes, 0, bytes.byteLength, () => this.requireReplicaLease(lease.id))) hash.update(chunk);
-        if (hash.digest("hex") !== entry.oid) throw new Error("Staged base does not match its immutable Git identity.");
-        this.requireReplicaLease(lease.id);
-        if (!this.storage.gitByteBlobs.get(entry.oid)) this.storage.gitByteBlobs.put({oid: entry.oid, bytes});
-        await this.ctx.storage.sync();
       },
       assertPathWritable: async (lease, checkoutId, path) => {
         const tree = requireTree(lease, checkoutId);
@@ -14134,9 +14127,6 @@ export class WorkspaceReplicaEndpoint extends WorkerEntrypoint<Cloudflare.Env,
     using session = await this.#session(); const result = await session.readByteAnchor(checkoutId, path, cursor);
     return {...result, value: result.value === null ? null :
       (replicaChangeFromRpc({setBytes: result.value}) as {setBytes: ByteValue}).setBytes};
-  }
-  async adoptByteBase(checkoutId: number, path: string, bytes: BytesRef): Promise<void> {
-    using session = await this.#session(); await session.adoptByteBase(checkoutId, path, bytes);
   }
   async listBaseEntries(id: string, checkoutId: number): Promise<Cursor<WorktreeBaseEntry>> {
     using session = await this.#session(); return await session.listBaseEntries(id, checkoutId);

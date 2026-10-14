@@ -1,7 +1,9 @@
+import type { GitOid } from "./gatekeeper";
+
 /** Identity and length of an immutable whole-file payload; possession alone grants no authority. */
 export interface BytesRef {
-  /** Opaque identity assigned by the byte store. */
-  id: string;
+  /** Git blob object ID computed from the complete payload. */
+  oid: GitOid;
   /** Exact payload length in bytes. */
   byteLength: number;
 }
@@ -14,7 +16,9 @@ export interface ByteValue {
 
 /** Validate byte-reference metadata without granting access to the named payload. */
 export function validateBytesRef(ref: BytesRef): void {
-  if (!/^[A-Za-z0-9:_-]{1,160}$/.test(ref.id) || !Number.isSafeInteger(ref.byteLength) || ref.byteLength < 0) {
+  if (typeof ref !== "object" || ref === null || Object.keys(ref).length !== 2 ||
+      !("oid" in ref) || !("byteLength" in ref) || !/^[0-9a-f]{40}$/.test(ref.oid) ||
+      !Number.isSafeInteger(ref.byteLength) || ref.byteLength < 0) {
     throw new Error("Invalid immutable byte reference.");
   }
 }

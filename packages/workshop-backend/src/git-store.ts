@@ -62,7 +62,6 @@ import type { AiChatAuthorInfo, CommitIdentity, CommitInfo } from "@gadgets/work
 import type { GitObjectRecord, GitByteBlobRecord } from "./storage-schema/overseer-storage";
 import type { ByteStore } from "./byte-store";
 import { decodeBlobText, MAX_GIT_OBJECT_SIZE } from "./git-cache";
-import { createHash } from "node:crypto";
 import type { FileContent } from "@gadgets/workshop-shared/code-change";
 import {
   encodeGitCommit,
@@ -465,12 +464,8 @@ export class GitStore {
     if (typeof text !== "string") {
       if (!this.byteStore || !this.byteBlobs) throw new Error("Byte storage is unavailable.");
       const bytes = this.byteStore.resolve(text);
-      const hash = createHash("sha1").update(`blob ${bytes.byteLength}\0`);
-      for await (const chunk of this.byteStore.read(bytes)) hash.update(chunk);
-      const oid = hash.digest("hex");
-      // Immutable Git anchors hash this reference metadata; identical uploads cannot replace it.
-      if (!this.byteBlobs.get(oid)) this.byteBlobs.put({oid, bytes});
-      return oid;
+      if (!this.byteBlobs.get(bytes.oid)) throw new Error("Git blob is unavailable.");
+      return bytes.oid;
     }
     try {
       return await writeBlob({ fs: this.#fs, gitdir: GITDIR, blob: new TextEncoder().encode(text) });
@@ -494,7 +489,7 @@ export class GitStore {
       } else if (entry.type === "blob" && (entry.mode === "100644" || entry.mode === "100755")) {
         const stored = this.byteBlobs?.get(entry.oid);
         const blob = stored
-          ? this.byteStore!.readSmall(stored.bytes, MAX_GIT_OBJECT_SIZE)
+          ? this.byteStore!.readSmall(this.byteStore!.reference(entry.oid), MAX_GIT_OBJECT_SIZE)
           : (await readBlob({ fs: this.#fs, gitdir: GITDIR, oid: entry.oid, cache: this.#cache })).blob;
         out.set(path, decodeBlobText(blob, path));
       } else {

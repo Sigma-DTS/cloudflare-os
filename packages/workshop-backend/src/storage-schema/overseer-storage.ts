@@ -30,16 +30,16 @@ import {
 import type { CodeChange, FileChange } from "@gadgets/workshop-shared/code-change";
 import type { BytesRef } from "@gadgets/workshop-shared/byte-change";
 
-/** Finished whole-file payload; raw chunks are indexed by `${id}:${chunkIndex}`. */
+/** Internal chunk root for a finished whole-file payload; never crosses an RPC boundary. */
 export interface ByteObjectRecord {
   id: string;
   byteLength: number;
 }
 /** Bounded raw bytes, mutable during staging and immutable after the upload finishes. */
 export interface ByteChunkRecord { id: string; data: Uint8Array; }
-/** Locally authored Git blob with streamed SHA-1 identity and chunk-backed immutable contents. */
-export interface GitByteBlobRecord { oid: string; bytes: BytesRef; }
-/** Explicit scoped authority for an immutable byte root delivered through a worktree read. */
+/** Git-cache blob whose immutable contents live under an internal chunk root. */
+export interface GitByteBlobRecord { oid: string; bytes: ByteObjectRecord; }
+/** Explicit scoped authority for an immutable Git blob reference delivered through a worktree read. */
 export interface ByteGrantRecord { id: string; scope: string; bytes: BytesRef; }
 /** Durable staging/finish receipt, scoped to the original writer capability. */
 export interface ByteUploadRecord {
@@ -47,8 +47,8 @@ export interface ByteUploadRecord {
   byteLength: number;
   sha256: string;
   offset: number;
-  root: BytesRef;
-  finished?: boolean;
+  root: ByteObjectRecord;
+  finished?: BytesRef;
 }
 import type { ChatGatewayRpcTarget } from "@gadgets/workshop-shared/external-message-gateway";
 import type {

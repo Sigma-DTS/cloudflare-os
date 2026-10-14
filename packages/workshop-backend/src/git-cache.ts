@@ -240,7 +240,7 @@ export class WorkspaceGitCache {
     const blob = this.storage.gitByteBlobs?.get(oid);
     if (blob && this.bytes) {
       if (blob.bytes.byteLength > MAX_GIT_OBJECT_SIZE) throw new GitObjectTooLargeError(oid, blob.bytes.byteLength);
-      return {type: "blob", payload: this.bytes.readSmall(blob.bytes, MAX_GIT_OBJECT_SIZE)};
+      return {type: "blob", payload: this.bytes.readSmall(this.bytes.reference(oid), MAX_GIT_OBJECT_SIZE)};
     }
     let record = this.storage.gitObjects.get(oid);
     return record === undefined ? undefined : decodeLooseObject(record.data);
@@ -250,7 +250,7 @@ export class WorkspaceGitCache {
     requireLive();
     const blob = this.storage.gitByteBlobs?.get(oid);
     if (blob && this.bytes) return {type: "blob", byteLength: blob.bytes.byteLength,
-      stream: this.bytes.read(blob.bytes, 0, blob.bytes.byteLength, requireLive)};
+      stream: this.bytes.read(this.bytes.reference(oid), 0, blob.bytes.byteLength, requireLive)};
     return this.ensureObject(oid, hint);
   }
 

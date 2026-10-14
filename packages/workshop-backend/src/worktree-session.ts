@@ -175,14 +175,14 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
   }
   async beginUpload(id: string, description: ByteUploadDescription): Promise<ByteUploadStatus> {
     const row = await this.#bytes().begin(this.#byteScope(), id, description.byteLength, description.sha256);
-    this.#pinBase(); return {offset: row.offset, ...(row.finished ? {finished: row.root} : {})};
+    this.#pinBase(); return {offset: row.offset, ...(row.finished ? {finished: row.finished} : {})};
   }
   async writeUpload(id: string, offset: number, stream: ReadableStream<Uint8Array>): Promise<number> {
     return this.#bytes().write(this.#byteScope(), id, offset, stream, () => { this.#pinBase(); });
   }
   async getUploadStatus(id: string): Promise<ByteUploadStatus> {
     const row = this.#bytes().status(this.#byteScope(), id);
-    return {offset: row.offset, ...(row.finished ? {finished: row.root} : {})};
+    return {offset: row.offset, ...(row.finished ? {finished: row.finished} : {})};
   }
   async finishUpload(id: string): Promise<BytesRef> {
     return this.#bytes().finish(this.#byteScope(), id, () => { this.#pinBase(); });

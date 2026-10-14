@@ -217,7 +217,7 @@ function applyTextChange(text: string, change: TextChange): string {
 }
 
 function byteFileChangeSize(change: {setBytes: ByteValue}): number {
-  return 128 + 2 * change.setBytes.base.id.length;
+  return 128 + 2 * change.setBytes.base.oid.length;
 }
 
 // Iterates a CodeChange's gadget entries as numeric ids. Assumes canonical keys

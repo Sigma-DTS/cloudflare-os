@@ -21,8 +21,8 @@
 
 /** An immutable whole-file payload; its identity alone grants no read access. */
 export interface BytesRef {
-  /** Opaque identity returned by finishUpload. */
-  id: string;
+  /** Git blob object ID returned by finishUpload. */
+  oid: string;
   /** Exact payload length in bytes. */
   byteLength: number;
 }
@@ -146,7 +146,7 @@ export interface Worktree {
   writeUpload(uploadId: string, offset: number, stream: ReadableStream<Uint8Array>): Promise<number>;
   /** Return a durable staging/finish receipt. */
   getUploadStatus(uploadId: string): Promise<ByteUploadStatus>;
-  /** Verify length/digest and return an immutable reference. */
+  /** Verify length/digest, publish the Git blob, and return its OID reference. */
   finishUpload(uploadId: string): Promise<BytesRef>;
   /** Stream current file bytes, preserving binary contents; absence is an error. */
   readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>>;

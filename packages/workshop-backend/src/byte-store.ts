@@ -1,35 +1,52 @@
 import { createHash } from "node:crypto";
 import type { Collection } from "@gadgets/typed-storage";
 import { validateBytesRef, type BytesRef, type ByteValue } from "@gadgets/workshop-shared/byte-change";
-import type { ByteObjectRecord, ByteChunkRecord, ByteUploadRecord, ByteGrantRecord } from "./storage-schema/overseer-storage";
+import type { ByteObjectRecord, ByteChunkRecord, ByteUploadRecord, ByteGrantRecord, GitByteBlobRecord } from "./storage-schema/overseer-storage";
 
 /** Maximum buffered payload per storage/read operation; unrelated to a file's total size. */
 export const BYTE_CHUNK_SIZE = 256 * 1024;
 
-/** Chunk-backed whole-file payloads with durable, scoped, resumable raw-byte staging. */
+/** Durable raw-byte staging that publishes chunk-backed blobs into the workspace Git cache. */
 export class ByteStore {
   constructor(private objects: Collection<ByteObjectRecord, string>,
     private chunks: Collection<ByteChunkRecord, string>, private uploads: Collection<ByteUploadRecord, string>,
-    private sync: () => Promise<void>, private grants: Collection<ByteGrantRecord, string>) {}
+    private sync: () => Promise<void>, private grants: Collection<ByteGrantRecord, string>,
+    private blobs: Collection<GitByteBlobRecord, string>) {}
 
-  /** Check finished identity against durable storage, rather than trusting a wire length. */
-  require(ref: BytesRef): void {
+  #root(ref: BytesRef): ByteObjectRecord {
     validateBytesRef(ref);
-    const object = this.objects.get(ref.id);
-    if (!object || object.byteLength !== ref.byteLength) throw new Error("Unknown immutable byte reference.");
+    const root = this.blobs.get(ref.oid)?.bytes;
+    if (!root || root.byteLength !== ref.byteLength || !this.objects.get(root.id)) {
+      throw new Error("Unknown immutable Git blob reference.");
+    }
+    return root;
+  }
+
+  /** Return the public reference for a chunk-backed Git blob already present in the cache. */
+  reference(oid: string): BytesRef {
+    const root = this.blobs.get(oid)?.bytes;
+    if (!root || !this.objects.get(root.id)) throw new Error("Unknown immutable Git blob reference.");
+    const ref = {oid, byteLength: root.byteLength};
+    validateBytesRef(ref);
+    return ref;
+  }
+
+  /** Check the Git identity against durable chunk-backed storage, rather than trusting wire metadata. */
+  require(ref: BytesRef): void {
+    this.#root(ref);
   }
   /** Resolve a whole-file value; binary deltas are deliberately unsupported. */
   resolve(value: ByteValue): BytesRef {
     if (Object.keys(value).length !== 1 || !("base" in value)) throw new Error("Binary content must name a whole-file payload.");
     this.require(value.base); return value.base;
   }
-  #chunk(ref: BytesRef, index: number): Uint8Array {
+  #chunk(ref: ByteObjectRecord, index: number): Uint8Array {
     const data = this.chunks.get(`${ref.id}:${index}`)?.data;
     if (!data) throw new Error("Missing byte chunk.");
     return data;
   }
   // Private staging reads may inspect acknowledged bytes before the immutable object exists.
-  *#pieces(ref: BytesRef, offset: number, length: number, requireLive: () => void): Generator<Uint8Array> {
+  *#pieces(ref: ByteObjectRecord, offset: number, length: number, requireLive: () => void): Generator<Uint8Array> {
     while (length > 0) {
       requireLive();
       const index = Math.floor(offset / BYTE_CHUNK_SIZE), start = offset % BYTE_CHUNK_SIZE;
@@ -39,7 +56,7 @@ export class ByteStore {
       offset += take; length -= take;
     }
   }
-  #stream(ref: BytesRef, offset: number, length: number, requireLive: () => void): ReadableStream<Uint8Array> {
+  #stream(ref: ByteObjectRecord, offset: number, length: number, requireLive: () => void): ReadableStream<Uint8Array> {
     const iterator = this.#pieces(ref, offset, length, requireLive);
     return new ReadableStream({pull(c) {const item = iterator.next(); if (item.done) c.close(); else c.enqueue(item.value);},
       cancel() {iterator.return(undefined);}}, {highWaterMark: 0});
@@ -105,25 +122,37 @@ export class ByteStore {
   }
   /** Only a finished upload in the original writer scope authorizes a new payload reference. */
   isFinishedFor(scope: string, ref: BytesRef): boolean {
-    const grant = this.grants.get(`${scope}:${ref.id}`);
-    return grant?.bytes.byteLength === ref.byteLength;
+    const grant = this.grants.get(`${scope}:${ref.oid}`);
+    return grant?.bytes.oid === ref.oid && grant.bytes.byteLength === ref.byteLength;
   }
   /** Persist path-authorized read authority before returning a reference to its original scope. */
   async grant(scope: string, bytes: BytesRef): Promise<void> {
-    this.require(bytes); this.grants.put({id: `${scope}:${bytes.id}`, scope, bytes}); await this.sync();
+    this.require(bytes); this.grants.put({id: `${scope}:${bytes.oid}`, scope, bytes}); await this.sync();
   }
   /** Verify the complete payload, then atomically publish its immutable object and scoped receipt. */
   async finish(scope: string, uploadId: string, requireLive: () => void): Promise<BytesRef> {
     const row = this.status(scope, uploadId);
-    if (row.finished) { requireLive(); await this.grant(scope, row.root); return row.root; }
+    if (row.finished) { requireLive(); await this.grant(scope, row.finished); return row.finished; }
     if (row.offset !== row.byteLength) throw new Error("Byte upload is incomplete.");
-    const hash = createHash("sha256");
-    for await (const chunk of this.#stream(row.root, 0, row.byteLength, requireLive)) hash.update(chunk);
-    if (hash.digest("hex") !== row.sha256) throw new Error("Byte upload digest mismatch.");
-    requireLive(); this.objects.put(row.root);
-    this.uploads.put({...row, finished: true});
-    this.grants.put({id: `${scope}:${row.root.id}`, scope, bytes: row.root});
-    await this.sync(); return row.root;
+    const receiptHash = createHash("sha256");
+    const gitHash = createHash("sha1").update(`blob ${row.byteLength}\0`);
+    for await (const chunk of this.#stream(row.root, 0, row.byteLength, requireLive)) {
+      receiptHash.update(chunk); gitHash.update(chunk);
+    }
+    if (receiptHash.digest("hex") !== row.sha256) throw new Error("Byte upload digest mismatch.");
+    const ref = {oid: gitHash.digest("hex"), byteLength: row.byteLength};
+    requireLive();
+    const canonical = this.blobs.get(ref.oid)?.bytes;
+    if (canonical && (canonical.byteLength !== ref.byteLength || !this.objects.get(canonical.id))) {
+      throw new Error("Git blob storage mismatch.");
+    }
+    if (!canonical) {
+      this.objects.put(row.root);
+      this.blobs.put({oid: ref.oid, bytes: row.root});
+    }
+    this.uploads.put({...row, finished: ref});
+    this.grants.put({id: `${scope}:${ref.oid}`, scope, bytes: ref});
+    await this.sync(); return ref;
   }
   /** Import a known local payload with the same staging/durability rules. */
   async import(scope: string, bytes: Uint8Array): Promise<BytesRef> {
@@ -134,17 +163,17 @@ export class ByteStore {
   }
   /** Stream a validated range, checking revocation on every chunk without a whole-file buffer. */
   read(ref: BytesRef, offset = 0, length = ref.byteLength - offset, requireLive = () => {}): ReadableStream<Uint8Array> {
-    this.require(ref);
+    const root = this.#root(ref);
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 ||
         offset > ref.byteLength || length > ref.byteLength - offset) throw new Error("Invalid byte range.");
-    return this.#stream(ref, offset, length, requireLive);
+    return this.#stream(root, offset, length, requireLive);
   }
   /** Compatibility read for explicitly bounded text/legacy APIs, never used by bulk transfer. */
   readSmall(ref: BytesRef, maximum: number): Uint8Array {
-    this.require(ref);
+    const root = this.#root(ref);
     if (ref.byteLength > maximum) throw new Error("Byte-backed blob requires streaming.");
     const bytes = new Uint8Array(ref.byteLength); let offset = 0;
-    for (const chunk of this.#pieces(ref, 0, ref.byteLength, () => {})) {
+    for (const chunk of this.#pieces(root, 0, ref.byteLength, () => {})) {
       bytes.set(chunk, offset); offset += chunk.length;
     }
     return bytes;

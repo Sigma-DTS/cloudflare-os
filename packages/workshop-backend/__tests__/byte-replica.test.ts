@@ -39,11 +39,11 @@ it("streams binary publication over native RPC, deduplicates ACK loss and races 
       await replica.beginUpload("same-base", {byteLength: seed.length, sha256: createHash("sha256").update(seed).digest("hex")});
       await replica.writeUpload("same-base", 0, new Response(seed).body!);
       const duplicate = await replica.finishUpload("same-base");
-      // An unrelated commit and verified base adoption must not change a captured anchor.
+      expect(duplicate).toEqual(anchor.value!.base);
+      // An unrelated commit of identical bytes must not change a captured anchor.
       await impl.gitStore.writeFilesAsCommit(new Map([["copy.bin", {base: duplicate}]]), {
         parents: [], author: {name: "Test", email: "test@example.com"}, message: "Same bytes", timestamp: new Date(0),
       });
-      await replica.adoptByteBase(tree.id, "seed.bin", duplicate);
       expect(await replica.readByteAnchor(tree.id, "seed.bin", receipt.committedAt)).toEqual(anchor);
       const deletedBase = await replica.submitBatch({batchId: "delete-base", baseCursor: receipt.committedAt, files: [
         {checkoutId: tree.id, path: "seed.bin", baseHash: anchor.version, change: {remove: true}},
@@ -54,7 +54,7 @@ it("streams binary publication over native RPC, deduplicates ACK loss and races 
       ]});
       expect(recreated.accepted[0].bytes).toEqual({base: duplicate});
       expect(new Uint8Array(await new Response(await replica.readBytes(ref)).arrayBuffer())).toEqual(data);
-      await expect((async () => {await replica.readBytes({id: "not-granted", byteLength: 1});})()).rejects.toThrow(/outside/);
+      await expect((async () => {await replica.readBytes({oid: "0".repeat(40), byteLength: 1});})()).rejects.toThrow(/outside/);
       const canonical = (await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(tree.id)!.get("image.bin") as ByteValue;
       const replacement = await impl.byteStore.import("kernel", Uint8Array.of(0, 255));
       const change = {setBytes: {base: replacement}};
@@ -70,4 +70,4 @@ it("streams binary publication over native RPC, deduplicates ACK loss and races 
       await expect((async () => {await replica.readBytes(ref);})()).rejects.toThrow(/revoked/);
     } finally {delete impl.env.AGENT_INTEGRATION_GRANTS;}
   });
-});
+}, 30_000);

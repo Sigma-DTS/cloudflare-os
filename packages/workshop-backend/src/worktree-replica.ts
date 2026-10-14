@@ -18,7 +18,6 @@ export type { WorktreeReplicaLease, WorktreeReplicaCommit } from "./storage-sche
 export interface WorktreeReplicaHost {
   bytes?: ByteStore;
   baseBytes?(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<ByteValue | null>;
-  adoptByteBase?(lease: WorktreeReplicaLease, checkoutId: number, path: string, bytes: BytesRef): Promise<void>;
   requireLease(id: string): WorktreeReplicaLease;
   saveLease(lease: WorktreeReplicaLease): void;
   capture(lease: WorktreeReplicaLease): Promise<{ cursor: string; overlay: WorktreeChange[]; pendingOverlay?: WorktreeChange[] }>;
@@ -57,7 +56,7 @@ export function requireReplicaPath(path: string): void {
 export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceReplica,
   "checkpoint" | "listBaseEntries" | "readBaseFile" | "readOverlay" | "changesSince" |
   "readGitPack" | "readCommitPack" | "closeGitBootstrap" | "submitBatch" | "renew" | "release" |
-  "beginUpload" | "writeUpload" | "getUploadStatus" | "finishUpload" | "readBytes" | "readByteAnchor" | "adoptByteBase"> {
+  "beginUpload" | "writeUpload" | "getUploadStatus" | "finishUpload" | "readBytes" | "readByteAnchor"> {
   constructor(private host: WorktreeReplicaHost, private leaseId: string) { super(); }
 
   #bytes(): ByteStore {
@@ -67,14 +66,14 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
   async beginUpload(id: string, description: ByteUploadDescription): Promise<ByteUploadStatus> {
     const row = await this.#bytes().begin(this.leaseId, id, description.byteLength, description.sha256);
     this.host.requireLease(this.leaseId);
-    return {offset: row.offset, ...(row.finished ? {finished: row.root} : {})};
+    return {offset: row.offset, ...(row.finished ? {finished: row.finished} : {})};
   }
   async writeUpload(id: string, offset: number, stream: ReadableStream<Uint8Array>): Promise<number> {
     return this.#bytes().write(this.leaseId, id, offset, stream, () => this.host.requireLease(this.leaseId));
   }
   async getUploadStatus(id: string): Promise<ByteUploadStatus> {
     const row = this.#bytes().status(this.leaseId, id);
-    return {offset: row.offset, ...(row.finished ? {finished: row.root} : {})};
+    return {offset: row.offset, ...(row.finished ? {finished: row.finished} : {})};
   }
   async finishUpload(id: string): Promise<BytesRef> {
     return this.#bytes().finish(this.leaseId, id, () => this.host.requireLease(this.leaseId));
@@ -93,19 +92,11 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
     this.host.requireLease(this.leaseId);
     return {value, version: await replicaContentHash(value)};
   }
-  async adoptByteBase(checkoutId: number, path: string, bytes: BytesRef): Promise<void> {
-    requireReplicaPath(path);
-    const lease = this.host.requireLease(this.leaseId);
-    if (!lease.checkpoint || !lease.worktrees.some(t => t.checkoutId === checkoutId) || !this.host.adoptByteBase) throw new Error("Checkout is outside this replica grant.");
-    this.#requireByteAuthority(bytes);
-    await this.host.adoptByteBase(lease, checkoutId, path, bytes);
-    this.host.requireLease(this.leaseId);
-  }
   #requireByteAuthority(ref: BytesRef): void {
     const lease = this.host.requireLease(this.leaseId);
     if (this.#bytes().isFinishedFor(this.leaseId, ref)) return;
     const includes = (changes: WorktreeChange[]) => changes.some(({change}) =>
-      byteRefs(change).some(r => r.id === ref.id && r.byteLength === ref.byteLength));
+      byteRefs(change).some(r => r.oid === ref.oid && r.byteLength === ref.byteLength));
     if (includes(lease.checkpoint?.overlay ?? [])) return;
     if (lease.checkpoint) {
       let cursor = lease.checkpoint.cursor;
