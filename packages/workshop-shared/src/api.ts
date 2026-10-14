@@ -2727,13 +2727,14 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Accept an agent's pending connection request (a "connectionRequest" chat message). The caller
-   * is responsible for having actually created the gatekeeper (via newGatekeeper()) and passes the
-   * resulting gatekeeper id. The gatekeeper is surfaced to the agent as a named binding in the
+   * supplies the gatekeeper id after creating a resource (via newGatekeeper()). For an ambient
+   * request, the workspace owner omits result to explicitly opt into the account; the server
+   * provisions its singleton. The gatekeeper is surfaced to the agent as a named binding in the
    * chat's env, under the name the agent chose when it made the request (see
    * `connectionRequest.bindingName`). This marks the request accepted, updates the inline card,
    * and resumes the agent so it can use the resource.
    */
-  acceptConnectionRequest(requestId: string, result: {gatekeeperId: WorkpieceId}): Promise<void>;
+  acceptConnectionRequest(requestId: string, result?: {gatekeeperId: WorkpieceId}): Promise<void>;
 
   /**
    * Deny an agent's pending connection request. Updates the inline card. Does NOT resume the agent:
@@ -3879,6 +3880,10 @@ export type AiChatMessageBody = {
   /** Denormalized vendor logo URL, for the connection card icon. */
   vendorLogoUrl?: string;
 
+  /** Ambient requests opt into an account without a resource URL or OAuth picker. Omitted on
+   * legacy resource requests. Only explicit owner acceptance provisions the account. */
+  connectionType?: "ambient";
+
   /**
    * Denormalized human-readable resource type/scope being requested (e.g. "Home Assistant
    * Instance", "Gmail Mailbox"), resolved from the vendor's supported resources at request time.
@@ -3894,7 +3899,8 @@ export type AiChatMessageBody = {
   /**
    * The urlPattern of the supported resource this request resolved to at request time (one of the
    * vendor's SupportedResource.urlPattern values, e.g. "https://github.com/:owner/:repo" or the
-   * whole-instance "https://*"). The backend guarantees every connection request resolves to a
+   * whole-instance "https://*"). Absent on ambient account requests. The backend guarantees every
+   * resource connection request resolves to a
    * concrete resource (see resolveRequestedResource), and the accept modal pre-selects exactly this
    * resource — so accepting never opens a blank "create new connection" picker.
    */

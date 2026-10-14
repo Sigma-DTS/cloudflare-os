@@ -6988,7 +6988,15 @@ class OverseerImpl implements AgentHooks {
   //
   // The session is reached through the owner's stored connected account, not by asserting the owner's
   // identity to the vendor — so the capability is the account the user actually holds.
-  async ensureAmbientCapsules(): Promise<void> {
+  #ambientCapsulesPromise?: Promise<void>;
+
+  ensureAmbientCapsules(): Promise<void> {
+    // open() and an in-chat opt-in can overlap across account/class RPCs.
+    return this.#ambientCapsulesPromise ??= this.#ensureAmbientCapsules()
+        .finally(() => { this.#ambientCapsulesPromise = undefined; });
+  }
+
+  async #ensureAmbientCapsules(): Promise<void> {
     let ownerId = this.ownerId;
     if (!ownerId) return;
     let ownerDo = this.ownerUserDo();
@@ -8395,7 +8403,7 @@ class OverseerImpl implements AgentHooks {
       return this.#vendorsCache.promise;
     }
     let promise = retryOnDoReset(
-        () => this.#ownerUserStub().listGatekeeperVendors(), this.logger);
+        () => this.#ownerUserStub().listGatekeeperVendors({}, true), this.logger);
     // Don't cache failures: drop the entry so the next call retries.
     promise.catch(() => {
       if (this.#vendorsCache?.promise === promise) this.#vendorsCache = null;
@@ -8445,6 +8453,12 @@ class OverseerImpl implements AgentHooks {
           `${vendors.map(v => v.id).join(", ") || "(none)"}.`;
     }
     if (vendor.supportedResources.length === 0) {
+      if (vendor.description.autoProvisionsAccount) {
+        return `Vendor "${vendorId}" (${vendor.description.displayName}) provides an ambient ` +
+            `account integration. Call requestConnection with vendorId="${vendorId}", a ` +
+            `bindingName and reason, omitting resourceUrl. The workspace owner can connect it ` +
+            `directly in chat; this does not approve any subsequent actions.`;
+      }
       return `Vendor "${vendorId}" (${vendor.description.displayName}) offers no connectable ` +
           `resources.`;
     }
@@ -8485,8 +8499,15 @@ class OverseerImpl implements AgentHooks {
     // Resolve the exact resource this request maps to, using the same precedence the accept modal
     // uses. If it can't be resolved, REJECT the request: otherwise the user would get an accept
     // card that opens a blank "create new connection" picker. The agent is told what to fix.
-    let resolved = resolveRequestedResource(vendor.supportedResources, input.resourceUrl);
-    if (!resolved.ok) {
+    const ambient = vendor.description.autoProvisionsAccount &&
+        vendor.supportedResources.length === 0;
+    if (ambient && input.resourceUrl !== undefined) {
+      return {requested: false, message: `Omit resourceUrl when requesting the ambient ` +
+          `"${vendor.description.displayName}" integration.`};
+    }
+    let resolved = ambient ? undefined :
+        resolveRequestedResource(vendor.supportedResources, input.resourceUrl);
+    if (resolved && !resolved.ok) {
       return { requested: false, message:
           `Cannot request a connection for "${vendor.description.displayName}": ${resolved.reason}` };
     }
@@ -8498,9 +8519,10 @@ class OverseerImpl implements AgentHooks {
       vendorId: input.vendorId,
       vendorName: vendor.description.displayName,
       vendorLogoUrl: vendor.description.logo?.url,
-      resourceTitle: resolved.resource.title,
+      ...(ambient ? {connectionType: "ambient"} : {}),
+      resourceTitle: resolved?.ok ? resolved.resource.title : undefined,
       resourceUrl: input.resourceUrl,
-      resourceUrlPattern: resolved.resource.urlPattern,
+      resourceUrlPattern: resolved?.ok ? resolved.resource.urlPattern : undefined,
       reason: input.reason,
       state: "pending",
       // Claims the name in the chat's scope from this moment until denial; on acceptance the
@@ -11194,10 +11216,30 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async acceptConnectionRequest(
-      requestId: string, result: {gatekeeperId: number}): Promise<void> {
+      requestId: string, result?: {gatekeeperId: number}): Promise<void> {
     let msg = this.#findConnectionRequest(requestId);
     if (msg.state !== "pending") {
       throw new Error(`Connection request is not pending: ${requestId}`);
+    }
+
+    if (msg.connectionType === "ambient") {
+      if (!this.isOwner) throw new Error("Only the workspace owner can add an ambient account.");
+      if (result) throw new Error("Ambient requests cannot select a resource gatekeeper.");
+      // Opt-in is a human decision, not something the agent or vendor can assert. The user DO
+      // rechecks current provisioning policy (the discovery cache may now be stale).
+      await this.#owner.provisionAmbientAccount(msg.vendorId);
+      await this.slashCommandsReady;
+      await this.impl.ensureAmbientCapsules();
+      const capsule = [...this.impl.storage.gatekeepers.list()].find(gk =>
+        gk.creationSpec?.type === "ambient" && gk.creationSpec.vendorId === msg.vendorId);
+      if (!capsule) throw new Error("The connected account provides no available agent binding.");
+      result = {gatekeeperId: capsule.id};
+      // Account provisioning releases the input gate. Don't overwrite a concurrent denial or
+      // another acceptance; retrying provisioning itself is safe and reuses the account.
+      msg = this.#findConnectionRequest(requestId);
+      if (msg.state !== "pending") throw new Error(`Connection request is not pending: ${requestId}`);
+    } else if (!result) {
+      throw new Error("A resource connection request requires a gatekeeper id.");
     }
 
     msg.state = "accepted";
@@ -11211,15 +11253,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Don't resume until every connection request from this turn was accepted. Scanning newest
     // first bounds the lookup to the current turn and usually finds a pending sibling immediately.
+    let currentRequest = false;
     for (let sibling of this.impl.storage.chats.list(
         {prefix: chatKeyPrefix(msg.chatId), reverse: true})) {
-      if (sibling.type === "connectionRequest" && sibling.state !== "accepted") return;
+      if (sibling.type === "connectionRequest") {
+        if (sibling.requestId === requestId) currentRequest = true;
+        if (sibling.state !== "accepted") return;
+      }
       if (sibling.type === "agentCallback" ||
           (sibling.type === "message" &&
            (sibling.author.type === "user" || sibling.author.type === "gadget"))) {
         break;
       }
     }
+    // Accepting an earlier card connects the resource, but never authorizes a newer prompt.
+    if (!currentRequest) return;
     await this.#resumeSuspendedAgent(msg.chatId);
   }
 
@@ -12146,7 +12194,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       : Promise<Array<{ gatekeeperId: WorkpieceId; actionKind: ActionKind }>> {
     this.#deny();
   }
-  async acceptConnectionRequest(_requestId: string, _result: {gatekeeperId: number}): Promise<void> { this.#deny(); }
+  async acceptConnectionRequest(_requestId: string, _result?: {gatekeeperId: number}): Promise<void> { this.#deny(); }
   async denyConnectionRequest(_requestId: string): Promise<void>  { this.#deny(); }
   async subscribeToActions(
       subscriber: RpcStub<ActionsSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {
