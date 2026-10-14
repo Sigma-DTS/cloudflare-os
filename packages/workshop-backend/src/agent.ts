@@ -4132,7 +4132,7 @@ async function runAgentPass(
     toolExecution: "sequential",
     // Pi polls before requests, never mid-tool-batch. Between steps, turn_end has already
     // persisted the assistant and tools; persist steering too so retries replay what Pi saw.
-    getSteeringMessages: () => {
+    getSteeringMessages: async () => {
       if (abortSignal.aborted || connectionRequested || awaitingActionDecision) return [];
       return hooks.consumeSteeringMessages(chatId).map(({message, timestamp}) => ({
         role: "user" as const, content: message, timestamp: timestamp.getTime(),
