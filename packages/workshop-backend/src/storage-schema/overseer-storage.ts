@@ -34,6 +34,36 @@ import type {
   HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
+import type {
+  AgentTurnEvent, AgentTurnParticipant,
+} from "@gadgets/workshop-shared/agent-integration";
+
+/** Durable logical-turn identity, independent of the invocation that happens to execute it. */
+export type AgentIntegrationTurn = {
+  chatId: number;
+  requestKey: string;
+  turnId: string;
+  segmentId: string;
+  /** Active execution that published this segment; terminal cleanup cannot discard a newer one. */
+  continuationId?: string;
+  state: "running" | "suspended" | "finished";
+  entry: AgentTurnEvent;
+  closing?: AgentTurnEvent;
+};
+
+/** Queue-time origin captured by a context or action; never resolves against a later turn. */
+export type AgentIntegrationOrigin = Pick<AgentIntegrationTurn, "chatId" | "turnId" | "segmentId">;
+
+/** Persistent callback and outbox, scoped to one binding and one logical turn. */
+export type AgentIntegrationParticipantRecord = {
+  id: string;
+  gatekeeperId: number;
+  turnId: string;
+  chatId: number;
+  participant: Fetcher<AgentTurnParticipant>;
+  pending: AgentTurnEvent[];
+  retryAt?: number;
+};
 
 // =======================================================================================
 // Workpieces
@@ -427,6 +457,16 @@ export type ActionRecord = {
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+  /** Queue-time authority; approval must not borrow an unrelated later turn. */
+  integrationOrigin?: AgentIntegrationOrigin;
+  /** Dispatches through the administrator-granted contextual action interface. */
+  contextualApply?: boolean;
+  /** Recovery must not append the same action-decision note twice. */
+  decisionNotified?: boolean;
+  /** Consumed with the submitting continuation's durable wake-up, not with its chat note. */
+  decisionResumed?: boolean;
+  /** Child approval IDs, persisted with submission for lost-ACK deduplication. */
+  followupActionIds?: number[];
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -736,6 +776,22 @@ export type ActiveAgentRecord = {
   initiator: AiChatAuthorInfo;
   /** Whether this turn was initiated by a gadget callback (vs. a chat message). */
   callbackInitiated: boolean;
+  /** Fences deferred recovery against a different execution of this chat after a DO restart. */
+  continuationId?: string;
+  /** Initiating request, captured before async startup; fences cleanup from an older prompt. */
+  requestKey?: string;
+  /** Authorized wake-up received while this continuation is still entering/tearing down a pause. */
+  resumeRequested?: true;
+};
+
+/** Approved intent only for integrations explicitly granted durable effect recovery. */
+export type ActionApplication = {
+  id: number;
+  resolvedBy: AiChatAuthorInfo;
+  autoApproved: boolean;
+  resumeUserId?: string;
+  phase: "apply" | "resume";
+  retryAt: number;
 };
 
 /**
@@ -1216,6 +1272,19 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     },
 
     collections: {
+      pausedAgents: collection<ActiveAgentRecord>()({primaryKey: "chatId"}),
+      actionApplications: collection<ActionApplication>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {retryAt: (record: ActionApplication) => record.retryAt},
+      }),
+      agentIntegrationTurns: collection<AgentIntegrationTurn>()({primaryKey: "chatId"}),
+      agentIntegrationParticipants: collection<AgentIntegrationParticipantRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {
+          byTurn: (record: AgentIntegrationParticipantRecord) => record.turnId,
+          retryAt: (record: AgentIntegrationParticipantRecord) => record.retryAt ?? null,
+        },
+      }),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
       // mainline code lives in `gitObjects` as commits -- and it is read only by the git-storage

@@ -3853,9 +3853,8 @@ export type AiChatMessageBody = {
   bindingName?: string;
 } | {
   /**
-   * **Obsolete.** A system-generated nudge message that was sent to the agent when it tried to
-   * end its turn while agent callbacks were still unresolved. No longer emitted since callable
-   * agents stopped returning values; retained so older chat logs remain readable.
+   * A system-generated continuation note, including an applied action decision. Unlike a user
+   * message it does not start a new logical turn. Also retained for older callback-wait nudges.
    */
   type: "agentNudge";
   text: string;
