@@ -59,7 +59,8 @@ describe("ChatComposer", () => {
     testState.gatekeeperModalProps = undefined;
   });
 
-  it("sends on Enter without clearing document changes made while sending", async () => {
+  it.each([false, true])("sends on Enter without clearing edits while sending (agent active: %s)", async (isAgentActive) => {
+    const onStop = vi.fn();
     let finishSend: (() => void) | undefined;
     const onSend = vi.fn<Parameters<typeof ChatComposer>[0]["onSend"]>(
       () => new Promise<void>((resolve) => { finishSend = resolve; }),
@@ -74,7 +75,8 @@ describe("ChatComposer", () => {
         createCapsuleGatekeeper={async () => null}
         getOverseer={() => overseer}
         onSend={onSend}
-        isAgentActive={false}
+        isAgentActive={isAgentActive}
+        onStop={onStop}
         models={[]}
         selectedModel={{ id: "model-a" }}
         onModelChange={() => {}}
@@ -115,6 +117,18 @@ describe("ChatComposer", () => {
     expect(textarea.value).toBe("Next question");
     expect(textarea.disabled).toBe(false);
     expect(testState.addToast).not.toHaveBeenCalled();
+    if (isAgentActive) {
+      const stop = container.querySelector<HTMLButtonElement>('[aria-label="Stop agent"]')!;
+      const send = container.querySelector<HTMLButtonElement>('[aria-label="Queue steering message"]')!;
+      expect(stop).not.toBeNull();
+      expect(send.disabled).toBe(false);
+      await act(async () => send.click());
+      expect(onSend).toHaveBeenCalledTimes(2);
+      expect(onStop).not.toHaveBeenCalled();
+      await act(async () => finishSend!());
+      await act(async () => stop.click());
+      expect(onStop).toHaveBeenCalledOnce();
+    }
   });
 
   it.each([
