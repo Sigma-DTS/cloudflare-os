@@ -168,7 +168,7 @@ describe("GatewayModels", () => {
       "userModelsEnabled" | "modelSettings" | "defaultReasoning">;
   const NO_CONFIG: Config = {
     modelModes: {}, addedProviders: [], addedModels: [], userModelsEnabled: true,
-    modelSettings: {}, defaultReasoning: null,
+    modelSettings: {}, defaultReasoning: null, modelsDevSuggestions: false,
   };
   const gatewayModels = (config: Partial<Config> = {}, providers?: string) =>
       new GatewayModels(new AiGatewayConfig(gatewayEnv(providers)), { ...NO_CONFIG, ...config });

@@ -17,6 +17,7 @@ import type { AdminSettings } from "./admin-settings.js";
 import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
+import { userModelConfig } from "./user-models.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
 import { deliver, registerDevice } from "./notification-service.js";
@@ -651,7 +652,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       source = this.#getHandAddedModel(copySecretsFrom, models).config;
     }
     // A gateway model, whatever its mode, would shadow the new model and leave it unreachable.
-    if (this.storage.aiModels.get(profile.id) || models?.get(profile.id)) {
+    if (models?.get(profile.id)) {
+      throw new Error(`A model with ID "${profile.id}" already exists: choose another ID for ` +
+          "your own version.");
+    }
+    if (this.storage.aiModels.get(profile.id)) {
       throw new Error(`A model with ID "${profile.id}" already exists.`);
     }
     this.#putModel(profile, resolveWithheldSecrets(config, source), models);
@@ -683,21 +688,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   #putModel(profile: AiChatAuthorInfo, config: AiModelConfig, models: GatewayModels | null) {
-    if (models && !models.providers.has(config.provider)) {
-      throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
-    }
-    for (let limit of [config.contextWindow, config.outputLimit]) {
-      if (limit !== undefined && !(Number.isSafeInteger(limit) && limit > 0)) {
-        throw new Error("Token limits must be positive integers.");
-      }
-    }
-
-    // capnweb-validate lets through properties that RedactedAiModelConfig omits, and these are a
-    // deployment's to set on its own models.
-    let {reasoning, compactionInputBudget, behavesLike, capabilities, ...own} = config;
-
     profile.type = "agent";
-    this.storage.aiModels.put({profile, config: own});
+    this.storage.aiModels.put({profile, config: userModelConfig(config, models)});
   }
 
   async deleteModel(id: string): Promise<void> {
@@ -882,11 +874,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /**
    * Resolve a model ID the way chats do: a gateway model shadows a stored model with the same ID
    * whatever its mode, so a disabled one resolves to nothing rather than to the stored model. No
-   * stored model resolves on a gateway deployment whose users may not add their own.
+   * stored model resolves on a gateway deployment whose users may not add their own, and on one
+   * whose users may, a stored model takes the deployment's default reasoning level unless it sets
+   * its own.
    */
   #resolveModel(id: string, models: GatewayModels | null): UserAiModelRecord | undefined {
     if (models?.get(id)) return models.resolve(id);
-    return models && !models.userModels ? undefined : this.storage.aiModels.get(id);
+    if (!models) return this.storage.aiModels.get(id);
+    if (!models.userModels) return undefined;
+    let record = this.storage.aiModels.get(id);
+    return record && { ...record, config: models.userRunConfig(record.config) };
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {

@@ -531,7 +531,10 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Adds a new model to the user's configured set. The ID must not name a model the user already
-   * added; use `updateModel()` to replace one.
+   * added; use `updateModel()` to replace one. `profile.id` may differ from `config.model`, which
+   * is how a user keeps their own version of a model the deployment provides, under an ID of their
+   * own. A compaction budget must be a positive whole number within the room the model's window
+   * leaves for a prompt (see ModelDescription.maxCompactionInputBudget).
    *
    * `copySecretsFrom` names a hand-added model (see `getModelConfig()`) whose stored secrets fill
    * in the `null` secrets of `config`, which is how a model is cloned without the client ever
@@ -553,7 +556,8 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Replaces the configuration of a model the user added by hand. `profile.id` names the model,
-   * and `config.provider` and `config.model` must match the stored values.
+   * and `config.provider` and `config.model` must match the stored values. The compaction budget
+   * is held to the bound addModel() holds it to.
    *
    * A `null` secret keeps the stored value; for a header, that of the stored header with exactly
    * the same name. Secrets may be kept only while `config.provider` and `config.apiUrl` are
@@ -579,6 +583,27 @@ export interface AuthenticatedApi extends RpcTarget {
    * are available. The frontend uses this to adjust the model management UI.
    */
   getAiConfig(): Promise<AiGatewayInfo>;
+
+  /**
+   * What the add-model form needs in order to offer reasoning and compaction settings for the
+   * model `config` describes, which may be one the user has not added. Throws outside AI Gateway
+   * mode, and for a model addModel() would refuse for its provider, limits or budget.
+   */
+  describeModel(config: RedactedAiModelConfig): Promise<ModelDescription>;
+
+  /**
+   * Test the model `config` describes, without adding it: the user's counterpart of
+   * AdminApi.testNewGatewayModel(). It sends one request with no level of the test's own, which
+   * goes out the way a chat turn on the model would (with the model's own reasoning level, else the
+   * deployment's default, else what BuiltInReasoning describes), and one at each level the model
+   * lists (see ModelDescription.reasoningLevels), each under that method's response cap and time
+   * limit and as the user. It stores nothing. Throws outside AI Gateway mode, for a model
+   * addModel() would refuse, and when the user's usage allows no further request; a request that
+   * fails is a result (see GatewayModelLevelTest).
+   *
+   * It counts against the user's usage as one chat turn does, and is billed as one would be.
+   */
+  testModel(config: RedactedAiModelConfig): Promise<GatewayModelLevelTest[]>;
 
   /** Resolve UI feature flags for the authenticated user. */
   getUiFeatureFlags(): Promise<UiFeatureFlags>;
@@ -1095,7 +1120,7 @@ export type AdminSettingsView = {
     /** Whether users may add models of their own (see AdminApi.setUserModelsEnabled). */
     userModelsEnabled: boolean;
     /**
-     * Whether the admin UI may suggest models from models.dev while an admin adds one (see
+     * Whether the UI may suggest models from models.dev while an admin or user adds one (see
      * AdminApi.setModelsDevSuggestions).
      */
     modelsDevSuggestions: boolean;
@@ -1305,13 +1330,13 @@ export interface AdminApi {
   setUserModelsEnabled(enabled: boolean): Promise<void>;
 
   /**
-   * Set whether the admin UI may suggest models from models.dev while an admin adds one. Off by
+   * Set whether the UI may suggest models from models.dev while an admin or user adds one. Off by
    * default.
    *
-   * The admin's browser reads the setting and, with it on, downloads models.dev's public model
-   * list while an admin adds a model, to fill in the add-model form. It changes nothing the server
-   * does: the server never contacts models.dev, and addGatewayModel() validates a suggested model
-   * like any other.
+   * The browser reads the setting and, with it on, downloads models.dev's public model list while
+   * an admin or user adds a model, to fill in the add-model form. It changes nothing the server
+   * does: the server never contacts models.dev, and addGatewayModel() and
+   * AuthenticatedApi.addModel() validate a suggested model like any other.
    */
   setModelsDevSuggestions(enabled: boolean): Promise<void>;
 
@@ -1329,7 +1354,7 @@ export interface AdminApi {
 
   /**
    * Set the reasoning level of every gateway model that has none of its own, or null for each
-   * model's built-in behaviour. It never applies to a model a user added.
+   * model's built-in behaviour. It applies to a model a user added that sets no level of its own.
    */
   setDefaultReasoning(level: ReasoningLevel | null): Promise<void>;
 
@@ -1527,6 +1552,11 @@ export type AiGatewayInfo = {
    */
   enabledProviders: AiModelProvider[];
   /**
+   * The reasoning level of each model that has none of its own, a user's included (see
+   * AdminApi.setDefaultReasoning), or null while the deployment sets none.
+   */
+  defaultReasoning: ReasoningLevel | null;
+  /**
    * The ID of every model the deployment provides through AI Gateway, in any mode (see
    * GatewayModelMode). A user can't edit or delete these, nor add a model under one of these IDs.
    */
@@ -1537,6 +1567,11 @@ export type AiGatewayInfo = {
    * resolved.
    */
   userModelsEnabled: boolean;
+  /**
+   * Whether the UI may suggest models from models.dev while the user adds one (see
+   * AdminApi.setModelsDevSuggestions).
+   */
+  modelsDevSuggestions: boolean;
 } | {
   enabled: false;
 };
@@ -1682,18 +1717,21 @@ export type AdminModel = GatewayModel & {
   settings?: GatewayModelSettings;
 };
 
-/** An AdminModel with what the admin UI needs in order to offer its settings. */
-export type AdminModelView = AdminModel & {
+/**
+ * What a UI needs in order to offer the reasoning and compaction settings of a model run through
+ * AI Gateway: an admin's (see AdminModelView) or a user's (see AuthenticatedApi.describeModel).
+ */
+export type ModelDescription = {
   /** The reasoning levels the model can be sent, least to most. Empty when it takes none. */
   reasoningLevels: ReasoningLevel[];
 
   /**
-   * What the model is asked for while neither its settings nor the deployment's default give it
-   * a reasoning level.
+   * What the model is asked for while neither its own settings nor the deployment's default give
+   * it a reasoning level.
    */
   builtInReasoning: BuiltInReasoning;
 
-  /** The compaction budget the model has while GatewayModelSettings sets none. */
+  /** The compaction budget the model has while none is set for it. */
   builtInCompactionInputBudget: number;
 
   /**
@@ -1707,7 +1745,10 @@ export type AdminModelView = AdminModel & {
    * entry is used, and neither `behavesLike` nor `capabilities` is.
    */
   runtimeKnown: boolean;
+};
 
+/** An AdminModel with what the admin UI needs in order to offer its settings. */
+export type AdminModelView = AdminModel & ModelDescription & {
   /**
    * For a model with a `behavesLike`, whether the model runtime knows the model it names. When
    * it does not, there is nothing to borrow, and the model runs as one the runtime does not know
@@ -1736,8 +1777,8 @@ export type AdminGatewayProvider = {
 };
 
 /**
- * What one request of AdminApi.testGatewayProvider(), AdminApi.testGatewayModel() or
- * AdminApi.testNewGatewayModel() found: the model asked, and whether it answered. A failure
+ * What one request of AdminApi.testGatewayProvider(), AdminApi.testGatewayModel(),
+ * AdminApi.testNewGatewayModel() or AuthenticatedApi.testModel() found: the model asked, and whether it answered. A failure
  * carries a message on one line, cut short: what the provider or the gateway answered, or why no
  * answer came. It carries the HTTP status of the response only when the model runtime reports
  * one, which it does not for every provider (a failed Google request has none): the message then
@@ -1747,8 +1788,8 @@ export type GatewayModelTest = { model: string } &
     ({ ok: true } | { ok: false; status?: number; message: string });
 
 /**
- * One request of AdminApi.testNewGatewayModel(): its result, and the reasoning level it asked
- * for. Null is the request sent with no level set.
+ * One request of AdminApi.testNewGatewayModel() or AuthenticatedApi.testModel(): its result, and
+ * the reasoning level it asked for. Null is the request that set no level of the test's own.
  */
 export type GatewayModelLevelTest = GatewayModelTest & { reasoning: ReasoningLevel | null };
 
@@ -1802,14 +1843,17 @@ export type AiModelConfig = {
   outputLimit?: number;
 
   /**
-   * The reasoning level of an agent's turns on the model. Absent gives the model's built-in
-   * behaviour. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   * The reasoning level of an agent's turns on the model. Absent gives the deployment's default
+   * level on an AI Gateway deployment (see AdminApi.setDefaultReasoning), else the model's
+   * built-in behaviour. Set on a gateway deployment's models (see GatewayModelSettings) and on
+   * the models its users add. Takes effect only through AI Gateway.
    */
   reasoning?: ReasoningLevel;
 
   /**
    * Overrides the model's built-in compaction budget, up to the room its window leaves for a
-   * prompt. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   * prompt. Set on a gateway deployment's models (see GatewayModelSettings) and on the models its
+   * users add.
    */
   compactionInputBudget?: number;
 
@@ -1820,8 +1864,9 @@ export type AiModelConfig = {
   behavesLike?: string;
 
   /**
-   * What the model is stated to do (see GatewayModel.capabilities). Set only on the models a
-   * deployment's admin added to its AI Gateway.
+   * What the model is stated to do (see GatewayModel.capabilities). Set on the models a
+   * deployment's admin added to its AI Gateway and on the models its users add. Takes effect only
+   * through AI Gateway.
    */
   capabilities?: GatewayModelCapabilities;
 };
@@ -1831,11 +1876,10 @@ export type AiModelConfig = {
  * and edited without the client ever receiving its secrets. As returned by
  * `AuthenticatedApi.getModelConfig()`, a `null` secret is a non-empty value that was withheld. As
  * passed to `AuthenticatedApi.updateModel()` or `addModel()`, a `null` secret keeps (or copies)
- * the stored value. It has none of the fields that only a deployment sets on its own models.
+ * the stored value. It has no `behavesLike`, which only a deployment's admin sets.
  */
 export type RedactedAiModelConfig = Omit<AiModelConfig,
-    "apiToken" | "extraHeaders" | "reasoning" | "compactionInputBudget" | "behavesLike" |
-    "capabilities"> & {
+    "apiToken" | "extraHeaders" | "behavesLike"> & {
   /** `AiModelConfig.apiToken`, or null if withheld. */
   apiToken: string | null;
 

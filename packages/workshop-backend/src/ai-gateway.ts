@@ -186,22 +186,32 @@ export class GatewayModels {
    * false, these are the only models a user can list or run.
    */
   readonly userModels: boolean;
+  /**
+   * Whether the UI may suggest models from models.dev while an admin or user adds one (see
+   * AdminApi.setModelsDevSuggestions).
+   */
+  readonly modelsDevSuggestions: boolean;
   readonly #byId = new Map<string, AdminModel>();
   /** The stored added models, including the ones this table leaves out. */
   readonly #added: readonly GatewayModel[];
-  /** The reasoning level of a model whose settings give none. */
-  readonly #defaultReasoning: ReasoningLevel | null;
+  /**
+   * The reasoning level of a model that has none of its own, a user's included (see
+   * AdminApi.setDefaultReasoning).
+   */
+  readonly defaultReasoning: ReasoningLevel | null;
 
   constructor(readonly gateway: AiGatewayConfig,
               config: Pick<AdminConfig, "modelModes" | "addedProviders" | "addedModels" |
-                  "userModelsEnabled" | "modelSettings" | "defaultReasoning">) {
+                  "userModelsEnabled" | "modelSettings" | "defaultReasoning" |
+                  "modelsDevSuggestions">) {
     this.providers = new Set([
       ...gateway.providers,
       ...config.addedProviders.filter(provider => GATEWAY_PROVIDERS.has(provider)),
     ]);
     this.#added = config.addedModels;
     this.userModels = config.userModelsEnabled;
-    this.#defaultReasoning = config.defaultReasoning;
+    this.modelsDevSuggestions = config.modelsDevSuggestions;
+    this.defaultReasoning = config.defaultReasoning;
     let add = (model: GatewayModel, defaultMode: GatewayModelMode, added: boolean) => {
       if (this.#byId.has(model.id)) return;
       // Object.hasOwn, so that an ID like "constructor" does not find an inherited mode.
@@ -280,8 +290,19 @@ export class GatewayModels {
   runConfig(id: string): AiModelConfig | undefined {
     let model = this.#byId.get(id);
     if (!model) return undefined;
-    return gatewayRunConfig(model, model.settings?.reasoning ?? this.#defaultReasoning,
+    return gatewayRunConfig(model, model.settings?.reasoning ?? this.defaultReasoning,
         model.settings?.compactionInputBudget);
+  }
+
+  /**
+   * The config a model a user added, stored as `config`, runs with: at its own reasoning level,
+   * else at the deployment's default, else with none set. The default is applied here rather than
+   * stored, so that the stored model keeps what its user set and a change to the default reaches
+   * it.
+   */
+  userRunConfig(config: AiModelConfig): AiModelConfig {
+    let reasoning = config.reasoning ?? this.defaultReasoning;
+    return reasoning === null ? config : { ...config, reasoning };
   }
 
   /** Throws if `id` names a gateway model that an admin disabled. */

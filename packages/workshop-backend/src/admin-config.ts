@@ -237,9 +237,12 @@ export function sanitizeAddedModel(value: unknown): GatewayModel | undefined {
   };
 }
 
-// The well-formed part of what an added model is stated to do, or undefined if none of it is:
-// a malformed statement is one not made. Reasoning levels are kept once each, least to most.
-function sanitizeCapabilities(value: unknown): GatewayModelCapabilities | undefined {
+/**
+ * The well-formed part of what a model is stated to do, an admin's added model or a user's, or
+ * undefined if none of it is: a malformed statement is one not made. Reasoning levels are kept
+ * once each, least to most.
+ */
+export function sanitizeCapabilities(value: unknown): GatewayModelCapabilities | undefined {
   if (!value || typeof value !== "object") return undefined;
   let {imageInput, reasoningLevels} = value as Partial<GatewayModelCapabilities>;
   let capabilities: GatewayModelCapabilities = {};
@@ -258,7 +261,7 @@ function isTokenLimit(value: unknown): value is number {
 /**
  * The well-formed part of a gateway model's settings, or undefined if none of it is. Shape only:
  * how large a compaction budget may be depends on the model (see compactionBudgetRange() in
- * admin-settings.ts).
+ * agent-compaction.ts).
  */
 export function sanitizeModelSettings(value: unknown): GatewayModelSettings | undefined {
   if (!value || typeof value !== "object") return undefined;

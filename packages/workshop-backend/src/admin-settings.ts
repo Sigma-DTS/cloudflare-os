@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminModel, AdminResourceVendor, AdminSettingsView, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ReasoningLevel, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminModel, AdminResourceVendor, AdminSettingsView, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ReasoningLevel, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -8,10 +8,10 @@ import { sanitizeBlueprintOutput } from './blueprint-archive.js';
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
 import { MAX_AGENT_HINT, defaultOutputFormatId, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration } from './storage-schema/admin-settings-storage.js';
-import { getModelTokenLimits } from './agent-compaction.js';
+import { compactionBudgetRange, getModelTokenLimits } from './agent-compaction.js';
 import { AiGatewayConfig, GatewayModels, assertGatewayProvider, gatewayModelConfig, gatewayRunConfig, getAiGatewayConfig, isCatalogModel } from './ai-gateway.js';
-import { AgentTurnError, completeText } from './ai-invoke.js';
-import { gatewayBuiltInReasoning, gatewayReasoningLevels, getModel, isRuntimeModel } from './ai-models.js';
+import { describeGatewayModel, gatewayReasoningLevels, isRuntimeModel } from './ai-models.js';
+import { MODEL_TEST_REQUEST, runLevelTests, runModelTest, type GatewayTest } from './model-test.js';
 import { SITE_LOGO_R2_KEY, siteLogoImage, validateSiteLogo } from './site-logo.js';
 import { ambientGatekeeperMode, DEFAULT_AMBIENT_GATEKEEPER_MODE } from './provisioning-policy.js';
 import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
@@ -28,44 +28,21 @@ function entriesWithout<T>(record: Record<string, T>, modelId: string): [string,
   return Object.entries(record).filter(([id]) => id !== modelId);
 }
 
-// The compaction budget a gateway model has while its settings give none, and the largest one
-// they may give it: the room its window leaves for a prompt.
-function compactionBudgetRange(model: AdminModel): { builtIn: number, max: number } {
-  let config = gatewayModelConfig(model);
-  return {
-    builtIn: getModelTokenLimits(config).inputBudget,
-    // A budget is capped at that room, so an unbounded one reads it back.
-    max: getModelTokenLimits({ ...config, compactionInputBudget: Infinity }).inputBudget,
-  };
-}
-
 // The model that `model`, a description of one, becomes once added: enabled, with nothing set
 // for it.
 function addedModel(model: GatewayModel): AdminModel {
   return { ...model, mode: "enabled", defaultMode: "enabled", added: true };
 }
 
-// One of the tests an admin runs through the gateway: the event and the message of its log line,
-// the response cap of its request (the model's own, where that is lower), whether the request
-// asks for what an agent's turn would (see completeText), and how long the model has to answer.
-type GatewayTest = {
-  event: string, logged: string, maxTokens: number, thinking: boolean, timeoutMs: number,
-};
+// The tests an admin runs through the gateway.
 const PROVIDER_TEST: GatewayTest = {
-  event: "gateway.provider.test", logged: "tested an AI Gateway provider",
+  logger, event: "gateway.provider.test", logged: "tested an AI Gateway provider",
   maxTokens: 16, thinking: false, timeoutMs: 15_000,
 };
 const MODEL_TEST: GatewayTest = {
-  event: "gateway.model.test", logged: "tested an AI Gateway model",
-  maxTokens: 2048, thinking: true, timeoutMs: 30_000,
+  logger, event: "gateway.model.test", logged: "tested an AI Gateway model",
+  ...MODEL_TEST_REQUEST,
 };
-
-// What a failed test tells the admin: the provider's or the gateway's own words with the
-// deployment's gateway token cut out, should they repeat it, on one line and cut short.
-function testFailureMessage(text: string, apiToken: string | undefined): string {
-  if (apiToken) text = text.replaceAll(apiToken, "[redacted]");
-  return text.replace(/\s+/g, " ").trim().slice(0, 300);
-}
 
 /**
  * Deployment-wide admin settings singleton.
@@ -463,21 +440,12 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       return {
         providers: models.addableProviders,
         providerSettings: models.providerSettings,
-        models: models.all.map(model => {
-          let budget = compactionBudgetRange(model);
-          return {
-            ...model,
-            reasoningLevels: gatewayReasoningLevels(
-                model.provider, model.id, model.behavesLike, model.capabilities),
-            builtInReasoning: gatewayBuiltInReasoning(
-                model.provider, model.id, model.behavesLike, model.capabilities),
-            builtInCompactionInputBudget: budget.builtIn,
-            maxCompactionInputBudget: budget.max,
-            runtimeKnown: isRuntimeModel(model.provider, model.id),
-            ...(model.behavesLike !== undefined &&
-                { behavesLikeKnown: isRuntimeModel(model.provider, model.behavesLike) }),
-          };
-        }),
+        models: models.all.map(model => ({
+          ...model,
+          ...describeGatewayModel(gatewayRunConfig(model, null)),
+          ...(model.behavesLike !== undefined &&
+              { behavesLikeKnown: isRuntimeModel(model.provider, model.behavesLike) }),
+        })),
         defaultReasoning: config.defaultReasoning,
         userModelsEnabled: models.userModels,
         modelsDevSuggestions: config.modelsDevSuggestions,
@@ -517,7 +485,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       if (!model) throw new Error(`No such model: ${modelId}`);
       let budget = settings.compactionInputBudget;
       if (budget !== undefined) {
-        let { max } = compactionBudgetRange(model);
+        let { max } = compactionBudgetRange(gatewayModelConfig(model));
         if (max <= 0) {
           throw new Error(`The "${model.name}" model's context window leaves no room for a ` +
               "compaction budget.");
@@ -643,7 +611,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     if (model === undefined) {
       throw new Error(`Provider "${provider}" has no suggested model to test.`);
     }
-    return this.#runTest(gateway, { provider, model, apiToken: "" }, adminUserId, PROVIDER_TEST);
+    return runModelTest(
+        this.env, gateway, { provider, model, apiToken: "" }, adminUserId, PROVIDER_TEST);
   }
 
   /**
@@ -660,7 +629,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     let gateway = this.#requireGateway();
     let config = new GatewayModels(gateway, this.#config()).runConfig(modelId);
     if (!config) throw new Error(`No such model: ${modelId}`);
-    return this.#runTest(gateway, config, adminUserId, MODEL_TEST);
+    return runModelTest(this.env, gateway, config, adminUserId, MODEL_TEST);
   }
 
   /**
@@ -682,51 +651,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     let added = addedModel(this.#addableModel(model, this.#config()));
     let levels = gatewayReasoningLevels(
         added.provider, added.id, added.behavesLike, added.capabilities);
-    return Promise.all([null, ...levels].map(async reasoning => ({
-      ...await this.#runTest(
-          gateway, gatewayRunConfig(added, reasoning), adminUserId, MODEL_TEST),
-      reasoning,
-    })));
-  }
-
-  // Send the model `config` describes one prompt through the gateway, as `test` says to and on
-  // behalf of the admin `adminUserId`, and report what happened.
-  async #runTest(gateway: AiGatewayConfig, config: AiModelConfig, adminUserId: string,
-                 test: GatewayTest): Promise<GatewayModelTest> {
-    let model = config.model;
-    let signal = AbortSignal.timeout(test.timeoutMs);
-    let startedAt = Date.now();
-    let failure: { status?: number, message: string } | undefined;
-    try {
-      let handle = getModel(this.env, config,
-          { type: "user", id: adminUserId, name: adminUserId });
-      await completeText(handle, {
-        prompt: "Reply with OK.", maxTokens: Math.min(test.maxTokens, handle.model.maxTokens),
-        thinking: test.thinking, signal,
-        // Agent turns let the provider cache their prompts, so a model that rejects the cache
-        // fields fails here rather than in the first turn.
-        cache: true,
-        // The request is the same every time, which a gateway that caches responses would
-        // answer without asking the provider.
-        headers: { "cf-aig-skip-cache": "true" },
-      });
-    } catch (error) {
-      // The signal is this call's own, so nothing but the timeout aborts it.
-      let message = signal.aborted
-          ? `The model did not answer within ${test.timeoutMs / 1000} seconds.`
-          : error instanceof Error ? error.message : String(error);
-      let status = error instanceof AgentTurnError ? error.statusCode : undefined;
-      failure = {
-        ...(status !== undefined && { status }),
-        message: testFailureMessage(message, gateway.apiToken),
-      };
-    }
-    // The failure message stays out of the log: a provider words it.
-    logger.info(test.logged, {
-      event: test.event, modelId: model, outcome: failure ? "error" : "ok",
-      statusCode: failure?.status, durationMs: Date.now() - startedAt,
-    });
-    return failure ? { model, ok: false, ...failure } : { model, ok: true };
+    return runLevelTests(this.env, gateway, reasoning => gatewayRunConfig(added, reasoning),
+        levels, adminUserId, MODEL_TEST);
   }
 
   /** Set whether users may add models of their own to the ones the gateway provides. */

@@ -1,11 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import type { AiModelConfig } from "@gadgets/workshop-shared/api";
+import type { AiModelConfig, RedactedAiModelConfig } from "@gadgets/workshop-shared/api";
 import { serializeAdminConfig } from "../src/admin-config.js";
+import { AiGatewayConfig, GatewayModels } from "../src/ai-gateway.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
 import type { UserAiModelRecord } from "../src/storage-schema/user-storage.js";
 import type { UserDurableObject } from "../src/user.js";
+import { describeUserModel, testUserModel } from "../src/user-models.js";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -112,22 +114,46 @@ describe("UserDurableObject model editing", () => {
     expect(await stored(PROFILE.id)).toEqual({ profile: PROFILE, config: CONFIG });
   });
 
-  // The validated RPC boundary lets through properties the argument's type omits.
-  it("stores none of the fields that only a deployment sets on its own models", async () => {
+  // The validated RPC boundary lets through properties the argument's type omits, and checks
+  // the shape of the ones it has only there.
+  it("keeps a model's own settings, and stores no model for it to behave like", async () => {
     const { user, stored } = await userWithModel();
-    const smuggled = {
-      reasoning: "max", compactionInputBudget: 5, behavesLike: "gpt-6-sol",
-      capabilities: { imageInput: true, reasoningLevels: ["high"] },
+    const settings = { reasoning: "max" as const, compactionInputBudget: 5 };
+    const sent = {
+      ...settings, behavesLike: "gpt-6-sol",
+      capabilities: { imageInput: "yes", reasoningLevels: ["high", "low", "high"] },
     };
+    const kept = { ...settings, capabilities: { reasoningLevels: ["low", "high"] } };
     const other = { type: "agent" as const, id: "other", name: "Other" };
-    await user.addModel(other, { ...CONFIG, model: "other", ...smuggled } as typeof CONFIG);
+    await user.addModel(other, { ...CONFIG, model: "other", ...sent } as typeof CONFIG);
     expect(await stored("other")).toStrictEqual(
-        { profile: other, config: { ...CONFIG, model: "other" } });
+        { profile: other, config: { ...CONFIG, model: "other", ...kept } });
 
-    await user.updateModel(PROFILE, { ...CONFIG, contextWindow: 200000, ...smuggled } as
+    await user.updateModel(PROFILE, { ...CONFIG, contextWindow: 200000, ...sent } as
         typeof CONFIG);
     expect(await stored(PROFILE.id)).toStrictEqual(
-        { profile: PROFILE, config: { ...CONFIG, contextWindow: 200000 } });
+        { profile: PROFILE, config: { ...CONFIG, contextWindow: 200000, ...kept } });
+    expect((await user.getModelConfig(PROFILE.id)).config).toMatchObject(kept);
+  });
+
+  it("refuses a compaction budget beyond the room the window leaves, or not a whole number",
+      async () => {
+    const { user, stored } = await userWithModel();
+    // 800 tokens are left for a prompt.
+    const limits = { ...CONFIG, contextWindow: 1000, outputLimit: 200 };
+    const refused = "The compaction budget must be a whole number of tokens from 1 to 800.";
+    for (let compactionInputBudget of [801, 1.5, 0, -1]) {
+      await expect(user.updateModel(PROFILE, { ...limits, compactionInputBudget }))
+          .rejects.toThrow(new Error(refused));
+    }
+    expect(await stored(PROFILE.id)).toEqual({ profile: PROFILE, config: CONFIG });
+    await expect(user.addModel({ ...PROFILE, id: "full" },
+        { ...limits, outputLimit: 1000, compactionInputBudget: 1 }))
+        .rejects.toThrow("leaves no room");
+
+    await user.updateModel(PROFILE, { ...limits, compactionInputBudget: 800 });
+    expect(await stored(PROFILE.id))
+        .toEqual({ profile: PROFILE, config: { ...limits, compactionInputBudget: 800 } });
   });
 
   it("requires every secret when adding without a source", async () => {
@@ -222,12 +248,47 @@ describe("UserDurableObject gateway model modes", () => {
     expect(context.aiModel?.profile.id).toBe(first.id);
   }));
 
-  it("gives a model the user added none of the deployment's default reasoning level",
+  it("refuses a built-in model's ID, suggesting another", () => inGatewayUser(async user => {
+    await expect(user.addModel({ ...PROFILE, id: ENABLED_ID },
+        { ...CONFIG, provider: "anthropic", model: ENABLED_ID }))
+        .rejects.toThrow(new Error(`A model with ID "${ENABLED_ID}" already exists: choose ` +
+            "another ID for your own version."));
+  }));
+
+  it("keeps the user's own version of a built-in model under its own ID",
+      () => inGatewayUser(async user => {
+    const variant = { type: "agent" as const, id: "opus-1m", name: "Opus 1M" };
+    const config: AiModelConfig = {
+      provider: "anthropic", model: ENABLED_ID, apiToken: "",
+      reasoning: "high", compactionInputBudget: 900000,
+    };
+    await user.addModel(variant, config);
+    const listed = await listedIds(user);
+    expect(listed).toContain(ENABLED_ID);
+    expect(listed.at(-1)).toBe(variant.id);
+
+    expect((await user.getChatContext(variant.id)).aiModel)
+        .toStrictEqual({ profile: variant, config });
+    const builtIn = (await user.getChatContext(ENABLED_ID)).aiModel!;
+    expect(builtIn.profile.name).toBe("Claude Opus 5.5");
+    expect(builtIn.config.compactionInputBudget).toBeUndefined();
+    expect(builtIn.config.reasoning).toBeUndefined();
+  }));
+
+  it("gives a model the user added the deployment's default reasoning level unless it sets its own",
       () => inGatewayUser(async user => {
     expect((await user.getChatContext(ENABLED_ID)).aiModel?.config.reasoning).toBe("high");
     const own = { ...CONFIG, provider: "anthropic" as const, model: "claude-mine" };
     await user.addModel(PROFILE, own);
-    expect((await user.getChatContext(PROFILE.id)).aiModel?.config).toStrictEqual(own);
+    expect((await user.getChatContext(PROFILE.id)).aiModel?.config)
+        .toStrictEqual({ ...own, reasoning: "high" });
+    // The default is applied as the model runs, not stored with it.
+    expect(storedModel(user, PROFILE.id)).toStrictEqual({ profile: PROFILE, config: own });
+    expect((await user.getModelConfig(PROFILE.id)).config.reasoning).toBeUndefined();
+
+    const low = { ...PROFILE, id: "low" };
+    await user.addModel(low, { ...own, reasoning: "low" });
+    expect((await user.getChatContext(low.id)).aiModel?.config.reasoning).toBe("low");
   }, { defaultReasoning: "high" }));
 
   describe("providers", () => {
@@ -455,4 +516,158 @@ describe("UserDurableObject gateway model modes", () => {
     expect(languageIds).toContain("@cf/zai-org/glm-5.2");
     expect(languageIds.filter(id => decisionIds.includes(id))).toEqual([]);
   }, { addedProviders: ["cloudflare"] }));
+});
+
+describe("describing and testing a model a user describes", () => {
+  const OPUS = "claude-opus-5-5";
+  const GATEWAY_VARS = {
+    CF_AI_GATEWAY: "platform-gateway",
+    CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+    CF_AI_GATEWAY_API_TOKEN: "gateway-token",
+    CF_AI_GATEWAY_PROVIDERS: "anthropic",
+  };
+  const NOT_GATEWAY = "This deployment does not provide models through AI Gateway.";
+  const VARIANT: RedactedAiModelConfig = {
+    provider: "anthropic", model: OPUS, apiToken: null, compactionInputBudget: 900000,
+  };
+
+  // "OK", as Anthropic's API streams it.
+  const answered = () => new Response([
+    { type: "message_start", message: {
+      id: "message", type: "message", role: "assistant", model: "claude", content: [],
+      stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 },
+    } },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "OK" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 1 } },
+    { type: "message_stop" },
+  ].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+      { headers: { "content-type": "text/event-stream" } });
+
+  /**
+   * A gateway deployment with the admin config `config`, whose Workers AI binding answers each
+   * request with `respond` and records the effort it asked for. `vars` adds to its environment.
+   */
+  function deployment(config: Partial<AdminConfig> = {}, vars: object = {},
+                      respond: (request: Request) => Response = answered) {
+    // What each request asked for, as JSON: the kind of thinking and the effort.
+    const efforts: string[] = [];
+    const fetch = vi.fn(async (input: Request | string | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const body = await request.clone().json() as {
+        messages?: { output_config?: { effort: string } }[], output_config?: { effort: string },
+        thinking?: { type: string },
+      };
+      efforts.push(JSON.stringify({
+        thinking: body.thinking?.type,
+        effort: body.messages?.at(-1)?.output_config?.effort ?? body.output_config?.effort,
+      }));
+      return respond(request);
+    });
+    const gatewayEnv =
+        { ...env, ...GATEWAY_VARS, WORKERS_AI: { fetch }, ...vars } as unknown as Cloudflare.Env;
+    const models = new GatewayModels(
+        new AiGatewayConfig(gatewayEnv), { ...DEFAULT_ADMIN_CONFIG, ...config });
+    const user = env.TEST_USER.getByName(`user-models-${++userCounter}`);
+    const test = async (described: RedactedAiModelConfig) => {
+      const logged = vi.spyOn(console, "info").mockImplementation(() => {});
+      try {
+        const result = await testUserModel(gatewayEnv, models, described, "user@example.com", user);
+        const entries = logged.mock.calls.map(([entry]) => entry as Record<string, unknown>)
+            .filter(entry => entry?.event === "user.model.test");
+        return { result, entries };
+      } finally {
+        logged.mockRestore();
+      }
+    };
+    return { models, fetch, efforts, test };
+  }
+
+  it("describes a model by its upstream ID, whatever budget and level it sets", () => {
+    const { models } = deployment();
+    const described = describeUserModel(models, { ...VARIANT, reasoning: "low" });
+    expect(described).toStrictEqual(describeUserModel(models,
+        { provider: "anthropic", model: OPUS, apiToken: "" }));
+    expect(described).toMatchObject({
+      builtInCompactionInputBudget: expect.any(Number), maxCompactionInputBudget: 1000000,
+      runtimeKnown: true,
+    });
+    expect(described.reasoningLevels).toContain("high");
+    // A model the runtime does not know takes the levels stated for it.
+    expect(describeUserModel(models, {
+      provider: "anthropic", model: "claude-unknown", apiToken: "",
+      capabilities: { reasoningLevels: ["off", "high"] },
+    })).toMatchObject({ runtimeKnown: false, reasoningLevels: ["off", "high"] });
+  });
+
+  it("refuses to describe or test outside AI Gateway mode, or a model adding would refuse",
+      async () => {
+    const { models, test, fetch } = deployment();
+    const user = env.TEST_USER.getByName(`user-models-${++userCounter}`);
+    expect(() => describeUserModel(null, VARIANT)).toThrow(new Error(NOT_GATEWAY));
+    await expect(testUserModel(env, null, VARIANT, "user@example.com", user))
+        .rejects.toThrow(new Error(NOT_GATEWAY));
+
+    const tooLarge = { ...VARIANT, compactionInputBudget: 1000001 };
+    expect(() => describeUserModel(models, tooLarge)).toThrow("from 1 to 1000000");
+    await expect(test(tooLarge)).rejects.toThrow("from 1 to 1000000");
+    const openai = { ...VARIANT, provider: "openai" as const, model: "gpt-6-sol" };
+    expect(() => describeUserModel(models, openai)).toThrow(providerUnavailable("openai"));
+    await expect(test(openai)).rejects.toThrow(providerUnavailable("openai"));
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses to test once users may not add their own models", async () => {
+    const { test, fetch } = deployment({ userModelsEnabled: false });
+    await expect(test(VARIANT)).rejects.toThrow(
+        "Adding your own models is disabled on this deployment by an administrator.");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("tests a model as its chats would ask it, then at each of its levels, as the user",
+      async () => {
+    const { test, models, fetch, efforts } = deployment({ defaultReasoning: "low" });
+    const { reasoningLevels } = describeUserModel(models, VARIANT);
+    const { result, entries } = await test(VARIANT);
+    expect(result).toStrictEqual([null, ...reasoningLevels].map(
+        reasoning => ({ model: OPUS, ok: true, reasoning })));
+    expect(fetch).toHaveBeenCalledTimes(reasoningLevels.length + 1);
+    // With no level of its own, the model is asked for the deployment's default, as it would be
+    // had it set that level itself.
+    const own = deployment();
+    await own.test({ ...VARIANT, reasoning: "low" });
+    expect(efforts.toSorted()).toEqual(own.efforts.toSorted());
+    const builtIn = deployment();
+    await builtIn.test(VARIANT);
+    expect(efforts.toSorted()).not.toEqual(builtIn.efforts.toSorted());
+    const [input, init] = fetch.mock.calls[0]!;
+    expect(JSON.parse(new Request(input, init).headers.get("cf-aig-metadata")!))
+        .toStrictEqual({ user: "user@example.com" });
+    expect(entries).toHaveLength(reasoningLevels.length + 1);
+    expect(entries[0]).toEqual({
+      component: "workshop.user.models", event: "user.model.test",
+      message: "tested a model a user described", modelId: OPUS, outcome: "ok",
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it("counts a test against the user's usage, and refuses one the usage does not allow",
+      async () => {
+    const { test, fetch } = deployment({}, {
+      ENABLE_CLOUDFLARE_LIMITS: "true", DAILY_LLM_CALL_LIMIT: "1",
+    });
+    await test(VARIANT);
+    const sent = fetch.mock.calls.length;
+    await expect(test(VARIANT)).rejects.toThrow(
+        "Free usage limit reached. Connect your Cloudflare account to continue.");
+    expect(fetch).toHaveBeenCalledTimes(sent);
+  });
+
+  it("reports a request that fails as the result of its level", async () => {
+    const { test } = deployment({}, {}, () => new Response("Overloaded", { status: 529 }));
+    const { result } = await test({ ...VARIANT, capabilities: { reasoningLevels: ["high"] } });
+    expect(result[0]).toMatchObject({ model: OPUS, ok: false, reasoning: null });
+  });
 });

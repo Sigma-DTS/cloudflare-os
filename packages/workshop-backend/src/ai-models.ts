@@ -29,8 +29,9 @@ import { DecisionAnswer, DecisionModelBinding, DecisionRequest } from "./decisio
 import DECISION_MODEL_BINDING_TYPES from "./decision-model-binding.txt";
 import {
   AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, GatewayModelCapabilities,
-  REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
+  ModelDescription, REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
 } from "@gadgets/workshop-shared/api";
+import { compactionBudgetRange } from "./agent-compaction.js";
 import { traceChat } from "./agent-tracing.js";
 import {
   AiGatewayConfig, getAiGatewayConfig, getGatewayModels, type AiGatewayLogRoute,
@@ -387,6 +388,23 @@ export function gatewayBuiltInReasoning(
   let model = gatewayNativeModel(
       { provider, model: modelId, apiToken: "", behavesLike, capabilities }, "");
   return model ? builtInReasoning(model) : null;
+}
+
+/**
+ * What a UI needs in order to offer the reasoning and compaction settings of the gateway model
+ * `config` describes, whether an admin's or a user's. The reasoning level and compaction budget
+ * set in `config` change none of it.
+ */
+export function describeGatewayModel(config: AiModelConfig): ModelDescription {
+  let { provider, model, behavesLike, capabilities } = config;
+  let budget = compactionBudgetRange(config);
+  return {
+    reasoningLevels: gatewayReasoningLevels(provider, model, behavesLike, capabilities),
+    builtInReasoning: gatewayBuiltInReasoning(provider, model, behavesLike, capabilities),
+    builtInCompactionInputBudget: budget.builtIn,
+    maxCompactionInputBudget: budget.max,
+    runtimeKnown: isRuntimeModel(provider, model),
+  };
 }
 
 // The per-API options that ask `model` for a reasoning level on a request whose response cap is
