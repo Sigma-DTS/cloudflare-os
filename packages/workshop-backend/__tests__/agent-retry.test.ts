@@ -222,4 +222,33 @@ describe("transient model failures", () => {
           "Capture it again with executeCode if needed.]",
     });
   }));
+
+  it("reserves provider image slots for non-executeCode content",
+      () => withImpl(async impl => {
+    seedChat(impl);
+    impl.executeCodeMode = async () => ({
+      output: "captured screenshots",
+      images: Array.from({length: 4}, () => ({
+        data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+        mimeType: "image/png" as const,
+      })),
+    });
+
+    let toolSteps = Array.from({length: 13}, (_, index) =>
+      fauxAssistantMessage(fauxToolCall("executeCode", {code: `capture${index}()`}),
+          {stopReason: "toolUse"}));
+    let {contexts} = await runScriptedTurn(impl, [
+      ...toolSteps,
+      fauxAssistantMessage(fauxText("Done.")),
+    ]);
+
+    expect(toolResultImages(contexts[12])).toHaveLength(48);
+    expect(toolResultImages(contexts[13])).toHaveLength(48);
+    let oldestResult = contexts[13].messages.find(message => message.role === "toolResult");
+    expect(oldestResult?.content).toContainEqual({
+      type: "text",
+      text: "[Earlier image output omitted to keep this model request within its size limit. " +
+          "Capture it again with executeCode if needed.]",
+    });
+  }));
 });
