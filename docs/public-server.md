@@ -80,6 +80,8 @@ apply to language models.
 Disabling a model or turning a provider off is not a spend control while **Users may add their
 own models** is on: a user can still add a model under any provider that is on, and it runs
 through the deployment's Gateway. Turn that switch off to make the listed models the only ones.
+A user can also add their own version of a model under another ID, with its own context window,
+compaction budget and reasoning level, and one that sets no level takes the deployment's default.
 An admin session can turn on any provider the Gateway serves.
 
 The **Web Search** gatekeeper (`packages/gatekeeper-websearch`) spends money outside these
