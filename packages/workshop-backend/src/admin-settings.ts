@@ -8,10 +8,10 @@ import { sanitizeBlueprintOutput } from './blueprint-archive.js';
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
 import { MAX_AGENT_HINT, defaultOutputFormatId, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration } from './storage-schema/admin-settings-storage.js';
-import { getModelTokenLimits } from './agent-compaction.js';
+import { compactionBudgetRange, getModelTokenLimits } from './agent-compaction.js';
 import { AiGatewayConfig, GatewayModels, assertGatewayProvider, gatewayModelConfig, gatewayRunConfig, getAiGatewayConfig, isCatalogModel } from './ai-gateway.js';
 import { AgentTurnError, completeText } from './ai-invoke.js';
-import { gatewayBuiltInReasoning, gatewayReasoningLevels, getModel, isRuntimeModel } from './ai-models.js';
+import { describeGatewayModel, gatewayReasoningLevels, getModel, isRuntimeModel } from './ai-models.js';
 import { SITE_LOGO_R2_KEY, siteLogoImage, validateSiteLogo } from './site-logo.js';
 import { ambientGatekeeperMode, DEFAULT_AMBIENT_GATEKEEPER_MODE } from './provisioning-policy.js';
 import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
@@ -26,17 +26,6 @@ const logger = createWorkshopLogger("workshop.admin.settings");
 // assigning into a copy would lose the entry of a model whose ID is "__proto__".
 function entriesWithout<T>(record: Record<string, T>, modelId: string): [string, T][] {
   return Object.entries(record).filter(([id]) => id !== modelId);
-}
-
-// The compaction budget a gateway model has while its settings give none, and the largest one
-// they may give it: the room its window leaves for a prompt.
-function compactionBudgetRange(model: AdminModel): { builtIn: number, max: number } {
-  let config = gatewayModelConfig(model);
-  return {
-    builtIn: getModelTokenLimits(config).inputBudget,
-    // A budget is capped at that room, so an unbounded one reads it back.
-    max: getModelTokenLimits({ ...config, compactionInputBudget: Infinity }).inputBudget,
-  };
 }
 
 // The model that `model`, a description of one, becomes once added: enabled, with nothing set
@@ -463,21 +452,12 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       return {
         providers: models.addableProviders,
         providerSettings: models.providerSettings,
-        models: models.all.map(model => {
-          let budget = compactionBudgetRange(model);
-          return {
-            ...model,
-            reasoningLevels: gatewayReasoningLevels(
-                model.provider, model.id, model.behavesLike, model.capabilities),
-            builtInReasoning: gatewayBuiltInReasoning(
-                model.provider, model.id, model.behavesLike, model.capabilities),
-            builtInCompactionInputBudget: budget.builtIn,
-            maxCompactionInputBudget: budget.max,
-            runtimeKnown: isRuntimeModel(model.provider, model.id),
-            ...(model.behavesLike !== undefined &&
-                { behavesLikeKnown: isRuntimeModel(model.provider, model.behavesLike) }),
-          };
-        }),
+        models: models.all.map(model => ({
+          ...model,
+          ...describeGatewayModel(gatewayRunConfig(model, null)),
+          ...(model.behavesLike !== undefined &&
+              { behavesLikeKnown: isRuntimeModel(model.provider, model.behavesLike) }),
+        })),
         defaultReasoning: config.defaultReasoning,
         userModelsEnabled: models.userModels,
         modelsDevSuggestions: config.modelsDevSuggestions,
@@ -517,7 +497,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       if (!model) throw new Error(`No such model: ${modelId}`);
       let budget = settings.compactionInputBudget;
       if (budget !== undefined) {
-        let { max } = compactionBudgetRange(model);
+        let { max } = compactionBudgetRange(gatewayModelConfig(model));
         if (max <= 0) {
           throw new Error(`The "${model.name}" model's context window leaves no room for a ` +
               "compaction budget.");

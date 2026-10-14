@@ -1682,18 +1682,21 @@ export type AdminModel = GatewayModel & {
   settings?: GatewayModelSettings;
 };
 
-/** An AdminModel with what the admin UI needs in order to offer its settings. */
-export type AdminModelView = AdminModel & {
+/**
+ * What a UI needs in order to offer the reasoning and compaction settings of a model run through
+ * AI Gateway (see AdminModelView).
+ */
+export type ModelDescription = {
   /** The reasoning levels the model can be sent, least to most. Empty when it takes none. */
   reasoningLevels: ReasoningLevel[];
 
   /**
-   * What the model is asked for while neither its settings nor the deployment's default give it
-   * a reasoning level.
+   * What the model is asked for while neither its own settings nor the deployment's default give
+   * it a reasoning level.
    */
   builtInReasoning: BuiltInReasoning;
 
-  /** The compaction budget the model has while GatewayModelSettings sets none. */
+  /** The compaction budget the model has while none is set for it. */
   builtInCompactionInputBudget: number;
 
   /**
@@ -1707,7 +1710,10 @@ export type AdminModelView = AdminModel & {
    * entry is used, and neither `behavesLike` nor `capabilities` is.
    */
   runtimeKnown: boolean;
+};
 
+/** An AdminModel with what the admin UI needs in order to offer its settings. */
+export type AdminModelView = AdminModel & ModelDescription & {
   /**
    * For a model with a `behavesLike`, whether the model runtime knows the model it names. When
    * it does not, there is nothing to borrow, and the model runs as one the runtime does not know

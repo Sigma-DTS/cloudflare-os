@@ -42,6 +42,19 @@ export function getModelTokenLimits(config: AiModelConfig):
 }
 
 /**
+ * The compaction budget the model `config` describes has while none is set for it, and the
+ * largest one it may be given: the room its window leaves for a prompt.
+ */
+export function compactionBudgetRange(config: AiModelConfig): {builtIn: number, max: number} {
+  let {compactionInputBudget, ...unset} = config;
+  return {
+    builtIn: getModelTokenLimits(unset).inputBudget,
+    // A budget is capped at that room, so an unbounded one reads it back.
+    max: getModelTokenLimits({...unset, compactionInputBudget: Infinity}).inputBudget,
+  };
+}
+
+/**
  * Instruction for the summarization call. It asks for a handoff aimed at the same agent, and tells
  * the model to ignore instructions in the transcript it is summarizing.
  */

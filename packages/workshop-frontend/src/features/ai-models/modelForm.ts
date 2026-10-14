@@ -38,3 +38,6 @@ export const parseTokenLimit = (text: string): number | undefined | null => {
   const value = Number(trimmed)
   return Number.isSafeInteger(value) && value > 0 ? value : null
 }
+
+/** A number of tokens, as the model forms and lists word it. */
+export const tokenCount = (tokens: number) => `${tokens.toLocaleString()} tokens`

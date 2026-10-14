@@ -1,6 +1,6 @@
 import { useId, useRef, useState, type FormEvent } from 'react'
-import { Badge, Button, Collapsible, Input, Radio, Select } from '@cloudflare/kumo'
-import { COMPACTION_TRIGGER_RATIO, GATEWAY_MODEL_MODES, modelKind } from '@gadgets/workshop-shared/api'
+import { Badge, Button, Collapsible, Input, Radio } from '@cloudflare/kumo'
+import { GATEWAY_MODEL_MODES, modelKind } from '@gadgets/workshop-shared/api'
 import type {
   AdminModelView,
   GatewayModelCapabilities,
@@ -8,13 +8,10 @@ import type {
   GatewayModelSettings,
   ReasoningLevel,
 } from '@gadgets/workshop-shared/api'
+import { CompactionBudgetHelp } from './CompactionBudgetHelp'
 import { GatewayTestButton, GatewayTestStatus } from './GatewayTest'
-import {
-  PROVIDER_LABELS,
-  REASONING_LEVEL_LABELS,
-  builtInReasoningLabel,
-  parseTokenLimit,
-} from './modelForm'
+import { PROVIDER_LABELS, REASONING_LEVEL_LABELS, parseTokenLimit, tokenCount } from './modelForm'
+import { ReasoningLevelSelect } from './ReasoningLevelSelect'
 import { useFieldErrorAlert } from './useFieldErrorAlert'
 import type { GatewayTestState } from './useGatewayTests'
 
@@ -32,14 +29,6 @@ export const MODES: Record<GatewayModelMode, { label: string; meaning: string }>
       'already use it.',
   },
 }
-
-// The reasoning select's value for a model with no level of its own.
-const DEPLOYMENT_DEFAULT = 'default'
-
-// A compaction budget under this many tokens is pointed out, since nothing refuses it.
-const SMALL_BUDGET = 100_000
-
-const tokenCount = (tokens: number) => `${tokens.toLocaleString()} tokens`
 
 // What is stated of an added model, each fact as its row words it. Empty where nothing is.
 const statedFacts = ({ imageInput, reasoningLevels }: GatewayModelCapabilities = {}): string[] => {
@@ -101,21 +90,6 @@ export const GatewayModelRow = ({
   const stated = statedFacts(model.capabilities)
   // A decision model runs no chat, so the chat-request test and the chat settings don't apply to it.
   const isDecision = modelKind(model.provider, model.id) === 'decision'
-  const ownLevel = model.settings?.reasoning
-  const levelInEffect = ownLevel ?? defaultReasoning
-  const takesLevels = model.reasoningLevels.length > 0
-  const levelNote = !takesLevels
-    ? 'This model takes no reasoning levels, so none is sent to it.'
-    : levelInEffect !== null && !model.reasoningLevels.includes(levelInEffect)
-      ? `This model has no “${REASONING_LEVEL_LABELS[levelInEffect]}” level. A request asks for ` +
-        'the nearest level it has, which is decided when the request is made.'
-      : undefined
-  // With no deployment default, the option names what the model is then asked for.
-  const deploymentDefault = `Deployment default (${
-    defaultReasoning
-      ? REASONING_LEVEL_LABELS[defaultReasoning]
-      : `built-in: ${builtInReasoningLabel(model.builtInReasoning)}`
-  })`
 
   const maxBudget = model.maxCompactionInputBudget
   const ownBudget = model.settings?.compactionInputBudget
@@ -127,7 +101,6 @@ export const GatewayModelRow = ({
       : budget !== undefined && budget > maxBudget
         ? `Enter at most ${tokenCount(maxBudget)}`
         : undefined
-  const smallBudget = typeof budget === 'number' && !budgetError && budget < SMALL_BUDGET
   // The server caps a stored budget at the maximum, which a smaller context window can lower.
   const budgetInEffect = Math.min(ownBudget ?? model.builtInCompactionInputBudget, maxBudget)
 
@@ -239,39 +212,16 @@ export const GatewayModelRow = ({
           </Collapsible.DefaultTrigger>
           <Collapsible.DefaultPanel>
             <div className="grid items-start gap-4 sm:grid-cols-2">
-              {/* A level stored for a model that takes none can still be cleared. */}
-              {takesLevels || ownLevel !== undefined ? (
-                <Select<ReasoningLevel | typeof DEPLOYMENT_DEFAULT>
-                  label="Reasoning level"
-                  aria-label={`Reasoning level for ${model.name}`}
-                  description={levelNote}
-                  className="w-full"
-                  disabled={busy}
-                  value={ownLevel ?? DEPLOYMENT_DEFAULT}
-                  onValueChange={(level, { reason }) => {
-                    // Only a pick is the admin's. The select also reports changes of its own: to
-                    // the value it started with, when its options change under a level that is
-                    // not one of them, and to an option whose first letter is typed while it is
-                    // closed.
-                    if (reason !== 'item-press') return
-                    if (!level || level === (ownLevel ?? DEPLOYMENT_DEFAULT)) return
-                    onSettingsChange(settingsWith(model, {
-                      reasoning: level === DEPLOYMENT_DEFAULT ? undefined : level,
-                    }))
-                  }}
-                  renderValue={(level) =>
-                    level === DEPLOYMENT_DEFAULT ? deploymentDefault : REASONING_LEVEL_LABELS[level]}
-                >
-                  <Select.Option value={DEPLOYMENT_DEFAULT}>{deploymentDefault}</Select.Option>
-                  {model.reasoningLevels.map((level) => (
-                    <Select.Option key={level} value={level}>
-                      {REASONING_LEVEL_LABELS[level]}
-                    </Select.Option>
-                  ))}
-                </Select>
-              ) : (
-                <p className="text-sm leading-snug text-kumo-subtle">{levelNote}</p>
-              )}
+              <ReasoningLevelSelect
+                levels={model.reasoningLevels}
+                value={model.settings?.reasoning}
+                defaultReasoning={defaultReasoning}
+                builtInReasoning={model.builtInReasoning}
+                disabled={busy}
+                ariaLabel={`Reasoning level for ${model.name}`}
+                onValueChange={(reasoning) =>
+                  onSettingsChange(settingsWith(model, { reasoning }))}
+              />
 
               {maxBudget > 0 && (
                 <form noValidate onSubmit={saveBudget} className="grid content-start gap-2">
@@ -287,21 +237,13 @@ export const GatewayModelRow = ({
                     aria-invalid={budgetError !== undefined}
                     aria-describedby={budgetFacts}
                   />
-                  {/* The warning is part of the description, and not a live region that would
-                      speak while the budget is being typed. */}
-                  <div id={budgetFacts} className="grid gap-2 text-sm leading-snug text-kumo-subtle">
-                    <p>
-                      Leave blank for the built-in budget of{' '}
-                      {tokenCount(model.builtInCompactionInputBudget)}. The maximum is{' '}
-                      {tokenCount(maxBudget)}. A chat on this model compacts at about{' '}
-                      {tokenCount(Math.round(COMPACTION_TRIGGER_RATIO * budgetInEffect))}.
-                    </p>
-                    {smallBudget && (
-                      <p className="text-kumo-warning">
-                        A budget under {tokenCount(SMALL_BUDGET)} makes a chat compact very often.
-                      </p>
-                    )}
-                  </div>
+                  <CompactionBudgetHelp
+                    id={budgetFacts}
+                    builtIn={model.builtInCompactionInputBudget}
+                    max={maxBudget}
+                    inEffect={budgetInEffect}
+                    typed={typeof budget === 'number' && !budgetError ? budget : undefined}
+                  />
                   {budgetAlert.alert}
                   <div className="flex gap-2">
                     <Button
