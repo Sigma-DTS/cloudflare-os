@@ -77,9 +77,10 @@ describe('ChatOtClient', () => {
     expect(h.client.getFiles(1)?.get('image.bin')).toEqual(value)
     expect(h.client.snapshot()(1, 'image.bin')).toEqual(value)
     expect(h.client.snapshot()(1, 'untouched')).toBeUndefined()
-    h.client.pushRow(row(0, 2, {1: [['image.bin', {editBytes: {beforeBytes: 3, sections: [1, [1], 1]}}]]}))
+    const replacement = {base: {id: 'replacement', byteLength: 2}}
+    h.client.pushRow(row(0, 2, {1: [['image.bin', {setBytes: replacement}]]}))
     await flush()
-    expect(h.client.snapshot()(1, 'image.bin')).toEqual({...value, edit: {beforeBytes: 3, sections: [1, [1], 1]}})
+    expect(h.client.snapshot()(1, 'image.bin')).toEqual(replacement)
     expect(h.fetches).toEqual([])
     expect(h.fatal).toBeNull()
     h.client.pushRow(row(0, 3, {1: [['image.bin', {remove: true}]]}))

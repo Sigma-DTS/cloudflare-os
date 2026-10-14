@@ -8,13 +8,14 @@ import type { ByteValue } from "@gadgets/workshop-shared/byte-change";
 import { replicaContentHash } from "../src/workspace-replica";
 
 declare module "cloudflare:workers" { interface ProvidedEnv {TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;} }
-it("streams binary publication over native RPC, deduplicates ACK loss and races a DO splice with deletion", async () => {
+it("streams binary publication over native RPC, deduplicates ACK loss and races a DO replacement with deletion", async () => {
   await runInDurableObject(env.TEST_OVERSEER.getByName(crypto.randomUUID()), async instance => {
     const impl = instance["impl"];
     impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"worktreeReplica":true}}';
     try {
       impl.storage.chatMeta.put({id: 1, title: "Binary", started: Date.now(), lastActive: Date.now()});
-      const commit = await impl.gitStore.writeFilesAsCommit(new Map(), {parents: [], author: {name: "Test", email: "test@example.com"}, message: "Base", timestamp: new Date(0)});
+      const seed = Uint8Array.of(0, 255), seedRef = await impl.byteStore.import("kernel", seed);
+      const commit = await impl.gitStore.writeFilesAsCommit(new Map([["seed.bin", {base: seedRef}]]), {parents: [], author: {name: "Test", email: "test@example.com"}, message: "Base", timestamp: new Date(0)});
       const exports = impl.ctx.exports as typeof impl.ctx.exports & {
         IntegrationTestActionGatekeeper(options: {props: Record<string, never>}): DurableObjectClass<IntegrationTestActionGatekeeper>;
       };
@@ -34,15 +35,33 @@ it("streams binary publication over native RPC, deduplicates ACK loss and races 
         files: [{checkoutId: tree.id, path: "image.bin", baseHash: null, change: {setBytes: {base: ref}}}]};
       const receipt = await replica.submitBatch(batch);
       expect(await replica.submitBatch(batch)).toEqual(receipt);
+      const anchor = await replica.readByteAnchor(tree.id, "seed.bin", receipt.committedAt);
+      await replica.beginUpload("same-base", {byteLength: seed.length, sha256: createHash("sha256").update(seed).digest("hex")});
+      await replica.writeUpload("same-base", 0, new Response(seed).body!);
+      const duplicate = await replica.finishUpload("same-base");
+      // An unrelated commit and verified base adoption must not change a captured anchor.
+      await impl.gitStore.writeFilesAsCommit(new Map([["copy.bin", {base: duplicate}]]), {
+        parents: [], author: {name: "Test", email: "test@example.com"}, message: "Same bytes", timestamp: new Date(0),
+      });
+      await replica.adoptByteBase(tree.id, "seed.bin", duplicate);
+      expect(await replica.readByteAnchor(tree.id, "seed.bin", receipt.committedAt)).toEqual(anchor);
+      const deletedBase = await replica.submitBatch({batchId: "delete-base", baseCursor: receipt.committedAt, files: [
+        {checkoutId: tree.id, path: "seed.bin", baseHash: anchor.version, change: {remove: true}},
+      ]});
+      expect(await replica.readByteAnchor(tree.id, "seed.bin", deletedBase.committedAt)).toEqual({value: null, version: null});
+      const recreated = await replica.submitBatch({batchId: "recreate-base", baseCursor: deletedBase.committedAt, files: [
+        {checkoutId: tree.id, path: "seed.bin", baseHash: null, change: {setBytes: {base: duplicate}}},
+      ]});
+      expect(recreated.accepted[0].bytes).toEqual({base: duplicate});
       expect(new Uint8Array(await new Response(await replica.readBytes(ref)).arrayBuffer())).toEqual(data);
       await expect((async () => {await replica.readBytes({id: "not-granted", byteLength: 1});})()).rejects.toThrow(/outside/);
       const canonical = (await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(tree.id)!.get("image.bin") as ByteValue;
-      const insert = await impl.byteStore.import("kernel", Uint8Array.of(0, 255));
-      const change = {editBytes: {beforeBytes: data.length, sections: [1, [1, {source: insert, offset: 0, length: 2}], data.length - 2] as [number, [number, {source: typeof insert; offset: number; length: number}], number]}};
+      const replacement = await impl.byteStore.import("kernel", Uint8Array.of(0, 255));
+      const change = {setBytes: {base: replacement}};
       await impl.commitAgentStep(1, {type: "agent", id: "test", name: "Test"}, [], {
         changes: [{change: {[tree.id]: [["image.bin", change]]}}], createdGadgets: [], createdWorktrees: [], addedBindings: [], worktreeCommits: [], blueprintMerges: [],
       });
-      // Container deletion races the canonical splice: assignment/removal supersedes edits.
+      // Container deletion races the DO replacement: the later server-ordered assignment wins.
       const removed = await replica.submitBatch({batchId: "binary-remove", baseCursor: receipt.committedAt,
         files: [{checkoutId: tree.id, path: "image.bin", baseHash: await replicaContentHash(canonical), change: {remove: true}}]});
       expect(removed.accepted[0].hash).toBeNull();

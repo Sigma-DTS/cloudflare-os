@@ -98,11 +98,6 @@ function makeTurn(impl: any, chatId: number) {
       content.set(id, files);
       return text;
     },
-    seedBytes: (id, path, value) => {
-      if (!content.get(id)?.has(path) && !removed.get(id)?.has(path)) {
-        content.set(id, new Map(content.get(id)).set(path, value));
-      }
-    },
     appendChange: (id, path, change) => {
       let one: CodeChange = { [id]: [[path, change]] };
       let updated: CodeContent = applyCodeChange(new Map([[id, content.get(id) ?? new Map()]]), one);
@@ -193,7 +188,34 @@ function makeLocalHarness(
 }
 
 describe("listFiles", () => {
-  it("stages, splices, commits and deletes bytes through the DO worktree API", () => withImpl(async impl => {
+  it("keeps raw reads observational and preserves text reads, edits and commits", () => withImpl(async impl => {
+    addChat(impl, 1);
+    const text = "\ufeffhello😀\n";
+    const base = await commitFiles(impl, {"a.txt": text});
+    const {session, turn, id} = await createWorktreeSession(impl, 1, base);
+    expect(await new Response(await session.readBytes("a.txt")).bytes()).toEqual(new TextEncoder().encode(text));
+    expect(turn.access.getOverlayFiles(id).has("a.txt")).toBe(false);
+    expect(await session.readFile("a.txt")).toBe(text);
+    expect(await impl.gitStore.readCommitFiles(base)).toEqual(new Map([["a.txt", text]]));
+    await session.writeFile("a.txt", text + "edited\n");
+    const commit = await session.commit("text after raw read");
+    await turn.barrier();
+    expect(await impl.gitStore.readCommitFiles(commit)).toEqual(new Map([["a.txt", text + "edited\n"]]));
+  }));
+
+  it("gives concurrent byte imports the same immutable Git identity and separate read grants", () => withImpl(async impl => {
+    const commit = await commitFiles(impl, {"a.txt": "same text\n"});
+    const [a, b] = await Promise.all([
+      impl.readByteFileAtCommit(commit, "a.txt", "reader-a"),
+      impl.readByteFileAtCommit(commit, "a.txt", "reader-b"),
+    ]);
+    expect(a).toEqual(b);
+    expect(impl.byteStore.isFinishedFor("reader-a", a.base)).toBe(true);
+    expect(impl.byteStore.isFinishedFor("reader-b", a.base)).toBe(true);
+    expect(await impl.gitStore.readCommitFiles(commit)).toEqual(new Map([["a.txt", "same text\n"]]));
+  }));
+
+  it("stages, replaces, commits and deletes bytes through the DO worktree API", () => withImpl(async impl => {
     addChat(impl, 1);
     const base = await commitFiles(impl, {});
     const {session, turn, id} = await createWorktreeSession(impl, 1, base);
@@ -205,10 +227,10 @@ describe("listFiles", () => {
     };
     const original = await stage("original", Uint8Array.of(0, 255, 3, 4));
     await session.writeBytes("image.bin", {base: original});
-    const inserted = await stage("insert", Uint8Array.of(5, 0));
-    await session.editBytes("image.bin", {beforeBytes: 4, sections: [1, [1, {source: inserted, offset: 0, length: 2}], 2]});
+    const replacement = await stage("replacement", Uint8Array.of(0, 5, 0, 3, 4));
+    await session.writeBytes("image.bin", {base: replacement});
     expect(new Uint8Array(await new Response(await session.readBytes("image.bin")).arrayBuffer())).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
-    const commit = await session.commit("binary splice");
+    const commit = await session.commit("binary replacement");
     await turn.barrier();
     expect(impl.getWorktreeRecord(id).headCommit).toBe(commit);
     const value = await impl.readByteFileAtCommit(commit, "image.bin");

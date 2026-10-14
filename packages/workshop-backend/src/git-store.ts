@@ -61,6 +61,7 @@ import type { Collection } from "@gadgets/typed-storage";
 import type { AiChatAuthorInfo, CommitIdentity, CommitInfo } from "@gadgets/workshop-shared/api";
 import type { GitObjectRecord, GitByteBlobRecord } from "./storage-schema/overseer-storage";
 import type { ByteStore } from "./byte-store";
+import { decodeBlobText, MAX_GIT_OBJECT_SIZE } from "./git-cache";
 import { createHash } from "node:crypto";
 import type { FileContent } from "@gadgets/workshop-shared/code-change";
 import {
@@ -467,7 +468,8 @@ export class GitStore {
       const hash = createHash("sha1").update(`blob ${bytes.byteLength}\0`);
       for await (const chunk of this.byteStore.read(bytes)) hash.update(chunk);
       const oid = hash.digest("hex");
-      this.byteBlobs.put({oid, bytes});
+      // Immutable Git anchors hash this reference metadata; identical uploads cannot replace it.
+      if (!this.byteBlobs.get(oid)) this.byteBlobs.put({oid, bytes});
       return oid;
     }
     try {
@@ -490,10 +492,11 @@ export class GitStore {
       if (entry.type === "tree") {
         await this.#collectTreeFiles(entry.oid, `${path}/`, out);
       } else if (entry.type === "blob" && (entry.mode === "100644" || entry.mode === "100755")) {
-        if (this.byteBlobs?.get(entry.oid)) throw new Error(`Binary file requires the worktree byte API: ${path}`);
-        let { blob } = await readBlob({ fs: this.#fs, gitdir: GITDIR, oid: entry.oid, cache: this.#cache });
-        if (blob.includes(0)) throw new Error(`Binary file requires the worktree byte API: ${path}`);
-        out.set(path, new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(blob));
+        const stored = this.byteBlobs?.get(entry.oid);
+        const blob = stored
+          ? this.byteStore!.readSmall(stored.bytes, MAX_GIT_OBJECT_SIZE)
+          : (await readBlob({ fs: this.#fs, gitdir: GITDIR, oid: entry.oid, cache: this.#cache })).blob;
+        out.set(path, decodeBlobText(blob, path));
       } else {
         throw new Error(`unsupported tree entry at ${path}: mode ${entry.mode}`);
       }

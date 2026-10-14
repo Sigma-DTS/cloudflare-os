@@ -30,15 +30,12 @@ import {
 import type { CodeChange, FileChange } from "@gadgets/workshop-shared/code-change";
 import type { BytesRef } from "@gadgets/workshop-shared/byte-change";
 
-/** Immutable byte rope node; leaves refer to bounded raw chunks, branches retain subtrees. */
-export interface ByteNodeRecord {
+/** Finished whole-file payload; raw chunks are indexed by `${id}:${chunkIndex}`. */
+export interface ByteObjectRecord {
   id: string;
   byteLength: number;
-  height: number;
-  chunk?: {id: string; offset: number};
-  children?: [BytesRef, BytesRef];
 }
-/** Raw immutable bytes, never base64 in storage or transport. */
+/** Bounded raw bytes, mutable during staging and immutable after the upload finishes. */
 export interface ByteChunkRecord { id: string; data: Uint8Array; }
 /** Locally authored Git blob with streamed SHA-1 identity and chunk-backed immutable contents. */
 export interface GitByteBlobRecord { oid: string; bytes: BytesRef; }
@@ -1409,7 +1406,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       gitObjects: collection<GitObjectRecord>()({
         primaryKey: "oid",
       }),
-      byteNodes: collection<ByteNodeRecord>()({primaryKey: "id"}),
+      byteObjects: collection<ByteObjectRecord>()({primaryKey: "id"}),
       byteChunks: collection<ByteChunkRecord>()({primaryKey: "id"}),
       byteUploads: collection<ByteUploadRecord>()({primaryKey: "id"}),
       gitByteBlobs: collection<GitByteBlobRecord>()({primaryKey: "oid"}),

@@ -6,31 +6,20 @@ identity, **not** read authority. Bulk payloads never travel inside a `CodeChang
 
 ## Data and operations
 
-`BytesRef = {id, byteLength}` names immutable storage. `ByteSlice = {source, offset, length}`
-names a positive-length range of a reference. `ByteValue = {base, edit?}` represents a
-postimage without fetching it. The optional `ByteChange` uses byte coordinates:
-
-```ts
-{beforeBytes: 10, sections: [4, [2, {source: inserted, offset: 0, length: 3}], 4]}
-```
-
-This retains four bytes, deletes two, inserts three immutable bytes, then retains four.
-Every transform tiles its exact before-length. Range arithmetic, source bounds, section
-counts and the existing serialized OT budget are checked before publication.
+`BytesRef = {id, byteLength}` names an immutable whole-file payload.
+`ByteValue = {base: BytesRef}` represents that file without fetching it. Binary mutations
+are whole-file replacements only; byte diffs/splices are deferred until measurements justify
+them. The existing serialized change budget covers reference metadata, not embedded payloads.
 
 The file operations are:
 
 - `setBytes`: create/replace a file with a `ByteValue`, including an empty byte file.
-- `editBytes`: splice an existing byte postimage; absence or representation/length mismatch
-  fails. Inserts are references, not embedded bytes.
 - `remove`: the existing deletion operation, equally applicable to text and bytes.
 
-Sequential edits compose over the original base. Concurrent byte edits transform without
-reading or hashing payloads; earlier canonical inserts win insertion-order ties. The existing
-assignment/remove policy supersedes edits; later assignments supersede earlier assignments.
-Concurrent text edits and byte edits reject representation disagreement. These are mechanical
-byte merges, **not** format-aware merges of PNG, ZIP, SQLite, etc. Use replacement by default;
-only issue explicit byte splices when the writer knows the ranges and format can tolerate it.
+Sequential replacements discard the earlier assignment. Concurrent replacements/deletions
+use last-writer-wins by server order, without reading or merging payloads. A replacement or
+deletion also supersedes an opposing text edit, matching the existing assignment policy.
+Text/text edits retain the existing UTF-16 OT algebra. Binary formats are never auto-merged.
 
 ## Staging and authority
 
@@ -42,11 +31,11 @@ only issue explicit byte splices when the writer knows the ranges and format can
    gaps, inconsistent IDs or simultaneous conflicting writers are refused.
 3. `getUploadStatus(id)` recovers the durable offset/receipt after a lost response or DO reset.
 4. `finishUpload(id)` verifies exact length and SHA-256 and persists an immutable reference.
-5. Publish `writeBytes`/`editBytes` or a replica batch only after staging finishes.
+5. Publish `writeBytes` or a replica `setBytes` batch only after staging finishes.
 
 Upload IDs are scoped to a worktree or the original replica lease. Ephemeral `env.GIT`
 worktrees have separate random staging scopes. Staging does not change a visible file.
-Replica reads/inserts additionally require references granted to that lease or present in its
+Replica reads/replacements additionally require references granted to that lease or present in its
 selected checkpoint/journal. Every streamed chunk rechecks lease revocation. A reset resumes
 the original authorized upload/batch; it never borrows a new turn's authority.
 
@@ -57,14 +46,19 @@ at a consumed cursor. Guest-supplied immutable Git base bytes may be cached via
 
 ## Persistence and Git
 
-The DO stores payload chunks of at most 256 KiB separately from a persistent balanced piece
-tree. Splices share untouched chunks/subtrees. OT application and composition handle only
-metadata; streaming reads walk the tree with bounded buffers and backpressure. This is not
-a whole-file cache or base64 encoding.
+The DO stores payload blocks of at most 256 KiB, indexed by payload identity and block number.
+Partial blocks and append offsets persist during staging; only verified finished uploads become
+immutable objects. Replacements upload a new complete payload, leaving old references intact.
+Change application/composition handle only metadata; range reads stream indexed blocks with
+bounded buffers and backpressure. There is no piece tree or base64 encoding.
 
 Binary Git blobs are stored as OID-to-byte-reference mappings. Commit writes stream SHA-1
 over Git's `blob <length>\0` header and payload; tree and commit identities remain real Git
-identities. Pack export streams compression and the pack trailer. Existing small loose
+identities. A blob's first byte-reference mapping stays stable across identical uploads,
+imports and base adoption, so an unrelated commit cannot invalidate a replica anchor.
+Raw reads never seed the worktree overlay or change a text file's representation; text
+readers classify bounded payloads by their contents, not their storage format.
+Pack export streams compression and the pack trailer. Existing small loose
 objects remain readable. Text-only tools/editor views explicitly reject or skip opaque bytes;
 the code browser still lists their changed paths, without showing stale base text.
 
@@ -79,13 +73,13 @@ remains the only replica mutation commit boundary. A lost ACK reuses that receip
 re-diffs a mutable file or repeats a command. Unacknowledged guest changes can still be lost
 if the guest is destroyed before uploading, as with existing text synchronization.
 
-Unreferenced uploads, immutable chunks and piece-tree metadata currently have no collection
+Unreferenced uploads and immutable payloads currently have no collection
 or quota policy (the Git store also retains objects). Production rollout needs a shared
 retention/quota decision; do not delete references by age without tracing commits, checkpoints,
 pending batches and grants. Legacy remote object pulls still have their existing bounded
 decoder; a git-hydrated replica can seed a large binary base through verified staging instead.
 No arbitrary total-file cap is introduced for new streamed byte mutations.
 
-Coverage includes randomized OT laws, resumable/digest-verified storage, bounded reads,
-tiny metadata-only splices, real Git blob/pack identities, real DO/native RPC publication,
-DO worktree commits/deletion, binary attachments, scope/revocation checks and deletion races.
+Coverage includes replacement/deletion convergence, resumable/digest-verified storage,
+non-aligned upload recovery, bounded reads, real Git blob/pack identities, real DO/native RPC
+publication, DO worktree commits/deletion, binary attachments and scope/revocation checks.

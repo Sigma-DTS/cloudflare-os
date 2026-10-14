@@ -282,48 +282,42 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
   }
 
   async #anchor(lease: WorktreeReplicaLease, checkoutId: number, path: string, cursor: string, binary = false): Promise<FileContent | null> {
-    if (this.host.anchorFile && lease.checkpoint!.pendingOverlay !== undefined) {
-      let content: CodeContent;
-      if (binary && this.host.anchorBytes) {
-        const value = await this.host.anchorBytes(lease, checkoutId, path);
-        content = new Map([[checkoutId, new Map(value === null ? [] : [[path, value]])]]);
-      } else {
-        const text = await this.host.anchorFile(lease, checkoutId, path);
+    let change: CodeChange = {};
+    const anchorFile = this.host.anchorFile;
+    const accepted = anchorFile !== undefined && lease.checkpoint!.pendingOverlay !== undefined;
+    const overlay = accepted ? lease.checkpoint!.pendingOverlay! : lease.checkpoint!.overlay;
+    for (const item of overlay) if (item.checkoutId === checkoutId && item.path === path) {
+      change = composeCodeChange(change, {[checkoutId]: [[path, item.change]]});
+    }
+    change = composeCodeChange(change, this.#changes(lease, lease.checkpoint!.cursor, [{checkoutId, path}], cursor));
+    const operation = change[checkoutId]?.[0]?.[1];
+    let content: CodeContent = new Map();
+    // A replacement/removal already describes the anchor, regardless of the base's encoding.
+    // Only untouched files and text edits need an immutable base read.
+    if (!operation || "edit" in operation) {
+      if (!operation && binary) {
+        const readBytes = accepted ? this.host.anchorBytes : this.host.baseBytes;
+        if (!readBytes) throw new Error("Replica binary anchors require the byte API.");
+        const value = await readBytes(lease, checkoutId, path);
+        content = new Map([[checkoutId, new Map(value ? [[path, value]] : [])]]);
+      } else if (accepted) {
+        const text = await anchorFile(lease, checkoutId, path);
         content = new Map([[checkoutId, new Map(text === null ? [] : [[path, text]])]]);
+      } else {
+        let bytes: Uint8Array;
+        try { bytes = await this.host.baseFile(lease, checkoutId, path); }
+        catch (error) {
+          // Absence is determined by metadata, not by swallowing authorization/pull errors.
+          if ((await this.host.entries(lease, checkoutId)).some(entry => entry.path === path)) throw error;
+          bytes = new Uint8Array();
+        }
+        const exists = (await this.host.entries(lease, checkoutId)).some(entry => entry.path === path);
+        const text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(bytes);
+        if (text.includes("\0")) throw new Error("Replica binary anchors require the byte API.");
+        content = new Map([[checkoutId, new Map(exists ? [[path, text]] : [])]]);
       }
-      for (const item of lease.checkpoint!.pendingOverlay) if (item.checkoutId === checkoutId && item.path === path) {
-        content = applyCodeChange(content, {[checkoutId]: [[path, item.change]]});
-      }
-      content = applyCodeChange(content, this.#changes(lease, lease.checkpoint!.cursor,
-        [{checkoutId, path}], cursor));
-      return content.get(checkoutId)?.get(path) ?? null;
     }
-    // Legacy checkpoints and hosts retain the original upstream-anchored operations.
-    let content: CodeContent;
-    if (binary && this.host.baseBytes) {
-      const value = await this.host.baseBytes(lease, checkoutId, path);
-      content = new Map([[checkoutId, new Map(value ? [[path, value]] : [])]]);
-    } else {
-      let bytes: Uint8Array;
-      try { bytes = await this.host.baseFile(lease, checkoutId, path); }
-      catch (error) {
-        // Absence is determined by tree metadata, not by swallowing authorization/pull errors.
-        if ((await this.host.entries(lease, checkoutId)).some(entry => entry.path === path)) throw error;
-        bytes = new Uint8Array();
-      }
-      const exists = (await this.host.entries(lease, checkoutId)).some(entry => entry.path === path);
-      const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-      if (text.includes("\0")) throw new Error("Replica binary anchors require the byte API.");
-      content = new Map([[checkoutId, new Map(exists ? [[path, text]] : [])]]);
-    }
-    const apply = (changes: WorktreeChange[]) => {
-      for (const item of changes) if (item.checkoutId === checkoutId && item.path === path) {
-        content = applyCodeChange(content, { [checkoutId]: [[path, item.change]] });
-      }
-    };
-    apply(lease.checkpoint!.overlay);
-    content = applyCodeChange(content, this.#changes(lease, lease.checkpoint!.cursor,
-      [{checkoutId, path}], cursor));
+    content = applyCodeChange(content, change);
     return content.get(checkoutId)?.get(path) ?? null;
   }
 
@@ -351,10 +345,7 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
 }
 
 function byteRefs(change: import("@gadgets/workshop-shared/code-change").FileChange): BytesRef[] {
-  const value = "setBytes" in change ? change.setBytes : undefined;
-  const edit = "editBytes" in change ? change.editBytes : value?.edit;
-  return [...(value ? [value.base] : []), ...(edit?.sections ?? []).flatMap(section =>
-    typeof section === "number" ? [] : (section.slice(1) as import("@gadgets/workshop-shared/byte-change").ByteSlice[]).map(s => s.source))];
+  return "setBytes" in change ? [change.setBytes.base] : [];
 }
 
 @validateRpc()

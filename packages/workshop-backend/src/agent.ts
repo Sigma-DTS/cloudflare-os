@@ -127,8 +127,6 @@ export interface WorktreeTurnAccess {
    * explicit commit()'s tree build applies over the pin base, together with getRemovedPaths().
    */
   getOverlayFiles(worktreeId: WorkpieceId): ReadonlyMap<string, FileContent>;
-  /** Fault a path-authorized immutable binary base without clobbering concurrent edits/deletes. */
-  seedBytes?(worktreeId: WorkpieceId, path: string, value: import("@gadgets/workshop-shared/byte-change").ByteValue): void;
 
   /** Paths whose latest change is a removal: absent from the overlay, but not from the base. */
   getRemovedPaths(worktreeId: WorkpieceId): ReadonlySet<string>;
@@ -463,8 +461,6 @@ export interface AgentHooks {
    * target), oversized or binary content, and pull failures.
    */
   readFileAtCommit(commit: string, path: string): Promise<string | undefined>;
-  /** Byte-mode lazy reads resolve only the touched blob into immutable chunk storage. */
-  readByteFileAtCommit?(commit: string, path: string): Promise<import("@gadgets/workshop-shared/byte-change").ByteValue | undefined>;
 
   /**
    * readFileAtCommit that also reports the blob's oid: the file's content address, which an
@@ -1712,14 +1708,8 @@ async function runAgentPass(
       let worktreeId = Number(key);
       if (!worktreePinBases.has(worktreeId)) continue;
       for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange || "editBytes" in fileChange) || sessionContent.get(worktreeId)?.has(path)) continue;
-        if ("editBytes" in fileChange) {
-          const value = await hooks.readByteFileAtCommit?.(worktreeBase(worktreeId)!, path);
-          if (value && !sessionContent.get(worktreeId)?.has(path)) {
-            sessionContent = new Map(sessionContent);
-            sessionContent.set(worktreeId, new Map(sessionContent.get(worktreeId)).set(path, value));
-          }
-        } else await faultWorktreeBase(worktreeId, path);
+        if (!("edit" in fileChange) || sessionContent.get(worktreeId)?.has(path)) continue;
+        await faultWorktreeBase(worktreeId, path);
       }
     }
   };
@@ -3015,12 +3005,6 @@ async function runAgentPass(
     getBufferedHead: id =>
         pendingWorktreeCommits.findLast(entry => entry.worktreeId === id)?.commit,
     getOverlayFiles: id => sessionContent.get(id) ?? new Map(),
-    seedBytes: (id, path, value) => {
-      if (!sessionContent.get(id)?.has(path) && !worktreeRemovedPaths.get(id)?.has(path)) {
-        sessionContent = new Map(sessionContent);
-        sessionContent.set(id, new Map(sessionContent.get(id)).set(path, value));
-      }
-    },
     getRemovedPaths: id => worktreeRemovedPaths.get(id) ?? new Set(),
     readFile: async (id, path) => hooks.isWorktree(id)
         ? requireTextContent(sessionContent.get(id)?.get(path)) ?? await readWorktreeBase(id, path)

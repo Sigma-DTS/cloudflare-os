@@ -48,8 +48,7 @@
 
 import { ChangeSet, Text } from "@codemirror/state";
 import fastDiff from "fast-diff";
-import { applyByteChange, byteValueLength, composeByteChange, transformByteChange,
-  validateByteChange, validateBytesRef, type ByteChange, type ByteValue } from "./byte-change";
+import { validateBytesRef, type ByteValue } from "./byte-change";
 
 // =======================================================================================
 // Wire types
@@ -76,10 +75,9 @@ export type TextChange = (number | [number, ...string[]])[];
  * - `{remove}`: delete the file. Valid against any state (deleting an absent file is a no-op),
  *   which keeps `remove` composable and transformable without knowing the base.
  * - `{setBytes}`: create/replace with an immutable byte postimage, against any state;
- * - `{editBytes}`: splice an existing byte postimage with exact byte-coordinate tiling.
  */
 export type FileChange = { edit: TextChange } | { set: string } | { remove: true }
-  | { setBytes: ByteValue } | { editBytes: ByteChange };
+  | { setBytes: ByteValue };
 
 /** Text remains UTF-16; opaque byte postimages use immutable payload references. */
 export type FileContent = string | ByteValue;
@@ -186,7 +184,7 @@ export function codeChangeSerializedSize(change: CodeChange): number {
       bytes += SERIALIZED_ENTRY_OVERHEAD + 2 * path.length;
       if ("set" in fileChange) {
         bytes += 2 * fileChange.set.length;
-      } else if ("setBytes" in fileChange || "editBytes" in fileChange) {
+      } else if ("setBytes" in fileChange) {
         bytes += byteFileChangeSize(fileChange);
       } else if ("edit" in fileChange) {
         for (let section of fileChange.edit) {
@@ -218,16 +216,8 @@ function applyTextChange(text: string, change: TextChange): string {
   return toChangeSet(change).apply(Text.of(text.split("\n"))).toString();
 }
 
-function byteFileChangeSize(change: {setBytes: ByteValue} | {editBytes: ByteChange}): number {
-  const edit = "editBytes" in change ? change.editBytes : change.setBytes.edit;
-  let size = "setBytes" in change ? 128 + 2 * change.setBytes.base.id.length : 32;
-  for (const section of edit?.sections ?? []) {
-    size += 32;
-    if (Array.isArray(section)) for (const slice of section.slice(1) as import("./byte-change").ByteSlice[]) {
-      size += 128 + 2 * slice.source.id.length;
-    }
-  }
-  return size;
+function byteFileChangeSize(change: {setBytes: ByteValue}): number {
+  return 128 + 2 * change.setBytes.base.id.length;
 }
 
 // Iterates a CodeChange's gadget entries as numeric ids. Assumes canonical keys
@@ -293,13 +283,8 @@ export function applyCodeChange(content: CodeContent, change: CodeChange): CodeC
         if (existing === undefined) {
           throw new Error(`edit of absent file: gadget ${gadgetId} ${path}`);
         }
-        if ("editBytes" in fileChange) {
-          if (typeof existing === "string") throw new Error("Byte edit requires a binary base.");
-          files.set(path, applyByteChange(existing, fileChange.editBytes));
-        } else {
-          if (typeof existing !== "string") throw new Error("Text edit requires a text base.");
-          files.set(path, applyTextChange(existing, fileChange.edit));
-        }
+        if (typeof existing !== "string") throw new Error("Text edit requires a text base.");
+        files.set(path, applyTextChange(existing, fileChange.edit));
       }
     }
   }
@@ -359,11 +344,6 @@ function composeFileChange(
   if (b === undefined) return a;
   // b is later: its `set` or `remove` wholesale-supersedes whatever a did.
   if ("set" in b || "setBytes" in b || "remove" in b) return b;
-  if ("editBytes" in b) {
-    if ("setBytes" in a) return {setBytes: applyByteChange(a.setBytes, b.editBytes)};
-    if ("editBytes" in a) return {editBytes: composeByteChange(a.editBytes, b.editBytes)};
-    throw new Error(`cannot compose byte edit over text or removal: gadget ${gadgetId} ${path}`);
-  }
   // b is an edit of a's result.
   if ("set" in a) return { set: applyTextChange(a.set, b.edit) };
   if ("remove" in a) {
@@ -430,16 +410,10 @@ export function transformCodeChange(a: CodeChange, b: CodeChange): TransformedCo
       let bSet = toChangeSet(bChange.edit);
       aFiles.set(path, { edit: aSet.map(bSet, true).toJSON() });
       bFiles.set(path, { edit: bSet.map(aSet).toJSON() });
-    } else if ("editBytes" in aChange && "editBytes" in bChange) {
-      const mapped = transformByteChange(aChange.editBytes, bChange.editBytes);
-      aFiles.set(path, {editBytes: mapped.a}); bFiles.set(path, {editBytes: mapped.b});
-    } else if (("edit" in aChange || "editBytes" in aChange) &&
-        ("edit" in bChange || "editBytes" in bChange)) {
-      throw new Error("Concurrent edits disagree on text/binary representation.");
-    } else if ("edit" in aChange || "editBytes" in aChange) {
+    } else if ("edit" in aChange) {
       // b's set/remove supersedes a's edit.
       bFiles.set(path, bChange);
-    } else if ("edit" in bChange || "editBytes" in bChange) {
+    } else if ("edit" in bChange) {
       // a's set/remove wholesale-replaced b's base; b's edit is dropped.
       aFiles.set(path, aChange);
     } else {
@@ -619,24 +593,20 @@ function validateFileChangeSchema(where: string, fileChange: FileChange, budget:
   // `applyCodeChange` tests `set` before `edit` while `transformCodeChange` tests `edit` first,
   // so a two-variant FileChange would be read differently by two replicas and diverge them.
   let keys = Object.keys(fileChange);
-  if (keys.length !== 1 || !["edit", "set", "remove", "setBytes", "editBytes"].includes(keys[0])) {
-    throw new Error(`file change must have exactly one of edit/set/remove: ${where}`);
+  if (keys.length !== 1 || !["edit", "set", "remove", "setBytes"].includes(keys[0])) {
+    throw new Error(`file change must have exactly one of edit/set/remove/setBytes: ${where}`);
   }
   if ("set" in fileChange) {
     if (2 * fileChange.set.length > budget) throw new Error("code change is too large");
     return 2 * fileChange.set.length;
   }
   if ("remove" in fileChange) return 0;
-  if ("setBytes" in fileChange || "editBytes" in fileChange) {
-    if ("setBytes" in fileChange) {
-      validateBytesRef(fileChange.setBytes.base);
-      if (fileChange.setBytes.edit) {
-        validateByteChange(fileChange.setBytes.edit);
-        if (fileChange.setBytes.edit.beforeBytes !== fileChange.setBytes.base.byteLength) {
-          throw new Error("Binary postimage has an invalid base length.");
-        }
-      }
-    } else validateByteChange(fileChange.editBytes);
+  if ("setBytes" in fileChange) {
+    // Reject legacy splice metadata rather than silently interpreting a delta as its base.
+    if (Object.keys(fileChange.setBytes).length !== 1 || !("base" in fileChange.setBytes)) {
+      throw new Error(`Binary content must name a whole-file payload: ${where}`);
+    }
+    validateBytesRef(fileChange.setBytes.base);
     const cost = byteFileChangeSize(fileChange);
     if (cost > budget) throw new Error("code change is too large");
     return cost;
@@ -723,11 +693,6 @@ export function validateCodeChangeContent(change: CodeChange, content: CodeConte
             throw new Error(`file change edit inserts a lone surrogate: ${where}`);
           }
         });
-      } else if ("editBytes" in fileChange) {
-        const bytes = content.get(gadgetId)?.get(path);
-        if (bytes === undefined || typeof bytes === "string" || byteValueLength(bytes) !== fileChange.editBytes.beforeBytes) {
-          throw new Error(`Byte edit requires a binary base of the declared length: ${where}`);
-        }
       }
       // `remove` needs no content checks: it is valid against any state.
     }

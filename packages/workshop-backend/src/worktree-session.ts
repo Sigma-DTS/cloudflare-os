@@ -34,7 +34,7 @@ import { commitIdentityForAuthor, type GitStore } from "./git-store";
 import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
 import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
 import type { ByteStore } from "./byte-store";
-import type { ByteChange, ByteValue, BytesRef } from "@gadgets/workshop-shared/byte-change";
+import type { ByteValue, BytesRef } from "@gadgets/workshop-shared/byte-change";
 import type { ByteUploadDescription, ByteUploadStatus } from "@gadgets/workshop-shared/agent-integration";
 import { validateCodeChangeSchema } from "@gadgets/workshop-shared/code-change";
 
@@ -187,57 +187,38 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
   async finishUpload(id: string): Promise<BytesRef> {
     return this.#bytes().finish(this.#byteScope(), id, () => { this.#pinBase(); });
   }
-  async #byteValue(path: string): Promise<ByteValue> {
+  async #byteValue(path: string): Promise<FileContent> {
     const overlay = this.turn.getOverlayFiles(this.worktreeId);
     const value = overlay.get(path);
-    if (value !== undefined) {
-      if (typeof value === "string") throw new Error("Use a binary replacement to change representation.");
-      return value;
-    }
+    if (value !== undefined) return value;
     if (this.turn.getRemovedPaths(this.worktreeId).has(path)) throw new Error(`${path}: no such file`);
     if (!this.host.readByteFileAtCommit) throw new Error("Byte storage is unavailable.");
     const base = await this.host.readByteFileAtCommit(this.#pinBase(), path, this.#byteScope());
     this.#pinBase();
     if (!base) throw new Error(`${path}: no such file`);
-    this.turn.seedBytes?.(this.worktreeId, path, base);
     const current = this.turn.getOverlayFiles(this.worktreeId).get(path);
     if (this.turn.getRemovedPaths(this.worktreeId).has(path)) throw new Error(`${path}: no such file`);
-    if (typeof current === "string") throw new Error("File was replaced with text.");
     return current ?? base;
   }
   async readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>> {
     this.#pinBase();
-    const value = this.turn.getOverlayFiles(this.worktreeId).get(path);
+    const value = await this.#byteValue(path);
     if (typeof value === "string") {
       const bytes = new TextEncoder().encode(value), offset = range?.offset ?? 0, length = range?.length ?? bytes.length;
       if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset + length > bytes.length) throw new Error("Invalid byte range.");
       return new ReadableStream({start(c) { c.enqueue(bytes.slice(offset, offset + length)); c.close(); }});
     }
-    const ref = this.#bytes().resolve(await this.#byteValue(path));
+    const ref = this.#bytes().resolve(value);
     return this.#bytes().read(ref, range?.offset, range?.length, () => { this.#pinBase(); });
   }
   async writeBytes(path: string, value: ByteValue): Promise<void> {
     const change = {setBytes: value};
     validateCodeChangeSchema({[this.worktreeId]: [[path, change]]});
     await this.host.gitCache.assertWorktreePathWritable(this.#pinBase(), path);
-    const refs = [value.base, ...(value.edit?.sections ?? []).flatMap(section =>
-      typeof section === "number" ? [] : (section.slice(1) as import("@gadgets/workshop-shared/byte-change").ByteSlice[]).map(s => s.source))];
-    for (const ref of refs) if (!this.#bytes().isFinishedFor(this.#byteScope(), ref)) throw new Error("Byte source is outside this worktree scope.");
+    if (!this.#bytes().isFinishedFor(this.#byteScope(), value.base)) throw new Error("Byte source is outside this worktree scope.");
     this.#bytes().resolve(value); this.#pinBase();
     this.turn.appendChange(this.worktreeId, path, change);
   }
-  async editBytes(path: string, change: ByteChange): Promise<void> {
-    validateCodeChangeSchema({[this.worktreeId]: [[path, {editBytes: change}]]});
-    const base = await this.#byteValue(path);
-    for (const section of change.sections) if (Array.isArray(section)) {
-      for (const slice of section.slice(1) as import("@gadgets/workshop-shared/byte-change").ByteSlice[]) {
-        if (!this.#bytes().isFinishedFor(this.#byteScope(), slice.source)) throw new Error("Byte source is outside this worktree scope.");
-      }
-    }
-    this.#bytes().resolve({base: this.#bytes().resolve(base), edit: change});
-    this.turn.appendChange(this.worktreeId, path, {editBytes: change});
-  }
-
   async writeFile(path: string, text: string): Promise<void> {
     let base = this.#pinBase();
     let overlay = this.turn.getOverlayFiles(this.worktreeId);

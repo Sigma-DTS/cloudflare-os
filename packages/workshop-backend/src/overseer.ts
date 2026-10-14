@@ -1193,7 +1193,7 @@ class OverseerImpl implements AgentHooks {
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
-    this.byteStore = new ByteStore(this.storage.byteNodes, this.storage.byteChunks, this.storage.byteUploads,
+    this.byteStore = new ByteStore(this.storage.byteObjects, this.storage.byteChunks, this.storage.byteUploads,
       () => ctx.storage.sync(), this.storage.byteGrants);
     this.gitStore = new GitStore(this.storage.gitObjects, this.byteStore, this.storage.gitByteBlobs);
     this.gitCache = new WorkspaceGitCache(this.storage, {
@@ -2014,8 +2014,11 @@ class OverseerImpl implements AgentHooks {
     if (stored) { await this.byteStore.grant(scope, stored.bytes); return {base: stored.bytes}; }
     const object = await this.gitCache.ensureObject(entry.oid, {type: "blob", referencedBy: entry.referencedBy});
     const bytes = await this.byteStore.import(scope, object.payload);
-    this.storage.gitByteBlobs.put({oid: entry.oid, bytes});
-    return {base: bytes};
+    // Import awaited I/O: another reader/writer may already have fixed this OID's identity.
+    const canonical = this.storage.gitByteBlobs.get(entry.oid)?.bytes ?? bytes;
+    if (canonical === bytes) this.storage.gitByteBlobs.put({oid: entry.oid, bytes});
+    await this.byteStore.grant(scope, canonical);
+    return {base: canonical};
   }
 
   // AgentHooks implementation: the same read, plus the blob's oid for the read's stamp.
@@ -2132,9 +2135,8 @@ class OverseerImpl implements AgentHooks {
       let base = worktreeBases.get(worktreeId);
       if (base === undefined) continue;
       for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange || "editBytes" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let text = "editBytes" in fileChange ? await this.readByteFileAtCommit(base, path)
-          : await this.gitCache.readFileAtCommitIfExists(base, path);
+        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
+        let text = await this.gitCache.readFileAtCommitIfExists(base, path);
         if (text === undefined) continue;
         if (result === content) result = new Map(content);
         let files = new Map(result.get(worktreeId));
@@ -2305,12 +2307,11 @@ class OverseerImpl implements AgentHooks {
       let base = worktreeBases.get(worktreeId);
       if (base === undefined) continue;
       for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange || "editBytes" in fileChange) || result.get(worktreeId)?.has(path)) continue;
+        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
         let key = `${worktreeId}:${path}`;
         let text = seeds.get(key);
         if (text === undefined) {
-          text = ("editBytes" in fileChange ? await this.readByteFileAtCommit(base, path)
-            : await this.gitCache.readFileAtCommitIfExists(base, path)) ?? null;
+          text = await this.gitCache.readFileAtCommitIfExists(base, path) ?? null;
           seeds.set(key, text);
         }
         if (text === null) continue;
@@ -2334,7 +2335,7 @@ class OverseerImpl implements AgentHooks {
       let worktreeId = Number(key);
       if (!worktreeBases.has(worktreeId)) continue;
       for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange || "editBytes" in fileChange) || result.get(worktreeId)?.has(path)) continue;
+        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
         let text = seeds.get(`${worktreeId}:${path}`);
         if (text === undefined) return null;
         if (text === null) continue;  // absent from the base: the edit's own validation reports
@@ -2828,13 +2829,9 @@ class OverseerImpl implements AgentHooks {
   // acquire byte state that their runtime cannot compile or display.
   #validateByteChanges(change: CodeChange): void {
     for (const [id, entries] of Object.entries(change)) for (const [, file] of entries) {
-      if (!("setBytes" in file || "editBytes" in file)) continue;
+      if (!("setBytes" in file)) continue;
       if (!this.isWorktree(Number(id))) throw new Error("Binary mutations require a worktree.");
-      if ("setBytes" in file) this.byteStore.require(file.setBytes.base);
-      const edit = "setBytes" in file ? file.setBytes.edit : file.editBytes;
-      for (const section of edit?.sections ?? []) if (Array.isArray(section)) {
-        for (const slice of section.slice(1) as import("@gadgets/workshop-shared/byte-change").ByteSlice[]) this.byteStore.require(slice.source);
-      }
+      this.byteStore.require(file.setBytes.base);
     }
   }
 
@@ -6688,7 +6685,7 @@ class OverseerImpl implements AgentHooks {
         for await (const chunk of this.byteStore.read(bytes, 0, bytes.byteLength, () => this.requireReplicaLease(lease.id))) hash.update(chunk);
         if (hash.digest("hex") !== entry.oid) throw new Error("Staged base does not match its immutable Git identity.");
         this.requireReplicaLease(lease.id);
-        this.storage.gitByteBlobs.put({oid: entry.oid, bytes});
+        if (!this.storage.gitByteBlobs.get(entry.oid)) this.storage.gitByteBlobs.put({oid: entry.oid, bytes});
         await this.ctx.storage.sync();
       },
       assertPathWritable: async (lease, checkoutId, path) => {

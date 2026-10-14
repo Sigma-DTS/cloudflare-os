@@ -84,9 +84,6 @@ class InMemoryWorktree implements WorktreeTurnAccess, WorktreeSessionHost {
   getRemovedPaths(): ReadonlySet<string> {
     return this.#removed;
   }
-  seedBytes(_id: unknown, path: string, value: ByteValue): void {
-    if (!this.#files.has(path) && !this.#removed.has(path)) this.#files = new Map(this.#files).set(path, value);
-  }
 
   async readFile(_worktreeId: unknown, path: string): Promise<string | undefined> {
     let existing = this.#files.get(path);

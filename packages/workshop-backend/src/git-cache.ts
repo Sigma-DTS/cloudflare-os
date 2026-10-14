@@ -246,12 +246,12 @@ export class WorkspaceGitCache {
     return record === undefined ? undefined : decodeLooseObject(record.data);
   }
   /** Stream locally authored chunk-backed blobs; ordinary small Git objects retain their codec. */
-  async packObject(oid: string, hint?: {type: GitObjectType; referencedBy?: string}, requireLive = () => {}): Promise<StreamPackableObject | PackableObject> {
+  async packObject(oid: string, hint: {type: GitObjectType; referencedBy?: string}, requireLive = () => {}): Promise<StreamPackableObject | PackableObject> {
     requireLive();
     const blob = this.storage.gitByteBlobs?.get(oid);
     if (blob && this.bytes) return {type: "blob", byteLength: blob.bytes.byteLength,
       stream: this.bytes.read(blob.bytes, 0, blob.bytes.byteLength, requireLive)};
-    return this.ensureObject(oid, hint ?? {type: "blob"});
+    return this.ensureObject(oid, hint);
   }
 
   /**
@@ -1210,7 +1210,7 @@ export class WorkspaceGitCache {
     }
 
     const marks = this.#recordsMarkedFor(actionId), cache = this;
-    async function* objects() { for (const mark of marks) yield await cache.packObject(mark.oid); }
+    async function* objects() { for (const mark of marks) yield await cache.packObject(mark.oid, {type: mark.type}); }
     return buildPackStream(marks.length, objects());
   }
 
@@ -1424,9 +1424,8 @@ function tooLargeMessage(path: string): string {
   return `${path} is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)`;
 }
 
-// Decodes a blob's payload as strict UTF-8 text, throwing the path-flavored
-// UnreadableContentError for binary content (NUL bytes or invalid UTF-8).
-function decodeBlobText(payload: Uint8Array, path: string): string {
+/** Decode a Git payload as strict text, independently of its loose/chunk-backed storage. */
+export function decodeBlobText(payload: Uint8Array, path: string): string {
   if (payload.includes(0)) throw new UnreadableContentError(`${path} is not a text file`);
   try {
     return TEXT_DECODER_STRICT.decode(payload);

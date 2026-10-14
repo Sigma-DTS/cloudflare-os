@@ -137,21 +137,6 @@ export interface ChatOtClientDelegate {
 
 const EMPTY_CHANGE: CodeChange = {}
 
-// The text editor never fetches binary payloads or publishes these placeholders. A first
-// byte splice can arrive without an earlier setBytes row (its base is committed Git); retain
-// opaque length/transform metadata so the editor can consume the row without decoding bytes.
-function applyDisplayChange(content: CodeContent, change: CodeChange): CodeContent {
-  const seeded = new Map(content)
-  for (const [id, entries] of Object.entries(change)) {
-    const files = new Map(content.get(Number(id)) ?? [])
-    for (const [path, file] of entries) if ('editBytes' in file && !files.has(path)) {
-      files.set(path, {base: {id: 'display-only-byte-base', byteLength: file.editBytes.beforeBytes}})
-    }
-    seeded.set(Number(id), files)
-  }
-  return applyCodeChange(seeded, change)
-}
-
 function isEmptyChange(change: CodeChange): boolean {
   return Object.keys(change).length === 0
 }
@@ -674,7 +659,7 @@ export class ChatOtClient {
       displayChange = a
       this.#pending = b
     }
-    this.#display = applyDisplayChange(this.#display, displayChange)
+    this.#display = applyCodeChange(this.#display, displayChange)
     const events: RemoteFileEvent[] = []
     for (const [gadgetKey, entries] of Object.entries(displayChange)) {
       for (const [path, change] of entries) {
@@ -689,7 +674,7 @@ export class ChatOtClient {
 
   // Fold an acknowledged change into the acked content and its tombstones together.
   #applyAcked(change: CodeChange): void {
-    this.#applied = applyDisplayChange(this.#applied, change)
+    this.#applied = applyCodeChange(this.#applied, change)
     for (const [gadgetKey, entries] of Object.entries(change)) {
       const gadgetId = Number(gadgetKey)
       let removed = this.#removed.get(gadgetId)

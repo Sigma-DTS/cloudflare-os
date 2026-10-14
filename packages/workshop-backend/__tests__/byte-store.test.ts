@@ -11,7 +11,7 @@ import type { ByteValue } from "@gadgets/workshop-shared/byte-change";
 function fixture() {
   const storage = makeOverseerStorage(makeMockStorage());
   let flushes = 0;
-  const store = new ByteStore(storage.byteNodes, storage.byteChunks, storage.byteUploads, async () => { ++flushes; }, storage.byteGrants);
+  const store = new ByteStore(storage.byteObjects, storage.byteChunks, storage.byteUploads, async () => { ++flushes; }, storage.byteGrants);
   return {storage, store, flushes: () => flushes};
 }
 function stream(bytes: Uint8Array, fail = false) {
@@ -26,7 +26,7 @@ it("resumes persisted offsets after a disconnect, verifies retries and returns a
   await store.begin("lease-a", "upload", data.length, hash(data));
   await expect(store.write("lease-a", "upload", 0, stream(data.subarray(0, BYTE_CHUNK_SIZE), true), () => {})).rejects.toThrow("disconnect");
   expect(store.status("lease-a", "upload").offset).toBe(BYTE_CHUNK_SIZE);
-  const resumed = new ByteStore(storage.byteNodes, storage.byteChunks, storage.byteUploads, async () => {}, storage.byteGrants);
+  const resumed = new ByteStore(storage.byteObjects, storage.byteChunks, storage.byteUploads, async () => {}, storage.byteGrants);
   await resumed.write("lease-a", "upload", 0, stream(data.subarray(0, BYTE_CHUNK_SIZE)), () => {});
   await expect(resumed.write("lease-a", "upload", 0, stream(new Uint8Array(BYTE_CHUNK_SIZE)), () => {})).rejects.toThrow("changed durable");
   await resumed.write("lease-a", "upload", BYTE_CHUNK_SIZE, stream(data.subarray(BYTE_CHUNK_SIZE)), () => {});
@@ -38,18 +38,33 @@ it("resumes persisted offsets after a disconnect, verifies retries and returns a
   await expect(read(resumed.read(ref, 0, ref.byteLength, () => { throw new Error("revoked"); }))).rejects.toThrow("revoked");
 });
 
-it("keeps a tiny splice to a large file metadata-only and streams bounded chunks", async () => {
-  const {store, storage} = fixture(), data = new Uint8Array(16 * 1024 * 1024).fill(17);
-  const base = await store.import("kernel", data), inserted = await store.import("kernel", new Uint8Array([0, 255]));
-  const count = [...storage.byteChunks.list()].length;
-  const value: ByteValue = {base, edit: {beforeBytes: data.length, sections: [7, [1, {source: inserted, offset: 0, length: 2}], data.length - 8]}};
+it("keeps large replacements immutable, references compact and streaming buffers bounded", async () => {
+  const {store} = fixture(), data = new Uint8Array(16 * 1024 * 1024).fill(17);
+  const original = await store.import("kernel", data);
+  const replacement = data.slice(); replacement.set([0, 255], BYTE_CHUNK_SIZE - 1);
+  const value: ByteValue = {base: await store.import("kernel", replacement)};
   const ref = store.resolve(value);
-  expect([...storage.byteChunks.list()].length).toBe(count);
   expect(JSON.stringify(value).length).toBeLessThan(500);
   let total = 0;
   for await (const chunk of store.read(ref)) { expect(chunk.length).toBeLessThanOrEqual(BYTE_CHUNK_SIZE); total += chunk.length; }
-  expect(total).toBe(data.length + 1);
-  expect(await read(store.read(ref, 5, 6))).toEqual(new Uint8Array([17, 17, 0, 255, 17, 17]));
+  expect(total).toBe(data.length);
+  expect(await read(store.read(ref, BYTE_CHUNK_SIZE - 3, 6))).toEqual(new Uint8Array([17, 17, 0, 255, 17, 17]));
+  expect(await read(store.read(original, BYTE_CHUNK_SIZE - 3, 6))).toEqual(new Uint8Array(6).fill(17));
+});
+
+it("resumes non-aligned partial blocks without publishing staged bytes", async () => {
+  const {store, storage} = fixture(), data = new Uint8Array(BYTE_CHUNK_SIZE + 19).map((_, i) => i % 251);
+  const row = await store.begin("a", "partial", data.length, hash(data));
+  await store.write("a", "partial", 0, stream(data.subarray(0, 4193)), () => {});
+  expect(() => store.require(row.root)).toThrow(/Unknown/);
+  const resumed = new ByteStore(storage.byteObjects, storage.byteChunks, storage.byteUploads, async () => {}, storage.byteGrants);
+  await resumed.write("a", "partial", 0, stream(data.subarray(0, 4193)), () => {});
+  await resumed.write("a", "partial", 4193, stream(data.subarray(4193)), () => {});
+  const ref = await resumed.finish("a", "partial", () => {});
+  expect(await read(resumed.read(ref))).toEqual(data);
+  expect(resumed.readSmall(ref, data.length)).toEqual(data);
+  await expect(resumed.write("a", "partial", 0, stream(data), () => {})).rejects.toThrow(/offset or length/);
+  expect(await read(resumed.read(ref))).toEqual(data);
 });
 
 it("distinguishes empty bytes from deletion and rejects a wrong digest", async () => {
@@ -60,6 +75,7 @@ it("distinguishes empty bytes from deletion and rejects a wrong digest", async (
   await store.begin("a", "bad", 1, hash(new Uint8Array([1])));
   await store.write("a", "bad", 0, stream(new Uint8Array([2])), () => {});
   await expect(store.finish("a", "bad", () => {})).rejects.toThrow("digest mismatch");
+  expect(() => store.require(store.status("a", "bad").root)).toThrow(/Unknown/);
 });
 
 it("commits byte-backed blobs with real Git identities and streams a pack", async () => {
@@ -77,4 +93,22 @@ it("commits byte-backed blobs with real Git identities and streams a pack", asyn
   for await (const chunk of buildPackStream(1, (async function* () {yield object;})())) chunks.push(chunk);
   expect(chunks.reduce((n, chunk) => n + chunk.length, 0)).toBeGreaterThan(bytes.length);
   expect(storage.gitObjects.get(blob)).toBeUndefined();
+});
+
+it("decodes byte-backed text by content and keeps identical Git blob mappings stable", async () => {
+  const {store, storage} = fixture();
+  const git = new GitStore(storage.gitObjects, store, storage.gitByteBlobs);
+  const text = "\ufeffhello😀\n", payload = new TextEncoder().encode(text);
+  const options = {parents: [], author: {name: "Test", email: "test@example.com"}, message: "text", timestamp: new Date(0)};
+  const first = await store.import("a", payload), second = await store.import("b", payload);
+  const commit = await git.writeFilesAsCommit(new Map([["a.txt", {base: first}]]), options);
+  expect(await git.readCommitFiles(commit)).toEqual(new Map([["a.txt", text]]));
+  expect(await git.writeFilesAsCommit(new Map([["a.txt", {base: second}]]), options)).toBe(commit);
+  const oid = createHash("sha1").update(`blob ${payload.length}\0`).update(payload).digest("hex");
+  expect(storage.gitByteBlobs.get(oid)?.bytes).toEqual(first);
+  for (const data of [Uint8Array.of(0), Uint8Array.of(255)]) {
+    const ref = await store.import("a", data);
+    const binary = await git.writeFilesAsCommit(new Map([["a.bin", {base: ref}]]), options);
+    await expect(git.readCommitFiles(binary)).rejects.toThrow(/not a text file/);
+  }
 });
