@@ -2,10 +2,25 @@ import { describe, expect, it } from "vitest";
 import { RpcStub } from "cloudflare:workers";
 import { CodeModeOutputImpl } from "../src/overseer.js";
 
-const PNG = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
-const JPEG = Uint8Array.of(0xff, 0xd8, 0xff);
+function png(width = 1, height = 1): Uint8Array {
+  let data = Uint8Array.of(
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
+    0, 0, 0, 0, 0, 0, 0, 0,
+  );
+  let view = new DataView(data.buffer);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  return data;
+}
+
+const PNG = png();
+const JPEG = Uint8Array.of(
+  0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0, 1, 0, 1, 3, 1, 0, 2, 0, 3, 0, 0, 0, 0,
+);
 const WEBP = Uint8Array.of(
-  0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+  0x52, 0x49, 0x46, 0x46, 22, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+  0x56, 0x50, 0x38, 0x58, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 );
 
 describe("code mode image output", () => {
@@ -48,6 +63,13 @@ describe("code mode image output", () => {
     const output = new CodeModeOutputImpl();
     expect(() => output.image(PNG, "image/jpeg"))
       .toThrow("image bytes do not match their MIME type");
+  });
+
+  it("rejects an image beyond the provider's absolute dimension limit", () => {
+    const output = new CodeModeOutputImpl();
+    expect(() => output.image(png(1280, 9000), "image/png"))
+      .toThrow("dimensions 1280 x 9000 exceed 8000px per axis");
+    expect(output.takeImages()).toEqual([]);
   });
 
   it("rejects unsupported media types", () => {
