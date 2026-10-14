@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, ChatPreset, MAX_CHAT_PRESETS, MAX_CHAT_PRESET_NAME_LENGTH, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -12,6 +12,7 @@ import {
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
 import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
+import { validateChatModelSettings } from "./ai-models.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { deleteBlueprintContent } from "./blueprint-archive.js";
@@ -719,6 +720,31 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     } else {
       return null;
     }
+  }
+
+  async listChatPresets(): Promise<ChatPreset[]> {
+    return [...this.storage.chatPresets.list()].toSorted((a, b) =>
+        a.name.localeCompare(b.name, undefined, {sensitivity: "accent"}) || (a.id < b.id ? -1 : 1));
+  }
+
+  async saveChatPreset(preset: ChatPreset): Promise<void> {
+    let name = preset.name.trim();
+    if (preset.id.length === 0 || preset.id.length > 100) {
+      throw new Error("A preset's ID must be 1 to 100 characters long.");
+    }
+    if (name.length === 0 || name.length > MAX_CHAT_PRESET_NAME_LENGTH) {
+      throw new Error(`A preset's name must be 1 to ${MAX_CHAT_PRESET_NAME_LENGTH} characters long.`);
+    }
+    let settings = validateChatModelSettings(preset.settings);
+    if (!this.storage.chatPresets.get(preset.id) &&
+        [...this.storage.chatPresets.list()].length >= MAX_CHAT_PRESETS) {
+      throw new Error(`You can have at most ${MAX_CHAT_PRESETS} presets.`);
+    }
+    this.storage.chatPresets.put({id: preset.id, name, settings});
+  }
+
+  async deleteChatPreset(id: string): Promise<void> {
+    this.storage.chatPresets.delete(id);
   }
 
   async getPreferredModel(): Promise<string | null> {

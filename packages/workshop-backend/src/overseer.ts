@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, modelKind } from '@gadgets/workshop-shared/api'
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, ChatModelDescription, ChatModelSettings, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, modelKind } from '@gadgets/workshop-shared/api'
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
   MAX_CODE_CHANGE_SIZE, transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -34,8 +34,11 @@ import {
 import type { Usage } from "@earendil-works/pi-ai";
 import {
   AiModelGatekeeperProps,
+  describeChatModel,
   getModel,
   UserGatewayRouting,
+  validateChatModelSettings,
+  withChatSettings,
 } from "./ai-models";
 import { AgentTurnError, completeText } from "./ai-invoke";
 import {
@@ -6090,11 +6093,13 @@ class OverseerImpl implements AgentHooks {
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     externalChatKey?: string,
     formats?: MessageFormatRef[],
+    modelSettings?: ChatModelSettings,
   ): Promise<number> {
     if (responseTargetRegistration) {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
       if (decision.reuseExisting) return decision.record.chatId;
     }
+    let settings = validateChatModelSettings(modelSettings ?? {});
     if (typeof initialMessage !== "string" && (capsules?.length || attachments?.length)) {
       throw new Error("Slash commands cannot include resources or attachments.");
     }
@@ -6119,6 +6124,7 @@ class OverseerImpl implements AgentHooks {
       if (prepared.message !== undefined && userMeta.aiModel) {
         meta.activeAgent = userMeta.aiModel.profile;
       }
+      if (Object.keys(settings).length > 0) meta.modelSettings = settings;
       this.storage.chatMeta.put(meta);
 
       let promptSequence = this.#commitPreparedChatMessage(
@@ -6632,8 +6638,10 @@ class OverseerImpl implements AgentHooks {
         }
 
         let sessionAffinity = await computeSessionAffinity(this.ctx.id.toString(), chatId);
+        let config = withChatSettings(
+            aiModel.config, this.storage.chatMeta.get(chatId)?.modelSettings);
         let chosenModel = getModel(
-            this.env, aiModel.config, initiator, {
+            this.env, config, initiator, {
               sessionAffinity,
               userGateway: byokRouting,
               metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId },
@@ -6644,7 +6652,7 @@ class OverseerImpl implements AgentHooks {
         controller.signal.throwIfAborted();
 
         await runAgent(
-            this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
+            this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, config);
         finished = true;
         turnLogger.debug("agent run finished", {
           event: "agent.run.finished", outcome: "ok",
@@ -11321,6 +11329,13 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return retryOnDoReset(() => this.#clientUser.listModels(), this.impl.logger);
   }
 
+  async describeChatModel(modelId: string): Promise<ChatModelDescription> {
+    let {aiModel} = await retryOnDoReset(
+        () => this.#clientUser.getChatContext(modelId), this.impl.logger);
+    if (!aiModel) throw new Error(`No such model: ${modelId}`);
+    return describeChatModel(this.impl.env, aiModel.config);
+  }
+
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
     await this.slashCommandsReady;
     return this.impl.listSlashCommands();
@@ -11521,11 +11536,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-                formats?: MessageFormatRef[]): Promise<number> {
+                formats?: MessageFormatRef[], modelSettings?: ChatModelSettings): Promise<number> {
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
-                             undefined, undefined, formats);
+                             undefined, undefined, formats, modelSettings);
   }
 
   async sendChatMessage(
@@ -11545,6 +11560,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     meta.lastActive = this.impl.getChatTimestamp();
     meta.title = title;
+    this.impl.storage.chatMeta.put(meta);
+  }
+
+  // Leaves lastActive alone, so that changing a setting doesn't reorder the chat list.
+  async setChatModelSettings(chatId: number, settings: ChatModelSettings): Promise<void> {
+    settings = validateChatModelSettings(settings);
+    let meta = this.impl.storage.chatMeta.get(chatId);
+    if (!meta) {
+      throw new Error("No such chatId: " + chatId);
+    }
+    if (Object.keys(settings).length > 0) {
+      meta.modelSettings = settings;
+    } else {
+      delete meta.modelSettings;
+    }
     this.impl.storage.chatMeta.put(meta);
   }
 
@@ -12163,6 +12193,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
   async listChats(): Promise<AiChatMetadata[]> { this.#deny(); }
   async listModels(): Promise<AiChatAuthorInfo[]> { this.#deny(); }
+  async describeChatModel(_modelId: string): Promise<ChatModelDescription> { this.#deny(); }
   async getChatHistory(_chatId: number, _beforeSequence?: number): Promise<AiChatHistoryPage> {
     this.#deny();
   }
@@ -12188,6 +12219,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async getChatAttachmentContent(_chatId: number, _id: string): Promise<Uint8Array> { this.#deny(); }
   async deleteChatAttachment(_id: string): Promise<void> { this.#deny(); }
   async setChatTitle(_chatId: number, _title: string): Promise<void> { this.#deny(); }
+  async setChatModelSettings(_chatId: number, _settings: ChatModelSettings): Promise<void> {
+    this.#deny();
+  }
   async mergeChanges(_chatId: number): Promise<MergeChangesResult> {
     this.#deny();
   }

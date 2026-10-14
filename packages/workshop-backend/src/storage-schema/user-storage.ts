@@ -6,7 +6,7 @@
 
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import type {
-  AiChatAuthorInfo, AiModelConfig, BlueprintMetadata, BlueprintOutput,
+  AiChatAuthorInfo, AiModelConfig, BlueprintMetadata, BlueprintOutput, ChatPreset,
   GadgetMetadata, WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
@@ -146,6 +146,10 @@ export function makeUserStorage(storage: DurableObjectStorage) {
     collections: {
       aiModels: collection<UserAiModelRecord>()({
         primaryKey: record => record.profile.id,
+      }),
+      // The user's chat presets (see AuthenticatedApi.listChatPresets()).
+      chatPresets: collection<ChatPreset>()({
+        primaryKey: "id",
       }),
       gadgets: collection<GadgetRecord>()({
         primaryKey: "id"

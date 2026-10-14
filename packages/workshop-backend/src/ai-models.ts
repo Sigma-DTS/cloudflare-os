@@ -28,10 +28,11 @@ import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { DecisionAnswer, DecisionModelBinding, DecisionRequest } from "./decision-model-binding";
 import DECISION_MODEL_BINDING_TYPES from "./decision-model-binding.txt";
 import {
-  AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, GatewayModelCapabilities,
-  ModelDescription, REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
+  AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, ChatModelDescription,
+  ChatModelSettings, GatewayModelCapabilities, ModelDescription, REASONING_LEVELS, ReasoningLevel,
+  SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
 } from "@gadgets/workshop-shared/api";
-import { compactionBudgetRange } from "./agent-compaction.js";
+import { compactionBudgetRange, getModelTokenLimits } from "./agent-compaction.js";
 import { traceChat } from "./agent-tracing.js";
 import {
   AiGatewayConfig, getAiGatewayConfig, getGatewayModels, type AiGatewayLogRoute,
@@ -404,6 +405,54 @@ export function describeGatewayModel(config: AiModelConfig): ModelDescription {
     maxCompactionInputBudget: budget.max,
     runtimeKnown: isRuntimeModel(provider, model),
   };
+}
+
+/**
+ * What the composer needs in order to offer the chat settings of the model `config` describes
+ * (see Overseer.describeChatModel()). On a deployment without AI Gateway it lists no reasoning
+ * levels and none in effect, since getModel() then connects directly, which sends none.
+ */
+export function describeChatModel(env: Cloudflare.Env, config: AiModelConfig): ChatModelDescription {
+  let description = describeGatewayModel(config);
+  // getModel()'s other gateway, the user's own, is chosen per turn by their balance, so it can't
+  // be counted on here.
+  let gateway = getAiGatewayConfig(env) !== null;
+  return {
+    ...description,
+    reasoningLevels: gateway ? description.reasoningLevels : [],
+    reasoning: gateway ? config.reasoning ?? null : null,
+    compactionInputBudget: getModelTokenLimits(config).inputBudget,
+  };
+}
+
+// The fields `settings` sets, without the ones it leaves undefined or doesn't know.
+function definedSettings({ reasoning, compactionInputBudget }: ChatModelSettings): ChatModelSettings {
+  return {
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(compactionInputBudget !== undefined ? { compactionInputBudget } : {}),
+  };
+}
+
+/**
+ * `settings` holding only the fields it sets, throwing for a compaction budget that is not a
+ * positive whole number. Both a chat's settings and a preset's are checked through here.
+ */
+export function validateChatModelSettings(settings: ChatModelSettings): ChatModelSettings {
+  let budget = settings.compactionInputBudget;
+  if (budget !== undefined && !(Number.isSafeInteger(budget) && budget > 0)) {
+    throw new Error("A compaction budget must be a positive whole number of tokens.");
+  }
+  return definedSettings(settings);
+}
+
+/**
+ * `config` with the fields a chat's `settings` set in place of its own, which is how they come
+ * ahead of the model's (see ChatModelSettings). `config` itself when they set none.
+ */
+export function withChatSettings(config: AiModelConfig, settings: ChatModelSettings | undefined)
+    : AiModelConfig {
+  let own = definedSettings(settings ?? {});
+  return Object.keys(own).length > 0 ? { ...config, ...own } : config;
 }
 
 // The per-API options that ask `model` for a reasoning level on a request whose response cap is

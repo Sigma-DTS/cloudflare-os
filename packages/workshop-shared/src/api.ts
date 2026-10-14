@@ -580,6 +580,23 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   getAiConfig(): Promise<AiGatewayInfo>;
 
+  /**
+   * The user's chat presets, ordered by name (case-insensitively, then by id). Empty until the
+   * user adds one.
+   */
+  listChatPresets(): Promise<ChatPreset[]>;
+
+  /**
+   * Adds the preset, or replaces the user's preset with its id. Throws for an empty id or one over
+   * 100 characters, a name that is empty after trimming or longer than
+   * MAX_CHAT_PRESET_NAME_LENGTH, a compaction budget that is not a positive whole number, and a
+   * new preset beyond MAX_CHAT_PRESETS.
+   */
+  saveChatPreset(preset: ChatPreset): Promise<void>;
+
+  /** Deletes the user's preset with this id. Deleting an unknown id does nothing. */
+  deleteChatPreset(id: string): Promise<void>;
+
   /** Resolve UI feature flags for the authenticated user. */
   getUiFeatureFlags(): Promise<UiFeatureFlags>;
 
@@ -1598,15 +1615,16 @@ export const COMPACTION_TRIGGER_RATIO = 0.85;
 export type GatewayModelSettings = {
   /**
    * The reasoning level of the agent's turns on the model, ahead of the deployment's default
-   * (see AdminApi.setDefaultReasoning). One-shot calls, such as titles, compaction summaries
-   * and gadget model bindings, ask for none either way.
+   * (see AdminApi.setDefaultReasoning) and behind a chat's own (see ChatModelSettings). One-shot
+   * calls, such as titles, compaction summaries and gadget model bindings, ask for none either way.
    */
   reasoning?: ReasoningLevel;
 
   /**
    * The prompt budget, in tokens, that a chat on the model compacts against (see
-   * COMPACTION_TRIGGER_RATIO), in place of the model's built-in one. A positive whole number, at
-   * most the model's AdminModelView.maxCompactionInputBudget.
+   * COMPACTION_TRIGGER_RATIO), in place of the model's built-in one, unless the chat sets its own
+   * (see ChatModelSettings). A positive whole number, at most the model's
+   * AdminModelView.maxCompactionInputBudget.
    */
   compactionInputBudget?: number;
 };
@@ -1683,16 +1701,19 @@ export type AdminModel = GatewayModel & {
 };
 
 /**
- * What a UI needs in order to offer the reasoning and compaction settings of a model run through
- * AI Gateway (see AdminModelView).
+ * What a UI needs in order to offer the reasoning and compaction settings of a model (see
+ * AdminModelView and ChatModelDescription).
  */
 export type ModelDescription = {
-  /** The reasoning levels the model can be sent, least to most. Empty when it takes none. */
+  /**
+   * The reasoning levels the model can be sent, least to most. Empty when it takes none, or when
+   * a level would be ignored (see Overseer.describeChatModel()).
+   */
   reasoningLevels: ReasoningLevel[];
 
   /**
-   * What the model is asked for while neither its own settings nor the deployment's default give
-   * it a reasoning level.
+   * What the model is asked for while neither a chat's settings, its own settings nor the
+   * deployment's default give it a reasoning level.
    */
   builtInReasoning: BuiltInReasoning;
 
@@ -1809,13 +1830,15 @@ export type AiModelConfig = {
 
   /**
    * The reasoning level of an agent's turns on the model. Absent gives the model's built-in
-   * behaviour. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   * behaviour. Stored only on a deployment's AI Gateway models (see GatewayModelSettings); a
+   * chat's own level comes ahead of it on the chat's turns (see ChatModelSettings).
    */
   reasoning?: ReasoningLevel;
 
   /**
    * Overrides the model's built-in compaction budget, up to the room its window leaves for a
-   * prompt. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   * prompt. Stored only on a deployment's AI Gateway models (see GatewayModelSettings); a chat's
+   * own budget comes ahead of it on the chat's turns (see ChatModelSettings).
    */
   compactionInputBudget?: number;
 
@@ -2779,6 +2802,14 @@ export interface Overseer extends RpcTarget {
   listModels(): Promise<AiChatAuthorInfo[]>;
 
   /**
+   * Describes what the composer needs in order to offer the chat settings (see
+   * ChatModelSettings) of a model this workspace offers: one of the IDs in the result of
+   * `listModels()`, or a model the user can run. Throws for a model the user can't run. Outside
+   * AI Gateway, `reasoningLevels` is empty, since a level would be ignored.
+   */
+  describeChatModel(modelId: string): Promise<ChatModelDescription>;
+
+  /**
    * Fetch one page of messages in the chat history for the given chat thread. If `beforeSequence`
    * is absent, fetch the current tail. Otherwise, fetch messages before that sequence.
    *
@@ -2826,10 +2857,13 @@ export interface Overseer extends RpcTarget {
    * `formats` records where the message names one of the deployment's standard output formats, so
    * the transcript can draw it as a chip. Display only -- what the agent reads is the noun, which
    * is already in the text.
+   *
+   * The chat starts with `modelSettings`, as setChatModelSettings() would set them and with the
+   * same check, so that its first turn runs with them.
    */
   newChat(initialMessage: string | SlashCommandRequest, modelId: string | null,
           capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-          formats?: MessageFormatRef[]): Promise<number>;
+          formats?: MessageFormatRef[], modelSettings?: ChatModelSettings): Promise<number>;
 
   /**
    * Send a message to the chat from this client. Sending a message causes the LLM to start
@@ -2870,6 +2904,13 @@ export interface Overseer extends RpcTarget {
    * the first message.
    */
   setChatTitle(chatId: number, title: string): Promise<void>;
+
+  /**
+   * Replaces the chat's model settings; `{}` clears them. They apply from the chat's next turn.
+   * Throws for a compaction budget that is not a positive whole number. Neither field is checked
+   * against a model, since the model is chosen per message.
+   */
+  setChatModelSettings(chatId: number, settings: ChatModelSettings): Promise<void>;
 
   /**
    * Indicates that the user has requested that the chat's proposed changes be merged into the
@@ -3140,6 +3181,61 @@ export interface Overseer extends RpcTarget {
   previewRevokeShareLink(linkId: string): Promise<AffectedCollaborator[]>;
 }
 
+/**
+ * What a conversation sets for its model's turns, over the model's own settings. A field left out
+ * falls back to the model's setting. The reasoning level is fitted to a level the model has when a
+ * request is made (see REASONING_LEVELS), and takes effect only through AI Gateway. The compaction
+ * budget is capped at the room the chat's model leaves for a prompt when a turn runs, so it can
+ * outlive a change of model.
+ */
+export type ChatModelSettings = {
+  /** The reasoning level of the chat's turns, ahead of the model's own. */
+  reasoning?: ReasoningLevel;
+
+  /**
+   * The prompt budget, in tokens, that the chat compacts against (see COMPACTION_TRIGGER_RATIO),
+   * ahead of the model's own. A positive whole number.
+   */
+  compactionInputBudget?: number;
+};
+
+/**
+ * What the composer needs in order to offer a model's chat settings, as returned by
+ * Overseer.describeChatModel().
+ */
+export type ChatModelDescription = ModelDescription & {
+  /**
+   * The level the model's turns run with while the chat sets none: the model's own setting, else
+   * the deployment's default. Null for the model's built-in behaviour (see `builtInReasoning`),
+   * and outside AI Gateway, where no level is sent.
+   */
+  reasoning: ReasoningLevel | null;
+
+  /** The budget a chat on the model compacts against while the chat sets none. */
+  compactionInputBudget: number;
+};
+
+/**
+ * Chat settings the user saved under a name, to apply to a conversation in one step. Presets
+ * belong to the user, not to a workspace (see AuthenticatedApi.listChatPresets()).
+ */
+export type ChatPreset = {
+  /** Chosen by the client; unique among the user's presets. */
+  id: string;
+
+  /** As the user typed it, trimmed. */
+  name: string;
+
+  /** Applied as the chat's own settings when the preset is picked. */
+  settings: ChatModelSettings;
+};
+
+/** The most chat presets a user may have. */
+export const MAX_CHAT_PRESETS = 50;
+
+/** Maximum length (characters) of a chat preset's name. */
+export const MAX_CHAT_PRESET_NAME_LENGTH = 100;
+
 export type AiChatMetadata = {
   id: number,
   title: string,
@@ -3210,6 +3306,12 @@ export type AiChatMetadata = {
    * first submitCodeChange() simply passes `generation: 0, revision: 0`.
    */
   codeBase?: ChatCodeBase;
+
+  /**
+   * What the chat has set for its model's turns (see Overseer.setChatModelSettings()). Absent
+   * while nothing is set. Never submitted by clients.
+   */
+  modelSettings?: ChatModelSettings;
 };
 
 /**
