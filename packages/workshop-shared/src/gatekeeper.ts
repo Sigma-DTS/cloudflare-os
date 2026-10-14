@@ -948,6 +948,13 @@ export interface Gatekeeper<Session> extends DurableObject {
    */
   gitPull?(oids: GitOid[], cache: RpcStub<GitCache>, hints: GitPullHints): Promise<void>;
 
+  /**
+   * Stream a native Git v2 fetch for an already-advertised commit in this resource. The provider
+   * must reject requests for any other object/ref or command; credentials never enter the guest.
+   * Unlike gitPull, the pack bypasses the DO object cache and goes straight to a local Git client.
+   */
+  gitReadPack?(commit: GitOid, request: Uint8Array): Promise<ReadableStream<Uint8Array>>;
+
   // ---------------------------------------------------------------------------
   // Callbacks invoked by the overseer to apply (or reject) actions that were previously queued
   // for approval via the ApprovalQueue.
