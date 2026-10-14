@@ -87,6 +87,66 @@ describe("replica review regressions over durable kernel storage", () => {
     expect(objects[0].payload).toEqual((await impl.gitCache.readLocalObject(base))!.payload);
   }));
 
+  it("stops a migrated explicit HEAD at the original shallow boundary, not the newer hydration base", () => inKernel(crypto.randomUUID(), async impl => {
+    const missingParent = "1".repeat(40);
+    const original = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "aaa"]]), {
+      parents: [missingParent], author: {name: "Test", email: "test@example.com"},
+      message: "Shallow upstream", timestamp: new Date(0),
+    });
+    const tree = await worktree(impl);
+    const accepted = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "accepted"]]), {
+      parents: [original], author: {name: "Test", email: "test@example.com"},
+      message: "Accepted before v6", timestamp: new Date(1),
+    });
+    const record = impl.storage.gadgets.get(tree.id)!;
+    if (record.type !== "worktree") throw new Error("Expected worktree");
+    impl.storage.gadgets.put({...record, baseCommit: original, headCommit: original, pinBase: accepted});
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    expect(checkpoint.worktrees[0]).toMatchObject({baseCommit: accepted, headCommit: original});
+    const ensure = vi.spyOn(impl.gitCache, "ensureObject"), objects = [];
+    for await (const object of decodePackStream(await replica.readCommitPack(checkpoint.checkpointId, tree.id), {
+      maxPackSize: 1024 * 1024, maxObjectSize: 1024 * 1024,
+    })) objects.push(object);
+    expect(objects.filter(object => object.type === "commit").map(object => object.oid).toSorted())
+      .toEqual([original, accepted].toSorted());
+    expect(ensure.mock.calls.some(([oid]) => oid === missingParent)).toBe(false);
+    ensure.mockRestore();
+  }));
+
+  it("checkpoints a large accepted prefix across eviction and preserves its tiny subsequent OT", async () => {
+    const name = crypto.randomUUID(), text = "a".repeat(600 * 1024);
+    const saved = await inKernel(name, async impl => {
+      const tree = await worktree(impl);
+      await step(impl, 1, {[tree.id]: [["large.txt", {set: text}]]});
+      expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+      await step(impl, 1, {[tree.id]: [["large.txt", {edit: [text.length, [0, "!"]]}]]});
+      await impl.beginAgentIntegrationTurn(1);
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      const overlay = await replica.readOverlay(checkpoint.checkpointId);
+      expect(await overlay.next()).toEqual([{checkoutId: tree.id, path: "large.txt", change: {edit: [text.length, [0, "!"]]}}]);
+      expect(await overlay.next()).toBeNull();
+      await impl.ctx.storage.sync();
+      return {id: tree.id, checkpoint, leaseId: checkpoint.cursor.split(":")[0]};
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      const replica = impl.getWorkspaceReplicaSession(saved.leaseId);
+      expect(await replica.checkpoint()).toEqual(saved.checkpoint);
+      await replica.submitBatch({batchId: "large-prefix", baseCursor: saved.checkpoint.cursor, files: [
+        {checkoutId: saved.id, path: "large.txt", baseHash: await replicaTextHash(text + "!"),
+          change: {edit: [[1, "b"], text.length]}},
+      ]});
+      const page = await replica.changesSince(saved.checkpoint.cursor, 128);
+      expect(page.events[0].changes).toEqual([{checkoutId: saved.id, path: "large.txt", change: {edit: [[1, "b"], text.length]}}]);
+      expect((await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(saved.id)?.get("large.txt"))
+        .toBe("b" + text.slice(1) + "!");
+      const prefix = [...impl.storage.worktreeBaseChanges.byWorkpiece.get(saved.id)];
+      expect(prefix).toHaveLength(1);
+      expect(prefix[0].change).toEqual({set: text});
+    });
+  });
+
   it("pages a large non-Latin-1 canonical backlog within a byte budget, without losing revisions", () => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl);
     await impl.beginAgentIntegrationTurn(1);
@@ -227,6 +287,15 @@ describe("replica review regressions over durable kernel storage", () => {
       const tree = impl.storage.gadgets.get(treeId)!;
       if (tree.type !== "worktree") throw new Error("Expected worktree");
       expect(await impl.gitCache.readFileAtCommitIfExists(tree.pinBase, "large.txt")).toBe(text);
+      await impl.beginAgentIntegrationTurn(1);
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      const overlay = await replica.readOverlay(checkpoint.checkpointId);
+      expect(await overlay.next()).toBeNull();
+      await replica.submitBatch({batchId: "chunked-prefix", baseCursor: checkpoint.cursor, files: [
+        {checkoutId: treeId, path: "large.txt", baseHash: await replicaTextHash(text),
+          change: {edit: [text.length, [0, "!"]]}},
+      ]});
+      expect([...impl.storage.worktreeBaseChanges.byWorkpiece.get(treeId)]).toEqual(records);
     });
   }, 30_000);
 
@@ -444,6 +513,59 @@ describe("replica review regressions over durable kernel storage", () => {
     expect([...impl.storage.chats.list()].some(message => message.type === "message" && message.message === "Done.")).toBe(true);
   }));
 
+  it.each(["budget", "applicability"] as const)("rejects a whole live replica batch on %s failure without buffering its first checkout", mode => inKernel(crypto.randomUUID(), async impl => {
+    const first = await worktree(impl);
+    const second = await impl.createWorktree("Second", 1, first.baseCommit);
+    impl.storage.chatContext.put({chatId: 1, bindings: {REPO: first.id, SECOND: second.id}});
+    await impl.commitAgentStep(1, AUTHOR, [], {changes: [], createdGadgets: [],
+      createdWorktrees: [{worktreeId: second.id, title: second.title, bindingName: "SECOND"}],
+      addedBindings: [], worktreeCommits: [], blueprintMerges: []});
+    impl.addChatMessages(1, USER, [{type: "message", message: "Exercise a rejected replica batch."}]);
+    await impl.beginAgentIntegrationTurn(1);
+    let access!: WorktreeTurnAccess;
+    const register = impl.registerWorktreeReplicaTurn.bind(impl);
+    impl.registerWorktreeReplicaTurn = (...args) => {access = args[1]; register(...args);};
+    const faux = createFauxCore({models: [{id: "faux-model"}]});
+    faux.setResponses([async () => {
+      const endpoint = await open(impl), checkpoint = await endpoint.checkpoint();
+      const session = impl.getWorkspaceReplicaSession(checkpoint.cursor.split(":")[0]);
+      if (mode === "budget") {
+        const host = session["host"], version = host.version;
+        host.version = lease => {
+          // Land an ordinary write after the preliminary flush but before sampling the version.
+          access.appendChange(first.id, "ordinary.txt", {set: "o".repeat(3_750_000)});
+          host.version = version;
+          return version(lease);
+        };
+        const hash = await replicaTextHash("aaa");
+        await expect(session.submitBatch({batchId: "budget", baseCursor: checkpoint.cursor, files: [first, second].map(tree =>
+          ({checkoutId: tree.id, path: "a.txt", baseHash: hash, change: {set: "r".repeat(150_000)}}))}))
+          .rejects.toThrow(/Too many code changes/);
+      } else {
+        const revision = access.getRevision!();
+        await expect(access.flushReplica!({[first.id]: [["a.txt", {set: "must not land"}]],
+          [second.id]: [["a.txt", {edit: [4, [0, "invalid"]]}]]}, revision)).rejects.toThrow();
+        expect(access.getRevision!()).toBe(revision);
+      }
+      expect(await access.readFile(first.id, "a.txt")).toBe("aaa");
+      expect(await access.readFile(second.id, "a.txt")).toBe("aaa");
+      expect([...impl.storage.worktreeReplicaCommits.list()]).toEqual([]);
+      expect(await access.flushReplica!({}, access.getRevision!())).toBe(true);
+      const content = await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!);
+      expect(content.get(first.id)?.get("a.txt")).not.toBe("must not land");
+      expect(content.get(first.id)?.get("a.txt")).not.toBe("r".repeat(150_000));
+      expect([...impl.storage.chatChanges.list()].flatMap(row => Object.values(row.change).flat())
+        .every(([path]) => path === "ordinary.txt")).toBe(true);
+      await session.submitBatch({batchId: "valid", baseCursor: checkpoint.cursor, files: [
+        {checkoutId: second.id, path: "a.txt", baseHash: await replicaTextHash("aaa"), change: {edit: [3, [0, "!"]]}},
+      ]});
+      return fauxAssistantMessage(fauxText("Done."));
+    }]);
+    await runAgent(impl, {model: faux.getModel(), stream: faux.stream}, 1, AUTHOR,
+      new AbortController().signal, USER, {provider: "cloudflare", model: "faux-model", apiToken: ""});
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toHaveLength(1);
+  }));
+
   it("does not project an upload when message validation fails, including after retry and reset", async () => {
     const name = crypto.randomUUID();
     const saved = await inKernel(name, async impl => {
@@ -595,8 +717,8 @@ describe("replica review regressions over durable kernel storage", () => {
         [path, (await impl.gitCache.readFileAtCommitIfExists(accepted, path))!] as const)))]]), change);
       expect(content.get(id)?.get("a")).toBe("z" + text.slice(1, -1) + "x");
       expect(content.get(id)?.get("b")).toBe("z" + text.slice(1));
-      // The complete original operations still anchor reconciliation, never a flattened re-diff.
-      const prefix = impl.storage.worktreeReplicaLeases.get(checkpoint.cursor.split(":")[0])!.checkpoint!.overlay;
+      // Accepted operations remain in their bounded original storage chunks, not a checkpoint copy.
+      const prefix = [...impl.storage.worktreeBaseChanges.byWorkpiece.get(id)];
       expect(prefix).toHaveLength(3);
       expect(prefix.every(item => "edit" in item.change)).toBe(true);
       expect(JSON.stringify(prefix).length).toBeLessThan(1000);

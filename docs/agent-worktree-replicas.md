@@ -79,10 +79,13 @@ barrier from a dispatched model request; stream creation is not receipt of provi
    checkpoint's captured accepted and explicit heads. It omits unchanged base objects and
    bounds content buffering by an object, not a repository or pack. Every scoped base also receives
    its original commit header: even a repository worktree may require byte hydration when its local
-   base has no provider provenance. This neither sends base blobs nor walks beyond the shallow base.
-   `readOverlay()` then exports only pending operations above the accepted commit. The complete
-   original composed prefix stays in the kernel checkpoint for OT anchors; exporting commits
-   must not replace canonical operations with diffs of flattened files. No whole-repository
+   base has no provider provenance. This neither sends base blobs nor walks beyond the original
+   upstream shallow boundary, even when a migrated worktree hydrates from a newer local commit.
+   `readOverlay()` then exports only pending operations above the accepted commit. Accepted OTs
+   stay in their bounded storage chunks; the checkpoint captures their exact accepted Git identity
+   instead of copying a cumulative prefix into one record. Reconciliation reads only a touched
+   file from that commit, applies captured pending OTs, and replays intervening canonical events.
+   Neither checkpoint capture nor export replaces canonical operations with file diffs. No whole-repository
    content buffer or base64 transfer is introduced. A provider may alternatively serve a
    validated native Git v2 pack for the already-advertised exact base commit. GitHub and GitLab
    implement this through the shared gatekeeper-kit validator and their authenticated

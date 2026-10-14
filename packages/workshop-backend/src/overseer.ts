@@ -51,7 +51,7 @@ import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import { chatChangeStatuses, foldCompactedCode, foldProposedChanges, replayChatBindings } from "./agent-compaction";
-import {composeWorktreeBaseChanges, prepareWorktreeBaseChanges} from "./worktree-base-changes";
+import {prepareWorktreeBaseChanges} from "./worktree-base-changes";
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import {
   blueprintContentKey, deleteBlueprintContent, readBlueprintRelease, sanitizeBlueprintOutput,
@@ -6604,6 +6604,19 @@ class OverseerImpl implements AgentHooks {
           expiresAt: Math.min(lease.expiresAt, current.cleanupDeadline ?? Infinity)});
       },
       entries, baseFile,
+      anchorFile: async (lease, checkoutId, path) => {
+        requireTree(lease, checkoutId);
+        const tree = lease.checkpoint!.worktrees.find(tree => tree.checkoutId === checkoutId)!;
+        const commit = tree.acceptedCommit ?? tree.baseCommit;
+        if (!commit) return null;
+        const entry = await this.gitCache.pathEntryAtCommit(commit, path);
+        if (!entry || entry.kind === "dir" || entry.kind === "submodule") return null;
+        const bytes = (await this.gitCache.ensureObject(entry.oid,
+          {type: "blob", referencedBy: entry.referencedBy})).payload;
+        const text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(bytes);
+        if (text.includes("\0")) throw new Error("Replica mutations of binary files are unsupported.");
+        return text;
+      },
       assertPathWritable: async (lease, checkoutId, path) => {
         const tree = requireTree(lease, checkoutId);
         if (tree.baseCommit) await this.gitCache.assertWorktreePathWritable(tree.baseCommit, path);
@@ -6625,10 +6638,13 @@ class OverseerImpl implements AgentHooks {
         }
         throw new Error("No authorized source can hydrate this immutable Git commit.");
       },
-      commitPack: (lease, checkoutId) => replicaCommitPack(this.gitCache,
-        lease.checkpoint!.worktrees.find(tree => tree.checkoutId === checkoutId)!, () => {
+      commitPack: (lease, checkoutId) => {
+        const piece = this.storage.gadgets.get(checkoutId);
+        const tree = lease.checkpoint!.worktrees.find(tree => tree.checkoutId === checkoutId)!;
+        return replicaCommitPack(this.gitCache, tree, () => {
           if (this.requireReplicaLease(lease.id).gitBootstrapClosed) throw new Error("Git bootstrap is closed.");
-        }),
+        }, piece?.type === "worktree" ? piece.baseCommit : tree.baseCommit);
+      },
       capture: async lease => {
         const active = this.#worktreeReplicaTurns.get(lease.chatId)?.access;
         if (active?.flushReplica && !await active.flushReplica({}, active.getRevision?.() ?? 0)) {
@@ -6646,10 +6662,9 @@ class OverseerImpl implements AgentHooks {
           tree.headCommit = piece?.type === "worktree" ? piece.headCommit : tree.baseCommit;
           const root = tree.baseCommit && await this.gitCache.pathEntryAtCommit(tree.baseCommit, "");
           tree.baseTree = root ? root.oid : null;
-          const prefix = composeWorktreeBaseChanges(tree.checkoutId,
-            this.storage.worktreeBaseChanges.byWorkpiece.get(tree.checkoutId));
-          const composed = composeCodeChange(prefix,
-            {[tree.checkoutId]: pending[tree.checkoutId] ?? []});
+          // Accepted commits already represent the prefix exactly. Reconstruct only touched
+          // anchors from that captured identity; never compose/store an unbounded prefix here.
+          const composed = {[tree.checkoutId]: pending[tree.checkoutId] ?? []};
           // Bound the stored transforms, not their resulting full files or a JSON copy.
           overlayBytes += codeChangeSerializedSize(composed) + 256 * (composed[tree.checkoutId]?.length ?? 0);
           if (overlayBytes > 1024 * 1024) throw new Error("Replica checkpoint transforms exceed their storage budget.");

@@ -5,7 +5,7 @@ import { buildPackStream, parseGitCommitRefs, parseGitTree } from "./git-codec";
 
 /** Export captured heads, excluding objects already present in the fully materialized base. */
 export async function replicaCommitPack(cache: WorkspaceGitCache, tree: WorktreeBase,
-    requireLive: () => void): Promise<ReadableStream<Uint8Array>> {
+    requireLive: () => void, historyBase = tree.baseCommit): Promise<ReadableStream<Uint8Array>> {
   const objects = new Map<string, {type: GitObjectType; referencedBy?: string}>();
   const add = (oid: string, type: GitObjectType, referencedBy?: string) => {
     objects.set(oid, {type, referencedBy});
@@ -39,7 +39,9 @@ export async function replicaCommitPack(cache: WorkspaceGitCache, tree: Worktree
     add(oid, "commit");
     const commit = parseGitCommitRefs((await read(oid, "commit")).payload);
     await trees(commit.tree, baseTree);
-    commits.push(...commit.parents);
+    // A migrated worktree can hydrate from a newer local accepted commit while its explicit
+    // HEAD still points at the original upstream shallow boundary. Never pull its ancestry.
+    if (oid !== historyBase) commits.push(...commit.parents);
   }
   // Any source can fall back to byte hydration, with only a placeholder base commit. Export
   // the real header too, retaining the shallow boundary without retransmitting base files.

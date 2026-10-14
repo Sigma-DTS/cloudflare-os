@@ -2956,6 +2956,23 @@ async function runAgentPass(
     // Source reads may yield to another edit. Validate once, before the synchronous batch,
     // rather than after each append (which itself advances workspaceRevision).
     if (revision !== undefined && revision !== workspaceRevision) return false;
+    // Appending one checkout at a time must not leave a rejected batch partially buffered.
+    // Preflight the same per-checkout framing and applicability against an immutable view.
+    validateCodeChangeSchema(change);
+    const size = prepared.reduce((bytes, item) => bytes +
+      codeChangeSerializedSize({[item.workpieceId]: item.entries}), 0);
+    if (stepBuffer.bytes + size > MAX_CODE_CHANGE_SIZE) {
+      throw new Error("Too many code changes in one step. End this response; the changes made so far " +
+        "are being saved, and you can continue the work in your next step.");
+    }
+    let content = sessionContent;
+    for (const {workpieceId, entries, pin} of prepared) {
+      if (pin) {
+        content = new Map(content);
+        content.set(workpieceId, pin.baseFiles);
+      }
+      content = applyCodeChange(content, {[workpieceId]: entries});
+    }
     for (let {workpieceId, entries, pin} of prepared) {
       appendAgentEdit(workpieceId, {[workpieceId]: entries}, pin);
       stepBuffer.changes.at(-1)!.replica = true;

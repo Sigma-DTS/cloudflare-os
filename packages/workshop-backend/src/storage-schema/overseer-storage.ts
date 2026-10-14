@@ -85,7 +85,7 @@ export type WorktreeReplicaLease = {
   gitBootstrapClosed?: boolean;
   worktrees: WorktreeBase[];
   checkpoint?: WorkspaceCheckpoint & {
-    /** Original composed operations over the upstream base, retained for OT anchors. */
+    /** Legacy upstream-anchored operations; new checkpoints retain only pending operations. */
     overlay: WorktreeChange[];
     /** Bootstrap operations above the accepted commit; absent on legacy checkpoints. */
     pendingOverlay?: WorktreeChange[];

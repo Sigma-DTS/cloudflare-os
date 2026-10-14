@@ -18,6 +18,8 @@ export interface WorktreeReplicaHost {
   capture(lease: WorktreeReplicaLease): Promise<{ cursor: string; overlay: WorktreeChange[]; pendingOverlay?: WorktreeChange[] }>;
   entries(lease: WorktreeReplicaLease, checkoutId: number): Promise<WorktreeBaseEntry[]>;
   baseFile(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<Uint8Array>;
+  /** Read one anchor from the captured accepted commit, without flattening its cumulative OTs. */
+  anchorFile?(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<string | null>;
   /** Reuse ordinary file-tool checks against the immutable tree, including directory entries. */
   assertPathWritable(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<void>;
   /** Fetch only a lease-selected immutable repository commit, without storing its blobs. */
@@ -203,6 +205,17 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
   }
 
   async #anchor(lease: WorktreeReplicaLease, checkoutId: number, path: string, cursor: string): Promise<string | null> {
+    if (this.host.anchorFile && lease.checkpoint!.pendingOverlay !== undefined) {
+      const text = await this.host.anchorFile(lease, checkoutId, path);
+      let content = new Map([[checkoutId, new Map(text === null ? [] : [[path, text]])]]);
+      for (const item of lease.checkpoint!.pendingOverlay) if (item.checkoutId === checkoutId && item.path === path) {
+        content = applyCodeChange(content, {[checkoutId]: [[path, item.change]]});
+      }
+      content = applyCodeChange(content, this.#changes(lease, lease.checkpoint!.cursor,
+        [{checkoutId, path}], cursor));
+      return content.get(checkoutId)?.get(path) ?? null;
+    }
+    // Legacy checkpoints and hosts retain the original upstream-anchored operations.
     let bytes: Uint8Array;
     try { bytes = await this.host.baseFile(lease, checkoutId, path); }
     catch (error) {
