@@ -42,13 +42,6 @@ import { formatGrep, type GrepScan } from "./grep";
 
 const logger = createWorkshopLogger("workshop.agent");
 
-/** Apply the same spawned-agent write restriction to file tools and replica ingestion. */
-export function assertAgentMayModifyWorkpiece(context: AiChatAgentContext, isWorktree: boolean): void {
-  if (context.spawnerConfig && !isWorktree) {
-    throw new Error("You do not have permission to edit this gadget's code.");
-  }
-}
-
 /** Content-free counters for rejected transforms; diagnostics must contain no paths or text. */
 export function agentCodeChangeShape(change: CodeChange) {
   const shape = {changeWorkpieceCount: Object.keys(change).length, changeFileCount: 0, changeEmptyPathCount: 0};
@@ -2061,7 +2054,9 @@ async function runAgentPass(
   // Refuses a file-tool write the chat may not make: a spawned agent runs with no user present to
   // review changes, so it may modify only worktrees, never a gadget's code.
   let assertMayModifyWorkpiece = (workpieceId: WorkpieceId) => {
-    assertAgentMayModifyWorkpiece(agentContext, hooks.isWorktree(workpieceId));
+    if (agentContext.spawnerConfig && !hooks.isWorktree(workpieceId)) {
+      throw new Error("You do not have permission to edit this gadget's code.");
+    }
   };
 
   // Always-available resources (e.g. the Context Library) describe the agent's environment, so
@@ -2840,30 +2835,6 @@ async function runAgentPass(
   // within the step, later tools read the edit through the session content. The first write to
   // an unpinned worktree pins it too, at its accepted commit, with nothing to declare (see
   // pinWorktreeInSession).
-  let stepBarrier: Promise<void> = Promise.resolve();
-  let stepBarrierError: unknown;
-  const progressLogger = logger.with({chatId, executionId: crypto.randomUUID()});
-  let barrierSequence = 0;
-  let persistStep = <T>(operation: () => Promise<T>, isDurabilityFailure = () => true): Promise<T> => {
-    const sequence = ++barrierSequence, queuedAt = Date.now();
-    progressLogger.debug("agent persistence queued", {event: "agent.step.persist.queued", sequence});
-    let result = stepBarrier.then(async () => {
-      if (stepBarrierError !== undefined) throw stepBarrierError;
-      progressLogger.debug("agent persistence started", {event: "agent.step.persist.started", sequence,
-        durationMs: Date.now() - queuedAt});
-      return await operation();
-    });
-    // A failed durability barrier is fatal, including to concurrently queued replica work.
-    stepBarrier = result.then(() => {
-      progressLogger.debug("agent persistence completed", {event: "agent.step.persist.completed", sequence,
-        durationMs: Date.now() - queuedAt});
-    }, error => {
-      if (isDurabilityFailure()) stepBarrierError = error;
-      progressLogger.debug("agent persistence failed", {event: "agent.step.persist.failed", sequence,
-        durationMs: Date.now() - queuedAt});
-    });
-    return result;
-  };
   let appendAgentEdit = (
       workpieceId: WorkpieceId, change: CodeChange,
       pin?: {baseCommit: string, baseFiles: Map<string, string>}) => {
@@ -4155,29 +4126,27 @@ async function runAgentPass(
         // The barrier itself: one transaction persists the step's messages and its buffered
         // effects -- rows, the step's single "changes" message, retirement, registry stamps --
         // so the effects are durable iff the transcript that explains them is. The buffer is
-        // drained inside the serialized operation, so it cannot take an in-flight replica's edits.
-        // If the barrier throws, the turn dies with it and re-delivering the effects would be wrong.
-        await persistStep(async () => {
-          let stepChanges = stepBuffer.changes;
-          stepBuffer.changes = [];
-          stepBuffer.bytes = 0;
-          let createdGadgets = pendingCreatedGadgets;
-          pendingCreatedGadgets = [];
-          let createdWorktrees = pendingCreatedWorktrees;
-          pendingCreatedWorktrees = [];
-          let addedBindings = pendingAddedBindings;
-          pendingAddedBindings = [];
-          let worktreeCommits = pendingWorktreeCommits;
-          pendingWorktreeCommits = [];
-          let blueprintMerges = pendingBlueprintMerges;
-          pendingBlueprintMerges = [];
-          if (await hooks.commitAgentStep(chatId, author, msgs,
-              {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
-               worktreeCommits, blueprintMerges},
-              message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
-            ++nextChangeId;
-          }
-        });
+        // drained before the call: if the barrier throws, the turn dies with it (rethrown out
+        // of the loop), and re-delivering the step's changes anywhere would be wrong.
+        let stepChanges = stepBuffer.changes;
+        stepBuffer.changes = [];
+        stepBuffer.bytes = 0;
+        let createdGadgets = pendingCreatedGadgets;
+        pendingCreatedGadgets = [];
+        let createdWorktrees = pendingCreatedWorktrees;
+        pendingCreatedWorktrees = [];
+        let addedBindings = pendingAddedBindings;
+        pendingAddedBindings = [];
+        let worktreeCommits = pendingWorktreeCommits;
+        pendingWorktreeCommits = [];
+        let blueprintMerges = pendingBlueprintMerges;
+        pendingBlueprintMerges = [];
+        if (await hooks.commitAgentStep(chatId, author, msgs,
+            {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
+             worktreeCommits, blueprintMerges},
+            message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
+          ++nextChangeId;
+        }
 
         // Reset per-step streaming state.
         toolCallNotes.clear();
@@ -4215,31 +4184,6 @@ async function runAgentPass(
       {...systemMessage, toolsAdded: toolList.map(toToolDeclaration)}, ...modelMessages,
     ],
     tools: toolList,
-  };
-
-  let modelRequestSequence = 0;
-  const progressStream: ModelHandle["stream"] = (...args) => {
-    const sequence = ++modelRequestSequence, startedAt = Date.now();
-    progressLogger.debug("agent model request dispatched", {event: "agent.model.dispatch", sequence});
-    try {
-      const stream = handle.stream(...args);
-      // Creating a stream is not receipt of HTTP response headers. Its result settles only
-      // after inference; these breadcrumbs deliberately log no request/response/error text.
-      progressLogger.debug("agent model stream created", {event: "agent.model.stream.created", sequence});
-      void stream.result().then(message => {
-        progressLogger.debug("agent model request completed", {event: "agent.model.completed", sequence,
-          durationMs: Date.now() - startedAt,
-          outcome: message.stopReason === "error" || message.stopReason === "aborted" ? "error" : "ok"});
-      }, () => {
-        progressLogger.debug("agent model request failed", {event: "agent.model.failed", sequence,
-          durationMs: Date.now() - startedAt});
-      });
-      return stream;
-    } catch (error) {
-      progressLogger.debug("agent model dispatch failed", {event: "agent.model.failed", sequence,
-        durationMs: Date.now() - startedAt});
-      throw error;
-    }
   };
 
   await runAgentLoopContinue(context, {
@@ -4286,7 +4230,7 @@ async function runAgentPass(
         return {action: "end"};
       }
     },
-  }, emit, abortSignal, progressStream);
+  }, emit, abortSignal, handle.stream);
 
   // Ordinary effects were barrier-committed with each completed step. The overseer's finally
   // also delivers persistent integration lifecycle events on cancellation or provider failure.
