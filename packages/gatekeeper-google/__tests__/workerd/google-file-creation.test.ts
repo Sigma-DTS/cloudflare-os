@@ -253,6 +253,25 @@ describe("placing a created file", () => {
       .toEqual({ resourceUrl: SHEET_URL });
   });
 
+  // Its file is where Google created it, so binding it in My Drive needs no Drive scope, which an
+  // account connected before per-resource grants may lack.
+  it("binds the file of a receipt from before folders in My Drive, without asking Drive", async () => {
+    const docUrl = "https://docs.google.com/document/d/doc-1/edit";
+    await hooks().createResource("place-old-receipt", DOC_PATTERN, "Plan");
+    await hooks().applyStorage("place-old-receipt", [{ kind: "put", key: "createdFile", value: {
+      userObjectId: env.USER_ACCOUNT.idFromName("user-a").toString(), fileId: "doc-1",
+    } }]);
+    parents.set("doc-1", [ROOT_ID]);
+
+    expect(await hooks().applyCreation("place-old-receipt", "user-b", MY_DRIVE_URL))
+      .toEqual({ resourceUrl: docUrl });
+    expect(requests.filter(({ url }) => url.pathname.startsWith("/drive/"))).toEqual([]);
+    expect(await hooks().applyCreation("place-old-receipt", "user-a", FOLDER_URL))
+      .toEqual({ resourceUrl: docUrl });
+    expect(parents.get("doc-1")).toEqual(["folder-1"]);
+    expect(requests.filter(({ method }) => method === "POST")).toEqual([]);
+  });
+
   it("says so when the created file is gone before a retry moves it", async () => {
     refusedMoves = 1;
     await hooks().createResource("place-gone", SHEETS_PATTERN, "Budget");

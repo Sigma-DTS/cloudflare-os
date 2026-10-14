@@ -72,10 +72,10 @@ export function creationAction(resource: SupportedResource, title: string): Acti
 
 /**
  * The receipt of a file created for a pending creation, kept so a retry binds the same file: the
- * account it is in, and the folder this gatekeeper last put it in, or none while a move's outcome
- * is unknown.
+ * account it is in, and the folder this gatekeeper last put it in, or null while a move's outcome
+ * is unknown. A receipt from before folders has no `folderId`: its file is still in My Drive.
  */
-type CreatedFile = { userObjectId: string; fileId: string; folderId?: string };
+type CreatedFile = { userObjectId: string; fileId: string; folderId?: string | null };
 
 const CREATED_FILE_KEY = "createdFile";
 
@@ -200,15 +200,15 @@ export async function createFileOnce(
       event: "google.creation.file.created", userObjectId, fileId: receipt.fileId, folderId,
     });
   }
-  let { fileId } = receipt;
-  if (receipt.folderId !== folderId) {
+  let { fileId, folderId: placedIn = MY_DRIVE_FOLDER_ID } = receipt;
+  if (placedIn !== folderId) {
     if (userObjectId !== approverId) {
       throw new Error(`This ${FILE_NOUNS[kind]} was already created in another approver's Google ` +
         "account, and only they can move it. Ask them to approve it" +
-        (receipt.folderId === undefined ? "." : `, or approve it for ${describeFolder(receipt.folderId)}.`));
+        (placedIn === null ? "." : `, or approve it for ${describeFolder(placedIn)}.`));
     }
     folder ??= await destinationFolder(account, drive, folderId);
-    record({ userObjectId, fileId });
+    record({ userObjectId, fileId, folderId: null });
     await moveFile(drive, kind, fileId, folderId, folder);
     record({ userObjectId, fileId, folderId });
   }
