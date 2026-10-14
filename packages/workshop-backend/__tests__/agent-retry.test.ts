@@ -181,4 +181,45 @@ describe("transient model failures", () => {
       text: "Image output exceeds 6 MiB for this agent step.",
     });
   }));
+
+  it("elides older executeCode images before the provider request becomes too large",
+      () => withImpl(async impl => {
+    seedChat(impl);
+    let imageIndex = 0;
+    let mimeTypes = ["image/png", "image/jpeg", "image/webp"] as const;
+    let headers = [
+      Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+      Uint8Array.of(0xff, 0xd8, 0xff),
+      Uint8Array.of(0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50),
+    ];
+    impl.executeCodeMode = async () => {
+      let data = new Uint8Array(4 * 1024 * 1024 + 1);
+      data.set(headers[imageIndex]);
+      return {
+        output: "captured screenshot",
+        images: [{data, mimeType: mimeTypes[imageIndex++]}],
+      };
+    };
+
+    let {contexts} = await runScriptedTurn(impl, [
+      fauxAssistantMessage(fauxToolCall("executeCode", {code: "captureFirst()"}),
+          {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxToolCall("executeCode", {code: "captureSecond()"}),
+          {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxToolCall("executeCode", {code: "captureThird()"}),
+          {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxText("Done.")),
+    ]);
+
+    expect(toolResultImages(contexts[2]).map(image => image.mimeType))
+        .toEqual(["image/png", "image/jpeg"]);
+    expect(toolResultImages(contexts[3]).map(image => image.mimeType))
+        .toEqual(["image/jpeg", "image/webp"]);
+    let oldestResult = contexts[3].messages.find(message => message.role === "toolResult");
+    expect(oldestResult?.content).toContainEqual({
+      type: "text",
+      text: "[Earlier image output omitted to keep this model request within its size limit. " +
+          "Capture it again with executeCode if needed.]",
+    });
+  }));
 });

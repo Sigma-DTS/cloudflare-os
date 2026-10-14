@@ -8,7 +8,8 @@ import {
   Type, getSystemMessageText, isRetryableAssistantError, toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import type {
-  AssistantMessage, ImageContent, Message, SystemMessage, TSchema, TextContent, ToolCall, Usage,
+  AssistantMessage, ImageContent, Message, SystemMessage, TSchema, TextContent, ToolCall,
+  ToolResultMessage, Usage,
 } from "@earendil-works/pi-ai";
 import {
   runAgentLoopContinue, type AgentContext, type AgentEvent, type AgentTool,
@@ -53,6 +54,14 @@ export const MAX_CODE_MODE_IMAGES_PER_STEP = 4;
 
 /** Maximum image bytes all executeCode calls in one persisted agent step may emit. */
 export const MAX_CODE_MODE_IMAGE_BYTES_PER_STEP = 6 * 1024 * 1024;
+
+// Raw executeCode image bytes retained in one provider request. Their base64 representation is at
+// most 16 MiB, leaving the other half of a 32 MiB request envelope for text, JSON, and attachments.
+const MAX_CODE_MODE_IMAGE_BYTES_PER_REQUEST = 2 * MAX_CODE_MODE_IMAGE_BYTES_PER_STEP;
+
+const OMITTED_CODE_MODE_IMAGE_TEXT =
+    "[Earlier image output omitted to keep this model request within its size limit. " +
+    "Capture it again with executeCode if needed.]";
 
 /**
  * One buffered agent tool edit: an entry of the step buffer, which the step's persistence
@@ -1419,11 +1428,11 @@ const TRANSIENT_FAILURE_RETRIES = 2;
 /**
  * Runs one agent turn against the chat's history, compacting as needed. A pass over the history
  * may compact instead of prompting the model, or end after a persisted tool step because the next
- * request would cross the compaction trigger; either way the loop reloads the durable history,
- * which the next pass compacts first, and goes again. Each compaction moves the boundary strictly
- * forward and can never pass the newest turn start, so the loop is bounded. `/compact` is done once
- * it has compacted; the model is never prompted. A pass whose model request failed transiently is
- * also run again, a bounded number of times.
+ * request would cross the token or image-byte budget; either way the loop reloads the durable
+ * history, which the next pass compacts or elides old image output first, and goes again. Each
+ * compaction moves the boundary strictly forward and can never pass the newest turn start, so the
+ * loop is bounded. `/compact` is done once it has compacted; the model is never prompted. A pass
+ * whose model request failed transiently is also run again, a bounded number of times.
  */
 export async function runAgent(
     hooks: AgentHooks,
@@ -1804,6 +1813,34 @@ async function runAgentPass(
   // Records which chat message produced each model message, so compaction can convert a cut in the
   // prompt back to a durable chat sequence.
   let modelMessageSources: Omit<CompactionProjectionMessage, "message">[] = [];
+
+  // Persist every step's pixels for retry correctness, but retain only the newest contiguous
+  // executeCode image results in a provider request. This is selected before forward replay so an
+  // older image is never base64-encoded merely to be discarded after a newer result is found.
+  let storedModelDataBySequence = new Map<number, StoredAgentStepModelData | undefined>();
+  let getStoredModelData = (sequence: number): StoredAgentStepModelData | undefined => {
+    if (!storedModelDataBySequence.has(sequence)) {
+      storedModelDataBySequence.set(sequence, hooks.getChatModelData(chatId, sequence));
+    }
+    return storedModelDataBySequence.get(sequence);
+  };
+  let retainedToolResultImageCalls = new Set<string>();
+  let retainedToolResultImageBytes = 0;
+  let imageBudgetFull = false;
+  for (let msg of chatMessages.toReversed()) {
+    if (msg.type !== "message" || msg.author.type !== "agent") continue;
+    for (let result of (getStoredModelData(msg.sequence)?.toolResultImages ?? []).toReversed()) {
+      let bytes = result.images.reduce((total, image) => total + image.data.byteLength, 0);
+      if (imageBudgetFull ||
+          retainedToolResultImageBytes + bytes > MAX_CODE_MODE_IMAGE_BYTES_PER_REQUEST) {
+        imageBudgetFull = true;
+        continue;
+      }
+      retainedToolResultImageCalls.add(result.toolCallId);
+      retainedToolResultImageBytes += bytes;
+    }
+  }
+
   if (checkpoint) {
     // Machine-generated, and derived from content that may include tool output the agent fetched,
     // so say so: without the framing the agent would read it with the trust it gives the user's own
@@ -2076,7 +2113,7 @@ async function runAgentPass(
         // empty display record but must still be replayed. A degenerate empty snapshot is treated
         // as absent so the check can still drop the message.
         let storedModelData = msg.author.type === "agent"
-            ? hooks.getChatModelData(chatId, msg.sequence) : undefined;
+            ? getStoredModelData(msg.sequence) : undefined;
         if (storedModelData && storedModelData.message.content.length === 0 &&
             !storedModelData.toolResultImages?.length) {
           storedModelData = undefined;
@@ -2429,21 +2466,30 @@ async function runAgentPass(
               });
             }
 
-            modelMessages.push({
+            let storedImages = storedImagesByToolCall.get(toolCall.toolCallId) ?? [];
+            let toolResultContent: (TextContent | ImageContent)[] = [
+              {type: "text", text: toolOutput.text},
+            ];
+            if (storedImages.length > 0 &&
+                !retainedToolResultImageCalls.has(toolCall.toolCallId)) {
+              toolResultContent.push({type: "text", text: OMITTED_CODE_MODE_IMAGE_TEXT});
+            } else {
+              toolResultContent.push(...storedImages.map(image => ({
+                type: "image" as const,
+                data: image.data.toBase64(),
+                mimeType: image.mimeType,
+              })));
+            }
+
+            let toolResultMessage: ToolResultMessage = {
               role: "toolResult",
               toolCallId: toolCall.toolCallId,
               toolName: toolCall.toolName,
-              content: [
-                {type: "text", text: toolOutput.text},
-                ...(storedImagesByToolCall.get(toolCall.toolCallId) ?? []).map(image => ({
-                  type: "image" as const,
-                  data: image.data.toBase64(),
-                  mimeType: image.mimeType,
-                })),
-              ],
+              content: toolResultContent,
               isError: toolOutput.isError ?? false,
               timestamp: msgTimestamp,
-            });
+            };
+            modelMessages.push(toolResultMessage);
 
             modelToolCalls.push({
               type: "toolCall",
@@ -3949,8 +3995,8 @@ async function runAgentPass(
   // from a failed turn is persisted.
   let turnFailure: AssistantMessage | undefined;
 
-  // Set when the next provider request would cross the preferred compaction budget. The
-  // turn_end barrier persists this step before the caller reloads durable history.
+  // Set when the next provider request needs a fresh replay to compact text or elide old images.
+  // The turn_end barrier persists this step before the caller reloads durable history.
   let reloadForCompaction = false;
 
   // pi 0.87 calls finishTurn before turn_end. Capture actions there so the stop decision can
@@ -4209,6 +4255,12 @@ async function runAgentPass(
       }
       // The model stopped on its own; there is no next request to make room for.
       if (toolResults.length === 0) return;
+      // Images are persisted by the awaited turn_end barrier after this callback. If retaining
+      // this step's images would make the next request too large, end this pass so replay can keep
+      // the newest results and replace older ones with the omission marker above.
+      let nextImageBytes = retainedToolResultImageBytes + pendingToolResultImageBytes;
+      let exceedsImageBudget = nextImageBytes > MAX_CODE_MODE_IMAGE_BYTES_PER_REQUEST;
+      if (!exceedsImageBudget) retainedToolResultImageBytes = nextImageBytes;
       // Otherwise the next request is this step's measured prompt plus the tool results just
       // produced, weighed as the model will see them (pi's `details` can carry a second copy of a
       // large output). Without usage there is nothing to measure against, so reload: the
@@ -4216,7 +4268,7 @@ async function runAgentPass(
       let measured = message.usage.totalTokens;
       let next = measured + estimateProjectionTokens(
           toolResults.map(({details: _, ...message}) => ({message})));
-      if (measured <= 0 || shouldCompactChat(next, inputBudget)) {
+      if (exceedsImageBudget || measured <= 0 || shouldCompactChat(next, inputBudget)) {
         reloadForCompaction = true;
         // The rerun's fresh preview manager knows of no active file; end this one's marker here,
         // as a non-edit tool start would, so it doesn't outlive the run on the client.
