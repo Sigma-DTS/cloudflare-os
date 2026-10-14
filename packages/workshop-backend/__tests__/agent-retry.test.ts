@@ -223,18 +223,19 @@ describe("transient model failures", () => {
     });
   }));
 
-  it("reserves provider image slots for non-executeCode content",
+  it("retains only the newest four executeCode images",
       () => withImpl(async impl => {
     seedChat(impl);
+    let imageIndex = 0;
     impl.executeCodeMode = async () => ({
-      output: "captured screenshots",
-      images: Array.from({length: 4}, () => ({
-        data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+      output: "captured screenshot",
+      images: [{
+        data: Uint8Array.of(++imageIndex),
         mimeType: "image/png" as const,
-      })),
+      }],
     });
 
-    let toolSteps = Array.from({length: 13}, (_, index) =>
+    let toolSteps = Array.from({length: 5}, (_, index) =>
       fauxAssistantMessage(fauxToolCall("executeCode", {code: `capture${index}()`}),
           {stopReason: "toolUse"}));
     let {contexts} = await runScriptedTurn(impl, [
@@ -242,13 +243,51 @@ describe("transient model failures", () => {
       fauxAssistantMessage(fauxText("Done.")),
     ]);
 
-    expect(toolResultImages(contexts[12])).toHaveLength(48);
-    expect(toolResultImages(contexts[13])).toHaveLength(48);
-    let oldestResult = contexts[13].messages.find(message => message.role === "toolResult");
+    expect(toolResultImages(contexts[4]).map(image => image.data))
+        .toEqual(["AQ==", "Ag==", "Aw==", "BA=="]);
+    expect(toolResultImages(contexts[5]).map(image => image.data))
+        .toEqual(["Ag==", "Aw==", "BA==", "BQ=="]);
+    let oldestResult = contexts[5].messages.find(message => message.role === "toolResult");
     expect(oldestResult?.content).toContainEqual({
       type: "text",
       text: "[Earlier image output omitted to keep this model request within its size limit. " +
           "Capture it again with executeCode if needed.]",
     });
+  }));
+
+  it("includes chat attachments in the request media budget",
+      () => withImpl(async impl => {
+    seedChat(impl);
+    impl.storage.chats.put({
+      chatId: CHAT_ID, sequence: impl.nextChatSequence(CHAT_ID), timestamp: new Date(1),
+      author: OWNER, type: "message", message: "Use this reference image.",
+      attachments: [{
+        id: "reference-image", mimeType: "image/png", size: 9 * 1024 * 1024,
+      }],
+    });
+    // Budget from canonical metadata; the backing bytes can stay tiny in this focused test.
+    impl.getChatAttachmentData = async () => Uint8Array.of(0x89, 0x50, 0x4e, 0x47);
+    impl.executeCodeMode = async () => ({
+      output: "captured screenshot",
+      images: [{
+        data: new Uint8Array(4 * 1024 * 1024),
+        mimeType: "image/png",
+      }],
+    });
+
+    let {contexts} = await runScriptedTurn(impl, [
+      fauxAssistantMessage(fauxToolCall("executeCode", {code: "capture()"}),
+          {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxText("Done.")),
+    ]);
+
+    let result = contexts[1].messages.find(message => message.role === "toolResult");
+    expect(result?.isError).toBe(true);
+    expect(result?.content).toContainEqual({
+      type: "text",
+      text: "Image output cannot fit in this model request alongside the chat's attachments. " +
+          "Start a new chat without those attachments and try again.",
+    });
+    expect(toolResultImages(contexts[1])).toEqual([]);
   }));
 });

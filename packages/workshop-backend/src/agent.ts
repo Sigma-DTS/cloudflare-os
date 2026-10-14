@@ -55,13 +55,15 @@ export const MAX_CODE_MODE_IMAGES_PER_STEP = 4;
 /** Maximum image bytes all executeCode calls in one persisted agent step may emit. */
 export const MAX_CODE_MODE_IMAGE_BYTES_PER_STEP = 6 * 1024 * 1024;
 
-// Raw executeCode image bytes retained in one provider request. Their base64 representation is at
-// most 16 MiB, leaving the other half of a 32 MiB request envelope for text, JSON, and attachments.
-const MAX_CODE_MODE_IMAGE_BYTES_PER_REQUEST = 2 * MAX_CODE_MODE_IMAGE_BYTES_PER_STEP;
+// Keep the request's inline media below 12 MiB raw / 16 MiB base64, leaving the other half of a
+// 32 MiB request envelope for text and JSON. Chat attachments and executeCode output share this
+// budget: neither can make the other's otherwise-valid request fail at the provider boundary.
+const MAX_INLINE_MEDIA_BYTES_PER_REQUEST = 2 * MAX_CODE_MODE_IMAGE_BYTES_PER_STEP;
 
-// Claude's smallest documented request ceiling is 100 images. Reserve half for user attachments
-// and other non-executeCode image content in the same conversation.
-const MAX_CODE_MODE_IMAGES_PER_REQUEST = 50;
+// A small sliding window is enough for computer use and avoids provider-specific many-image
+// behavior. Chat attachments also occupy the request's conservative 20-part media allowance.
+const MAX_CODE_MODE_IMAGES_PER_REQUEST = MAX_CODE_MODE_IMAGES_PER_STEP;
+const MAX_INLINE_MEDIA_PARTS_PER_REQUEST = 20;
 
 const OMITTED_CODE_MODE_IMAGE_TEXT =
     "[Earlier image output omitted to keep this model request within its size limit. " +
@@ -1818,15 +1820,33 @@ async function runAgentPass(
   // prompt back to a durable chat sequence.
   let modelMessageSources: Omit<CompactionProjectionMessage, "message">[] = [];
 
-  // Persist every step's pixels for retry correctness, but retain only the newest contiguous
-  // executeCode image results in a provider request. This is selected before forward replay so an
-  // older image is never base64-encoded merely to be discarded after a newer result is found.
-  // Each storage row is read once; only its assistant snapshot, omission ids, and selected pixels
-  // survive the iteration, so discarded raw buffers are eligible for collection immediately.
+  // Persist every step's pixels for retry correctness, but retain only the newest four contiguous
+  // executeCode images in a provider request. Attachments occupy the same byte/part budget. This
+  // is selected before forward replay so an older image is never base64-encoded merely to be
+  // discarded after a newer result is found. Each storage row is read once; only its assistant
+  // snapshot, omission ids, and selected pixels survive the iteration, so discarded raw buffers
+  // are eligible for collection immediately.
   let storedAssistantMessages = new Map<number, StoredAssistantMessage | undefined>();
   let retainedToolResultImages =
       new Map<number, Map<string, StoredToolResultImage[]>>();
   let omittedToolResultImageCalls = new Map<number, Set<string>>();
+  let retainedAttachmentMediaBytes = 0;
+  let retainedAttachmentMediaCount = 0;
+  for (let msg of chatMessages) {
+    if (msg.type !== "message" ||
+        (msg.author.type !== "user" && msg.author.type !== "gadget")) continue;
+    for (let attachment of msg.attachments ?? []) {
+      if (attachment.mimeType.startsWith("image/") ||
+          (attachment.mimeType === PDF_MIME_TYPE &&
+           modelApiSupportsPdfAttachments(handle.model.api))) {
+        retainedAttachmentMediaBytes += attachment.size;
+        retainedAttachmentMediaCount++;
+      }
+    }
+  }
+  let fitsRequestMediaBudget = (toolImageBytes: number, toolImageCount: number): boolean =>
+    retainedAttachmentMediaBytes + toolImageBytes <= MAX_INLINE_MEDIA_BYTES_PER_REQUEST &&
+    retainedAttachmentMediaCount + toolImageCount <= MAX_INLINE_MEDIA_PARTS_PER_REQUEST;
   let retainedToolResultImageBytes = 0;
   let retainedToolResultImageCount = 0;
   let imageBudgetFull = false;
@@ -1837,7 +1857,9 @@ async function runAgentPass(
     for (let result of (stored?.toolResultImages ?? []).toReversed()) {
       let bytes = result.images.reduce((total, image) => total + image.data.byteLength, 0);
       if (imageBudgetFull ||
-          retainedToolResultImageBytes + bytes > MAX_CODE_MODE_IMAGE_BYTES_PER_REQUEST ||
+          !fitsRequestMediaBudget(
+              retainedToolResultImageBytes + bytes,
+              retainedToolResultImageCount + result.images.length) ||
           retainedToolResultImageCount + result.images.length >
             MAX_CODE_MODE_IMAGES_PER_REQUEST) {
         imageBudgetFull = true;
@@ -3843,6 +3865,12 @@ async function runAgentPass(
                 MAX_CODE_MODE_IMAGE_BYTES_PER_STEP) {
               throw new Error("Image output exceeds 6 MiB for this agent step.");
             }
+            if (!fitsRequestMediaBudget(
+                pendingToolResultImageBytes + imageBytes,
+                pendingToolResultImageCount + result.images.length)) {
+              throw new Error("Image output cannot fit in this model request alongside the " +
+                  "chat's attachments. Start a new chat without those attachments and try again.");
+            }
             pendingToolResultImageCount += result.images.length;
             pendingToolResultImageBytes += imageBytes;
             output += `\n\n(${result.images.length} image${result.images.length === 1 ? "" : "s"} ` +
@@ -4272,7 +4300,7 @@ async function runAgentPass(
       // the newest results and replace older ones with the omission marker above.
       let nextImageBytes = retainedToolResultImageBytes + pendingToolResultImageBytes;
       let nextImageCount = retainedToolResultImageCount + pendingToolResultImageCount;
-      let exceedsImageBudget = nextImageBytes > MAX_CODE_MODE_IMAGE_BYTES_PER_REQUEST ||
+      let exceedsImageBudget = !fitsRequestMediaBudget(nextImageBytes, nextImageCount) ||
           nextImageCount > MAX_CODE_MODE_IMAGES_PER_REQUEST;
       if (!exceedsImageBudget) {
         retainedToolResultImageBytes = nextImageBytes;
