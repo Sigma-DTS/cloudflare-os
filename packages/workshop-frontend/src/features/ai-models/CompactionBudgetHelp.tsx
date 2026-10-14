@@ -10,10 +10,10 @@ const SMALL_BUDGET = 100_000
  * often. It is the field's description, and not a live region that would speak while the budget
  * is being typed.
  */
-export const CompactionBudgetHelp = ({ id, builtIn, max, inEffect, typed }: {
+export const CompactionBudgetHelp = ({ id, builtIn, max, inEffect, typed, forChat = false }: {
   /** The ID the field is described by. */
   id: string
-  /** The budget the model has while none is set for it. */
+  /** The budget the model has while none is set for it, or for `forChat` the model's own. */
   builtIn: number
   /** The largest budget the model may be given. */
   max: number
@@ -21,12 +21,14 @@ export const CompactionBudgetHelp = ({ id, builtIn, max, inEffect, typed }: {
   inEffect: number
   /** The budget typed into the field, while it is a valid one. */
   typed: number | undefined
+  /** Whether the field is one chat's budget, rather than the model's. */
+  forChat?: boolean
 }) => (
   <div id={id} className="grid gap-2 text-sm leading-snug text-kumo-subtle">
     <p>
-      Leave blank for the built-in budget of {tokenCount(builtIn)}. The maximum is{' '}
-      {tokenCount(max)}. A chat on this model compacts at about{' '}
-      {tokenCount(Math.round(COMPACTION_TRIGGER_RATIO * inEffect))}.
+      Leave blank for the {forChat ? 'model’s' : 'built-in'} budget of {tokenCount(builtIn)}. The
+      maximum is {tokenCount(max)}. {forChat ? 'This chat' : 'A chat on this model'} compacts at
+      about {tokenCount(Math.round(COMPACTION_TRIGGER_RATIO * inEffect))}.
     </p>
     {typed !== undefined && typed < SMALL_BUDGET && (
       <p className="text-kumo-warning">

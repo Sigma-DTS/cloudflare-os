@@ -83,6 +83,7 @@ import {
   BlueprintMerge,
   BlueprintOutput,
   MessageFormatRef,
+  ChatModelSettings,
 } from "@gadgets/workshop-shared/api";
 import { composeEpochChanges, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import type { ChatChangeRow, ChatContentReader } from "./features/code/otClient";
@@ -116,6 +117,13 @@ import { isImeComposing } from "./keyboardEvent";
 import { formatAttachmentSize } from "./features/chat/attachmentFormatting";
 import { ChatComposer } from "./features/chat/composer/ChatComposer";
 import { composerDraftStorageKey } from "./features/chat/composer/draft/composerDraft";
+import { compactsAtLabel, hasChatSettings } from "./features/chat/composer/chatPresets";
+import {
+  getStoredChatSettings,
+  persistChatSettings,
+} from "./features/chat/composer/chatSettingsSelection";
+import { useChatModelDescription } from "./features/chat/composer/useChatModelDescription";
+import { useChatPresets } from "./features/chat/composer/useChatPresets";
 import {
   findUnresolvedConflicts, listConflictedFiles, type UnresolvedConflict,
 } from "./features/chat/mergeConflicts";
@@ -2694,6 +2702,9 @@ function ChatInterface({
     lastMessageTimestamp: null,
   });
   const provisionalRef = useRef<Map<number, ProvisionalChatState>>(new Map());
+  // Each chat's model settings as the server last gave or accepted them, which a refused change
+  // restores. The cached metadata may hold a change that is still being sent.
+  const serverChatSettingsRef = useRef<Map<number, ChatModelSettings | undefined>>(new Map());
   // Per-chat buffers of live (unmaterialized) change rows (see ChatLiveChangeRows), fed by
   // changeApplied, pruned by materialization watermarks and generation bumps.
   const chatChangeRowsRef = useRef<Map<number, ChatChangeRowBuffer>>(new Map());
@@ -2787,6 +2798,10 @@ function ChatInterface({
     [],
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  // The settings a new chat starts with: those last chosen, in any chat.
+  const [newChatSettings, setNewChatSettings] = useState<ChatModelSettings>(getStoredChatSettings);
+  const chatPresets = useChatPresets();
+  const chatModelDescription = useChatModelDescription(getOverseer, selectedModel);
   const [sidebarActiveTab, setSidebarActiveTab] = useState<
     "chat" | "connections"
   >("chat");
@@ -3135,6 +3150,7 @@ function ChatInterface({
   // Get metadata for selected chat
   const currentChatMetadata =
     selectedChatId !== null ? cacheRef.current.chats.get(selectedChatId) : null;
+  const newChatSettingsToSend = hasChatSettings(newChatSettings) ? newChatSettings : undefined;
 
   // Download a committed chat attachment. Image bytes are already inlined on the message; other
   // attachments are fetched on demand over the authenticated RPC connection.
@@ -3496,6 +3512,7 @@ function ChatInterface({
       }
 
       cacheRef.current.chats.set(chat.id, chat);
+      serverChatSettingsRef.current.set(chat.id, chat.modelSettings);
       bumpChatListVersion();
       forceUpdate();
     }
@@ -3503,6 +3520,7 @@ function ChatInterface({
     deleted(chatId: number) {
       // Remove from cache
       cacheRef.current.chats.delete(chatId);
+      serverChatSettingsRef.current.delete(chatId);
       cacheRef.current.messages.delete(chatId);
       cacheRef.current.compacted.delete(chatId);
       removeChatFromActionMessageIndex(chatId);
@@ -3811,6 +3829,7 @@ function ChatInterface({
 
           chats.forEach((chat) => {
             cacheRef.current.chats.set(chat.id, chat);
+            serverChatSettingsRef.current.set(chat.id, chat.modelSettings);
           });
           bumpChatListVersion();
           setChatListReady(true);
@@ -4003,7 +4022,7 @@ function ChatInterface({
       if (selectedChatId === null) {
         // Create a new chat (with optional capsules).
         const newChatId = await overseer.newChat(
-            message, model, capsules, attachments, formats);
+            message, model, capsules, attachments, formats, newChatSettingsToSend);
         onNavigateToChatRef.current(newChatId);
       } else {
         // Send message to existing chat.
@@ -4041,7 +4060,7 @@ function ChatInterface({
     const model = modelId !== undefined ? modelId : selectedModel;
     try {
       const newChatId = await overseer.newChat(
-          message, model, capsules, attachments, formats);
+          message, model, capsules, attachments, formats, newChatSettingsToSend);
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       if (!logRpcFailure("Failed to create new chat:", err, { reportSite: "chat.new" })) {
@@ -4059,6 +4078,58 @@ function ChatInterface({
   const handleModelChange = (modelId: string | null) => {
     setSelectedModel(modelId);
     persistSelectedModel(modelId);
+  };
+
+  const handleNewChatSettingsChange = (settings: ChatModelSettings) => {
+    setNewChatSettings(settings);
+    persistChatSettings(settings);
+  };
+
+  // An existing chat's change is shown at once, and undone if the server refuses it: the chat
+  // goes back to the settings the server last gave or accepted, not to what an earlier change,
+  // perhaps refused too, showed. Either way the settings are those the next new chat starts with.
+  const handleChatSettingsChange = (chatId: number, settings: ChatModelSettings) => {
+    handleNewChatSettingsChange(settings);
+    const chat = cacheRef.current.chats.get(chatId);
+    if (!chat) return;
+    const serverSettings = serverChatSettingsRef.current;
+    if (!serverSettings.has(chatId)) serverSettings.set(chatId, chat.modelSettings);
+    const applied = hasChatSettings(settings) ? settings : undefined;
+    cacheRef.current.chats.set(chatId, { ...chat, modelSettings: applied });
+    forceUpdate();
+    overseer.setChatModelSettings(chatId, settings).then(() => {
+      serverSettings.set(chatId, applied);
+    }, (err: unknown) => {
+      logRpcFailure("Failed to change the chat's model settings:", err);
+      // Only the latest change is undone: a later one, or the server's own, stands.
+      const current = cacheRef.current.chats.get(chatId);
+      if (current && current.modelSettings === applied) {
+        cacheRef.current.chats.set(chatId, {
+          ...current,
+          modelSettings: serverSettings.get(chatId),
+        });
+        forceUpdate();
+      }
+      toasts.add({
+        title: "Couldn’t change the model settings",
+        description: rpcFailureDescription(err),
+        variant: "error",
+      });
+    });
+  };
+
+  // The list's composer always starts a new chat, even beside a selected one in sidebar mode.
+  const newChatSettingsControl = {
+    settings: newChatSettings,
+    onSettingsChange: handleNewChatSettingsChange,
+    description: chatModelDescription,
+    presets: chatPresets,
+  };
+  const chatSettingsControl = selectedChatId === null ? newChatSettingsControl : {
+    ...newChatSettingsControl,
+    settings: currentChatMetadata?.modelSettings ?? {},
+    onSettingsChange: (settings: ChatModelSettings) =>
+      handleChatSettingsChange(selectedChatId, settings),
   };
 
   // Handle stopping the agent
@@ -5476,6 +5547,7 @@ function ChatInterface({
             models={availableModels}
             selectedModel={selectedModel === null ? null : { id: selectedModel }}
             onModelChange={handleModelChange}
+            chatSettings={newChatSettingsControl}
             showThinkingTraces={showThinkingTraces}
             onToggleThinkingTraces={toggleShowThinkingTraces}
             minRows={2}
@@ -6481,6 +6553,7 @@ function ChatInterface({
                       name: chatAgent?.id === selectedModel ? chatAgent.name : undefined,
                     }}
                     onModelChange={handleModelChange}
+                    chatSettings={chatSettingsControl}
                     pendingConsoleLogCount={pendingConsoleLogCount}
                     consoleLogPreview={consoleLogPreview}
                     consoleLogSeverity={consoleLogSeverity}
@@ -6562,6 +6635,14 @@ function ChatInterface({
                     )}
                     {currentChatMetadata?.totalCost != null && (
                       <span>${currentChatMetadata.totalCost.toFixed(4)}</span>
+                    )}
+                    {/* Until the model is described its maximum, which caps the budget, is unknown. */}
+                    {currentChatMetadata?.modelSettings?.compactionInputBudget !== undefined &&
+                     chatModelDescription.description && (
+                      <span>
+                        {compactsAtLabel(currentChatMetadata.modelSettings.compactionInputBudget,
+                                         chatModelDescription.description)}
+                      </span>
                     )}
                   </div>
                 </div>

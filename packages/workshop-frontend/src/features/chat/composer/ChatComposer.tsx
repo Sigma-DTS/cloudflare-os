@@ -49,6 +49,7 @@ import {
 } from "./attachments/useComposerAttachments";
 import { CapturedConsoleLogsPrompt } from "./CapturedConsoleLogsPrompt";
 import ComposerAddMenu from "./ComposerAddMenu";
+import { ComposerChatSettings, type ChatSettingsControl } from "./ComposerChatSettings";
 import { ComposerModelSelector, type SelectedModel } from "./ComposerModelSelector";
 import { useComposerDraft } from "./draft/useComposerDraft";
 import { buildComposerSubmission } from "./composerSubmission";
@@ -85,6 +86,7 @@ export const ChatComposer = ({
   models,
   selectedModel,
   onModelChange,
+  chatSettings,
   pendingConsoleLogCount = 0,
   consoleLogPreview = "",
   consoleLogSeverity = "info",
@@ -124,6 +126,8 @@ export const ChatComposer = ({
   models: AiChatAuthorInfo[];
   selectedModel: SelectedModel;
   onModelChange: (modelId: string | null) => void;
+  /** The chat's model settings, offered beside the model while one is selected. */
+  chatSettings?: ChatSettingsControl;
   pendingConsoleLogCount?: number;
   consoleLogPreview?: string;
   consoleLogSeverity?: "error" | "warn" | "info";
@@ -896,9 +900,12 @@ export const ChatComposer = ({
           </div>
         </div>
 
-        {/* Footer row: connection/options left, model + send right */}
-        <div className="flex items-center justify-between gap-1.5 px-3 pb-1.5">
-          <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+        {/* Footer row: connection/options left, model + send right. The left buttons keep their
+            size and the right group gives way, so the model's name truncates in a narrow composer
+            rather than the buttons being clipped. It is the container the right group's
+            container queries ask the width of. */}
+        <div className="@container flex items-center justify-between gap-1.5 px-3 pb-1.5">
+          <div className="flex flex-shrink-0 items-center gap-1.5">
             <ComposerAddMenu
               anchorRef={promptCardRef}
               catalogVersion={catalogVersion}
@@ -956,6 +963,7 @@ export const ChatComposer = ({
                 selectedModel={selectedModel}
                 onModelChange={onModelChange}
               />
+              {chatSettings && selectedModel !== null && <ComposerChatSettings {...chatSettings} />}
               {isAgentActive && onStop ? (
                 <WorkshopIconButton
                   onClick={onStop}

@@ -12,6 +12,7 @@ import {
   AiChatAuthorInfo,
   CapsuleSpecifier,
   ChatAttachmentHandle,
+  ChatModelSettings,
   MessageFormatRef,
   SlashCommandRequest,
 } from "@gadgets/workshop-shared/api";
@@ -22,6 +23,13 @@ import {
 import { useDocumentTitle } from "../useDocumentTitle";
 import { homePromptFromSearch } from "../homePrompt";
 import { composerDraftStorageKey } from "../features/chat/composer/draft/composerDraft";
+import { hasChatSettings } from "../features/chat/composer/chatPresets";
+import {
+  getStoredChatSettings,
+  persistChatSettings,
+} from "../features/chat/composer/chatSettingsSelection";
+import { useChatModelDescription } from "../features/chat/composer/useChatModelDescription";
+import { useChatPresets } from "../features/chat/composer/useChatPresets";
 
 type HomeSearch = {
   prompt?: string;
@@ -56,6 +64,10 @@ export function HomePageContent({ prompt }: HomeSearch) {
 
   const [models, setModels] = useState<AiChatAuthorInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [chatSettings, setChatSettings] = useState<ChatModelSettings>(getStoredChatSettings);
+  // Describing a model takes a workspace, which is created once the user reaches for the settings.
+  const [settingsWanted, setSettingsWanted] = useState(false);
+  const chatPresets = useChatPresets();
   // Bumped each time a task suggestion is picked; the composer re-seeds its text off the nonce.
   const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(null);
 
@@ -91,6 +103,11 @@ export function HomePageContent({ prompt }: HomeSearch) {
     persistSelectedModel(value);
   }, []);
 
+  const handleChatSettingsChange = (settings: ChatModelSettings) => {
+    setChatSettings(settings);
+    persistChatSettings(settings);
+  };
+
   // Pre-create a provisional gadget as soon as the user starts interacting, so that navigation
   // after submit is instant. Same pattern as before — disposed on unmount if never consumed.
   const provisionalOverseerRef = useRef<{ stub: RpcStub<Overseer> } | null>(null);
@@ -122,7 +139,8 @@ export function HomePageContent({ prompt }: HomeSearch) {
         const overseer = provisionalOverseerRef.current!.stub;
         // Pipeline both independent calls in one batch, but settle both before releasing the stub.
         const [chat, {id}] = await Promise.all([
-          overseer.newChat(message, modelId, capsules, attachments, formats),
+          overseer.newChat(message, modelId, capsules, attachments, formats,
+              hasChatSettings(chatSettings) ? chatSettings : undefined),
           overseer.getMetadata(),
         ]);
         provisionalOverseerRef.current?.stub[Symbol.dispose]();
@@ -147,13 +165,15 @@ export function HomePageContent({ prompt }: HomeSearch) {
         throw err;
       }
     },
-    [ensureProvisionalGadget, navigate, toasts],
+    [chatSettings, ensureProvisionalGadget, navigate, toasts],
   );
 
   const getOverseer = useCallback((): RpcStub<Overseer> => {
     ensureProvisionalGadget();
     return provisionalOverseerRef.current!.stub;
   }, [ensureProvisionalGadget]);
+
+  const chatModelDescription = useChatModelDescription(getOverseer, selectedModel, settingsWanted);
 
   const createCapsuleGatekeeper = useCallback(
     (accountId: number, url: string) => {
@@ -201,6 +221,13 @@ export function HomePageContent({ prompt }: HomeSearch) {
           models={models}
           selectedModel={selectedModel === null ? null : { id: selectedModel }}
           onModelChange={handleModelChange}
+          chatSettings={{
+            settings: chatSettings,
+            onSettingsChange: handleChatSettingsChange,
+            description: chatModelDescription,
+            presets: chatPresets,
+            onIntent: () => setSettingsWanted(true),
+          }}
           newChat
           offerFormats
           autoFocus

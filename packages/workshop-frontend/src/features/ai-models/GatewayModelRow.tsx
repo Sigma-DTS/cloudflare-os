@@ -10,7 +10,13 @@ import type {
 } from '@gadgets/workshop-shared/api'
 import { CompactionBudgetHelp } from './CompactionBudgetHelp'
 import { GatewayTestButton, GatewayTestStatus } from './GatewayTest'
-import { PROVIDER_LABELS, REASONING_LEVEL_LABELS, parseTokenLimit, tokenCount } from './modelForm'
+import {
+  PROVIDER_LABELS,
+  REASONING_LEVEL_LABELS,
+  deploymentDefaultReasoningLabel,
+  parseTokenLimit,
+  tokenCount,
+} from './modelForm'
 import { ReasoningLevelSelect } from './ReasoningLevelSelect'
 import { useFieldErrorAlert } from './useFieldErrorAlert'
 import type { GatewayTestState } from './useGatewayTests'
@@ -216,7 +222,7 @@ export const GatewayModelRow = ({
                 levels={model.reasoningLevels}
                 value={model.settings?.reasoning}
                 defaultReasoning={defaultReasoning}
-                builtInReasoning={model.builtInReasoning}
+                defaultLabel={deploymentDefaultReasoningLabel(defaultReasoning, model.builtInReasoning)}
                 disabled={busy}
                 ariaLabel={`Reasoning level for ${model.name}`}
                 onValueChange={(reasoning) =>
