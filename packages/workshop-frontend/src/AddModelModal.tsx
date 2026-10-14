@@ -1,14 +1,22 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useId } from 'react'
 import { Dialog, Button, Input, Select, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, RedactedAiModelConfig, SUGGESTED_MODELS, modelKind } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, GatewayModelCapabilities, GatewayModelLevelTest, ReasoningLevel, RedactedAiModelConfig, SUGGESTED_MODELS, modelKind } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import { CapabilityFields } from './features/ai-models/CapabilityFields'
+import { CompactionBudgetHelp } from './features/ai-models/CompactionBudgetHelp'
 import { ExtraHeadersEditor } from './features/ai-models/ExtraHeadersEditor'
+import { GatewayLevelTestsStatus, GatewayTestButton } from './features/ai-models/GatewayTest'
+import { ModelSuggestionInput } from './features/ai-models/ModelSuggestionInput'
+import { ReasoningLevelSelect } from './features/ai-models/ReasoningLevelSelect'
 import { StoredSecretInput } from './features/ai-models/StoredSecretInput'
 import {
   headerRowsFromRecord, headerRowsToRecord, validateHeaderRows, type HeaderRow,
 } from './features/ai-models/extraHeaders'
-import { PROVIDER_LABELS, parseTokenLimit } from './features/ai-models/modelForm'
+import { PROVIDER_LABELS, parseTokenLimit, tokenCount } from './features/ai-models/modelForm'
+import { useGatewayTests } from './features/ai-models/useGatewayTests'
+import { useModelDescription } from './features/ai-models/useModelDescription'
+import { useModelsDevSuggestions } from './features/ai-models/useModelsDevSuggestions'
 
 /**
  * Whether the modal adds a model from scratch, edits a stored one, or adds a model based on a
@@ -50,6 +58,12 @@ const TOKEN_OPTIONAL_WITH_HEADERS: ReadonlySet<AiModelProvider> = new Set(['anth
 const isTokenRequired = (provider: AiModelProvider, headerRows: readonly HeaderRow[]) =>
   provider !== 'ollama' &&
   !(TOKEN_OPTIONAL_WITH_HEADERS.has(provider) && headerRowsToRecord(headerRows) !== undefined)
+
+const TOKEN_LIMIT_ERROR = 'Please enter a positive whole number of tokens'
+const TEST_HELP =
+  'Test sends this model one request as its chats would send it, and one at each reasoning ' +
+  'level it lists. Each request can use up to 2,048 output tokens. The test counts toward your ' +
+  'usage as one chat turn, and nothing is added.'
 
 // Example used in the custom-model placeholders for providers that have no suggested models
 // (currently Ollama, which serves whatever the user has pulled locally).
@@ -128,9 +142,16 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const [accountId, setAccountId] = useState(source?.config.accountId ?? '')
   const [apiUrl, setApiUrl] = useState(source?.config.apiUrl ?? '')
   const [headerRows, setHeaderRows] = useState<HeaderRow[]>(() => headerRowsFromRecord(source?.config.extraHeaders))
-  // Token limits are specific to a model, so a clone doesn't inherit them.
+  // The ID chats and settings know the model by, or null while it follows the provider model ID.
+  const [ownId, setOwnId] = useState<string | null>(null)
+  // Token limits, the compaction budget and what is stated of the model are specific to a model,
+  // so a clone doesn't inherit them.
   const [contextWindow, setContextWindow] = useState(editing ? String(source!.config.contextWindow ?? '') : '')
   const [outputLimit, setOutputLimit] = useState(editing ? String(source!.config.outputLimit ?? '') : '')
+  const [compactionBudget, setCompactionBudget] = useState(editing ? String(source!.config.compactionInputBudget ?? '') : '')
+  const [capabilities, setCapabilities] = useState<GatewayModelCapabilities>((editing && source!.config.capabilities) || {})
+  const [reasoning, setReasoning] = useState<ReasoningLevel | undefined>(source?.config.reasoning)
+  const budgetFacts = useId()
 
   // Validation errors
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -143,6 +164,29 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const enabledProviders: Set<string> | null = gatewayMode
     ? new Set(aiConfig.enabledProviders)
     : null
+  // A built-in model's ID is a valid upstream model for a version of the user's own, so no
+  // suggestion is left out.
+  const suggestions = useModelsDevSuggestions(
+    gatewayMode && aiConfig.modelsDevSuggestions, gatewayMode ? aiConfig.enabledProviders : [], [])
+
+  const contextWindowTokens = parseTokenLimit(contextWindow)
+  const outputLimitTokens = parseTokenLimit(outputLimit)
+  const budgetTokens = parseTokenLimit(compactionBudget)
+  const id = editing ? source!.profile.id : ownId ?? modelId
+  // The model the settings that only AI Gateway offers are described for. Its own level and budget
+  // change nothing of what is described, and a budget out of range would be refused.
+  const described: RedactedAiModelConfig | null =
+    gatewayMode && selection && modelId.trim() && contextWindowTokens !== null && outputLimitTokens !== null
+      ? {
+          provider: selection.provider,
+          model: modelId.trim(),
+          apiToken: '',
+          ...(contextWindowTokens && { contextWindow: contextWindowTokens }),
+          ...(outputLimitTokens && { outputLimit: outputLimitTokens }),
+          ...(Object.keys(capabilities).length > 0 && { capabilities }),
+        }
+      : null
+  const description = useModelDescription(authenticatedApi, described)
 
   // The server keeps withheld secrets only for the endpoint they were configured for. Once the URL
   // changes, withheld values are shown (and sent) as blank, and header values must be re-entered.
@@ -160,8 +204,12 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       setAccountId('')
       setApiUrl('')
       setHeaderRows([])
+      setOwnId(null)
       setContextWindow('')
       setOutputLimit('')
+      setCompactionBudget('')
+      setCapabilities({})
+      setReasoning(undefined)
       setErrors({})
       setHeaderErrors({})
       setAdvancedOpen(false)
@@ -186,8 +234,12 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     setAccountId('')
     setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
     setHeaderRows([])
+    setOwnId(null)
     setContextWindow('')
     setOutputLimit('')
+    setCompactionBudget('')
+    setCapabilities({})
+    setReasoning(undefined)
   }
 
   const validate = (): boolean => {
@@ -204,6 +256,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         newErrors.modelId = "This is a decision model, which can't chat. Add it from AI Providers instead."
       }
       if (!displayName.trim()) newErrors.displayName = 'Please enter a display name'
+      if (!id.trim()) newErrors.id = 'Please enter an ID'
+      // A built-in model would shadow one added under its ID.
+      else if (!editing && gatewayMode && aiConfig.builtInModelIds.includes(id.trim())) {
+        newErrors.id = `This deployment already provides a model with this ID. Choose another, such as “${id.trim()}-custom”.`
+      }
     }
 
     const isOllama = selection?.provider === 'ollama'
@@ -224,11 +281,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       newErrors.apiUrl = 'Please enter the Ollama API URL'
     }
 
-    if (parseTokenLimit(contextWindow) === null) {
-      newErrors.contextWindow = 'Please enter a positive whole number of tokens'
-    }
-    if (parseTokenLimit(outputLimit) === null) {
-      newErrors.outputLimit = 'Please enter a positive whole number of tokens'
+    if (contextWindowTokens === null) newErrors.contextWindow = TOKEN_LIMIT_ERROR
+    if (outputLimitTokens === null) newErrors.outputLimit = TOKEN_LIMIT_ERROR
+    if (gatewayMode && budgetTokens === null) newErrors.compactionBudget = TOKEN_LIMIT_ERROR
+    else if (gatewayMode && description && budgetTokens && budgetTokens > description.maxCompactionInputBudget) {
+      newErrors.compactionBudget = `Please enter at most ${tokenCount(description.maxCompactionInputBudget)}`
     }
 
     const newHeaderErrors = showCredentials ? validateHeaderRows(headerRows) : {}
@@ -240,7 +297,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       }
     }
     // These fields live in the collapsible, so reveal their errors if it was closed.
-    if (Object.keys(newHeaderErrors).length > 0 || newErrors.contextWindow || newErrors.outputLimit) {
+    if (Object.keys(newHeaderErrors).length > 0 || newErrors.contextWindow || newErrors.outputLimit ||
+        newErrors.compactionBudget) {
       setAdvancedOpen(true)
     }
 
@@ -249,34 +307,49 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     return Object.keys(newErrors).length === 0 && Object.keys(newHeaderErrors).length === 0
   }
 
+  // The model the form describes, as it is sent to be added, saved or tested.
+  const formConfig = (selected: SelectionType): RedactedAiModelConfig => {
+    const extraHeaders = gatewayMode ? undefined : headerRowsToRecord(headerRows)
+    return {
+      provider: selected.provider,
+      model: selected.type === 'suggested' ? selected.modelId : modelId.trim(),
+      apiToken: gatewayMode ? '' : effectiveApiToken?.trim() ?? null,
+      ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
+      ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
+      ...(extraHeaders && { extraHeaders }),
+      ...(contextWindowTokens && { contextWindow: contextWindowTokens }),
+      ...(outputLimitTokens && { outputLimit: outputLimitTokens }),
+      // Only AI Gateway runs these. What is stated of a model the runtime knows is not used, and
+      // its fields are not shown, so it is not sent either.
+      ...(gatewayMode && reasoning && { reasoning }),
+      ...(gatewayMode && budgetTokens && { compactionInputBudget: budgetTokens }),
+      ...(gatewayMode && !description?.runtimeKnown && Object.keys(capabilities).length > 0 &&
+          { capabilities }),
+    }
+  }
+
+  // A test is kept under the model it is of, so its result shows only while the form describes it.
+  const testKey = gatewayMode && selection ? JSON.stringify(formConfig(selection)) : null
+  const { tests, startTest } = useGatewayTests<string, GatewayModelLevelTest[]>(
+    (key) => authenticatedApi.testModel(JSON.parse(key) as RedactedAiModelConfig))
+  const test = testKey === null ? undefined : tests.get(testKey)
+
+  const handleTest = () => {
+    if (testKey !== null && validate()) startTest(testKey)
+  }
+
   const handleSubmit = async () => {
     if (!validate()) return
 
     setLoading(true)
     try {
       const isSuggested = selection!.type === 'suggested'
-      const finalModelId = isSuggested ? selection!.modelId : modelId.trim()
-      const finalDisplayName = isSuggested ? selection!.displayName : displayName.trim()
-
+      const config = formConfig(selection!)
       const profile: AiChatAuthorInfo = {
         type: 'agent',
         // A model's ID is its identity to chats and settings, so editing never changes it.
-        id: editing ? source!.profile.id : finalModelId,
-        name: finalDisplayName,
-      }
-
-      const extraHeaders = gatewayMode ? undefined : headerRowsToRecord(headerRows)
-      const contextWindowTokens = parseTokenLimit(contextWindow)
-      const outputLimitTokens = parseTokenLimit(outputLimit)
-      const config: RedactedAiModelConfig = {
-        provider: selection!.provider,
-        model: finalModelId,
-        apiToken: gatewayMode ? '' : effectiveApiToken?.trim() ?? null,
-        ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
-        ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
-        ...(extraHeaders && { extraHeaders }),
-        ...(contextWindowTokens && { contextWindow: contextWindowTokens }),
-        ...(outputLimitTokens && { outputLimit: outputLimitTokens }),
+        id: editing ? source!.profile.id : isSuggested ? config.model : id.trim(),
+        name: isSuggested ? selection!.displayName : displayName.trim(),
       }
 
       if (editing) {
@@ -367,15 +440,44 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
           {/* Custom model fields */}
           {showCustomFields && (
             <>
+              {suggestions && !editing ? (
+                <ModelSuggestionInput
+                  label="Provider Model ID"
+                  description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
+                  provider={selection.provider}
+                  value={modelId}
+                  error={errors.modelId || undefined}
+                  suggestions={suggestions}
+                  onValueChange={(value) => { setModelId(value); setErrors(prev => ({ ...prev, modelId: '' })) }}
+                  onPick={(picked) => {
+                    setDisplayName(picked.name)
+                    setContextWindow(String(picked.contextWindow))
+                    setOutputLimit(String(picked.outputLimit ?? ''))
+                    setCapabilities(picked.capabilities ?? {})
+                  }}
+                />
+              ) : (
+                <Input
+                  label="Provider Model ID"
+                  placeholder={`e.g., ${example!.modelId}`}
+                  description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
+                  value={modelId}
+                  disabled={editing}
+                  onChange={(e) => { setModelId(e.target.value); setErrors(prev => ({ ...prev, modelId: '' })) }}
+                  error={errors.modelId}
+                  variant={errors.modelId ? 'error' : 'default'}
+                />
+              )}
+
               <Input
-                label="Model ID"
+                label="ID"
                 placeholder={`e.g., ${example!.modelId}`}
-                description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
-                value={modelId}
+                description="How chats and settings refer to this model. It follows the provider model ID until you change it, which lets you add your own version of a model under another ID. It can't be changed later."
+                value={id}
                 disabled={editing}
-                onChange={(e) => { setModelId(e.target.value); setErrors(prev => ({ ...prev, modelId: '' })) }}
-                error={errors.modelId}
-                variant={errors.modelId ? 'error' : 'default'}
+                onChange={(e) => { setOwnId(e.target.value); setErrors(prev => ({ ...prev, id: '' })) }}
+                error={errors.id}
+                variant={errors.id ? 'error' : 'default'}
               />
 
               <Input
@@ -488,11 +590,63 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
                     error={errors.outputLimit}
                     variant={errors.outputLimit ? 'error' : 'default'}
                   />
+                  {/* These take effect only through AI Gateway, and are offered once the server has
+                      described the model. */}
+                  {gatewayMode && description && (
+                    <>
+                      <ReasoningLevelSelect
+                        levels={description.reasoningLevels}
+                        value={reasoning}
+                        defaultReasoning={aiConfig.defaultReasoning}
+                        builtInReasoning={description.builtInReasoning}
+                        onValueChange={setReasoning}
+                      />
+                      {description.maxCompactionInputBudget > 0 && (
+                        <div className="grid gap-2">
+                          <Input
+                            label="Compaction Budget"
+                            inputMode="numeric"
+                            placeholder={`${description.builtInCompactionInputBudget.toLocaleString()} (built-in)`}
+                            value={compactionBudget}
+                            onChange={(e) => { setCompactionBudget(e.target.value); setErrors(prev => ({ ...prev, compactionBudget: '' })) }}
+                            error={errors.compactionBudget}
+                            variant={errors.compactionBudget ? 'error' : 'default'}
+                            aria-describedby={budgetFacts}
+                          />
+                          <CompactionBudgetHelp
+                            id={budgetFacts}
+                            builtIn={description.builtInCompactionInputBudget}
+                            max={description.maxCompactionInputBudget}
+                            inEffect={Math.min(budgetTokens || description.builtInCompactionInputBudget, description.maxCompactionInputBudget)}
+                            typed={budgetTokens && budgetTokens <= description.maxCompactionInputBudget ? budgetTokens : undefined}
+                          />
+                        </div>
+                      )}
+                      {!description.runtimeKnown && (
+                        <CapabilityFields capabilities={capabilities} onCapabilitiesChange={setCapabilities} />
+                      )}
+                    </>
+                  )}
                 </div>
               </Collapsible.DefaultPanel>
             </Collapsible.Root>
           )}
         </div>
+
+        {gatewayMode && selection && (
+          <div className="mt-4 flex flex-col items-start gap-2">
+            <GatewayTestButton
+              name="this model"
+              size="base"
+              testing={test?.state === 'testing'}
+              onTest={handleTest}
+            />
+            <div className="self-stretch">
+              <p className="text-xs leading-4 text-kumo-subtle">{TEST_HELP}</p>
+              <GatewayLevelTestsStatus test={test} noLevelLabel="As chats ask" deploymentHints={false} />
+            </div>
+          </div>
+        )}
 
         {/* Footer */}
         <div className="mt-6 flex justify-end gap-2">

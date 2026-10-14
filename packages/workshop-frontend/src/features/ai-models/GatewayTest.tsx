@@ -95,9 +95,18 @@ export const GatewayTestStatus = ({ test, subject }: {
  * order the server gave them, each under the level it asked for. The region is rendered before
  * any test is run, and is empty until one answers, so that the answer is announced.
  */
-export const GatewayLevelTestsStatus = ({ test }: {
+export const GatewayLevelTestsStatus = ({
+  test, noLevelLabel = 'No level set', deploymentHints = true,
+}: {
   /** Where the last test stands. Absent until one is run. */
   test: GatewayTestState<GatewayModelLevelTest[]> | undefined
+  /** What the request that set no level of the test's own is listed under. */
+  noLevelLabel?: string
+  /**
+   * Whether a refusal comes with the deployment settings that may explain it, which only an admin
+   * can change.
+   */
+  deploymentHints?: boolean
 }) => (
   <div role="status" className={STATUS_REGION}>
     {test?.state === 'answered' && (
@@ -107,14 +116,14 @@ export const GatewayLevelTestsStatus = ({ test }: {
             <li key={result.reasoning ?? 'none'} className={resultColor(result)}>
               <span className="font-medium text-kumo-default">
                 {result.reasoning === null
-                  ? 'No level set'
+                  ? noLevelLabel
                   : REASONING_LEVEL_LABELS[result.reasoning]}
               </span>
               : {resultWording(result, 'model')}
             </li>
           ))}
         </ul>
-        {test.result.some(unauthorized) && <UnauthorizedHint />}
+        {deploymentHints && test.result.some(unauthorized) && <UnauthorizedHint />}
       </>
     )}
     {test?.state === 'not-run' && <NotRun reason={test.reason} />}

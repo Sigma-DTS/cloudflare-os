@@ -23,7 +23,7 @@ import { GatewayModelRow, MODES } from './GatewayModelRow'
 import { GatewayProviders } from './GatewayProviders'
 import { rpcFailureDescription } from '../../rpcErrors'
 import { PROVIDER_LABELS, REASONING_LEVEL_LABELS } from './modelForm'
-import { fetchModelsDev, suggestModels } from './modelsDev'
+import { useModelsDevSuggestions } from './useModelsDevSuggestions'
 import { useGatewayTests } from './useGatewayTests'
 
 const CARD = 'rounded-xl border border-kumo-line bg-kumo-elevated p-6'
@@ -143,11 +143,10 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
   // The models' tests, by model ID. Like a provider's test, one neither takes nor waits for the
   // lock. A write to a model forgets its test, and a write to the default level forgets them all.
   const modelTests = useGatewayTests((modelId: string) => admin.testGatewayModel(modelId))
-  // What this panel's one request for the models.dev list settled with: the list, or undefined
-  // when the request failed. Null until then.
-  const [modelsDev, setModelsDev] = useState<{ list: unknown } | null>(null)
-  const modelsDevRequest = useRef<AbortController | null>(null)
-  useEffect(() => () => modelsDevRequest.current?.abort(), [])
+  const suggestions = useModelsDevSuggestions(
+    gatewayModels?.modelsDevSuggestions === true,
+    gatewayModels?.providers ?? [],
+    gatewayModels?.models.map((model) => model.id) ?? [])
   // A write disables every control, and a browser takes focus from a control that becomes disabled
   // without giving it back. So the control that had focus when the write began gets it again once
   // the controls are enabled, unless focus has gone elsewhere since. A control that left the
@@ -232,22 +231,6 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
     write(() => admin.setGatewayProviderEnabled(provider, enabled))
       .catch((err) => reportFailure(`Couldn’t update ${PROVIDER_LABELS[provider]}`, err))
 
-  // Runs when the add form's Model ID field is first turned to, and at most once for as long as
-  // the panel is mounted: the list is several megabytes, and a failure only costs the suggestions.
-  const loadModelsDev = () => {
-    if (modelsDevRequest.current) return
-    const request = new AbortController()
-    modelsDevRequest.current = request
-    fetchModelsDev(request.signal).then(
-      (list) => setModelsDev({ list }),
-      (err) => {
-        if (request.signal.aborted) return
-        console.error('Failed to load the models.dev list:', err)
-        setModelsDev({ list: undefined })
-      },
-    )
-  }
-
   const confirmRemoval = async () => {
     if (!pendingRemoval) return
     await writeModel(pendingRemoval, () => admin.removeGatewayModel(pendingRemoval.id))
@@ -270,17 +253,6 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
   }
   const added = gatewayModels.models.filter((model) => model.added)
   const { userModelsEnabled, defaultReasoning } = gatewayModels
-  const suggestions = gatewayModels.modelsDevSuggestions
-    ? {
-        models: suggestModels(
-          modelsDev?.list, gatewayModels.providers, gatewayModels.models.map((model) => model.id)),
-        // Nothing to suggest even counting the models already here: the request failed, or what
-        // it returned is not the list.
-        unavailable: modelsDev !== null
-          && suggestModels(modelsDev.list, gatewayModels.providers, []).length === 0,
-        onEngage: loadModelsDev,
-      }
-    : undefined
 
   return (
     <div className={CARD}>
