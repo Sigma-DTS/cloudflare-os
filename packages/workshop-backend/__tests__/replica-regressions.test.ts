@@ -162,7 +162,7 @@ describe("replica review regressions over durable kernel storage", () => {
       const page = await replica.changesSince(cursor, 128);
       const bytes = page.events.reduce((sum, event) => sum + codeChangeSerializedSize({[tree.id]:
         event.changes.map(change => [change.path, change.change])}) + 256, 0);
-      expect(bytes).toBeLessThanOrEqual(8 * 1024 * 1024);
+      expect(bytes).toBeLessThanOrEqual(24 * 1024 * 1024);
       expect(page.cursor).toBe(page.events.at(-1)?.cursor ?? cursor);
       revisions.push(...page.events.map(event => Number(event.cursor.split(":").at(-1))));
       ++pages;
@@ -174,6 +174,21 @@ describe("replica review regressions over durable kernel storage", () => {
     expect(revisions).toEqual(Array.from({length: count}, (_, i) => i + 1));
     expect(await replica.changesSince(cursor, 128)).toEqual({events: [], cursor, hasMore: false});
   }), 30_000); // A real >32 MiB native transport test needs headroom on cold CI workers.
+
+  it("returns one legal many-file canonical change without rejecting its event projection", () => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    const entries: [string, {set: string}][] = Array.from({length: 10_000}, (_, i) =>
+      [i.toString(36).padStart(6, "0"), {set: "x".repeat(350)}]);
+    const change = {[tree.id]: entries};
+    expect(codeChangeSerializedSize(change)).toBeLessThanOrEqual(MAX_CODE_CHANGE_SIZE);
+    await step(impl, 1, change);
+    const page = await replica.changesSince(checkpoint.cursor, 1);
+    expect(page.events).toHaveLength(1);
+    expect(page.events[0].changes).toHaveLength(entries.length);
+    expect(page.hasMore).toBe(false);
+  }), 30_000);
 
   it.each(["file", "directory", "second upload"] as const)("rejects an upload whose allocated root becomes a replica %s before the message commits", mode => inKernel(crypto.randomUUID(), async impl => {
     const user = env.TEST_USER.getByName(crypto.randomUUID());
@@ -378,6 +393,25 @@ describe("replica review regressions over durable kernel storage", () => {
       {checkoutId: tree.id, path: "src/a.txt", baseHash: await replicaTextHash("aaa"), change: {set: "valid"}},
     ]});
     expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+  }));
+
+  it.each(["set", "remove"] as const)("rejects an accepted-prefix directory %s before ACK", mode => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    await step(impl, 1, {[tree.id]: [["src/a.txt", {set: "aaa"}]]});
+    expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    expect(checkpoint.worktrees[0].acceptedCommit).toBeDefined();
+    const commitCount = [...impl.storage.worktreeReplicaCommits.list()].length;
+    const changeCount = [...impl.storage.chatChanges.list()].length;
+    await expect((async () => replica.submitBatch({batchId: "accepted-directory", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path: "src", baseHash: null, change: mode === "set" ? {set: "replacement"} : {remove: true}},
+    ]}))()).rejects.toThrow(/directory/);
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toHaveLength(commitCount);
+    expect([...impl.storage.chatChanges.list()]).toHaveLength(changeCount);
+    await replica.submitBatch({batchId: "accepted-directory", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path: "src/a.txt", baseHash: await replicaTextHash("aaa"), change: {set: "valid"}},
+    ]});
   }));
 
   it("persists replica edits and echo provenance before ACK when turn_end queues concurrently", () => inKernel(crypto.randomUUID(), async impl => {

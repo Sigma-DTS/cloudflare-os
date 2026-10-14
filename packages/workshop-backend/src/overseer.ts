@@ -388,8 +388,11 @@ function validateBlueprintScreenshotUpload(screenshot: BlueprintScreenshotUpload
 const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
 
-// Leave ample framing headroom below Workers RPC's 32 MiB serialized-value ceiling.
-const REPLICA_EVENTS_BYTE_BUDGET = 8 * 1024 * 1024;
+// A maximum-size canonical CodeChange must fit in one page. Its size estimate already charges
+// every path and change node; the event projection adds only these small per-file wrappers.
+// The 24 MiB page cap leaves framing headroom below Workers RPC's 32 MiB value ceiling.
+const REPLICA_EVENT_CHANGE_OVERHEAD = 64;
+const REPLICA_EVENTS_BYTE_BUDGET = 24 * 1024 * 1024;
 const CHAT_ATTACHMENT_EXTENSION_BY_MIME = new Map([
   ["text/csv", ".csv"],
   ["application/json", ".json"],
@@ -6619,7 +6622,8 @@ class OverseerImpl implements AgentHooks {
       },
       assertPathWritable: async (lease, checkoutId, path) => {
         const tree = requireTree(lease, checkoutId);
-        if (tree.baseCommit) await this.gitCache.assertWorktreePathWritable(tree.baseCommit, path);
+        const commit = tree.acceptedCommit ?? tree.baseCommit;
+        if (commit) await this.gitCache.assertWorktreePathWritable(commit, path);
       },
       gitPack: async (lease, checkoutId, request) => {
         const commit = lease.worktrees.find(tree => tree.checkoutId === checkoutId)?.baseCommit;
@@ -6713,7 +6717,7 @@ class OverseerImpl implements AgentHooks {
             ? {sourceBatchId: row.sourceReplica.batchId} : {}),
             changes: lease.worktrees.flatMap(tree => (row.change[tree.checkoutId] ?? []).map(([path, change]) =>
               ({ checkoutId: tree.checkoutId, path, change }))) };
-          const size = codeChangeSerializedSize(scoped) + 128 * event.changes.length +
+          const size = codeChangeSerializedSize(scoped) + REPLICA_EVENT_CHANGE_OVERHEAD * event.changes.length +
             256 + 2 * (event.cursor.length + (event.sourceBatchId?.length ?? 0));
           if (bytes + size > REPLICA_EVENTS_BYTE_BUDGET) {
             if (!events.length) throw new Error("Replica event exceeds its transfer budget.");
