@@ -3020,6 +3020,13 @@ export interface Overseer extends RpcTarget {
                   note?: string): Promise<CollaboratorInfo | null>;
 
   /**
+   * Change an existing collaborator's direct grant from the caller, without granting a role higher
+   * than the caller's own. The owner can also cap all incoming grants when downgrading someone;
+   * other callers can only change their own existing grant. Dependent access follows the new role.
+   */
+  setCollaboratorRole(profileId: string, role: CollaboratorRole): Promise<void>;
+
+  /**
    * Remove a collaborator (identified by profile.id).
    *
    * Owner can remove anyone. A non-owner collaborator can only remove their own edge(s)
@@ -5414,7 +5421,8 @@ export type PermissionEdge = {
 
   /**
    * The role granted by this edge. Absent on edges created before roles were introduced; such
-   * edges are treated as "build" for backwards compatibility.
+   * edges are treated as "build" for backwards compatibility. For a share-key edge, this also caps
+   * the role granted by its link, so the owner can downgrade one recipient without editing the link.
    */
   role?: CollaboratorRole;
 } & ({
@@ -5446,9 +5454,10 @@ export type CollaboratorInfo = {
 };
 
 /**
- * Describes a collaborator whose access would change (or did change) as a result of a removal or
- * share key revocation. Used by the preview/confirm flow, which must surface not only users who
- * lose access entirely but also users who would be downgraded to a lower role.
+ * Describes a collaborator whose access would change (or did change) as a result of a role
+ * update, removal, or share key revocation. Used by the preview/confirm flow, which must surface
+ * not only users who lose access entirely but also users who would be downgraded to a lower role.
+ * A role update can also report users whose role was raised.
  */
 export type AffectedCollaborator = {
   profile: AiChatAuthorInfo;

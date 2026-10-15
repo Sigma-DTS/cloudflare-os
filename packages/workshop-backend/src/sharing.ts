@@ -324,6 +324,41 @@ export class SharingManager {
     };
   }
 
+  /**
+   * Update the caller's direct grant. Owners may cap every incoming grant when downgrading a
+   * collaborator; other callers can only edit their own existing edge. Returns all role changes,
+   * including dependent upgrades and downgrades, for live-session and cached-listing updates.
+   */
+  setCollaboratorRole(
+      caller: SharingCaller, profileId: string, role: CollaboratorRole): AffectedCollaborator[] {
+    let callerRole = this.#requireCallerRole(caller);
+    if (roleRank(role) > roleRank(callerRole)) {
+      throw new Error("You cannot grant a role higher than your own.");
+    }
+    if (this.ownerInvitesOnly() && !caller.isOwner) {
+      throw new Error("Only the workspace owner can change access to this workspace.");
+    }
+    let baseline = this.computeEffectiveRoles();
+    let record = this.storage.collaborators.get(profileId);
+    if (!record || !baseline.has(profileId)) {
+      throw new Error("User is not a collaborator.");
+    }
+    let edge = record.addedBy.find(e => e.type === "user" && e.sharer === caller.profileId);
+    if (!edge && !caller.isOwner) {
+      throw new Error("You can only change access that you granted.");
+    }
+    if (caller.isOwner) {
+      for (let grant of record.addedBy) grant.role = minRole(edgeGrantedRole(grant), role);
+    }
+    if (edge) {
+      edge.role = role;
+    } else {
+      record.addedBy.push({ type: "user", sharer: caller.profileId, created: new Date(), role });
+    }
+    this.storage.collaborators.put(record);
+    return this.#computeAffected(baseline, this.computeEffectiveRoles(), true);
+  }
+
   previewRemoveCollaborator(caller: SharingCaller, profileId: string): AffectedCollaborator[] {
     let target = this.storage.collaborators.get(profileId);
     if (!target) return [];
@@ -598,7 +633,7 @@ export class SharingManager {
             if (!info) continue;  // link revoked or no longer exists
             let creatorRole = sharerRole(info.creator);
             if (!creatorRole) continue;
-            granted = minRole(info.role, creatorRole);
+            granted = minRole(edgeGrantedRole(edge), minRole(info.role, creatorRole));
           } else {
             // Skip the specifically-removed edge.
             if (removedEdge && id === removedEdge.target &&
@@ -646,16 +681,18 @@ export class SharingManager {
   }
 
   // Diff two effective-role maps, returning the collaborators whose access changed. A user is
-  // affected if they had access in `baseline` and either lost it (newRole null) or were downgraded
-  // (newRole lower than oldRole) in `modified`. Profiles/edges are read from current storage.
+  // affected if they had access in `baseline` and either lost it or were downgraded. Role edits
+  // also include upgrades so cached listings are refreshed. Profiles/edges come from current
+  // storage.
   #computeAffected(
       baseline: Map<string, CollaboratorRole>,
-      modified: Map<string, CollaboratorRole>): AffectedCollaborator[] {
+      modified: Map<string, CollaboratorRole>, includeUpgrades = false): AffectedCollaborator[] {
     let result: AffectedCollaborator[] = [];
     for (let [id, oldRole] of baseline) {
       let newRole = modified.get(id) ?? null;
-      if (newRole !== null && roleRank(newRole) >= roleRank(oldRole)) {
-        continue;  // unchanged or (shouldn't happen) upgraded
+      if (newRole !== null && (newRole === oldRole ||
+          (!includeUpgrades && roleRank(newRole) > roleRank(oldRole)))) {
+        continue;  // unchanged, or upgraded when upgrades aren't wanted
       }
       let record = this.storage.collaborators.get(id);
       if (!record) continue;

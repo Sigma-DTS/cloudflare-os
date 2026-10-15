@@ -8935,8 +8935,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Reconcile this workspace's cached listing for collaborators whose access changed: remove it
-  // for those who lost access entirely, and refresh the presentation-only role for those who were
-  // downgraded.
+  // for those who lost access entirely, and refresh the presentation-only role for role changes.
   async refreshAffectedCollaboratorListings(affected: AffectedCollaborator[]): Promise<void> {
     let gadgetId = this.ctx.id.toString();
 
@@ -11820,6 +11819,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     });
   }
 
+  async setCollaboratorRole(profileId: string, role: CollaboratorRole): Promise<void> {
+    let affected = (await this.impl.getSharingManager())
+        .setCollaboratorRole(this.#sharingCaller(), profileId, role);
+    if (affected.some(change => change.newRole === null ||
+        roleRank(change.newRole) < roleRank(change.oldRole))) {
+      this.impl.scheduleAccessRestart("Gadget restarted to apply a collaborator access change.");
+    }
+    await this.impl.tearDownLostObservers(affected);
+    await this.impl.refreshAffectedCollaboratorListings(affected);
+  }
+
   async previewRemoveCollaborator(profileId: string): Promise<AffectedCollaborator[]> {
     return (await this.impl.getSharingManager())
         .previewRemoveCollaborator(this.#sharingCaller(), profileId);
@@ -12201,6 +12211,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async listCollaborators(): Promise<CollaboratorInfo[]> { this.#deny(); }
   async addCollaborator(_username: string, _role: CollaboratorRole, _note?: string)
       : Promise<CollaboratorInfo | null> { this.#deny(); }
+  async setCollaboratorRole(_profileId: string, _role: CollaboratorRole)
+      : Promise<void> { this.#deny(); }
   async removeCollaborator(_profileId: string, _keepUsers: string[])
       : Promise<AffectedCollaborator[]> { this.#deny(); }
   async previewRemoveCollaborator(_profileId: string): Promise<AffectedCollaborator[]> {
