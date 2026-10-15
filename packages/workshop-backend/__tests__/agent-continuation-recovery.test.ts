@@ -21,6 +21,88 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each(["approval", "connection"] as const)("does not recover a predecessor's %s wait after a retry's final response", async kind => {
+    const s = await recoveryScenario(), requests = inference();
+    await s.visit(async impl => {
+      const prior = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      impl.continuations.enter(CHAT, prior.continuationId);
+      if (kind === "approval") {
+        impl.storage.actions.put({id: 7, gatekeeperId: GATEKEEPER, type: "action", action: 42, createdAt: new Date(),
+          state: "pending", caller: {from: "agent", chatId: CHAT},
+          description: {title: "Old command", description: "Command", implementsRevert: false, awaitDecision: true}});
+        impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}]);
+      } else {
+        impl.addChatMessages(CHAT, MODEL.profile, [{type: "connectionRequest", requestId: "old-connection",
+          vendorId: "github", vendorName: "GitHub", reason: "Old repo", state: "pending"}]);
+      }
+      impl.continuations.suspend(CHAT, prior.continuationId, kind === "approval"
+        ? {kind, actionIds: [7]} : {kind, requestIds: ["old-connection"]}, false);
+      impl.continuations.settle(CHAT, prior.continuationId);
+      const commit = impl.commitAgentStep.bind(impl);
+      vi.spyOn(impl, "commitAgentStep").mockImplementation(async (...args) => {
+        await commit(...args);
+        throw reset(); // Persisted final response, but no continuation disposition yet.
+      });
+      // retryAgent starts a fresh execution without adding a new user message.
+      impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+      await vi.waitFor(() => expect([...impl.storage.chats.list()])
+        .toContainEqual(expect.objectContaining({type: "message", message: "Recovered."})));
+      expect(impl.continuations.get(CHAT)?.status.phase).toBe("running");
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finished", reason: "completed"});
+      expect(requests()).toBe(1);
+    });
+  });
+
+  it("does not reap a successor's provisional binding when canceled cleanup returns late", async () => {
+    const s = await recoveryScenario();
+    const removal = Promise.withResolvers<void>(), request = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
+    const requests = inference(() => request.promise);
+    await s.visit(async impl => {
+      const prior = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      impl.continuations.enter(CHAT, prior.continuationId);
+      impl.continuations.suspend(CHAT, prior.continuationId, {kind: "approval", actionIds: [7]}, false);
+      impl.continuations.settle(CHAT, prior.continuationId);
+      const orphan = impl.createGadget("Orphan", "ORPHAN", CHAT);
+      const commit = await impl.gitStore.writeFilesAsCommit(new Map(), {
+        parents: [], author: {name: "Approver", email: "test@example.com"}, message: "Initial", timestamp: new Date(0),
+      });
+      const existing = impl.createGadget("Existing", "EXISTING", undefined, undefined, commit);
+      const remove = impl.removeWorkpiece.bind(impl), reconcile = impl.reconcilePendingGadgets.bind(impl);
+      let removals = 0, reconciles = 0;
+      vi.spyOn(impl, "removeWorkpiece").mockImplementation(async id => {
+        if (++removals === 1) await removal.promise; // A slow hook disable during the old reap.
+        await remove(id);
+      });
+      vi.spyOn(impl, "reconcilePendingGadgets").mockImplementation(async chatId => {
+        const old = ++reconciles === 1;
+        try { await reconcile(chatId); } finally { if (old) cleanup.resolve(); }
+      });
+      impl.cancelAgent(CHAT);
+      try {
+        await vi.waitFor(() => expect(removals).toBe(1));
+        impl.addChatMessages(CHAT, APPROVER, [{type: "message", message: "Start a new turn"}]);
+        impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+        await vi.waitFor(() => expect(requests()).toBe(1));
+        expect(impl.storage.gadgets.get(orphan.id)).toBeUndefined();
+        existing.bindings.NEW = {target: GATEKEEPER, pending: {chatId: CHAT}};
+        impl.storage.gadgets.put(existing);
+        removal.resolve();
+        await cleanup.promise;
+        expect(impl.getGadgetRecord(existing.id).bindings.NEW).toBeDefined();
+        expect(impl.continuations.get(CHAT)?.status.phase).toBe("running");
+      } finally {
+        removal.resolve(); request.resolve();
+        await cleanup.promise;
+        await impl.waitForAllAgentsToComplete();
+      }
+    });
+  });
+
   it.each([false, true])("fences failed chat deletion across eviction with callback lookup in flight=%s", async lookupInFlight => {
     const s = await recoveryScenario();
     const request = Promise.withResolvers<void>(), removal = Promise.withResolvers<void>(), lookup = Promise.withResolvers<void>();

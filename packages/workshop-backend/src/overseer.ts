@@ -1438,6 +1438,7 @@ class OverseerImpl implements AgentHooks {
   // Best-effort per gadget: a failure (e.g. a hook controller that can't be reached) leaves the
   // record for the next reconciliation attempt.
   async reconcilePendingGadgets(chatId: number): Promise<void> {
+    const continuationId = this.continuations.get(chatId)?.continuationId;
     let pending = this.listPendingGadgets(chatId);
     let unstamped = pending.filter(gadget => gadget.pending!.sequence === undefined);
     let stamped: WorkpieceRecord[] = [];
@@ -1471,6 +1472,9 @@ class OverseerImpl implements AgentHooks {
           event: "gadget.pending.reconcile.failed", chatId, error: err,
         });
       }
+      // Reaping can await a hook disable. A successor may already be mid-step, with
+      // legitimate unstamped bindings of its own; this invocation must not sweep them.
+      if (this.continuations.get(chatId)?.continuationId !== continuationId) return;
     }
 
     // (Listed after the reaps above, which may have removed a gadget along with its edges.)
@@ -4906,7 +4910,8 @@ class OverseerImpl implements AgentHooks {
 
   #continuationWait(chatId: number, kind: "approval" | "connection"): AgentContinuationWait {
     const actions: number[] = [], connections: string[] = [];
-    for (const message of this.storage.chats.list({ prefix: chatKeyPrefix(chatId), reverse: true })) {
+    const start = chatKey(chatId, this.continuations.get(chatId)?.startSequence ?? 0);
+    for (const message of this.storage.chats.list({prefix: chatKeyPrefix(chatId), start, reverse: true})) {
       if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
       if (message.type === "action") {
         const action = this.storage.actions.get(message.actionId);
@@ -6701,7 +6706,7 @@ class OverseerImpl implements AgentHooks {
       modelId: aiModel.profile.id,
       initiator,
       callbackInitiated,
-    });
+    }, this.nextChatSequencePeek(chatId));
     this.#registerRunningAgent(chatId);
 
     let liveChat = this.#getLiveChat(chatId, record.continuationId);
@@ -8524,7 +8529,8 @@ class OverseerImpl implements AgentHooks {
   #awaitsDecision(chatId: number): boolean {
     // Collect only this turn's waits before scanning another index: native KV allows one iterator.
     const actions: (ActionRecord & {type: "action"})[] = [];
-    for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId), reverse: true})) {
+    const start = chatKey(chatId, this.continuations.get(chatId)?.startSequence ?? 0);
+    for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId), start, reverse: true})) {
       if (msg.type === "agentCallback") break;
       if (msg.type === "message" && (msg.author.type === "user" || msg.author.type === "gadget")) {
         break;

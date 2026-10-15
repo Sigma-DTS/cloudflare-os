@@ -44,6 +44,8 @@ export type AgentContinuationWait =
 /** One authoritative execution record, including its lifecycle and any authorized wake-up. */
 export type AgentContinuation = ActiveAgentRecord & {
   continuationId: string;
+  /** First log sequence in this run; retries need a boundary even without a new prompt. Legacy records omit it. */
+  startSequence?: number;
   status:
     | { phase: "starting" | "running" }
     | { phase: "suspending" | "paused"; wait: AgentContinuationWait; ready: boolean }

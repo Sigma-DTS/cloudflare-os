@@ -18,8 +18,8 @@ export class AgentContinuations {
     return this.get(chatId)?.continuationId === continuationId;
   }
 
-  start(run: ActiveAgentRecord): AgentContinuation {
-    return this.#put({...run, continuationId: this.id(), status: {phase: "starting"}});
+  start(run: ActiveAgentRecord, startSequence = 0): AgentContinuation {
+    return this.#put({...run, startSequence, continuationId: this.id(), status: {phase: "starting"}});
   }
 
   enter(chatId: number, continuationId: string): AgentContinuation | undefined {

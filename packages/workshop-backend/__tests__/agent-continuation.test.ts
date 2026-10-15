@@ -8,7 +8,7 @@ function setup() {
   const storage = makeActionStorage();
   let id = 0;
   const machine = new AgentContinuations(storage, () => `id-${++id}`);
-  const first = machine.start(RUN);
+  const first = machine.start(RUN, 7);
   machine.enter(1, first.continuationId);
   return { machine, storage, first };
 }
@@ -26,6 +26,7 @@ describe("one durable agent continuation", () => {
     m.settle(1, first.continuationId);
     const resumed = m.resume(1)!;
     expect(resumed.continuationId).not.toBe(first.continuationId);
+    expect(resumed.startSequence).toBe(7);
     expect(m.resume(1)).toBeUndefined();
     m.enter(1, resumed.continuationId);
     m.suspend(1, resumed.continuationId, {kind: "approval", actionIds: [8]}, false);
