@@ -118,7 +118,10 @@ describe("on-demand ambient connection requests", () => {
   it("offers the container and creates a prompt without provisioning or starting it", () => workspace(async f => {
     expect(await f.impl.listConnectableVendors()).toContainEqual({ id: "container", displayName: "Linux Container" });
     expect(f.owner.listGatekeeperVendors).toHaveBeenCalledWith({}, true);
-    expect(await f.impl.listConnectableResources("container")).toContain("omitting resourceUrl");
+    const instructions = await f.impl.listConnectableResources("container");
+    expect(instructions).toContain("omitting resourceUrl");
+    expect(instructions).toContain("The workspace owner can connect it directly in chat");
+    expect(instructions).toContain("this does not approve any subsequent actions");
     const card = await f.persistRequest();
     expect(card).toMatchObject({ ...request, type: "connectionRequest", connectionType: "ambient", state: "pending" });
     expect(card.resourceUrlPattern).toBeUndefined();
