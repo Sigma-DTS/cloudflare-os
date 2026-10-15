@@ -30,7 +30,7 @@ import type { UserDurableObject } from "../user";
  * new workspace is born at (so it has nothing to migrate). The migrations themselves name
  * their versions literally, since each one's source and target are fixed for good.
  */
-export const OVERSEER_STORAGE_VERSION = 6;
+export const OVERSEER_STORAGE_VERSION = 7;
 
 /** Consolidate legacy active executions into the continuation machine. */
 export function migrateToAgentContinuations(host: Pick<OverseerMigrationHost, "storage">): void {
@@ -42,6 +42,29 @@ export function migrateToAgentContinuations(host: Pick<OverseerMigrationHost, "s
       host.storage.activeAgents.delete(record.chatId);
     }
     host.storage.version.put(6);
+  });
+}
+
+/** Add lifecycle identities to continuation-only rows without restarting paused executions. */
+export function migrateToAgentIntegration(host: Pick<OverseerMigrationHost, "storage">): void {
+  if (host.storage.version.get() !== 6) return;
+  host.storage.transaction(() => {
+    for (const record of Array.from(host.storage.agentContinuations.list())) {
+      if (record.turnId) continue;
+      const turnId = crypto.randomUUID(), segmentId = crypto.randomUUID();
+      const identity = {turnId, segmentId};
+      const entry = {...identity, eventId: crypto.randomUUID(), kind: "resumed" as const};
+      const status = record.status;
+      const event = status.phase === "paused" || status.phase === "suspending"
+        ? {...identity, eventId: crypto.randomUUID(), kind: "suspended" as const, reason: status.wait.kind}
+        : status.phase === "finished" || status.phase === "finishing"
+        ? {...identity, eventId: crypto.randomUUID(), kind: "finished" as const, reason: status.reason}
+        : undefined;
+      // No participant could register before this API existed, so there is no historical outbox.
+      host.storage.agentContinuations.put({...record, ...identity, entry,
+        status: event ? {...status, event} as typeof status : status});
+    }
+    host.storage.version.put(7);
   });
 }
 

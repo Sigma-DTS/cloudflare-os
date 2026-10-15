@@ -1,8 +1,10 @@
 // The Worker the unit suites run inside: the production Worker's exports (so `ctx.exports` resolves
 // the real Durable Objects and callbacks) plus test-only entrypoints that stand in for other Workers.
 
-import { DurableObject, WorkerEntrypoint, restore } from "cloudflare:workers";
-import type { AccountDescription } from "@gadgets/workshop-shared/gatekeeper";
+import { DurableObject, WorkerEntrypoint, restore, type RpcStub } from "cloudflare:workers";
+import type { AccountDescription, ActionDescription, Gatekeeper, ApprovalQueue, GatekeeperUserVerifier } from "@gadgets/workshop-shared/gatekeeper";
+import type { AgentContext, AgentTurnEvent, AgentTurnInfo, AgentTurnParticipant,
+  GatekeeperActionContext } from "@gadgets/workshop-shared/agent-integration";
 import { GatekeeperConnectCallbackImpl } from "../src/user.js";
 import { LoginConnectCallbackImpl } from "../src/auth/login-flow.js";
 import { OverseerDurableObject as RealOverseerDurableObject } from "../src/server.js";
@@ -34,6 +36,7 @@ export class OverseerDurableObject extends RealOverseerDurableObject {
     super(ctx, env);
     restoreTargets.set(ctx, this);
   }
+
 }
 /**
  * The `self` object / spawnCallable() stub entrypoint, named explicitly for the same reason as the
@@ -101,5 +104,78 @@ export class FakeGatekeeperAccount
 
   async calls(): Promise<string[]> {
     return accountCalls.get(this.ctx.props.name) ?? [];
+  }
+}
+
+const integrationCallbacks = new Map<string, { fail: boolean;
+  blocked?: {kind: AgentTurnEvent["kind"]; wait: Promise<void>; release: () => void};
+  calls: { event: AgentTurnEvent; turn: AgentTurnInfo }[] }>();
+
+/** A genuinely persistent native callback, so outbox tests cross RPC and DO storage boundaries. */
+export class IntegrationTestParticipant extends WorkerEntrypoint<unknown, { name: string }>
+    implements AgentTurnParticipant {
+  #state() {
+    let state = integrationCallbacks.get(this.ctx.props.name);
+    if (!state) integrationCallbacks.set(this.ctx.props.name, state = { fail: false, calls: [] });
+    return state;
+  }
+  async onAgentTurnEvent(event: AgentTurnEvent, context: RpcStub<AgentContext>): Promise<void> {
+    using borrowed = context;
+    const call = {event, turn: await borrowed.getTurn()};
+    this.#state().calls.push(call);
+    const blocked = this.#state().blocked;
+    if (blocked?.kind === event.kind) await blocked.wait;
+    if (this.#state().fail) throw new Error("participant unavailable");
+  }
+  setFailure(fail: boolean): void { this.#state().fail = fail; }
+  block(kind: AgentTurnEvent["kind"]): void {
+    let release!: () => void;
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    this.#state().blocked = {kind, wait, release};
+  }
+  releaseBlock(): void {
+    this.#state().blocked?.release();
+    delete this.#state().blocked;
+  }
+  calls() { return this.#state().calls; }
+}
+
+/** Real facet RPC dispatch: contextual failure must never fall back to the legacy handler. */
+export class IntegrationTestActionGatekeeper extends DurableObject<Cloudflare.Env>
+    implements Gatekeeper<object> {
+  async describe() { return { url: "container://test", title: "Test", suggestedBindingName: "TEST", tsType: "object" }; }
+  async getTypeScriptTypes(): Promise<string> { return ""; }
+  async getAutoApprovableActions() { return []; }
+  async startSession(queue: RpcStub<ApprovalQueue>): Promise<{ turn: AgentTurnInfo | null }> {
+    using borrowed = queue;
+    using context = await borrowed.getAgentContext();
+    return { turn: context ? await context.getTurn() : null };
+  }
+  async addObserver(_id: string, _verifier: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
+  async removeObserver(_id: string): Promise<void> {}
+  async rejectAction(_action: number): Promise<void> {}
+  async revertAction(_action: number): Promise<void> {}
+  async applyAction(action: number): Promise<void> { this.#record({ action, handler: "legacy" }); }
+  async applyActionInContext(action: number, context: RpcStub<GatekeeperActionContext>): Promise<void> {
+    using borrowed = context;
+    if (this.ctx.storage.kv.get(`receipt:${action}`)) return;
+    using agent = await borrowed.getAgentContext();
+    this.#record({ action, handler: "contextual", turn: agent ? await agent.getTurn() : null });
+    const followup = this.ctx.storage.kv.get<ActionDescription>("followup");
+    if (action === 42 && followup) {
+      await borrowed.submitAction(43, followup);
+      await borrowed.submitAction(43, followup); // Lost-ACK replay must not publish a second card.
+    }
+    if (this.ctx.storage.kv.get("fail")) throw new Error("Contextual handler failed");
+    if (this.ctx.storage.kv.get("recoverable")) this.ctx.storage.kv.put(`receipt:${action}`, true);
+  }
+  setRecoverable(): void { this.ctx.storage.kv.put("recoverable", true); }
+  setFollowup(description: ActionDescription): void { this.ctx.storage.kv.put("followup", description); }
+  setFailure(fail: boolean): void { this.ctx.storage.kv.put("fail", fail); }
+  calls(): { action: number; handler: string; turn?: AgentTurnInfo | null }[] {
+    return this.ctx.storage.kv.get("calls") ?? [];
+  }
+  #record(call: ReturnType<IntegrationTestActionGatekeeper["calls"]>[number]): void {
+    this.ctx.storage.kv.put("calls", [...this.calls(), call]);
   }
 }

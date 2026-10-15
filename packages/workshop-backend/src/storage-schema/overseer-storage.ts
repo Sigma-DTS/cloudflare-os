@@ -35,6 +35,9 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
 import type { AgentFinishReason } from "../agent-continuation";
+import type {
+  AgentTurnEvent, AgentTurnParticipant,
+} from "@gadgets/workshop-shared/agent-integration";
 
 /** The exact decision set a suspended execution is waiting for. */
 export type AgentContinuationWait =
@@ -46,10 +49,28 @@ export type AgentContinuation = ActiveAgentRecord & {
   continuationId: string;
   /** First log sequence in this run; retries need a boundary even without a new prompt. Legacy records omit it. */
   startSequence?: number;
+  turnId: string;
+  segmentId: string;
+  entry: AgentTurnEvent & { kind: "started" | "resumed" };
   status:
     | { phase: "starting" | "running" }
-    | { phase: "suspending" | "paused"; wait: AgentContinuationWait; ready: boolean }
-    | { phase: "finishing" | "finished"; reason: AgentFinishReason };
+    | { phase: "suspending" | "paused"; wait: AgentContinuationWait; ready: boolean;
+        event: AgentTurnEvent & { kind: "suspended" } }
+    | { phase: "finishing" | "finished"; reason: AgentFinishReason; event: AgentTurnEvent & { kind: "finished" } };
+};
+
+/** Queue-time origin captured by a context or action; never resolves against a later turn. */
+export type AgentIntegrationOrigin = Pick<AgentContinuation, "chatId" | "turnId" | "segmentId">;
+
+/** Persistent callback and outbox, scoped to one binding and one logical turn. */
+export type AgentIntegrationParticipantRecord = {
+  id: string;
+  gatekeeperId: number;
+  turnId: string;
+  chatId: number;
+  participant: Fetcher<AgentTurnParticipant>;
+  pending: AgentTurnEvent[];
+  retryAt?: number;
 };
 
 // =======================================================================================
@@ -444,6 +465,12 @@ export type ActionRecord = {
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+  /** Queue-time authority; approval must not borrow an unrelated later turn. */
+  integrationOrigin?: AgentIntegrationOrigin;
+  /** Dispatches through the administrator-granted contextual action interface. */
+  contextualApply?: boolean;
+  /** Child approval IDs, persisted with submission for lost-ACK deduplication. */
+  followupActionIds?: number[];
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -755,6 +782,16 @@ export type ActiveAgentRecord = {
   initiator: AiChatAuthorInfo;
   /** Whether this turn was initiated by a gadget callback (vs. a chat message). */
   callbackInitiated: boolean;
+};
+
+/** Approved intent only for integrations explicitly granted durable effect recovery. */
+export type ActionApplication = {
+  id: number;
+  resolvedBy: AiChatAuthorInfo;
+  autoApproved: boolean;
+  resumeUserId?: string;
+  phase: "apply" | "resume";
+  retryAt: number;
 };
 
 /**
@@ -1238,6 +1275,18 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       agentContinuations: collection<AgentContinuation>()({primaryKey: "chatId",
         nonUniqueIndexes: {runnable: (record: AgentContinuation) => record.status.phase === "finished" ||
           record.status.phase === "paused" && !record.status.ready ? null : 0},
+      }),
+      actionApplications: collection<ActionApplication>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {retryAt: (record: ActionApplication) => record.retryAt},
+      }),
+      agentIntegrationParticipants: collection<AgentIntegrationParticipantRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {
+          byTurn: (record: AgentIntegrationParticipantRecord) => record.turnId,
+          byChat: (record: AgentIntegrationParticipantRecord) => record.chatId,
+          retryAt: (record: AgentIntegrationParticipantRecord) => record.retryAt ?? null,
+        },
       }),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --

@@ -35,7 +35,7 @@ async function openSuspendedChat(requester: AiChatAuthorInfo, reason: string) {
   let startAgent = vi.fn();
   let client = await openFakeOverseer({
     chatMeta: { get: () => meta },
-    // Legacy chats without a continuation record still resume from their last agent message.
+    // Legacy chats without an integration journal still resume from their last agent message.
     agentContinuations: { get: () => undefined },
     chats: {
       list: (options: { reverse?: boolean }) => options.reverse ? messages.toReversed() : messages,

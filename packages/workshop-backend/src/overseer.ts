@@ -13,7 +13,7 @@ import { keyString } from "@gadgets/typed-storage";
 import type { ListOptions } from "@gadgets/typed-storage";
 import {
   actionLastChangedKey, chatChangeClientKey, chatKey, chatKeyPrefix, makeOverseerStorage,
-  type ActionRecord, type AgentContinuation, type AgentContinuationWait, type AgentSpawnerBindingProps,
+  type ActionRecord, type ActionApplication, type AgentContinuation, type AgentContinuationWait, type AgentSpawnerBindingProps,
   type AiChatAgentContext, type BindingRecord,
   type BlueprintGadgetRecord, type BoundHookRecord, type ChatBindingEntry,
   type ChatChangeBoundaryRecord, type ChatChangeRecord, type CompactionCheckpoint,
@@ -29,7 +29,7 @@ import {
 import { GitCacheImpl, WorkspaceGitCache } from "./git-cache";
 import {
   OVERSEER_STORAGE_VERSION, migrateToActionIndexes, migrateToBlueprintUpstreams,
-  migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes, migrateToAgentContinuations,
+  migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes, migrateToAgentContinuations, migrateToAgentIntegration,
 } from "./storage-schema/overseer-migrations";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
@@ -63,6 +63,9 @@ import { encodeGitTree, gitObjectOid, parseGitCommitRefs } from "./git-codec";
 import {
   listFeaturedBlueprintsFromKv, readBlueprintKvRecord, type BlueprintKvRecord,
 } from "./storage-schema/blueprints-kv";
+import type { AgentContext, AgentTurnInfo, AgentTurnParticipant, GatekeeperActionContext } from "@gadgets/workshop-shared/agent-integration";
+import { agentIntegrationGrant, requireIntegrationTurn,
+  deliverIntegrationEvent, type AgentIntegrationOrigin } from "./agent-integration";
 import { AgentContinuations, type AgentFinishReason } from "./agent-continuation";
 import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, type UserChatContext } from "./user";
@@ -696,6 +699,8 @@ class OverseerImpl implements AgentHooks {
   // Set of chatIds that currently have a running agent turn. Feeds the alarm (see
   // #agentKeepAliveTime) and lets `alarm()` wait for all agents to finish.
   #runningAgents = new Set<number>();
+  #integrationDeliveries = new Map<string, Promise<void>>();
+  #actionApplications = new Map<number, Promise<void>>();
 
   // Ambient connections whose getAgentCatalog() answered null, which the contract makes permanent
   // for the connection. Held in memory only: a gatekeeper that gains a catalog in a later version
@@ -939,6 +944,11 @@ class OverseerImpl implements AgentHooks {
       times.push(nextDeliveredRecord.deliveredAt + AGENT_RESPONSE_DELIVERED_RETENTION_MS);
     }
 
+    const integrationRetry = [...this.storage.agentIntegrationParticipants.retryAt.list({ limit: 1 })][0];
+    if (integrationRetry?.retryAt !== undefined) times.push(integrationRetry.retryAt);
+    const applicationRetry = [...this.storage.actionApplications.retryAt.list({ limit: 1 })][0];
+    if (applicationRetry) times.push(applicationRetry.retryAt);
+
     if (times.length > 0) {
       this.ctx.storage.setAlarm(Math.min(...times));
     } else {
@@ -965,6 +975,8 @@ class OverseerImpl implements AgentHooks {
           this.waitForAllAgentsToComplete(),
           this.drainAllPendingAgentCalls(),
           this.deliverReadyExternalMessageResponses(),
+          this.retryAgentIntegrationEvents(),
+          this.recoverActionApplications(),
         ]);
         for (let result of results) {
           if (result.status === "rejected") throw result.reason;
@@ -1021,6 +1033,13 @@ class OverseerImpl implements AgentHooks {
     }
     let aiModel: UserAiModelRecord | undefined;
     try {
+      for (const application of Array.from(this.storage.actionApplications.list())) {
+        const action = this.storage.actions.get(application.id);
+        if (action?.type === "action" && action.caller.from === "agent" &&
+            action.caller.chatId === record.chatId && action.state === "pending") {
+          await this.applyPendingAction(action, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
+        }
+      }
       const context = await retryOnDoReset(() =>
         this.users.get(this.users.idFromString(record.initiatorUserId)).getChatContext(record.modelId), this.logger);
       aiModel = context.aiModel;
@@ -1063,6 +1082,12 @@ class OverseerImpl implements AgentHooks {
   async #finishAgentContinuation(record: AgentContinuation, liveChat: LiveChatContext): Promise<void> {
     const owns = () => this.continuations.owns(record.chatId, record.continuationId) &&
       (this.#liveChats.get(record.chatId) === liveChat || !this.#liveChats.has(record.chatId));
+    if (!owns()) return;
+    try { await this.#deliverChatIntegrationEvents(record.chatId); }
+    catch (error) {
+      if (isDoResetError(error)) { this.#deferAgentResume(record, liveChat); return; }
+      this.logger.warn("agent integration cleanup deferred", { event: "agent.integration.cleanup.deferred", error });
+    }
     if (!owns()) return;
     await this.reconcilePendingGadgets(record.chatId);
     if (!owns()) return;
@@ -1161,12 +1186,14 @@ class OverseerImpl implements AgentHooks {
         migrateToWorkpieceTypes(this);
         migrateToBlueprintUpstreams(this);
         migrateToAgentContinuations(this);
+        migrateToAgentIntegration(this);
       }).then(() => this.#resumeInterruptedAgents(), () => {});
     } else {
       migrateToActionIndexes(this);
       migrateToWorkpieceTypes(this);
       migrateToBlueprintUpstreams(this);
       migrateToAgentContinuations(this);
+      migrateToAgentIntegration(this);
       this.#resumeInterruptedAgents();
     }
   }
@@ -1177,6 +1204,8 @@ class OverseerImpl implements AgentHooks {
   // any blocked event is delivered) so that if we were called at the start of the alarm handler,
   // it'll recognize that agents are running and wait for them.
   #resumeInterruptedAgents(): void {
+    // Durable approved intent is independent of browser lifetime and model inference.
+    this.ctx.waitUntil(this.recoverActionApplications());
     for (let record of Array.from(this.storage.agentContinuations.runnable.get(0))) {
       if (this.#runningAgents.has(record.chatId)) continue;
       if (record.status.phase === "paused") {
@@ -4770,16 +4799,54 @@ class OverseerImpl implements AgentHooks {
   // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
   // A creation also needs `creation`: the verifier of the account the approver chose to create it
   // in, and what they chose in that account's creation configurator.
-  async applyPendingAction(record: ActionRecord & {type: "action"},
-                           resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
-                           creation?: {creator: Fetcher<GatekeeperUserVerifier>,
-                                       configuration: string | null}): Promise<void> {
+  applyPendingAction(record: ActionRecord & {type: "action"},
+      resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
+      creation?: {creator: Fetcher<GatekeeperUserVerifier>, configuration: string | null},
+      resumeUserId?: string): Promise<void> {
+    const running = this.#actionApplications.get(record.id);
+    if (running) return running;
+    const promise = Promise.resolve().then(async () => {
+      const current = this.storage.actions.get(record.id);
+      if (!current || current.type !== "action") throw new Error("Action no longer exists.");
+      if (current.state === "approved") return;
+      if (current.state !== "pending") throw new Error("Action is not pending.");
+      let application = this.storage.actionApplications.get(record.id);
+      if (!application && current.action !== "create" && current.contextualApply && this.integrationGrant(current.gatekeeperId).recoverableActions) {
+        application = { id: record.id, resolvedBy, autoApproved, resumeUserId,
+          phase: "apply", retryAt: Date.now() + 1_000 };
+        this.storage.actionApplications.put(application);
+        this.#updateAlarm();
+        await this.ctx.storage.sync();
+      }
+      try {
+        await this.#applyPendingAction(current, application?.resolvedBy ?? resolvedBy,
+          application?.autoApproved ?? autoApproved, creation);
+        if (application) {
+          application = { ...application, phase: "resume", retryAt: Date.now() };
+          this.storage.actionApplications.put(application);
+          await this.#finishActionApplication(application);
+        }
+      } catch (error) {
+        // A normal handler error retains the explicit manual retry path. A reset/lost reply
+        // retains approved intent; only the opt-in receiver may reconcile/redeliver it.
+        if (application?.phase === "resume" || isDoResetError(error)) {
+          if (application) this.storage.actionApplications.put({ ...application, retryAt: Date.now() + 1_000 });
+        } else this.storage.actionApplications.delete(record.id);
+        throw error;
+      } finally { this.#updateAlarm(); }
+    }).finally(() => { this.#actionApplications.delete(record.id); });
+    this.#actionApplications.set(record.id, promise);
+    return promise;
+  }
+
+  async #applyPendingAction(record: ActionRecord & {type: "action"},
+      resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
+      creation?: {creator: Fetcher<GatekeeperUserVerifier>, configuration: string | null}): Promise<void> {
     let id = record.gatekeeperId;
-    // A created resource exists only once its creation applies, and that stays pending until then.
     if (record.action !== "create" && this.#creationPending(id)) {
       throw new Error("This resource doesn't exist yet. Approve its creation first.");
     }
-    let gatekeeper = await this.getGatekeeperFacet(record.gatekeeperId);
+    let gatekeeper = await this.getGatekeeperFacet(id);
     let created: {class: GatekeeperClass, resourceUrl: string} | undefined;
     if (record.action === "create") {
       if (!creation) throw new Error("Choose one of your accounts to create this resource in.");
@@ -4788,13 +4855,26 @@ class OverseerImpl implements AgentHooks {
       created = await (gatekeeper as unknown as Fetcher<Gatekeeper<any> &
           Required<Pick<Gatekeeper<any>, "applyCreation">>>)
           .applyCreation(creation.creator, creation.configuration);
+    } else if (record.contextualApply) {
+      const grant = this.integrationGrant(id);
+      if (!grant.contextualActions) {
+        throw new Error("Contextual action permission was revoked. This action cannot be applied.");
+      }
+      // Every redelivery path (including active-agent restoration before retryAt) reaches this
+      // effect boundary. A durable approval is not permission to bypass a revoked recovery grant.
+      if (this.storage.actionApplications.get(record.id) && !grant.recoverableActions) {
+        throw new Error("Automatic action recovery permission was revoked.");
+      }
+      // Trusted configuration selects this optional dispatch; never fall back after an effect.
+      await (gatekeeper as unknown as Fetcher<Gatekeeper<any> &
+          Required<Pick<Gatekeeper<any>, "applyActionInContext">>>)
+          .applyActionInContext(record.action, new GatekeeperActionContextImpl(this, record));
     } else {
-      // The apply-time cache stub is scoped to the gatekeeper AND to this action (approval can
-      // happen long after the session that queued it, so the queue-time stub is gone) -- the
-      // binding that makes buildPack() serve exactly this action's pending-push closure.
-      await gatekeeper.applyAction(record.action,
-          new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id));
+      await gatekeeper.applyAction(record.action, new GitCacheImpl(this.gitCache, id, record.id));
     }
+    // A long-running receiver may have submitted child approvals while this RPC was open.
+    const latest = this.storage.actions.get(record.id);
+    if (latest?.type === "action") record = latest;
     record.state = "approved";
     record.appliedAt = new Date();
     record.resolvedBy = resolvedBy;
@@ -4837,7 +4917,47 @@ class OverseerImpl implements AgentHooks {
     this.traceAgentActionApproval(record, "approved");
   }
 
-  // An approval resolves only the named durable wait.
+  // Alarm-driven recovery of already-authorized actions, never approval of pending requests.
+  async recoverActionApplications(): Promise<void> {
+    const due = [...this.storage.actionApplications.retryAt.list({ end: Date.now() + 1 })];
+    await Promise.all(due.map(async application => {
+      const started = performance.now();
+      try {
+        const record = this.storage.actions.get(application.id);
+        if (!record || record.type !== "action" || record.state === "rejected") {
+          this.storage.actionApplications.delete(application.id);
+        } else if (record.state === "approved" || application.phase === "resume") {
+          await this.#finishActionApplication(application);
+        } else {
+          await this.applyPendingAction(record, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
+        }
+      } catch (error) {
+        const latest = this.storage.actionApplications.get(application.id);
+        if (latest) this.storage.actionApplications.put({ ...latest, retryAt: Date.now() + 1_000 });
+        this.logger.warn("approved action recovery deferred", {
+          event: "action.recovery.deferred", actionId: application.id, error,
+        });
+      } finally {
+        this.logger.info("approved action recovery reconciled", {
+          event: "action.recovery.finished", actionId: application.id, operation: `action.recovery.${application.phase}`,
+          durationMs: performance.now() - started,
+          statusText: this.storage.actionApplications.get(application.id) ? "pending" : "reconciled",
+        });
+      }
+    }));
+    this.#updateAlarm();
+  }
+
+  async #finishActionApplication(application: ActionApplication): Promise<void> {
+    const record = this.storage.actions.get(application.id);
+    if (record?.type === "action" && record.caller.from === "agent" && record.description.awaitDecision) {
+      await this.resumeAfterActionDecision(record.caller.chatId, record.id, application.resolvedBy,
+        application.resumeUserId);
+    }
+    this.storage.actionApplications.delete(application.id);
+  }
+
+  // A live decision and a recovered effect resolve the same named suspension.
   async resumeAfterActionDecision(chatId: number, approvedId: number, author: AiChatAuthorInfo,
       fallbackUserId?: string): Promise<void> {
     // Before this schema, paused chats had no execution row. Adopt that one legacy wait into
@@ -5493,8 +5613,35 @@ class OverseerImpl implements AgentHooks {
   }
 
   async submitAction(gatekeeperId: number, action: number | "create",
-                     description: ActionDescription, caller: GatekeeperCaller)
+                     description: ActionDescription, caller: GatekeeperCaller,
+                     integrationOrigin?: AgentIntegrationOrigin, continuationOf?: number)
       : Promise<void> {
+    let parent: (ActionRecord & { type: "action" }) | undefined;
+    if (continuationOf !== undefined) {
+      const candidate = this.storage.actions.get(continuationOf);
+      const application = this.storage.actionApplications.get(continuationOf);
+      const grant = this.integrationGrant(gatekeeperId);
+      if (candidate?.type !== "action" || candidate.gatekeeperId !== gatekeeperId ||
+          candidate.caller.from !== "agent" || !candidate.integrationOrigin ||
+          candidate.state !== "pending" || !candidate.description.awaitDecision || application?.phase !== "apply" ||
+          !grant.contextualActions || !grant.recoverableActions)
+        throw new Error("The originating action is not being applied with recoverable authority.");
+      parent = candidate;
+      const turn = this.continuations.get(candidate.integrationOrigin.chatId);
+      integrationOrigin = { ...candidate.integrationOrigin, segmentId: turn?.segmentId ?? "" };
+      requireIntegrationTurn(turn, integrationOrigin, "applyingAction");
+      caller = candidate.caller;
+      for (const id of candidate.followupActionIds ?? []) {
+        const prior = this.storage.actions.get(id);
+        if (prior?.type === "action" && prior.action === action) {
+          if (JSON.stringify(prior.description) !== JSON.stringify(description))
+            throw new Error("Follow-up action ID was reused with a different description.");
+          return;
+        }
+      }
+      if ((candidate.followupActionIds?.length ?? 0) >= 32)
+        throw new Error("Follow-up approval budget exceeded.");
+    }
     // An in-flight facet RPC can outlive removeGatekeeper, and a pending action on a removed
     // connection could never be approved or rejected (both dereference the facet).
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
@@ -5502,6 +5649,10 @@ class OverseerImpl implements AgentHooks {
       throw new Error(
           "This action was blocked because the connection it was submitted through has been " +
           "removed from this workspace.");
+    }
+    if (integrationOrigin) {
+      requireIntegrationTurn(this.continuations.get(integrationOrigin.chatId),
+          integrationOrigin, parent ? "applyingAction" : "running");
     }
 
     // Restricted mode: the approver vouches for the text they read, and a push's commits cannot
@@ -5538,7 +5689,9 @@ class OverseerImpl implements AgentHooks {
       createdAt: new Date(),
       state: "pending",
       type: "action",
-      description
+      description,
+      integrationOrigin,
+      contextualApply: this.integrationGrant(gatekeeperId).contextualActions === true,
     };
 
     // The marking walk stamps the verified push closure "pending push" -- the read grant that
@@ -5549,8 +5702,16 @@ class OverseerImpl implements AgentHooks {
         this.gitCache.markPushClosure(gatekeeperId, actionId, description.pushedCommits);
       }
       this.storage.actions.put(record);
+      if (parent) {
+        this.storage.actions.put({ ...parent, followupActionIds: [...(parent.followupActionIds ?? []), actionId] });
+        this.continuations.addFollowup(parent.integrationOrigin!.chatId, parent.id, actionId);
+        // No executeCode call will consume a command's late approvals. Publish the existing
+        // action card now, in the same durable transaction as the deduplication receipt.
+        this.addChatMessages(parent.integrationOrigin!.chatId,
+          this.storage.actionApplications.get(parent.id)!.resolvedBy, [{ type: "action", actionId }]);
+      }
     });
-    this.#associateAction(caller, actionId);
+    if (!parent) this.#associateAction(caller, actionId);
 
     // Same auto-approval gate the drainer uses, named because awaitDecision uses it too. The drain
     // is deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
@@ -5560,7 +5721,7 @@ class OverseerImpl implements AgentHooks {
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending: on this
     // action, or on an earlier one the in-order drain stops at. Auto-approved actions keep the
     // seamless behavior the user opted into.
-    if (caller.from === "agent" && description.awaitDecision && this.#requiresManualDecision(record)) {
+    if (!parent && caller.from === "agent" && description.awaitDecision && this.#requiresManualDecision(record)) {
       this.#getOrCreateCapturedActions(caller.chatId).awaitDecision = true;
     }
 
@@ -5950,6 +6111,108 @@ class OverseerImpl implements AgentHooks {
     return facet.startSession(new ApprovalQueueImpl(this, id, caller));
   }
 
+  integrationGrant(gatekeeperId: number) {
+    this.assertGatekeeperUsable(gatekeeperId);
+    const record = this.storage.gatekeepers.get(gatekeeperId);
+    if (!record) throw new Error("Agent integration connection was removed.");
+    const vendorId = gatekeeperVendorId(record);
+    return vendorId ? agentIntegrationGrant(this.env.AGENT_INTEGRATION_GRANTS, vendorId) : {};
+  }
+
+  captureIntegrationOrigin(caller: GatekeeperCaller): AgentIntegrationOrigin | undefined {
+    if (caller.from !== "agent") return undefined;
+    const turn = this.continuations.get(caller.chatId);
+    return turn?.status.phase === "running"
+      ? { chatId: turn.chatId, turnId: turn.turnId, segmentId: turn.segmentId } : undefined;
+  }
+
+  getIntegrationContext(gatekeeperId: number, origin: AgentIntegrationOrigin | undefined,
+      phase: AgentTurnInfo["phase"] = "running"): AgentContext | null {
+    if (!origin) return null;
+    const grant = this.integrationGrant(gatekeeperId);
+    if (!grant.lifecycle && !grant.contextualActions) return null;
+    requireIntegrationTurn(this.continuations.get(origin.chatId), origin, phase);
+    return new AgentContextImpl(this, gatekeeperId, origin, phase);
+  }
+
+  async registerIntegrationParticipant(gatekeeperId: number, origin: AgentIntegrationOrigin,
+      phase: AgentTurnInfo["phase"], participant: Fetcher<AgentTurnParticipant>): Promise<void> {
+    if (!this.integrationGrant(gatekeeperId).lifecycle) {
+      throw new Error("Lifecycle participation has not been granted to this integration.");
+    }
+    const turn = this.continuations.get(origin.chatId);
+    requireIntegrationTurn(turn, origin, phase);
+    if (!turn || phase === "finishing" || phase === "suspending") {
+      throw new Error("Cannot register a participant while closing a turn.");
+    }
+    const id = `${origin.turnId}:${gatekeeperId}`;
+    if (!this.storage.agentIntegrationParticipants.get(id)) {
+      this.storage.agentIntegrationParticipants.put({ id, gatekeeperId, participant,
+        turnId: origin.turnId, chatId: origin.chatId,
+        pending: "event" in turn.status ? [turn.entry, turn.status.event] : [turn.entry],
+        retryAt: Date.now() + 30_000 });
+      this.#updateAlarm();
+    }
+    await this.#deliverIntegrationParticipant(id);
+  }
+
+  async #deliverIntegrationParticipant(id: string): Promise<void> {
+    const running = this.#integrationDeliveries.get(id);
+    if (running) return running;
+    const delivery = (async () => {
+      for (;;) {
+        const record = this.storage.agentIntegrationParticipants.get(id);
+        const event = record?.pending[0];
+        if (!record || !event) return;
+        try {
+          const permitted = this.storage.gatekeepers.get(record.gatekeeperId) !== undefined &&
+              this.integrationGrant(record.gatekeeperId).lifecycle;
+          // An entry callback may be retried after cleanup started. Its fresh capability must
+          // reflect the durable closing state, not reopen command execution for the old event.
+          // Revocation forbids new work, not cleanup of resources already opened. Retain
+          // terminal callbacks (and retries), but discard undelivered entry callbacks.
+          if (permitted || event.kind === "suspended" || event.kind === "finished") {
+            await deliverIntegrationEvent(() => record.participant.onAgentTurnEvent(event,
+              new AgentContextImpl(this, record.gatekeeperId, {
+                chatId: record.chatId, turnId: event.turnId, segmentId: event.segmentId,
+              }, "running", {participantId: id, eventId: event.eventId})));
+          }
+        } catch (error) {
+          const latest = this.storage.agentIntegrationParticipants.get(id);
+          if (latest) {
+            latest.retryAt = Date.now() + 30_000;
+            this.storage.agentIntegrationParticipants.put(latest);
+            this.#updateAlarm();
+          }
+          throw error;
+        }
+        // Re-read after the RPC: turn cleanup may have appended another event meanwhile.
+        const latest = this.storage.agentIntegrationParticipants.get(id);
+        if (latest?.pending[0]?.eventId === event.eventId) {
+          latest.pending.shift();
+          if (latest.pending.length) latest.retryAt = Date.now() + 30_000;
+          else delete latest.retryAt;
+          if (event.kind === "finished") this.storage.agentIntegrationParticipants.delete(id);
+          else this.storage.agentIntegrationParticipants.put(latest);
+        }
+      }
+    })();
+    this.#integrationDeliveries.set(id, delivery);
+    try { await delivery; }
+    finally { this.#integrationDeliveries.delete(id); this.#updateAlarm(); }
+  }
+
+  async retryAgentIntegrationEvents(): Promise<void> {
+    const pending = [...this.storage.agentIntegrationParticipants.retryAt.list({ end: Date.now() + 1 })];
+    await Promise.all(pending.map(record => this.#deliverIntegrationParticipant(record.id)));
+  }
+
+  async closeAgentIntegrationTurn(chatId: number,
+      outcome: AgentFinishReason | "approval" | "connection"): Promise<void> {
+    this.#closeAgentContinuation(chatId, outcome);
+    await this.#deliverChatIntegrationEvents(chatId);
+  }
+
   #closeAgentContinuation(chatId: number, outcome: AgentFinishReason | "approval" | "connection"): void {
     const record = this.continuations.get(chatId);
     if (!record) return;
@@ -5962,6 +6225,21 @@ class OverseerImpl implements AgentHooks {
       });
     } else this.continuations.close(chatId, outcome);
     this.#updateAlarm();
+  }
+
+  async #deliverChatIntegrationEvents(chatId: number): Promise<void> {
+    await Promise.all([...this.storage.agentIntegrationParticipants.byChat.get(chatId)]
+      .map(record => this.#deliverIntegrationParticipant(record.id)));
+  }
+
+  async beginAgentIntegrationTurn(chatId: number, continuationId: string): Promise<void> {
+    // Drain predecessor cleanup before publishing this execution's entry event.
+    await this.#deliverChatIntegrationEvents(chatId);
+    if (!this.continuations.enter(chatId, continuationId)) {
+      throw new Error("Agent continuation canceled or superseded during lifecycle startup.");
+    }
+    this.#updateAlarm();
+    await this.#deliverChatIntegrationEvents(chatId);
   }
 
   // Sessions are authorized and verified only at open(), so widening what a live session's holder
@@ -6742,8 +7020,9 @@ class OverseerImpl implements AgentHooks {
     // reflects the spend this turn just incurred, rather than waiting for the cache TTL to lapse.
     let byokOwnerStub: DurableObjectStub<UserDurableObject> | undefined;
     let finished = false;
-    let outcome: AgentFinishReason | "approval" | "connection" = "failed";
+    let integrationOutcome: AgentFinishReason | "approval" | "connection" = "failed";
     let interrupted = false;
+    let entered = false;
     let startedAt = Date.now();
     const turnLogger = this.logger.with({
       operation: "agent.run",
@@ -6755,7 +7034,8 @@ class OverseerImpl implements AgentHooks {
     });
 
     try {
-      if (!this.continuations.enter(chatId, continuationId)) return;
+      await this.beginAgentIntegrationTurn(chatId, continuationId);
+      entered = true;
 
       // The trace span covers the turn's setup and run, not the teardown below, which can start the
       // chat's next turn.
@@ -6818,7 +7098,7 @@ class OverseerImpl implements AgentHooks {
         let disposition = await runAgent(
             this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
         finished = true;
-        outcome = disposition === "awaitingActionDecision" ? "approval"
+        integrationOutcome = disposition === "awaitingActionDecision" ? "approval"
           : disposition === "awaitingConnection" ? "connection" : "completed";
         turnLogger.debug("agent run finished", {
           event: "agent.run.finished", outcome: "ok",
@@ -6827,6 +7107,12 @@ class OverseerImpl implements AgentHooks {
       });
     } catch (err: unknown) {
       if (!this.continuations.owns(chatId, continuationId)) return;
+      if (!entered && !liveChat.cancelController.signal.aborted) {
+        // Callback delivery is retryable backpressure, not a failed user turn.
+        interrupted = true;
+        turnLogger.warn("agent lifecycle startup deferred", {event: "agent.integration.startup.deferred", error: err});
+        return;
+      }
       if (isDoResetError(err) && !liveChat.cancelController.signal.aborted) {
         // Rebuild from the committed model/tool log. External effects recover through
         // their own journals; this is not permission to repeat arbitrary writes.
@@ -6836,7 +7122,7 @@ class OverseerImpl implements AgentHooks {
         });
         return;
       }
-      if (liveChat.cancelController.signal.aborted) outcome = "canceled";
+      if (liveChat.cancelController.signal.aborted) integrationOutcome = "canceled";
       // A failed model request surfaces as AgentTurnError (pi reports provider failures as data;
       // runAgent converts them back to a throw), carrying the failing request's HTTP status when
       // one was observed.
@@ -6873,9 +7159,9 @@ class OverseerImpl implements AgentHooks {
     } finally {
       if (interrupted) {
         const active = this.continuations.get(chatId);
-        if (active?.continuationId === continuationId) this.#deferAgentResume(active, liveChat);
+        if (active?.continuationId === continuationId) this.#deferAgentResume(active, liveChat, entered ? 1_000 : 30_000);
       } else if (this.continuations.owns(chatId, continuationId)) {
-        this.#closeAgentContinuation(chatId, outcome);
+        this.#closeAgentContinuation(chatId, integrationOutcome);
         // If this turn billed the user's own Cloudflare account, refresh their cached balance now (in
         // the background) so the next turn's billing decision reflects the spend just incurred. Runs
         // on both the success and error paths — an "insufficient funds" failure is exactly when an
@@ -11015,7 +11301,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let creator = action.action === "create" && creation && vendorId
         ? await this.#clientUser.getVerifier(creation.accountId, vendorId) : null;
     await this.impl.applyPendingAction(action, profile, false,
-        creator ? {creator, configuration: creation?.configuration ?? null} : undefined);
+        creator ? {creator, configuration: creation?.configuration ?? null} : undefined,
+        this.#clientUser.id.toString());
 
     // If this was an awaited agent action, resume only after all awaited actions in the turn are
     // approved. If applyPendingAction throws, the action stays pending and the turn stays suspended.
@@ -11171,6 +11458,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Resolve the rejecter's identity before notifying the gatekeeper, so a failed profile fetch
     // can't leave the action rejected with the gatekeeper but still "pending" in storage.
     let profile = await this.#getClientProfile();
+
+    if (this.impl.storage.actionApplications.get(id))
+      throw new Error("Action approval is already being applied or recovered; inspect its execution receipt.");
 
     await gatekeeper.rejectAction(action.action);
 
@@ -12917,8 +13207,71 @@ function makeHookFiringCallback(impl: OverseerImpl, hookId: number): NativeRpcSt
   }));
 }
 
+class AgentContextImpl extends NativeRpcTarget implements AgentContext {
+  constructor(private impl: OverseerImpl, private gatekeeperId: number,
+      private origin: AgentIntegrationOrigin, private phase: AgentTurnInfo["phase"],
+      private delivery?: {participantId: string; eventId: string}) { super(); }
+
+  async getTurn(): Promise<AgentTurnInfo> {
+    if (this.delivery) {
+      const record = this.impl.storage.agentIntegrationParticipants.get(this.delivery.participantId);
+      if (!record?.pending.some(event => event.eventId === this.delivery!.eventId)) {
+        throw new Error("Agent lifecycle delivery context expired.");
+      }
+      const current = this.impl.continuations.get(this.origin.chatId);
+      const closing = record.pending.findLast(event => event.kind === "finished" || event.kind === "suspended");
+      const phase = closing?.kind === "finished" ? "finishing" : closing?.kind === "suspended" ? "suspending" : "running";
+      if (phase !== "running") return { ...this.origin, chatId: String(this.origin.chatId), phase };
+      requireIntegrationTurn(current, this.origin, phase);
+    }
+    if (this.phase !== "suspending" && this.phase !== "finishing") {
+      const grant = this.impl.integrationGrant(this.gatekeeperId);
+      if (!grant.lifecycle && !grant.contextualActions) {
+        throw new Error("Agent integration grant revoked.");
+      }
+    }
+    return requireIntegrationTurn(this.impl.continuations.get(this.origin.chatId),
+        this.origin, this.phase);
+  }
+
+  async participate(participant: Fetcher<AgentTurnParticipant>): Promise<void> {
+    const turn = await this.getTurn();
+    await this.impl.registerIntegrationParticipant(this.gatekeeperId, this.origin, turn.phase, participant);
+  }
+
+}
+
+@validateRpc()
+class GatekeeperActionContextImpl extends NativeRpcTarget implements GatekeeperActionContext {
+  constructor(private impl: OverseerImpl, private record: ActionRecord & { type: "action" }) { super(); }
+
+  async getGitCache(): Promise<GitCache> {
+    this.impl.integrationGrant(this.record.gatekeeperId);
+    return new GitCacheImpl(this.impl.gitCache, this.record.gatekeeperId, this.record.id);
+  }
+
+  async getAgentContext(): Promise<AgentContext | null> {
+    // Approval may be retried after the same logical turn resumes in a new segment. Mint a
+    // fresh capability for that segment, retaining the queue-time mount selection. Existing
+    // session capabilities remain segment-fenced, and a later prompt cannot adopt this action.
+    let origin = this.record.integrationOrigin;
+    const turn = origin && this.impl.continuations.get(origin.chatId);
+    if (origin && turn?.turnId === origin.turnId && !["finished", "finishing"].includes(turn.status.phase)) {
+      origin = { ...origin, segmentId: turn.segmentId };
+    }
+    return this.impl.getIntegrationContext(this.record.gatekeeperId,
+        origin, "applyingAction");
+  }
+
+  async submitAction(action: number, description: ActionDescription): Promise<void> {
+    return this.impl.submitAction(this.record.gatekeeperId, action, description,
+        this.record.caller, this.record.integrationOrigin, this.record.id);
+  }
+}
+
 @validateRpc()
 class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
+  readonly #integrationOrigin: AgentIntegrationOrigin | undefined;
   // `hookId` is set only on the queue startHook returns with each firing: that queue is held by
   // the gatekeeper across awaits (even other DOs), so like the firing's callback it revalidates
   // the hook per call -- otherwise a firing raced by a disable/delete could keep authorizing
@@ -12928,6 +13281,16 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   constructor(private impl: OverseerImpl, private gatekeeperId: number,
               private caller: GatekeeperCaller, private hookId?: number) {
     super();
+    if (caller.from === "agent") {
+      const grant = impl.integrationGrant(gatekeeperId);
+      this.#integrationOrigin = grant.lifecycle || grant.contextualActions
+        ? impl.captureIntegrationOrigin(caller) : undefined;
+    }
+  }
+
+  async getAgentContext(): Promise<AgentContext | null> {
+    if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
+    return this.impl.getIntegrationContext(this.gatekeeperId, this.#integrationOrigin);
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {
@@ -12941,7 +13304,8 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
 
   submitAction(action: number, description: ActionDescription): Promise<void> {
     if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
-    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller);
+    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller,
+        this.#integrationOrigin);
   }
 
   bindHook<Hook extends RpcTarget>(

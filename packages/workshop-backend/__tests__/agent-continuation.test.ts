@@ -48,7 +48,8 @@ describe("one durable agent continuation", () => {
 
   it("re-enters after a reset without changing execution or caller authority", () => {
     const {machine: m, first} = setup();
-    expect(m.enter(1, first.continuationId)).toEqual({...first, status: {phase: "running"}});
+    expect(m.enter(1, first.continuationId)).toMatchObject({...RUN,
+      continuationId: first.continuationId, status: {phase: "running"}});
   });
 
   it.each(["same prompt", "different prompt"])("fences old cleanup against a new execution of %s", request => {
