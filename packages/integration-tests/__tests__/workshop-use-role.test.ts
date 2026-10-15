@@ -114,6 +114,7 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
   denyConnectionRequest: ws => ws.denyConnectionRequest("request"),
   listChats: ws => ws.listChats(),
   listModels: ws => ws.listModels(),
+  describeChatModel: ws => ws.describeChatModel("model"),
   getChatHistory: ws => ws.getChatHistory(1),
   getChatMessage: ws => ws.getChatMessage(1, 0),
   subscribeToChat: async ws => {
@@ -128,6 +129,7 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
   getChatAttachmentContent: ws => ws.getChatAttachmentContent(1, "attachment"),
   deleteChatAttachment: ws => ws.deleteChatAttachment("attachment"),
   setChatTitle: ws => ws.setChatTitle(1, "Title"),
+  setChatModelSettings: ws => ws.setChatModelSettings(1, {}),
   mergeChanges: ws => ws.mergeChanges(1),
   updateChatFromMainline: ws => ws.updateChatFromMainline(1),
   revertChanges: ws => ws.revertChanges(1, 0),
