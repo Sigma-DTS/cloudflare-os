@@ -191,6 +191,8 @@ describe('ChatInterface chat settings', () => {
     await pickPreset('Deep work')
     expect(chat.setChatModelSettings).toHaveBeenCalledExactlyOnceWith(CHAT_ID, { reasoning: 'high' })
     expect(trigger().getAttribute('aria-label')).toBe('Model settings: Deep work')
+    // As the server does, it notifies the chat's metadata before it answers.
+    await chat.pushMetadata(metadata(DEEP.settings))
     await act(async () => settle())
     expect(trigger().getAttribute('aria-label')).toBe('Model settings: Deep work')
     expect(toasts.add).not.toHaveBeenCalled()
@@ -234,6 +236,28 @@ describe('ChatInterface chat settings', () => {
     expect(trigger().getAttribute('aria-label')).toBe('Model settings: Long reads')
     await act(async () => refusals[1](new Error('Refused')))
     expect(trigger().getAttribute('aria-label')).toBe('Model settings: Custom')
+  })
+
+  it('keeps a newer change over the notification of an earlier one', async () => {
+    const answers: Array<() => void> = []
+    const chat = await renderChat({
+      selectedChatId: CHAT_ID,
+      chats: [metadata()],
+      setChatModelSettings: () => new Promise<void>((resolve) => { answers.push(resolve) }),
+    })
+    await pickPreset('Deep work')
+    const longReads = Array.from(document.querySelectorAll<HTMLElement>('[role="radio"]'))
+      .find((element) => element.textContent?.startsWith('Long reads'))!
+    await act(async () => { longReads.click() })
+    // The server notifies the first write, and answers it, while the second is on its way.
+    await chat.pushMetadata(metadata(DEEP.settings))
+    expect(trigger().getAttribute('aria-label')).toBe('Model settings: Long reads')
+    await act(async () => answers[0]())
+    expect(trigger().getAttribute('aria-label')).toBe('Model settings: Long reads')
+    expect(contextLine()).toEqual(['compacts at ~680K'])
+    await chat.pushMetadata(metadata(LONG.settings))
+    await act(async () => answers[1]())
+    expect(trigger().getAttribute('aria-label')).toBe('Model settings: Long reads')
   })
 
   it('starts a new chat with the settings last chosen', async () => {

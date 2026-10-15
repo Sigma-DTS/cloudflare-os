@@ -2702,9 +2702,12 @@ function ChatInterface({
     lastMessageTimestamp: null,
   });
   const provisionalRef = useRef<Map<number, ProvisionalChatState>>(new Map());
-  // Each chat's model settings as the server last gave or accepted them, which a refused change
-  // restores. The cached metadata may hold a change that is still being sent.
-  const serverChatSettingsRef = useRef<Map<number, ChatModelSettings | undefined>>(new Map());
+  // Each chat's latest settings change while it is being sent, shown over the cached metadata,
+  // which holds only what the server sent: a notification of an earlier write must not replace a
+  // newer change. `seq` tells the latest change from earlier ones as each settles.
+  const pendingChatSettingsRef =
+      useRef<Map<number, { settings: ChatModelSettings, seq: number }>>(new Map());
+  const chatSettingsSeqRef = useRef(0);
   // Per-chat buffers of live (unmaterialized) change rows (see ChatLiveChangeRows), fed by
   // changeApplied, pruned by materialization watermarks and generation bumps.
   const chatChangeRowsRef = useRef<Map<number, ChatChangeRowBuffer>>(new Map());
@@ -3150,6 +3153,9 @@ function ChatInterface({
   // Get metadata for selected chat
   const currentChatMetadata =
     selectedChatId !== null ? cacheRef.current.chats.get(selectedChatId) : null;
+  const currentChatSettings = (selectedChatId !== null
+      ? pendingChatSettingsRef.current.get(selectedChatId)?.settings : undefined) ??
+      currentChatMetadata?.modelSettings ?? {};
   const newChatSettingsToSend = hasChatSettings(newChatSettings) ? newChatSettings : undefined;
 
   // Download a committed chat attachment. Image bytes are already inlined on the message; other
@@ -3512,7 +3518,6 @@ function ChatInterface({
       }
 
       cacheRef.current.chats.set(chat.id, chat);
-      serverChatSettingsRef.current.set(chat.id, chat.modelSettings);
       bumpChatListVersion();
       forceUpdate();
     }
@@ -3520,7 +3525,7 @@ function ChatInterface({
     deleted(chatId: number) {
       // Remove from cache
       cacheRef.current.chats.delete(chatId);
-      serverChatSettingsRef.current.delete(chatId);
+      pendingChatSettingsRef.current.delete(chatId);
       cacheRef.current.messages.delete(chatId);
       cacheRef.current.compacted.delete(chatId);
       removeChatFromActionMessageIndex(chatId);
@@ -3829,7 +3834,6 @@ function ChatInterface({
 
           chats.forEach((chat) => {
             cacheRef.current.chats.set(chat.id, chat);
-            serverChatSettingsRef.current.set(chat.id, chat.modelSettings);
           });
           bumpChatListVersion();
           setChatListReady(true);
@@ -4085,31 +4089,24 @@ function ChatInterface({
     persistChatSettings(settings);
   };
 
-  // An existing chat's change is shown at once, and undone if the server refuses it: the chat
-  // goes back to the settings the server last gave or accepted, not to what an earlier change,
-  // perhaps refused too, showed. Either way the settings are those the next new chat starts with.
+  // An existing chat's change is shown at once, until the latest change settles. The server
+  // notifies the chat's metadata before it answers, so the metadata then shows what it holds: the
+  // change, or for a refused one what it held before. Either way the settings are those the next
+  // new chat starts with.
   const handleChatSettingsChange = (chatId: number, settings: ChatModelSettings) => {
     handleNewChatSettingsChange(settings);
-    const chat = cacheRef.current.chats.get(chatId);
-    if (!chat) return;
-    const serverSettings = serverChatSettingsRef.current;
-    if (!serverSettings.has(chatId)) serverSettings.set(chatId, chat.modelSettings);
-    const applied = hasChatSettings(settings) ? settings : undefined;
-    cacheRef.current.chats.set(chatId, { ...chat, modelSettings: applied });
+    const pending = pendingChatSettingsRef.current;
+    const seq = ++chatSettingsSeqRef.current;
+    pending.set(chatId, { settings, seq });
     forceUpdate();
-    overseer.setChatModelSettings(chatId, settings).then(() => {
-      serverSettings.set(chatId, applied);
-    }, (err: unknown) => {
+    const settle = () => {
+      if (pending.get(chatId)?.seq !== seq) return;
+      pending.delete(chatId);
+      forceUpdate();
+    };
+    overseer.setChatModelSettings(chatId, settings).then(settle, (err: unknown) => {
       logRpcFailure("Failed to change the chat's model settings:", err);
-      // Only the latest change is undone: a later one, or the server's own, stands.
-      const current = cacheRef.current.chats.get(chatId);
-      if (current && current.modelSettings === applied) {
-        cacheRef.current.chats.set(chatId, {
-          ...current,
-          modelSettings: serverSettings.get(chatId),
-        });
-        forceUpdate();
-      }
+      settle();
       toasts.add({
         title: "Couldn’t change the model settings",
         description: rpcFailureDescription(err),
@@ -4127,7 +4124,7 @@ function ChatInterface({
   };
   const chatSettingsControl = selectedChatId === null ? newChatSettingsControl : {
     ...newChatSettingsControl,
-    settings: currentChatMetadata?.modelSettings ?? {},
+    settings: currentChatSettings,
     onSettingsChange: (settings: ChatModelSettings) =>
       handleChatSettingsChange(selectedChatId, settings),
   };
@@ -6637,10 +6634,10 @@ function ChatInterface({
                       <span>${currentChatMetadata.totalCost.toFixed(4)}</span>
                     )}
                     {/* Until the model is described its maximum, which caps the budget, is unknown. */}
-                    {currentChatMetadata?.modelSettings?.compactionInputBudget !== undefined &&
+                    {currentChatSettings.compactionInputBudget !== undefined &&
                      chatModelDescription.description && (
                       <span>
-                        {compactsAtLabel(currentChatMetadata.modelSettings.compactionInputBudget,
+                        {compactsAtLabel(currentChatSettings.compactionInputBudget,
                                          chatModelDescription.description)}
                       </span>
                     )}
