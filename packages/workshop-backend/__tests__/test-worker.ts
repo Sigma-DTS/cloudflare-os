@@ -1,13 +1,14 @@
 // The Worker the unit suites run inside: the production Worker's exports (so `ctx.exports` resolves
 // the real Durable Objects and callbacks) plus test-only entrypoints that stand in for other Workers.
 
-import { DurableObject, WorkerEntrypoint, restore, type RpcStub } from "cloudflare:workers";
+import { DurableObject, RpcTarget, WorkerEntrypoint, restore, type RpcStub } from "cloudflare:workers";
 import type { AccountDescription, ActionDescription, Gatekeeper, ApprovalQueue, GatekeeperUserVerifier } from "@gadgets/workshop-shared/gatekeeper";
 import type { AgentContext, AgentTurnEvent, AgentTurnInfo, AgentTurnParticipant,
   GatekeeperActionContext } from "@gadgets/workshop-shared/agent-integration";
 import { GatekeeperConnectCallbackImpl } from "../src/user.js";
 import { LoginConnectCallbackImpl } from "../src/auth/login-flow.js";
 import { OverseerDurableObject as RealOverseerDurableObject } from "../src/server.js";
+import { GatekeeperLoopback as RealGatekeeperLoopback } from "../src/overseer";
 
 export * from "../src/server.js";
 export { default } from "../src/server.js";
@@ -44,7 +45,20 @@ export class OverseerDurableObject extends RealOverseerDurableObject {
  */
 export { AgentSelfLoopback } from "../src/server.js";
 /** What a loaded gadget's `env.GADGET` and tail worker are minted from, likewise. */
-export { GatekeeperLoopback, GadgetTailLoopback } from "../src/server.js";
+export { GadgetTailLoopback } from "../src/server.js";
+/**
+ * The pool invokes declared prototype methods, bypassing the constructor's dynamic session
+ * proxy. Forward the fixture API through that real proxy so binding tests exercise its routing.
+ */
+export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, ConstructorParameters<typeof RealGatekeeperLoopback>[0]["props"]> {
+  #open() {
+    return new RealGatekeeperLoopback(this.ctx, this.env) as RealGatekeeperLoopback & Fetcher<IntegrationTestSession>;
+  }
+  getTurn(): Promise<AgentTurnInfo | null> { return this.#open().getTurn(); }
+  submitAction(...args: Parameters<IntegrationTestSession["submitAction"]>): Promise<void> {
+    return this.#open().submitAction(...args);
+  }
+}
 /** What an executeCode run's tail worker is minted from, likewise. */
 export { CodeModeTailLoopback } from "../src/server.js";
 /**
@@ -146,10 +160,9 @@ export class IntegrationTestActionGatekeeper extends DurableObject<Cloudflare.En
   async describe() { return { url: "container://test", title: "Test", suggestedBindingName: "TEST", tsType: "object" }; }
   async getTypeScriptTypes(): Promise<string> { return ""; }
   async getAutoApprovableActions() { return []; }
-  async startSession(queue: RpcStub<ApprovalQueue>): Promise<{ turn: AgentTurnInfo | null }> {
+  async startSession(queue: RpcStub<ApprovalQueue>): Promise<IntegrationTestSession> {
     using borrowed = queue;
-    using context = await borrowed.getAgentContext();
-    return { turn: context ? await context.getTurn() : null };
+    return new IntegrationTestSession(borrowed.dup());
   }
   async addObserver(_id: string, _verifier: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
   async removeObserver(_id: string): Promise<void> {}
@@ -177,5 +190,17 @@ export class IntegrationTestActionGatekeeper extends DurableObject<Cloudflare.En
   }
   #record(call: ReturnType<IntegrationTestActionGatekeeper["calls"]>[number]): void {
     this.ctx.storage.kv.put("calls", [...this.calls(), call]);
+  }
+}
+
+class IntegrationTestSession extends RpcTarget {
+  constructor(private queue: RpcStub<ApprovalQueue>) { super(); }
+  [Symbol.dispose](): void { this.queue[Symbol.dispose](); }
+  async getTurn(): Promise<AgentTurnInfo | null> {
+    using context = await this.queue.getAgentContext();
+    return context ? await context.getTurn() : null;
+  }
+  submitAction(action: number, description: ActionDescription): Promise<void> {
+    return this.queue.submitAction(action, description);
   }
 }

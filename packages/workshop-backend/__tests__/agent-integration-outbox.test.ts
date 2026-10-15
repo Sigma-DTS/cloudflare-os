@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { migrateToAgentIntegration } from "../src/storage-schema/overseer-migrations";
 import type { AgentContinuation } from "../src/storage-schema/overseer-storage";
 import { makeActionStorage } from "./fixtures";
+import type { IntegrationTestActionGatekeeper } from "./test-worker";
 import { CHAT, GATEKEEPER, RUN, finish, flush, inKernel, origin, pause, resume, start } from "./agent-integration-fixture";
 
 describe("lifecycle delivery over persistent native RPC", () => {
@@ -41,7 +42,7 @@ describe("lifecycle delivery over persistent native RPC", () => {
     const first = await start(impl);
     const facet = await impl.getGatekeeperFacet(GATEKEEPER);
     using session = await impl.openGatekeeperSession(GATEKEEPER, facet, {from: "agent", chatId: CHAT});
-    expect(session.turn).toMatchObject({turnId: first.turnId, segmentId: first.segmentId, phase: "running"});
+    expect(await session.getTurn()).toMatchObject({turnId: first.turnId, segmentId: first.segmentId, phase: "running"});
     await impl.registerIntegrationParticipant(GATEKEEPER, first, "running", participant);
     await impl.registerIntegrationParticipant(GATEKEEPER, first, "running", participant);
     await pause(impl);
@@ -53,6 +54,22 @@ describe("lifecycle delivery over persistent native RPC", () => {
       ["started", "running"], ["suspended", "suspending"], ["resumed", "running"], ["finished", "finishing"],
     ]);
     expect([...impl.storage.agentIntegrationParticipants.list()]).toEqual([]);
+  }));
+
+  it.each(["successor", "resumed segment"])("does not revive a retained agent binding in a %s", mode => inKernel(async impl => {
+    type Session = Awaited<ReturnType<IntegrationTestActionGatekeeper["startSession"]>>;
+    const binding = () => impl.getEnvForAgent(CHAT, {TEST: {type: "workpiece", id: GATEKEEPER}}, "exec") as {TEST: Fetcher<Session>};
+    await start(impl);
+    const old = binding(), oldAction = binding();
+    if (mode === "successor") await finish(impl);
+    else await pause(impl);
+    const next = mode === "successor" ? await start(impl) : await resume(impl);
+    expect(await binding().TEST.getTurn()).toMatchObject({turnId: next.turnId, segmentId: next.segmentId});
+    await expect(async () => await old.TEST.getTurn()).rejects.toThrow(/expired/);
+    await expect(async () => await oldAction.TEST.submitAction(42, {title: "Old command", description: "Must not borrow authority",
+      implementsRevert: false, awaitDecision: true})).rejects.toThrow(/expired/);
+    expect([...impl.storage.actions.list()]).toEqual([]);
+    await finish(impl);
   }));
 
   it("keeps failed delivery's event ID and blocks startup until it can drain", () => inKernel(async (impl, participant) => {

@@ -1056,14 +1056,24 @@ class OverseerImpl implements AgentHooks {
         if (action?.type === "action" && action.caller.from === "agent" &&
             action.caller.chatId === record.chatId && action.integrationOrigin?.turnId === record.turnId &&
             action.state === "pending") {
-          await this.applyPendingAction(action, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
+          if (!await this.#waitForAgentWork(record, liveChat.cancelController.signal,
+              () => this.applyPendingAction(action, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId))) break;
         }
       }
     } catch (error) {
-      this.logger.warn("approved actions deferred before agent resume", {
-        event: "agent.resume.actions.deferred", chatId: record.chatId, error,
-      });
-      this.#deferAgentResume(record, liveChat, isDoResetError(error) ? 1_000 : 30_000);
+      const retryPhase = this.continuations.get(record.chatId)?.status.phase;
+      if (this.continuations.owns(record.chatId, record.continuationId) && (retryPhase === "starting" || retryPhase === "running")) {
+        this.logger.warn("approved actions deferred before agent resume", {
+          event: "agent.resume.actions.deferred", chatId: record.chatId, error,
+        });
+        this.#deferAgentResume(record, liveChat, isDoResetError(error) ? 1_000 : 30_000);
+        return;
+      }
+    }
+    if (!this.continuations.owns(record.chatId, record.continuationId)) return;
+    const replayedPhase = this.continuations.get(record.chatId)!.status.phase;
+    if (replayedPhase === "suspending" || replayedPhase === "finishing") {
+      await this.#finishAgentContinuation(record, liveChat);
       return;
     }
     let aiModel: UserAiModelRecord | undefined;
@@ -2522,6 +2532,7 @@ class OverseerImpl implements AgentHooks {
       overseerId: this.ctx.id.toString(),
       target,
       caller,
+      integrationOrigin: this.captureIntegrationOrigin(caller),
     };
     return this.ctx.exports.GatekeeperLoopback({props});
   }
@@ -5249,7 +5260,8 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Open the session behind a binding loopback.
-  startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
+  startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller,
+      integrationOrigin: AgentIntegrationOrigin | null = null): Promise<any> {
     switch (target.type) {
       case "gadget": {
         if (caller.from === "agent") {
@@ -5261,7 +5273,7 @@ class OverseerImpl implements AgentHooks {
 
       case "gatekeeper":
         return this.getGatekeeperFacet(target.id)
-            .then(facet => this.openGatekeeperSession(target.id, facet, caller));
+            .then(facet => this.openGatekeeperSession(target.id, facet, caller, integrationOrigin));
 
       case "worktree": {
         // The programmatic Worktree binding (worktree-session.ts). A worktree's uncommitted
@@ -6150,11 +6162,12 @@ class OverseerImpl implements AgentHooks {
   // startGatekeeperSession alike -- passes through here, so this is where a connection still
   // blocked pending a scope-widening restart is refused (see #gatekeepersPendingRestart).
   openGatekeeperSession<Session extends RpcCompatible<Session>>(
-      id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller)
+      id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller,
+      integrationOrigin: AgentIntegrationOrigin | null = this.captureIntegrationOrigin(caller) ?? null)
       : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
-    return facet.startSession(new ApprovalQueueImpl(this, id, caller));
+    return facet.startSession(new ApprovalQueueImpl(this, id, caller, undefined, integrationOrigin ?? undefined));
   }
 
   integrationGrant(gatekeeperId: number) {
@@ -7055,56 +7068,82 @@ class OverseerImpl implements AgentHooks {
         callbackInitiated, liveChat));
   }
 
+  // Stop observing external work when this execution closes, without canceling an effect
+  // that may already have run. Its durable receipt remains independently reconcilable.
+  async #waitForAgentWork(record: AgentContinuation, signal: AbortSignal, work: () => Promise<unknown>): Promise<boolean> {
+    const running = () => {
+      const current = this.continuations.get(record.chatId);
+      return !signal.aborted && current?.continuationId === record.continuationId &&
+        (current.status.phase === "starting" || current.status.phase === "running");
+    };
+    if (!running()) return false;
+    const stopped = Promise.withResolvers<void>();
+    const check = () => { if (!running()) stopped.resolve(); };
+    // Collection subscribers run before the write; observe the committed transition.
+    const changed = () => queueMicrotask(check);
+    const subscriber = {add: changed, update: changed, remove: changed};
+    this.storage.agentContinuations.subscribe(subscriber);
+    signal.addEventListener("abort", check);
+    try {
+      check();
+      await Promise.race([work(), stopped.promise]);
+      return running();
+    } finally {
+      this.storage.agentContinuations.unsubscribe(subscriber);
+      signal.removeEventListener("abort", check);
+    }
+  }
+
   // A final model response is not the end of a contextual command dispatched in the
   // background. Keep its authority alive until application completes, unless a manual
   // follow-up suspends the turn (or cancellation/supersession ends that authority).
   async #waitForAgentActions(record: AgentContinuation, signal: AbortSignal): Promise<boolean> {
     const ids = new Set(this.#actionApplications.keys());
+    for (const application of this.storage.actionApplications.list()) ids.add(application.id);
     for (const message of this.storage.chats.list({prefix: chatKeyPrefix(record.chatId), reverse: true})) {
       if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
       if (message.type === "action") ids.add(message.actionId);
     }
-    const actions = [...ids].map(id => this.storage.actions.get(id))
-      .filter((action): action is ActionRecord & {type: "action"} => action?.type === "action" &&
-        action.contextualApply === true && action.state === "pending" && action.integrationOrigin?.turnId === record.turnId);
-    const stopped = Promise.withResolvers<void>();
-    const check = () => {
-      const current = this.continuations.get(record.chatId);
-      if (signal.aborted || current?.continuationId !== record.continuationId || current.status.phase !== "running") {
-        stopped.resolve();
+    const pending = () => {
+      for (const id of this.#actionApplications.keys()) ids.add(id);
+      const actions: (ActionRecord & {type: "action"})[] = [];
+      for (const id of ids) {
+        const action = this.storage.actions.get(id);
+        if (action?.type !== "action" || !action.contextualApply || action.integrationOrigin?.turnId !== record.turnId) continue;
+        // A receiver can submit descendants after the model's final response. Walk the
+        // durable edges afresh, including children of parents that have already completed.
+        for (const child of action.followupActionIds ?? []) ids.add(child);
+        if (action.state === "pending" || this.storage.actionApplications.get(id)) actions.push(action);
       }
-      // The shared drain may continue into another chat's command. Its work must not
-      // hold this turn open after our own effects and durable receipts have settled.
-      if (actions.every(action => this.storage.actions.get(action.id)?.state !== "pending" &&
-          !this.storage.actionApplications.get(action.id))) stopped.resolve();
+      return actions;
     };
+    let changed = Promise.withResolvers<void>();
     // Collection subscribers run before the write; observe the committed transition.
-    const changed = () => queueMicrotask(check);
-    const subscriber = {add: changed, update: changed, remove: changed};
-    this.storage.agentContinuations.subscribe(subscriber);
+    const notify = () => queueMicrotask(() => changed.resolve());
+    const subscriber = {add: notify, update: notify, remove: notify};
     this.storage.actions.subscribe(subscriber);
     this.storage.actionApplications.subscribe(subscriber);
-    signal.addEventListener("abort", check);
     try {
-      check();
-      const gatekeepers = new Set(actions.map(action => action.gatekeeperId));
-      await Promise.race([
-        Promise.allSettled([
+      for (;;) {
+        changed = Promise.withResolvers<void>();
+        const actions = pending();
+        const gatekeepers = new Set(actions.map(action => action.gatekeeperId));
+        const work = [
           ...actions.flatMap(action => this.#actionApplications.get(action.id) ?? []),
           // Joining a live drain must not re-dispatch a failed, nonrecoverable effect.
           ...[...gatekeepers].flatMap(id => this.#autoApprovalDrainer.running(id) ?? []),
-        ]),
-        stopped.promise,
-      ]);
-      // An uncertain effect must reconcile before closing its context. The ordinary resume
-      // driver will retry its durable receipt; this is not permission to replay a shell command.
-      return this.continuations.get(record.chatId)?.status.phase !== "running" ||
-        !actions.some(action => this.storage.actionApplications.get(action.id));
+        ];
+        // An uncertain effect must reconcile before closing its context. The ordinary resume
+        // driver retries its journal; this observer never starts another effect attempt.
+        if (!work.length) return !actions.some(action => this.storage.actionApplications.get(action.id));
+        if (!await this.#waitForAgentWork(record, signal, () => Promise.race([
+          Promise.allSettled(work), changed.promise,
+        ]))) return true;
+        // Re-read this turn, not the shared drain: another chat's command must not hold us open.
+      }
     } finally {
-      this.storage.agentContinuations.unsubscribe(subscriber);
       this.storage.actions.unsubscribe(subscriber);
       this.storage.actionApplications.unsubscribe(subscriber);
-      signal.removeEventListener("abort", check);
     }
   }
 
@@ -10445,8 +10484,9 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async startGatekeeperSession(
-      target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
-    return this.impl.startGatekeeperSession(target, caller);
+      target: BindingLoopbackTarget, caller: GatekeeperCaller,
+      integrationOrigin: AgentIntegrationOrigin | null = null): Promise<any> {
+    return this.impl.startGatekeeperSession(target, caller, integrationOrigin);
   }
 
   startGatekeeperHook(id: number): NativeRpcStub<RpcTarget> {
@@ -10614,6 +10654,10 @@ type GatekeeperLoopbackProps = {
   target: BindingLoopbackTarget;
 
   caller: GatekeeperCaller;
+
+  // A retained loopback must never recapture a later prompt's integration authority.
+  // Missing on legacy bindings: they get no contextual authority, not the current turn.
+  integrationOrigin?: AgentIntegrationOrigin;
 };
 
 type BindingLoopbackTarget = {
@@ -10653,7 +10697,7 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 
     // @ts-ignore: LSP-only RPC types bug, "type instantiation is excessively deep"
     let session = stub.startGatekeeperSession(
-        this.ctx.props.target, this.ctx.props.caller);
+        this.ctx.props.target, this.ctx.props.caller, this.ctx.props.integrationOrigin ?? null);
 
     return new Proxy(session, {
       get(target, prop, receiver) {
@@ -13406,12 +13450,13 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   // containsRestrictedData). Session queues (openGatekeeperSession) pass no hookId: they are
   // bounded by the facet's in-DO lifetime, which the session chokepoints already gate.
   constructor(private impl: OverseerImpl, private gatekeeperId: number,
-              private caller: GatekeeperCaller, private hookId?: number) {
+              private caller: GatekeeperCaller, private hookId?: number,
+              integrationOrigin?: AgentIntegrationOrigin) {
     super();
     if (caller.from === "agent") {
       const grant = impl.integrationGrant(gatekeeperId);
       this.#integrationOrigin = grant.lifecycle || grant.contextualActions
-        ? impl.captureIntegrationOrigin(caller) : undefined;
+        ? integrationOrigin : undefined;
     }
   }
 

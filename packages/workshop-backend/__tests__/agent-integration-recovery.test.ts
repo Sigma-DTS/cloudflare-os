@@ -36,6 +36,98 @@ function deletionClient(impl: Impl) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it("keeps late auto-approved descendants inside the finalization barrier", async () => {
+    const s = await recoveryScenario();
+    await s.visit(async (impl, participant) => {
+      const parent = Promise.withResolvers<void>(), child = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+      const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+      await handler.setRecoverable();
+      const description = {title: "Run", description: "Command", implementsRevert: false,
+        awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}};
+      await handler.setFollowup(description);
+      impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER, actionKind: description.actionKind, enabledBy: APPROVER});
+      impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+        if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+          if (args[0] === 42) await parent.promise;
+          if (args[0] === 43) { entered.resolve(); await child.promise; }
+          return target.applyActionInContext(...args);
+        };
+        return Reflect.get(target, key);
+      }});
+      const apply = vi.spyOn(impl, "applyPendingAction");
+      const requests = inference(async () => {
+        await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+        await impl.submitAction(GATEKEEPER, 42, description, {from: "agent", chatId: CHAT}, origin(impl));
+        const captured = impl.consumeCapturedActions(CHAT)!;
+        impl.addChatMessages(CHAT, MODEL.profile, captured.actions.map(actionId => ({type: "action", actionId})));
+      });
+      try {
+        impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+        await vi.waitFor(() => expect([...impl.storage.chats.list()]).toContainEqual(
+          expect.objectContaining({type: "message", message: "Recovered."})));
+        parent.resolve();
+        await entered.promise;
+        await apply.mock.results[0].value;
+        await impl.ctx.storage.sync();
+        expect(impl.continuations.get(CHAT)?.status.phase).toBe("running");
+        expect((await participant.calls()).some(call => call.event.kind === "finished")).toBe(false);
+        child.resolve();
+        await impl.waitForAllAgentsToComplete();
+        expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finished", reason: "completed"});
+        expect((await handler.calls()).map(call => call.action)).toEqual([42, 43]);
+        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+        expect(requests()).toBe(1);
+      } finally { parent.resolve(); child.resolve(); }
+    });
+  });
+
+  it("lets Stop release interrupted action replay without abandoning its receipt", async () => {
+    const s = await recoveryScenario(), requests = inference();
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let facetSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await s.visit(async impl => {
+        const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+        await impl.beginAgentIntegrationTurn(CHAT, record.continuationId);
+        impl.storage.chatMeta.put({...impl.storage.chatMeta.get(CHAT)!, activeAgent: MODEL.profile});
+        impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+          actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+        impl.storage.actions.put({id: 7, gatekeeperId: GATEKEEPER, type: "action", action: 42, createdAt: new Date(),
+          state: "pending", caller: {from: "agent", chatId: CHAT}, contextualApply: true, integrationOrigin: origin(impl),
+          description: {title: "Run", description: "Command", implementsRevert: false,
+            awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}}});
+        impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}]);
+        impl.storage.actionApplications.put({id: 7, resolvedBy: APPROVER, autoApproved: false,
+          phase: "apply", retryAt: Date.now() + 60_000});
+        const prototype = Object.getPrototypeOf(impl), getFacet: Impl["getGatekeeperFacet"] = prototype.getGatekeeperFacet;
+        facetSpy = vi.spyOn(prototype, "getGatekeeperFacet").mockImplementation(async function(this: Impl, id: number) {
+          const handler = await getFacet.call(this, id);
+          return new Proxy(handler, {get(target, key) {
+            if (key === "applyActionInContext") return async (...args: Parameters<IntegrationTestActionGatekeeper["applyActionInContext"]>) => {
+              entered.resolve();
+              await release.promise;
+              return (target as Fetcher<IntegrationTestActionGatekeeper>).applyActionInContext(...args);
+            };
+            return Reflect.get(target, key);
+          }});
+        });
+        await impl.ctx.storage.sync();
+      });
+      await evictDurableObject(s.stub);
+      await s.visit(async impl => {
+        await entered.promise;
+        impl.cancelAgent(CHAT);
+        await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finished", reason: "canceled"}));
+        expect(() => impl.assertChatNotActive(CHAT)).not.toThrow();
+        expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
+        expect(impl.storage.actionApplications.get(7)).toMatchObject({phase: "apply", resolvedBy: APPROVER});
+        expect(requests()).toBe(0);
+        release.resolve();
+        await impl.waitForAllAgentsToComplete();
+      });
+    } finally { release.resolve(); facetSpy?.mockRestore(); }
+  });
+
   it.each([false, true])("does not retry a failed nonrecoverable effect at finalization, lost reply=%s", async lostReply => {
     const s = await recoveryScenario();
     await s.visit(async impl => {
