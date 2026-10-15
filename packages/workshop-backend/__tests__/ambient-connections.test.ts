@@ -60,24 +60,31 @@ describe("ambient account discovery", () => {
 let sequence = 0;
 async function workspace(test: (fixture: {
   impl: any;
-  owner: { provisionAmbientAccount: ReturnType<typeof vi.fn>; listGatekeeperVendors: ReturnType<typeof vi.fn> };
+  owner: {
+    provisionAmbientAccount: ReturnType<typeof vi.fn>;
+    listGatekeeperVendors: ReturnType<typeof vi.fn>;
+    listProvidedAccounts: ReturnType<typeof vi.fn>;
+    getSingletonGatekeeperClass: ReturnType<typeof vi.fn>;
+  };
   client: Awaited<ReturnType<typeof openFakeOverseer>>;
   resume: ReturnType<typeof vi.fn>;
-  persistRequest: () => Promise<AiChatMessage & { type: "connectionRequest" }>;
-}) => Promise<void>) {
+  persistRequest: (options?: typeof request) => Promise<AiChatMessage & { type: "connectionRequest" }>;
+}) => Promise<void>, vendors = [container, repository]) {
   await runInDurableObject(env.TEST_OVERSEER.getByName(`ambient-connections-${++sequence}`),
       async (instance: OverseerDurableObject) => {
     const impl = (instance as unknown as { impl: any }).impl;
-    let added = false;
+    const added = new Set<string>();
     const owner = {
       id: { toString: () => "owner-id" },
-      listGatekeeperVendors: vi.fn(async () => [container, repository]),
-      provisionAmbientAccount: vi.fn(async () => { added = true; }),
-      listProvidedAccounts: async () => added ? [{ accountId: 5, vendorId: "container",
-        description: { displayName: "Container", uniqueName: "container", singleton: { tsType: "{}" } } }] : [],
-      getSingletonGatekeeperClass: async () => impl.ctx.exports.AgentSpawnerGatekeeper({ props: {
+      listGatekeeperVendors: vi.fn(async () => vendors),
+      provisionAmbientAccount: vi.fn(async (vendorId: string) => { added.add(vendorId); }),
+      listProvidedAccounts: vi.fn(async () => vendors.flatMap((vendor, index) => added.has(vendor.id)
+        ? [{ accountId: index + 5, vendorId: vendor.id, description: {
+          displayName: vendor.description.displayName, uniqueName: vendor.id, singleton: { tsType: "{}" },
+        } }] : [])),
+      getSingletonGatekeeperClass: vi.fn(async () => impl.ctx.exports.AgentSpawnerGatekeeper({ props: {
         overseerId: impl.ctx.id.toString(), config: { displayName: "Container fixture", modelId: null, env: {} },
-      } }),
+      } })),
       whoami: async () => ({ id: "owner-profile", name: "Owner" }),
       setGadgetLastActive: async () => {},
       getChatContext: async () => ({ profile: { type: "user", id: "owner", name: "Owner" },
@@ -92,12 +99,13 @@ async function workspace(test: (fixture: {
     const resume = vi.fn();
     const client = await openFakeOverseer(impl.storage, { impl: {
       users: impl.users, startAgent: resume, waitForChatMessagePreparation: () => undefined,
-      getChatTimestamp: () => new Date(), ensureAmbientCapsules: () => impl.ensureAmbientCapsules(),
+      getChatTimestamp: () => impl.getChatTimestamp(), ensureAmbientCapsules: () => impl.ensureAmbientCapsules(),
     } });
-    const persistRequest = async () => {
-      expect(await impl.requestConnection(1, request)).toMatchObject({ requested: true });
+    let requestSequence = 1;
+    const persistRequest = async (options = request) => {
+      expect(await impl.requestConnection(1, options)).toMatchObject({ requested: true });
       const [body] = impl.consumeCapturedConnectionRequests(1);
-      const card = { ...body, chatId: 1, sequence: 1, timestamp: new Date(), author };
+      const card = { ...body, chatId: 1, sequence: requestSequence++, timestamp: impl.getChatTimestamp(), author };
       impl.storage.chats.put(card);
       return card;
     };
@@ -131,6 +139,64 @@ describe("on-demand ambient connection requests", () => {
     expect(f.impl.storage.chatContext.get(1)).toMatchObject({ bindings: {}, alwaysAvailableCapsuleIds: [] });
     expect([...f.impl.storage.actions.list()]).toEqual([]);
     await f.impl.ensureAmbientCapsules();
+    expect([...f.impl.storage.gatekeepers.list()]).toHaveLength(1);
+  }));
+
+  it("refreshes the account snapshot for concurrent acceptances without duplicating capsules", () => {
+    const scheduler = { ...container, id: "scheduler", description: {
+      ...container.description, displayName: "Scheduled Tasks",
+    } };
+    return workspace(async f => {
+      const firstCard = await f.persistRequest();
+      const secondCard = await f.persistRequest({
+        vendorId: "scheduler", bindingName: "SCHEDULER", reason: "Schedule a follow-up.",
+      });
+      await f.impl.ensureAmbientCapsules();
+      const firstSnapshotRead = Promise.withResolvers<void>();
+      const releaseFirstPass = Promise.withResolvers<void>();
+      const secondReconcileRequested = Promise.withResolvers<void>();
+      const getClass = f.owner.getSingletonGatekeeperClass.getMockImplementation()!;
+      f.owner.getSingletonGatekeeperClass.mockImplementationOnce(async () => {
+        firstSnapshotRead.resolve();
+        await releaseFirstPass.promise;
+        return getClass();
+      });
+      const reconcile = f.impl.ensureAmbientCapsules.bind(f.impl);
+      let calls = 0;
+      vi.spyOn(f.impl, "ensureAmbientCapsules").mockImplementation(() => {
+        const pending = reconcile();
+        if (++calls === 2) secondReconcileRequested.resolve();
+        return pending;
+      });
+
+      const firstAccept = f.client.acceptConnectionRequest(firstCard.requestId);
+      await firstSnapshotRead.promise;
+      // The first pass already captured just the container account. Provision Scheduler now,
+      // and ensure its acceptance joins reconciliation before allowing that older pass to finish.
+      const secondAccept = f.client.acceptConnectionRequest(secondCard.requestId);
+      const accepted = Promise.all([firstAccept, secondAccept]);
+      await secondReconcileRequested.promise;
+      releaseFirstPass.resolve();
+      await accepted;
+
+      expect([...f.impl.storage.gatekeepers.list()].map(gk => gk.creationSpec.vendorId).toSorted())
+        .toEqual(["container", "scheduler"]);
+      expect(f.owner.getSingletonGatekeeperClass).toHaveBeenCalledTimes(2);
+      const cards = [...f.impl.storage.chats.list()].filter(m => m.type === "connectionRequest");
+      expect(cards.map(card => card.state)).toEqual(["accepted", "accepted"]);
+      expect(new Set(cards.map(card => card.gatekeeperId)).size).toBe(2);
+      expect(f.resume).toHaveBeenCalledOnce();
+    }, [container, scheduler, repository]);
+  });
+
+  it("does not let a failed reconciliation poison a queued fresh pass", () => workspace(async f => {
+    await f.impl.ensureAmbientCapsules();
+    await f.owner.provisionAmbientAccount("container");
+    f.owner.listProvidedAccounts.mockRejectedValueOnce(new Error("Account lookup interrupted."));
+    const failed = f.impl.ensureAmbientCapsules();
+    const retry = f.impl.ensureAmbientCapsules();
+    await expect(failed).rejects.toThrow("Account lookup interrupted.");
+    await expect(retry).resolves.toBeUndefined();
     expect([...f.impl.storage.gatekeepers.list()]).toHaveLength(1);
   }));
 
@@ -200,10 +266,13 @@ describe("on-demand ambient connection requests", () => {
 
   it("does not overwrite a concurrent denial while provisioning", () => workspace(async f => {
     const card = await f.persistRequest();
-    f.owner.provisionAmbientAccount.mockImplementationOnce(async () => {
+    const provision = f.owner.provisionAmbientAccount.getMockImplementation()!;
+    f.owner.provisionAmbientAccount.mockImplementationOnce(async vendorId => {
       await f.client.denyConnectionRequest(card.requestId);
+      await provision(vendorId);
     });
-    await expect(f.client.acceptConnectionRequest(card.requestId)).rejects.toThrow();
+    await expect(f.client.acceptConnectionRequest(card.requestId)).rejects.toThrow("Connection request is not pending");
+    expect([...f.impl.storage.gatekeepers.list()]).toHaveLength(1);
     expect([...f.impl.storage.chats.list()].find(m => m.type === "connectionRequest").state).toBe("denied");
     expect(f.resume).not.toHaveBeenCalled();
   }));

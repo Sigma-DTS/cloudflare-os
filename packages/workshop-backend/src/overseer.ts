@@ -6984,16 +6984,22 @@ class OverseerImpl implements AgentHooks {
   // executeCode — search/list/read recorded as observations — and optionally wire into a gadget
   // via setGadgetBinding if the gadget's persistent code needs it. (Most gadgets never call the
   // library programmatically, so a gadget binding would just be noise.) Idempotent:
-  // provisioned once per gadget and re-added if missing. Called on open(), before any agent turn.
+  // provisioned once per gadget and re-added if missing. Called on open() and after account opt-in.
   //
   // The session is reached through the owner's stored connected account, not by asserting the owner's
   // identity to the vendor — so the capability is the account the user actually holds.
   #ambientCapsulesPromise?: Promise<void>;
 
   ensureAmbientCapsules(): Promise<void> {
-    // open() and an in-chat opt-in can overlap across account/class RPCs.
-    return this.#ambientCapsulesPromise ??= this.#ensureAmbientCapsules()
-        .finally(() => { this.#ambientCapsulesPromise = undefined; });
+    // An older pass may have read accounts before this caller provisioned one. Serialize fresh
+    // passes rather than sharing snapshots, even if the prior pass failed. Each caller keeps its
+    // own result; serialization also prevents duplicate capsule creation across class RPCs.
+    const reconcile = () => this.#ensureAmbientCapsules();
+    let pending = (this.#ambientCapsulesPromise ?? Promise.resolve()).then(reconcile, reconcile);
+    this.#ambientCapsulesPromise = pending;
+    return pending.finally(() => {
+      if (this.#ambientCapsulesPromise === pending) this.#ambientCapsulesPromise = undefined;
+    });
   }
 
   async #ensureAmbientCapsules(): Promise<void> {
