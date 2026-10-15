@@ -169,7 +169,7 @@ describe('in chat', () => {
       },
     })
     await render(
-      <ChatInterface workspaceId="workspace" overseer={server.overseer} selectedChatId={1}
+      <ChatInterface workspaceId="workspace" overseer={server.overseer} isWorkspaceOwner selectedChatId={1}
         onNavigateToChat={() => {}} pendingConsoleLogCount={0} consoleLogPreview="" consoleLogSeverity="info"
         onConsumeConsoleLogs={() => ''} onDiscardConsoleLogs={() => {}} onOpenGadget={() => {}}
         outputOfWorkpiece={() => undefined} />,

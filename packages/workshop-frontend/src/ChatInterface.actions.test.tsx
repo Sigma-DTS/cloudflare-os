@@ -88,12 +88,13 @@ function withChatApi(
 
 function renderChat(
   overseer: RpcStub<Overseer>,
-  props: { restricted?: boolean, selectedChatId?: number } = {},
+  props: { restricted?: boolean, selectedChatId?: number, isWorkspaceOwner?: boolean } = {},
 ) {
   return testRoot.render(
     <ChatInterface
       workspaceId="workspace"
       overseer={overseer}
+      isWorkspaceOwner={props.isWorkspaceOwner ?? true}
       restricted={props.restricted}
       selectedChatId={props.selectedChatId ?? null}
       onNavigateToChat={() => {}}
@@ -164,7 +165,7 @@ describe('ChatInterface ambient connection requests', () => {
     reason: 'Run unit tests.', state: 'pending',
   }
 
-  async function showConnection() {
+  async function showConnection(isWorkspaceOwner = true, message = pendingConnection) {
     const server = makeOverseer()
     const accept = vi.fn<(requestId: string) => Promise<void>>(async () => {})
     const deny = vi.fn<(requestId: string) => Promise<void>>(async () => {})
@@ -172,17 +173,22 @@ describe('ChatInterface ambient connection requests', () => {
     const chat = withChatApi(server, undefined, [
       { id: 1, title: 'Chat', started: new Date(), lastActive: new Date() },
     ])
-    await renderChat(server.overseer, { selectedChatId: 1 })
+    await renderChat(server.overseer, { selectedChatId: 1, isWorkspaceOwner })
     await server.resolveSubscription()
     await server.resolvePendingQuery({ entries: [] })
-    chat.emitMessage(pendingConnection)
+    chat.emitMessage(message)
+    return { accept, deny, chat }
+  }
+
+  function connectButton() {
     const button = [...document.querySelectorAll('button')].find(b => b.textContent === 'Connect')!
     expect(button).toBeDefined()
-    return { accept, deny, chat, button }
+    return button
   }
 
   it('offers an in-chat opt-in and accepts without a resource picker or fabricated gatekeeper id', async () => {
-    const { accept, chat, button } = await showConnection()
+    const { accept, chat } = await showConnection()
+    const button = connectButton()
     expect(document.body.textContent).toContain('Connect Linux Container')
     expect(document.body.textContent).toContain('Actions still require approval.')
     expect(accept).not.toHaveBeenCalled()
@@ -194,7 +200,8 @@ describe('ChatInterface ambient connection requests', () => {
   })
 
   it('disables repeated acceptance while the connection is being provisioned', async () => {
-    const { accept, button } = await showConnection()
+    const { accept } = await showConnection()
+    const button = connectButton()
     let finish!: () => void
     accept.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
     await act(async () => button.click())
@@ -207,7 +214,8 @@ describe('ChatInterface ambient connection requests', () => {
 
   it('leaves failed connections retryable', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
-    const { accept, button } = await showConnection()
+    const { accept } = await showConnection()
+    const button = connectButton()
     accept.mockRejectedValueOnce(new Error('temporarily unavailable'))
     await act(async () => button.click())
     expect(button.disabled).toBe(false)
@@ -221,6 +229,37 @@ describe('ChatInterface ambient connection requests', () => {
     await act(async () => button.click())
     expect(deny).toHaveBeenCalledExactlyOnceWith('1:container')
     expect(accept).not.toHaveBeenCalled()
+  })
+
+  it('shows build collaborators that an ambient connection is awaiting the workspace owner', async () => {
+    const { accept, deny } = await showConnection(false)
+    expect(document.body.textContent).toContain('Awaiting workspace owner')
+    expect(document.body.textContent).not.toContain('Add this integration to your account')
+    expect([...document.querySelectorAll('button')].filter(b =>
+      b.textContent === 'Connect' || b.textContent === 'Deny')).toHaveLength(0)
+    expect(accept).not.toHaveBeenCalled()
+    expect(deny).not.toHaveBeenCalled()
+  })
+
+  it.each(['accepted', 'denied'] as const)('removes the owner-waiting state when a request is %s', async state => {
+    const { chat } = await showConnection(false)
+    chat.emitMessage({ ...pendingConnection, state })
+    expect(document.body.textContent).not.toContain('Awaiting workspace owner')
+    expect(document.body.textContent).toContain(state === 'accepted' ? 'Connected' : 'Denied')
+    expect(document.body.textContent).not.toContain('Add this integration to your account')
+  })
+
+  it('keeps resource connection controls available to build collaborators', async () => {
+    const { deny } = await showConnection(false, {
+      ...pendingConnection, requestId: '1:github', vendorId: 'github', vendorName: 'GitHub',
+      resourceUrl: 'https://github.com/cloudflare/cloudflare-os', connectionType: undefined,
+    })
+    const buttons = [...document.querySelectorAll('button')]
+    expect(buttons.find(b => b.textContent === 'Set up')?.disabled).toBe(false)
+    expect(document.body.textContent).not.toContain('Awaiting workspace owner')
+    const button = buttons.find(b => b.textContent === 'Deny')!
+    await act(async () => button.click())
+    expect(deny).toHaveBeenCalledExactlyOnceWith('1:github')
   })
 })
 

@@ -2445,6 +2445,7 @@ function fallbackToStoredModelSelection(
 interface ChatInterfaceProps {
   workspaceId: string | undefined;
   overseer: RpcStub<Overseer>;
+  isWorkspaceOwner: boolean;
   // True once the workspace has read restricted data (GadgetMetadata.containsRestrictedData).
   // Latched actions are never auto-approved, so the always-approve affordance is hidden.
   restricted?: boolean;
@@ -2656,6 +2657,7 @@ function getOrCreateProvisionalToolCall(
 function ChatInterface({
   workspaceId,
   overseer,
+  isWorkspaceOwner,
   restricted,
   selectedChatId,
   onNavigateToChat,
@@ -4908,13 +4910,17 @@ function ChatInterface({
                   {msg.reason}
                 </p>
               )}
-              {msg.connectionType === "ambient" && (
+              {msg.connectionType === "ambient" && isWorkspaceOwner && (
                 <p className="mt-1 text-[13px] leading-[18px] text-kumo-subtle">
                   Add this integration to your account. Actions still require approval.
                 </p>
               )}
             </div>
-            {isPending && (
+            {isPending && (msg.connectionType === "ambient" && !isWorkspaceOwner ? (
+              <span role="status" className="ml-3 self-center text-[13px] leading-4">
+                Awaiting workspace owner
+              </span>
+            ) : (
               <div className="ml-3 flex flex-shrink-0 items-center gap-2 self-center text-[13px] leading-4">
                 <button
                   type="button"
@@ -4933,7 +4939,7 @@ function ChatInterface({
                   {msg.connectionType === "ambient" ? "Connect" : "Set up"}
                 </button>
               </div>
-            )}
+            ))}
           </div>
         </div>
       </div>

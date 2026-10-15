@@ -158,6 +158,7 @@ async function renderProposalChat(options: {
     <ChatInterface
       workspaceId="workspace"
       overseer={server.overseer as RpcStub<Overseer>}
+      isWorkspaceOwner
       selectedChatId={CHAT_ID}
       onNavigateToChat={() => {}}
       chatContent={options.content && {
