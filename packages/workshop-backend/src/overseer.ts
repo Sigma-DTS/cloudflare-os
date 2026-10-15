@@ -1062,7 +1062,7 @@ class OverseerImpl implements AgentHooks {
   // Normal completion, cancellation, model-lookup failure and eviction share this fenced teardown.
   async #finishAgentContinuation(record: AgentContinuation, liveChat: LiveChatContext): Promise<void> {
     const owns = () => this.continuations.owns(record.chatId, record.continuationId) &&
-      (this.#liveChats.get(record.chatId) === liveChat || !this.storage.chatMeta.get(record.chatId));
+      (this.#liveChats.get(record.chatId) === liveChat || !this.#liveChats.has(record.chatId));
     if (!owns()) return;
     await this.reconcilePendingGadgets(record.chatId);
     if (!owns()) return;
@@ -1081,7 +1081,7 @@ class OverseerImpl implements AgentHooks {
     this.ctx.waitUntil((async () => {
       await scheduler.wait(delayMs);
       if (this.continuations.owns(record.chatId, record.continuationId) &&
-          (this.#liveChats.get(record.chatId) === liveChat || !this.storage.chatMeta.get(record.chatId))) {
+          (this.#liveChats.get(record.chatId) === liveChat || !this.#liveChats.has(record.chatId))) {
         await this.#resumeAgent(this.continuations.get(record.chatId)!, liveChat);
       }
     })());

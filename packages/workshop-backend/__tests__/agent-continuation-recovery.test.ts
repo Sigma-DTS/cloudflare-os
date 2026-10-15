@@ -21,6 +21,36 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it("cleans up canceled agents when workspace deletion fails after destroying live contexts", async () => {
+    const s = await recoveryScenario();
+    let release!: () => void;
+    const request = new Promise<void>(resolve => { release = resolve; });
+    const requests = inference(() => request);
+    await s.visit(async impl => {
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(CHAT)!, activeAgent: MODEL.profile});
+      impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+      try {
+        await vi.waitFor(() => expect(requests()).toBe(1));
+        using client = await openFakeOverseer({
+          ...impl.storage, boundHooks: {list: () => [{id: 7, enabled: true}]},
+        }, {impl: {destroyAllLiveChats: impl.destroyAllLiveChats.bind(impl)}});
+        vi.spyOn(client, "disableHook").mockRejectedValue(new Error("Hook disable failed"));
+        await expect(client.deleteSelf()).rejects.toThrow("Hook disable failed");
+      } finally { release(); }
+      await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status)
+        .toMatchObject({phase: "finished", reason: "canceled"}));
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.storage.chatMeta.get(CHAT)).toBeDefined();
+      expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
+      impl.assertChatNotActive(CHAT, true);
+      impl.addChatMessages(CHAT, APPROVER, [{type: "message", message: "Retry after failed deletion"}]);
+      impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+      await impl.waitForAllAgentsToComplete();
+      expect(requests()).toBe(2);
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finished", reason: "completed"});
+    });
+  });
+
   it.each([false, true])("recovers an auto-eligible action with an earlier manual gate=%s", async manualGate => {
     const s = await recoveryScenario(), requests = inference();
     await s.visit(async impl => {
