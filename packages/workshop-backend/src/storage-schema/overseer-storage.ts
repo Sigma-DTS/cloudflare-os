@@ -34,6 +34,21 @@ import type {
   HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
+import type { AgentFinishReason } from "../agent-continuation";
+
+/** The exact decision set a suspended execution is waiting for. */
+export type AgentContinuationWait =
+  | { kind: "approval"; actionIds: number[] }
+  | { kind: "connection"; requestIds: string[] };
+
+/** One authoritative execution record, including its lifecycle and any authorized wake-up. */
+export type AgentContinuation = ActiveAgentRecord & {
+  continuationId: string;
+  status:
+    | { phase: "starting" | "running" }
+    | { phase: "suspending" | "paused"; wait: AgentContinuationWait; ready: boolean }
+    | { phase: "finishing" | "finished"; reason: AgentFinishReason };
+};
 
 // =======================================================================================
 // Workpieces
@@ -715,10 +730,8 @@ export type CompactionCheckpoint = {
 };
 
 /**
- * Server-only record describing an in-progress agent turn, enabling resumption after a server
- * restart. Keyed by chatId. A record is present (mirroring `chatMeta.activeAgent`) for exactly as
- * long as an agent turn is, or should be, running. On startup, the set of these records identifies
- * which agents were interrupted by a restart and need to be resumed.
+ * Original caller and model authority retained by a continuation. Also the legacy `activeAgents`
+ * row format, drained by the continuation migration.
  *
  * Note we deliberately do NOT store the resolved `AiModelConfig` here, because it contains a secret
  * API token. Instead we store enough to re-fetch it from the initiator's user DO on resume.
@@ -1216,6 +1229,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     },
 
     collections: {
+      agentContinuations: collection<AgentContinuation>()({primaryKey: "chatId",
+        nonUniqueIndexes: {runnable: (record: AgentContinuation) => record.status.phase === "finished" ||
+          record.status.phase === "paused" && !record.status.ready ? null : 0},
+      }),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
       // mainline code lives in `gitObjects` as commits -- and it is read only by the git-storage
@@ -1358,8 +1375,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: (checkpoint) => chatKey(checkpoint.chatId, checkpoint.compactedTo),
       }),
 
-      // Tracks in-progress agent turns so they can be resumed after a server restart. See
-      // `ActiveAgentRecord`.
+      // Read-only pre-continuation schema; version 6 drains it into agentContinuations.
       activeAgents: collection<ActiveAgentRecord>()({
         primaryKey: "chatId"
       }),

@@ -206,7 +206,7 @@ describe("durable agent calls", () => {
 
     expect(messages(impl).map(msg => msg.type === "agentCallback" ? msg.methodName : msg.type))
         .toEqual(["first", "error", "second", "error"]);
-    expect([...impl.storage.activeAgents.list()]).toEqual([]);
+    expect(impl.continuations.get(CHAT_ID)?.status.phase).toBe("finished");
   }));
 
   it("a call recorded while a message is being prepared is delivered when the reservation ends",
@@ -651,6 +651,7 @@ describe("durable agent calls", () => {
         chatId: CHAT_ID, initiatorUserId: userId, modelId: "gone-model", initiator: OWNER,
         callbackInitiated: false,
       });
+      impl.storage.version.put(5); // The pre-continuation schema this fixture models.
       // ...and a call recorded while it was running.
       impl.storage.pendingAgentCalls.put({
         chatId: CHAT_ID, callId: 0, methodName: "queuedBehind", args: [], argsSummary: "",

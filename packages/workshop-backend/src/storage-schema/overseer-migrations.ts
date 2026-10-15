@@ -21,6 +21,7 @@ import {
 import { migrateCodeLogToGit } from "./overseer-git-migration";
 import { retryOnDoReset } from "../do-retry";
 import { GitStore, commitIdentityForAuthor } from "../git-store";
+import { AgentContinuations } from "../agent-continuation";
 import type { createWorkshopLogger } from "../observability";
 import type { UserDurableObject } from "../user";
 
@@ -29,7 +30,20 @@ import type { UserDurableObject } from "../user";
  * new workspace is born at (so it has nothing to migrate). The migrations themselves name
  * their versions literally, since each one's source and target are fixed for good.
  */
-export const OVERSEER_STORAGE_VERSION = 5;
+export const OVERSEER_STORAGE_VERSION = 6;
+
+/** Consolidate legacy active executions into the continuation machine. */
+export function migrateToAgentContinuations(host: Pick<OverseerMigrationHost, "storage">): void {
+  if (host.storage.version.get() !== 5) return;
+  host.storage.transaction(() => {
+    const continuations = new AgentContinuations(host.storage);
+    for (const record of Array.from(host.storage.activeAgents.list())) {
+      continuations.start(record);
+      host.storage.activeAgents.delete(record.chatId);
+    }
+    host.storage.version.put(6);
+  });
+}
 
 /**
  * The most chat messages that migrateToBlueprintUpstreams() reads, over all of a workspace's

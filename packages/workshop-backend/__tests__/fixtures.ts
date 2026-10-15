@@ -104,12 +104,14 @@ export async function openFakeOverseer(
           recordSharedGadgetOpen: async () => {},
         }),
       },
-      storage: Object.assign(storage, {
+      wakeAgentContinuation: () => {},
+      storage: Object.assign({agentContinuations: {get: () => undefined}, transaction: (callback: () => unknown) => callback()}, storage, {
         containsRestrictedData: { get: () => false },
         title: { get: () => "Test Workspace" },
       }),
       ...opts.impl,
     },
   } satisfies Pick<OverseerDurableObject, "open"> & { impl: object };
-  return overseer.open(userId, `${userId}-profile`, new NativeRpcStub<() => void>(() => {}));
+  using notifyClosed = new NativeRpcStub<() => void>(() => {});
+  return await overseer.open(userId, `${userId}-profile`, notifyClosed);
 }
