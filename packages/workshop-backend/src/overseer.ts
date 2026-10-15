@@ -1028,7 +1028,19 @@ class OverseerImpl implements AgentHooks {
         event: "agent.resume.model.resolve.failed", chatId: record.chatId, modelId: record.modelId, error,
       });
     }
+    // A message can reserve this chat while model lookup releases the input gate. Let it
+    // commit (or fail) before claiming the chat, then recheck the continuation it may supersede.
+    let preparation = this.waitForChatMessagePreparation(record.chatId);
+    while (preparation) {
+      await preparation;
+      preparation = this.waitForChatMessagePreparation(record.chatId);
+    }
     if (!this.continuations.owns(record.chatId, record.continuationId)) return;
+    const resumedPhase = this.continuations.get(record.chatId)!.status.phase;
+    if (resumedPhase === "suspending" || resumedPhase === "finishing") {
+      await this.#finishAgentContinuation(record, liveChat);
+      return;
+    }
     if (liveChat.cancelController.signal.aborted || !aiModel || !this.storage.chatMeta.get(record.chatId)) {
       if (!liveChat.cancelController.signal.aborted && !aiModel && this.storage.chatMeta.get(record.chatId)) {
         this.postAgentErrorMessage(record.chatId, record.initiator,
@@ -5540,10 +5552,7 @@ class OverseerImpl implements AgentHooks {
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending: on this
     // action, or on an earlier one the in-order drain stops at. Auto-approved actions keep the
     // seamless behavior the user opted into.
-    if (caller.from === "agent" && description.awaitDecision && (!willAutoApprove ||
-        [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)].some(queued =>
-            queued.type === "action" &&
-            autoApprovalRule(this.storage, gatekeeperId, queued.description) === undefined))) {
+    if (caller.from === "agent" && description.awaitDecision && this.#requiresManualDecision(record)) {
       this.#getOrCreateCapturedActions(caller.chatId).awaitDecision = true;
     }
 
@@ -6333,6 +6342,8 @@ class OverseerImpl implements AgentHooks {
       meta.activeAgent = userMeta.aiModel.profile;
     }
     this.ctx.storage.transactionSync(() => {
+      // Even a human-only prompt supersedes the prior turn's decision wait.
+      if (runsAgentTurn) this.#closeAgentContinuation(chatId, "abandoned");
       this.storage.chatMeta.put(meta);
       let promptSequence = this.#commitPreparedChatMessage(
           chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
@@ -8503,21 +8514,32 @@ class OverseerImpl implements AgentHooks {
   // Whether the chat's current turn waits on the user's decision on a connection or action. Scans
   // back to whatever started the turn, as #maybeResumeAfterActionDecision does.
   #awaitsDecision(chatId: number): boolean {
+    // Collect only this turn's waits before scanning another index: native KV allows one iterator.
+    const actions: (ActionRecord & {type: "action"})[] = [];
     for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId), reverse: true})) {
-      if (msg.type === "agentCallback") return false;
+      if (msg.type === "agentCallback") break;
       if (msg.type === "message" && (msg.author.type === "user" || msg.author.type === "gadget")) {
-        return false;
+        break;
       }
       if (msg.type === "connectionRequest" && msg.state === "pending") return true;
       if (msg.type === "action") {
         let record = this.storage.actions.get(msg.actionId);
         if (record?.type === "action" && record.caller.from === "agent" &&
             record.description.awaitDecision && record.state === "pending") {
-          return true;
+          actions.push(record);
         }
       }
     }
-    return false;
+    return actions.some(record => this.#requiresManualDecision(record));
+  }
+
+  // Match submission's suspension decision: an auto-eligible action waits only if an
+  // earlier manual gate prevents the in-order drain from reaching it.
+  #requiresManualDecision(record: ActionRecord & {type: "action"}): boolean {
+    return autoApprovalRule(this.storage, record.gatekeeperId, record.description) === undefined ||
+      [...this.storage.actions.pendingByGatekeeper.get(record.gatekeeperId)].some(queued =>
+        queued.id < record.id && queued.type === "action" &&
+        autoApprovalRule(this.storage, record.gatekeeperId, queued.description) === undefined);
   }
 
   // --- Connection-request hooks ---

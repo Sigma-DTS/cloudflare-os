@@ -30,7 +30,9 @@ Suspensions name their exact action/request IDs and persist a ready bit. The fin
 and wake-up are recorded synchronously, before profile/message-preparation I/O; recovery
 finishes cleanup and resumes a ready wait without a browser. A resumed execution gets a new
 ID. Cleanup checks that ID after awaits so an older execution cannot clear its successor.
-An interrupted step that already committed decision cards recovers the wait before inference.
+An interrupted step that already committed decision cards recovers a manual wait before inference;
+an auto-eligible pending action alone is not a pause. Resumption rechecks message preparation
+after model lookup, and a newer prompt retires the old wait even when it selects no AI model.
 
 One transition helper owns state changes; the overseer's driver handles model lookup,
 execution and cleanup. Startup and alarms use the same runnable index. Unready pauses and

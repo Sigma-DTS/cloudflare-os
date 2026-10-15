@@ -21,6 +21,91 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each([false, true])("recovers an auto-eligible action with an earlier manual gate=%s", async manualGate => {
+    const s = await recoveryScenario(), requests = inference();
+    await s.visit(async impl => {
+      const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      impl.continuations.enter(CHAT, record.continuationId);
+      impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+        actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+      const action = {id: 7, gatekeeperId: GATEKEEPER, type: "action" as const, action: 42, createdAt: new Date(),
+        state: "pending" as const, caller: {from: "agent" as const, chatId: CHAT},
+        description: {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true,
+          autoApprovable: true, actionKind: {tag: "run", label: "Run"}}};
+      if (manualGate) impl.storage.actions.put({...action, id: 6,
+        description: {...action.description, autoApprovable: false}});
+      impl.storage.actions.put(action);
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: action.id}]);
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect(requests()).toBe(manualGate ? 0 : 1);
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject(manualGate
+        ? {phase: "paused", ready: false} : {phase: "finished"});
+    });
+  });
+
+  it("waits for a message reserved during resumed model lookup before claiming the chat", async () => {
+    const s = await recoveryScenario(), requests = inference();
+    let release!: () => void, entered = false;
+    const lookup = new Promise<void>(resolve => { release = resolve; });
+    const get = UserDurableObject.prototype.getChatContext;
+    vi.spyOn(UserDurableObject.prototype, "getChatContext").mockImplementation(async function(id) {
+      entered = true; await lookup; return get.call(this, id);
+    });
+    await s.visit(async impl => {
+      impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      const reservation = impl.reserveChatMessagePreparation(CHAT);
+      const wait = vi.spyOn(impl, "waitForChatMessagePreparation");
+      try {
+        release();
+        await vi.waitFor(() => expect(wait).toHaveBeenCalled());
+        expect(requests()).toBe(0);
+        impl.assertChatNotActive(CHAT, true);
+        impl.addChatMessages(CHAT, APPROVER, [{type: "message", message: "Prepared message"}]);
+      } finally { reservation[Symbol.dispose](); }
+      await impl.waitForAllAgentsToComplete();
+      expect(requests()).toBe(1);
+      expect([...impl.storage.chats.list()]).toContainEqual(expect.objectContaining({message: "Prepared message"}));
+    });
+  });
+
+  it("does not resume an old decision after a newer human-only prompt, including after eviction", async () => {
+    const s = await recoveryScenario(), requests = inference();
+    await s.visit(async impl => {
+      const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      impl.continuations.enter(CHAT, record.continuationId);
+      impl.continuations.suspend(CHAT, record.continuationId, {kind: "approval", actionIds: [7]}, false);
+      impl.continuations.settle(CHAT, record.continuationId);
+      impl.storage.actions.put({id: 7, gatekeeperId: GATEKEEPER, type: "action", action: 42, createdAt: new Date(),
+        state: "pending", caller: {from: "agent", chatId: CHAT},
+        description: {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true}});
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}]);
+      await impl.sendChatMessage(s.user, {profile: APPROVER}, CHAT, "No AI on this prompt");
+      const action = impl.storage.actions.get(7)!;
+      impl.storage.actions.put({...action, state: "approved"});
+      impl.wakeAgentContinuation(CHAT, 7, APPROVER);
+      await impl.resumeAfterActionDecision(CHAT, 7, APPROVER);
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finishing", reason: "abandoned"});
+      expect(requests()).toBe(0);
+      expect([...impl.storage.chats.list()].filter(message => message.type === "agentNudge")).toHaveLength(0);
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finished", reason: "abandoned"});
+      expect(requests()).toBe(0);
+    });
+  });
+
   it("records the action receipt and wake-up together before the approving client can resume", async () => {
     const s = await recoveryScenario(), requests = inference();
     await s.visit(async impl => {
