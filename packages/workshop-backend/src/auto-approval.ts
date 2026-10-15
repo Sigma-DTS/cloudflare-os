@@ -60,6 +60,11 @@ export class AutoApprovalDrainer {
       private storage: AutoApprovalStorage,
       private applyPendingAction: ApplyPendingActionFn) {}
 
+  /** Observe work already dispatched; unlike drain(), this never starts or retries effects. */
+  running(gatekeeperId: number): Promise<void> | undefined {
+    return this.#draining.get(gatekeeperId);
+  }
+
   drain(gatekeeperId: number): Promise<void> {
     // An already-authorized handler may be awaiting a child while the ordinary drain awaits
     // that handler. Also revisit these children when a user enables a rule or clears a gate.

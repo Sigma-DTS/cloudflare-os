@@ -969,7 +969,7 @@ class OverseerImpl implements AgentHooks {
   async runAlarmTasks(): Promise<void> {
     this.#inAlarmHandler = true;
     // The alarm keeps live work open, but a parent command may be waiting on a child
-    // whose reply was lost. Pump due receipts without joining those already applying.
+    // whose reply was lost. Pump due receipts and lifecycle cleanup independently of it.
     const recovery = new AbortController();
     const pumping = (async () => {
       try {
@@ -977,6 +977,9 @@ class OverseerImpl implements AgentHooks {
           await scheduler.wait(1_000, {signal: recovery.signal});
           if (recovery.signal.aborted) return;
           this.ctx.waitUntil(this.recoverActionApplications(true));
+          this.ctx.waitUntil(this.retryAgentIntegrationEvents().catch(error => {
+            this.logger.warn("agent lifecycle delivery deferred", {event: "agent.integration.delivery.deferred", error});
+          }));
         }
       } catch (error) {
         if (!recovery.signal.aborted) throw error;
@@ -7056,33 +7059,40 @@ class OverseerImpl implements AgentHooks {
   // background. Keep its authority alive until application completes, unless a manual
   // follow-up suspends the turn (or cancellation/supersession ends that authority).
   async #waitForAgentActions(record: AgentContinuation, signal: AbortSignal): Promise<boolean> {
+    const ids = new Set(this.#actionApplications.keys());
+    for (const message of this.storage.chats.list({prefix: chatKeyPrefix(record.chatId), reverse: true})) {
+      if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
+      if (message.type === "action") ids.add(message.actionId);
+    }
+    const actions = [...ids].map(id => this.storage.actions.get(id))
+      .filter((action): action is ActionRecord & {type: "action"} => action?.type === "action" &&
+        action.contextualApply === true && action.state === "pending" && action.integrationOrigin?.turnId === record.turnId);
     const stopped = Promise.withResolvers<void>();
     const check = () => {
       const current = this.continuations.get(record.chatId);
       if (signal.aborted || current?.continuationId !== record.continuationId || current.status.phase !== "running") {
         stopped.resolve();
       }
+      // The shared drain may continue into another chat's command. Its work must not
+      // hold this turn open after our own effects and durable receipts have settled.
+      if (actions.every(action => this.storage.actions.get(action.id)?.state !== "pending" &&
+          !this.storage.actionApplications.get(action.id))) stopped.resolve();
     };
     // Collection subscribers run before the write; observe the committed transition.
     const changed = () => queueMicrotask(check);
     const subscriber = {add: changed, update: changed, remove: changed};
     this.storage.agentContinuations.subscribe(subscriber);
+    this.storage.actions.subscribe(subscriber);
+    this.storage.actionApplications.subscribe(subscriber);
     signal.addEventListener("abort", check);
     try {
       check();
-      const ids = new Set(this.#actionApplications.keys());
-      for (const message of this.storage.chats.list({prefix: chatKeyPrefix(record.chatId), reverse: true})) {
-        if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
-        if (message.type === "action") ids.add(message.actionId);
-      }
-      const actions = [...ids].map(id => this.storage.actions.get(id))
-        .filter((action): action is ActionRecord & {type: "action"} => action?.type === "action" &&
-          action.contextualApply === true && action.state === "pending" && action.integrationOrigin?.turnId === record.turnId);
       const gatekeepers = new Set(actions.map(action => action.gatekeeperId));
       await Promise.race([
         Promise.allSettled([
           ...actions.flatMap(action => this.#actionApplications.get(action.id) ?? []),
-          ...[...gatekeepers].map(id => this.drainAutoApprovals(id)),
+          // Joining a live drain must not re-dispatch a failed, nonrecoverable effect.
+          ...[...gatekeepers].flatMap(id => this.#autoApprovalDrainer.running(id) ?? []),
         ]),
         stopped.promise,
       ]);
@@ -7092,6 +7102,8 @@ class OverseerImpl implements AgentHooks {
         !actions.some(action => this.storage.actionApplications.get(action.id));
     } finally {
       this.storage.agentContinuations.unsubscribe(subscriber);
+      this.storage.actions.unsubscribe(subscriber);
+      this.storage.actionApplications.unsubscribe(subscriber);
       signal.removeEventListener("abort", check);
     }
   }

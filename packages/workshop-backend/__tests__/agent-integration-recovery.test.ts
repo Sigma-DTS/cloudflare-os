@@ -36,6 +36,126 @@ function deletionClient(impl: Impl) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each([false, true])("does not retry a failed nonrecoverable effect at finalization, lost reply=%s", async lostReply => {
+    const s = await recoveryScenario();
+    await s.visit(async impl => {
+      vi.spyOn(impl, "integrationGrant").mockReturnValue({lifecycle: true, contextualActions: true, recoverableActions: false});
+      const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+      if (!lostReply) await handler.setFailure(true);
+      impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+        if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+          await target.applyActionInContext(...args);
+          throw Object.assign(new Error("Injected lost reply"), {durableObjectReset: true});
+        };
+        return Reflect.get(target, key);
+      }});
+      impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+        actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+      const apply = vi.spyOn(impl, "applyPendingAction");
+      const requests = inference(async () => {
+        await impl.submitAction(GATEKEEPER, 42, {title: "Run", description: "Command", implementsRevert: false,
+          awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}},
+          {from: "agent", chatId: CHAT}, origin(impl));
+        await vi.waitFor(() => expect(apply.mock.calls.length).toBe(1));
+        await expect(apply.mock.results[0].value).rejects.toThrow(lostReply ? /lost reply/ : /handler failed/);
+        const captured = impl.consumeCapturedActions(CHAT)!;
+        impl.addChatMessages(CHAT, MODEL.profile, captured.actions.map(actionId => ({type: "action", actionId})));
+      });
+      impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)?.status.phase).toBe("finished");
+      expect(await handler.calls()).toHaveLength(1);
+      expect(apply.mock.calls.length).toBe(1);
+      expect([...impl.storage.actions.list()][0].state).toBe("pending");
+      expect([...impl.storage.actionApplications.list()]).toEqual([]);
+      expect(requests()).toBe(1);
+    });
+  });
+
+  it("retries due lifecycle cleanup while the alarm is holding another turn open", async () => {
+    const s = await recoveryScenario();
+    await s.visit(async (impl, participant) => {
+      await start(impl);
+      await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+      const turn = impl.continuations.close(CHAT, "completed")!;
+      impl.continuations.settle(CHAT, turn.continuationId);
+      const pending = [...impl.storage.agentIntegrationParticipants.list()][0];
+      impl.storage.agentIntegrationParticipants.put({...pending, retryAt: Date.now()});
+      await participant.setFailure(true);
+      const held = Promise.withResolvers<void>();
+      vi.spyOn(impl, "waitForAllAgentsToComplete").mockReturnValue(held.promise);
+      const alarm = impl.runAlarmTasks();
+      try {
+        await vi.waitFor(async () => expect((await participant.calls()).filter(call => call.event.kind === "finished")).toHaveLength(1));
+        await participant.setFailure(false);
+        const latest = [...impl.storage.agentIntegrationParticipants.list()][0];
+        // Make the durable retry due without sleeping through the production backoff.
+        impl.storage.agentIntegrationParticipants.put({...latest, retryAt: Date.now()});
+        await vi.waitFor(() => expect([...impl.storage.agentIntegrationParticipants.list()].length).toBe(0), {timeout: 3_000});
+        const terminal = (await participant.calls()).filter(call => call.event.kind === "finished");
+        expect(terminal).toHaveLength(2);
+        expect(terminal[0].event.eventId).toBe(terminal[1].event.eventId);
+      } finally {
+        held.resolve();
+        await expect(alarm).rejects.toThrow(/unavailable/);
+      }
+    });
+  });
+
+  it("finishes a turn without waiting on another chat's command in the same gatekeeper drain", async () => {
+    const s = await recoveryScenario();
+    await s.visit(async (impl, participant) => {
+      const otherChat = 2, dispatch = Promise.withResolvers<void>(), followup = Promise.withResolvers<void>();
+      const timestamp = impl.getChatTimestamp();
+      impl.storage.chatMeta.put({id: otherChat, title: "Other chat", started: timestamp, lastActive: timestamp});
+      impl.storage.chatContext.put({chatId: otherChat, bindings: {}, alwaysAvailableCapsuleIds: []});
+      impl.addChatMessages(otherChat, APPROVER, [{type: "message", message: "Other prompt"}]);
+      const other = impl.continuations.start({...RUN, chatId: otherChat, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      await impl.beginAgentIntegrationTurn(otherChat, other.continuationId);
+      const otherOrigin = {chatId: otherChat, turnId: other.turnId, segmentId: other.segmentId};
+      const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+      await handler.setRecoverable();
+      await handler.setFollowup({title: "Network", description: "Other chat's destination",
+        implementsRevert: false, awaitDecision: true, autoApprovable: false});
+      impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+        actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+      impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+        if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+          if (args[0] === 44) await dispatch.promise;
+          await target.applyActionInContext(...args);
+          if (args[0] === 42) await followup.promise;
+        };
+        return Reflect.get(target, key);
+      }});
+      const requests = inference(async () => {
+        if (requests() !== 1) return;
+        await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+        const description = {title: "Run", description: "Command", implementsRevert: false,
+          awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}};
+        await impl.submitAction(GATEKEEPER, 44, description, {from: "agent", chatId: CHAT}, origin(impl));
+        await impl.submitAction(GATEKEEPER, 42, description, {from: "agent", chatId: otherChat}, otherOrigin);
+        const captured = impl.consumeCapturedActions(CHAT)!;
+        impl.addChatMessages(CHAT, MODEL.profile, captured.actions.map(actionId => ({type: "action", actionId})));
+      });
+      try {
+        impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+        await vi.waitFor(() => expect([...impl.storage.chats.list()]).toContainEqual(
+          expect.objectContaining({type: "message", message: "Recovered."})));
+        dispatch.resolve();
+        await vi.waitFor(() => expect(impl.continuations.get(otherChat)?.status.phase).toBe("suspending"));
+        await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status.phase).toBe("finished"));
+        expect((await participant.calls()).at(-1)?.event.kind).toBe("finished");
+        expect([...impl.storage.actionApplications.list()]).toHaveLength(1);
+        expect([...impl.storage.actions.list()].filter(action => action.state === "pending")).toHaveLength(2);
+        expect(requests()).toBe(1);
+      } finally {
+        dispatch.resolve(); followup.resolve();
+        await impl.drainAutoApprovals(GATEKEEPER);
+        await impl.waitForAllAgentsToComplete();
+      }
+    });
+  });
+
   it.each(["queued commands", "manual follow-up", "lost reply"])("keeps final-response cleanup behind contextual applies: %s", async scenario => {
     const followup = scenario === "manual follow-up";
     const s = await recoveryScenario();

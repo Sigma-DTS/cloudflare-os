@@ -44,9 +44,11 @@ that publishes the child. A manual follow-up from an auto-approved, still-runnin
 that pause immediately; the agent consumes it at its next step barrier rather than finishing the
 logical turn. Cancellation, chat deletion, and superseding prompts terminate the
 old continuation; stale cleanup is fenced by execution identity.
-On normal model completion, contextual applications finish before terminal cleanup. A late manual
-follow-up can still suspend that wait; an uncertain application keeps its durable recovery receipt
-and the turn's authority alive until reconciliation.
+On normal model completion, this turn's contextual applications finish before terminal cleanup;
+another chat's command does not extend that wait. Finalization observes existing drains rather
+than starting another attempt at a failed effect. A late manual follow-up can still suspend the
+wait; an uncertain application keeps its durable recovery receipt and the turn's authority alive
+until reconciliation.
 
 Follow-up drains preserve earlier sibling order and stop behind failures. They can bypass their
 authorized ancestors, but do not run unrelated queued actions ahead of those ancestors.
@@ -64,8 +66,13 @@ receipts without an open browser. Effects are retried only under the receiver's 
 deduplication contract. This does not make arbitrary shell commands or other unjournalled
 effects exactly-once.
 While an alarm is holding a live turn or command open, an abortable one-second pump also dispatches
-due action receipts. It skips in-flight applications: a parent waiting on a follow-up must not
-prevent the follow-up's own lost-response retry from running.
+due action receipts and lifecycle outboxes. Existing per-action/per-participant single-flight
+guards prevent duplicate concurrent dispatch: a held command cannot block unrelated cleanup
+or its follow-up's lost-response retry.
+
+Chat deletion durably fences new turns and callbacks and discards queued calls before canceling
+the current execution. If workpiece cleanup fails or the DO resets, the fence remains and another
+deletion request retries cleanup; the chat cannot silently restart work while awaiting deletion.
 
 Workspace deletion closes persisted turns (including paused turns) and drains lifecycle outboxes
 before deleting storage. A failed delivery fails deletion without erasing its retry receipts;
