@@ -233,6 +233,7 @@ class RestoreForgerImpl extends NativeRpcTarget {
 
 // Per-chat in-memory state, used while an agent is running.
 type LiveChatContext = {
+  continuationId: string;
   // Abort controller for the running agent.
   cancelController: AbortController;
 };
@@ -850,10 +851,11 @@ class OverseerImpl implements AgentHooks {
     sub[Symbol.dispose]();
   }
 
-  #getLiveChat(chatId: number): LiveChatContext {
+  #getLiveChat(chatId: number, continuationId: string): LiveChatContext {
     let ctx = this.#liveChats.get(chatId);
-    if (!ctx) {
+    if (ctx?.continuationId !== continuationId) {
       ctx = {
+        continuationId,
         cancelController: new AbortController(),
       };
       this.#liveChats.set(chatId, ctx);
@@ -1183,7 +1185,7 @@ class OverseerImpl implements AgentHooks {
       }
       if (record.status.phase === "finished") continue;
       this.#registerRunningAgent(record.chatId);
-      const liveChat = this.#getLiveChat(record.chatId);
+      const liveChat = this.#getLiveChat(record.chatId, record.continuationId);
       this.ctx.waitUntil(Promise.resolve().then(() => this.#resumeAgent(record, liveChat)));
     }
 
@@ -4864,7 +4866,7 @@ class OverseerImpl implements AgentHooks {
     const resumed = this.continuations.resume(chatId);
     if (!resumed) return;
     this.#registerRunningAgent(chatId);
-    this.ctx.waitUntil(this.#resumeAgent(resumed, this.#getLiveChat(chatId)));
+    this.ctx.waitUntil(this.#resumeAgent(resumed, this.#getLiveChat(chatId, resumed.continuationId)));
   }
 
   // Called synchronously with the decision write, before a client/profile/preparation await.
@@ -6508,7 +6510,7 @@ class OverseerImpl implements AgentHooks {
       const record = this.continuations.get(chatId);
       if (record?.status.phase === "finishing") {
         this.#registerRunningAgent(chatId);
-        this.ctx.waitUntil(this.#finishAgentContinuation(record, this.#getLiveChat(chatId)));
+        this.ctx.waitUntil(this.#finishAgentContinuation(record, this.#getLiveChat(chatId, record.continuationId)));
       }
     }
   }
@@ -6699,7 +6701,7 @@ class OverseerImpl implements AgentHooks {
     });
     this.#registerRunningAgent(chatId);
 
-    let liveChat = this.#getLiveChat(chatId);
+    let liveChat = this.#getLiveChat(chatId, record.continuationId);
     let turn = this.#runAgentTurn(
         chatId, aiModel, initiator, initiatorUserId, record.continuationId, callbackInitiated, liveChat);
     if (keepAlive) this.ctx.waitUntil(turn);
@@ -7032,6 +7034,7 @@ class OverseerImpl implements AgentHooks {
       // the turn to end. Each call's arguments get an env name, unique in the chat's scope as of
       // this point in the log, stamped on the message like capsule binding names are.
       let initiatorUserId = first.initiatorUserId;
+      this.#closeAgentContinuation(chatId, "abandoned");
       let taken = this.chatScopeNames(chatId);
       for (let call of Array.from(this.storage.pendingAgentCalls.list(
           {prefix: chatKeyPrefix(chatId)}))) {

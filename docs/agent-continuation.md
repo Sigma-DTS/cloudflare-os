@@ -32,7 +32,9 @@ finishes cleanup and resumes a ready wait without a browser. A resumed execution
 ID. Cleanup checks that ID after awaits so an older execution cannot clear its successor.
 An interrupted step that already committed decision cards recovers a manual wait before inference;
 an auto-eligible pending action alone is not a pause. Resumption rechecks message preparation
-after model lookup, and a newer prompt retires the old wait even when it selects no AI model.
+after model lookup. Each execution owns its cancellation controller, so a canceled recovery
+cannot abort its replacement. A newer prompt or consumed callback retires the old wait even
+when it starts no model.
 
 One transition helper owns state changes; the overseer's driver handles model lookup,
 execution and cleanup. Startup and alarms use the same runnable index. Unready pauses and
