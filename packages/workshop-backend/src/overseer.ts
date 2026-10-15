@@ -1031,7 +1031,6 @@ class OverseerImpl implements AgentHooks {
       await this.#finishAgentContinuation(current, liveChat);
       return;
     }
-    let aiModel: UserAiModelRecord | undefined;
     try {
       for (const application of Array.from(this.storage.actionApplications.list())) {
         const action = this.storage.actions.get(application.id);
@@ -1040,6 +1039,15 @@ class OverseerImpl implements AgentHooks {
           await this.applyPendingAction(action, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
         }
       }
+    } catch (error) {
+      this.logger.warn("approved actions deferred before agent resume", {
+        event: "agent.resume.actions.deferred", chatId: record.chatId, error,
+      });
+      this.#deferAgentResume(record, liveChat, isDoResetError(error) ? 1_000 : 30_000);
+      return;
+    }
+    let aiModel: UserAiModelRecord | undefined;
+    try {
       const context = await retryOnDoReset(() =>
         this.users.get(this.users.idFromString(record.initiatorUserId)).getChatContext(record.modelId), this.logger);
       aiModel = context.aiModel;
@@ -4958,6 +4966,9 @@ class OverseerImpl implements AgentHooks {
 
   async #finishActionApplication(application: ActionApplication): Promise<void> {
     const record = this.storage.actions.get(application.id);
+    // Recovery clears the same queue gate as a client approval. Do not await the drain:
+    // it may already be waiting for this application's completion.
+    if (record?.type === "action") this.ctx.waitUntil(this.drainAutoApprovals(record.gatekeeperId));
     if (record?.type === "action" && record.caller.from === "agent" && record.description.awaitDecision) {
       await this.resumeAfterActionDecision(record.caller.chatId, record.id, application.resolvedBy,
         application.resumeUserId);
@@ -5644,6 +5655,9 @@ class OverseerImpl implements AgentHooks {
         if (prior?.type === "action" && prior.action === action) {
           if (JSON.stringify(prior.description) !== JSON.stringify(description))
             throw new Error("Follow-up action ID was reused with a different description.");
+          if (prior.state === "pending" && autoApprovalRule(this.storage, gatekeeperId, prior.description)) {
+            this.ctx.waitUntil(this.drainAutoApprovals(gatekeeperId));
+          }
           return;
         }
       }
@@ -5712,8 +5726,8 @@ class OverseerImpl implements AgentHooks {
       this.storage.actions.put(record);
       if (parent) {
         this.storage.actions.put({ ...parent, followupActionIds: [...(parent.followupActionIds ?? []), actionId] });
-        this.continuations.addFollowup(parent.integrationOrigin!.chatId, parent.id, actionId,
-          description.awaitDecision === true && this.#requiresManualDecision(record));
+        if (description.awaitDecision) this.continuations.addFollowup(
+          parent.integrationOrigin!.chatId, parent.id, actionId, this.#requiresManualDecision(record));
         // No executeCode call will consume a command's late approvals. Publish the existing
         // action card now, in the same durable transaction as the deduplication receipt.
         this.addChatMessages(parent.integrationOrigin!.chatId,

@@ -38,6 +38,41 @@ async function prepare(impl: Impl, recoverable = true, awaited = false) {
 const reset = () => Object.assign(new Error("Injected lost reply"), { durableObjectReset: true });
 
 describe("durable approved-action recovery", () => {
+  it("drains auto-approved work behind a manual gate whose apply reply was lost", () => inKernel(async impl => {
+    const handler = facet(impl);
+    await handler.setRecoverable();
+    await start(impl);
+    const description = {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true};
+    await impl.submitAction(31, 42, description, {from: "agent", chatId: 1}, origin(impl));
+    impl.storage.autoApproveTags.put({gatekeeperId: 31, actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+    await impl.submitAction(31, 43, {...description, autoApprovable: true, actionKind: {tag: "run", label: "Run"}},
+      {from: "agent", chatId: 1}, origin(impl));
+    const records = [...impl.storage.actions.list()].filter(record => record.type === "action");
+    impl.addChatMessages(1, RUN.initiator, records.map(record => ({type: "action", actionId: record.id})));
+    await impl.drainAutoApprovals(31);
+    expect(await handler.calls()).toEqual([]);
+    await impl.closeAgentIntegrationTurn(1, "approval");
+    impl.continuations.settle(1, impl.continuations.get(1)!.continuationId);
+    impl.resumePausedAgent = async () => {};
+    impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+      if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+        await target.applyActionInContext(...args);
+        throw reset();
+      };
+      return Reflect.get(target, key);
+    }});
+    await expect(impl.applyPendingAction(records[0]!, APPROVER, false)).rejects.toThrow("lost reply");
+    facet(impl);
+    const application = impl.storage.actionApplications.get(records[0]!.id)!;
+    impl.storage.actionApplications.put({...application, retryAt: Date.now()});
+    await impl.recoverActionApplications();
+    await impl.drainAutoApprovals(31);
+    expect(records.map(record => impl.storage.actions.get(record.id)?.state)).toEqual(["approved", "approved"]);
+    expect((await handler.calls()).map(call => call.action)).toEqual([42, 43]);
+    expect(impl.continuations.get(1)?.status).toMatchObject({phase: "paused", ready: true});
+    expect([...impl.storage.actionApplications.list()]).toEqual([]);
+  }));
+
   it.each(["contextualActions", "recoverableActions"] as const)(
     "preserves a lost effect receipt while %s is revoked, then reconciles without repeating the effect", revoked => inKernel(async impl => {
       const handler = await prepare(impl);
@@ -155,51 +190,22 @@ describe("durable approved-action recovery", () => {
     });
   });
 
-  it("rechecks recovery permission during active-agent restoration even before retryAt", async () => {
-    const stub = env.TEST_OVERSEER.getByName(crypto.randomUUID());
-    let grantSpy: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      await runInDurableObject(stub, async instance => {
-        const impl = instance.impl;
-        await prepare(impl);
-        const parent = action(impl);
-        impl.storage.gatekeepers.put({...impl.storage.gatekeepers.get(31)!,
-          class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({props: {}})});
-        impl.storage.actionApplications.put({id: parent.id, resolvedBy: APPROVER, autoApproved: false,
-          phase: "apply", retryAt: Date.now() + 60_000});
-        const continuation = impl.continuations.get(1)!;
-        impl.storage.agentContinuations.put({...continuation, initiatorUserId: "invalid-do-id", modelId: "missing",
-          status: {phase: "running"}});
-        grantSpy = vi.spyOn(Object.getPrototypeOf(impl), "integrationGrant").mockReturnValue({
-          lifecycle: true, contextualActions: true, recoverableActions: false,
-        });
-        await impl.ctx.storage.sync();
-      });
-      await evictDurableObject(stub);
-      await runInDurableObject(stub, async instance => {
-        const impl = instance.impl;
-        await impl.waitForAllAgentsToComplete();
-        const handler = await impl.getGatekeeperFacet(31) as Fetcher<IntegrationTestActionGatekeeper>;
-        expect(await handler.calls()).toEqual([]);
-        expect(action(impl).state).toBe("pending");
-        expect([...impl.storage.actionApplications.list()]).toMatchObject([{phase: "apply"}]);
-      });
-    } finally { grantSpy?.mockRestore(); delete env.AGENT_INTEGRATION_GRANTS; }
-  });
-
-  it("publishes an in-flight follow-up through the real context, with durable deduplication and original scope", async () => {
+  it.each([false, true])("publishes an awaited=%s follow-up without inventing a wait", async awaitedChild => {
     await runInDurableObject(env.TEST_OVERSEER.getByName(crypto.randomUUID()), async instance => {
       const impl = instance.impl, handler = await prepare(impl, true, true);
       try {
+        impl.resumePausedAgent = async () => {};
         await handler.setFollowup({title: "Allow network", description: "Exact destination", implementsRevert: false,
-          autoApprovable: false, awaitDecision: true});
+          autoApprovable: false, awaitDecision: awaitedChild});
         await impl.applyPendingAction(action(impl), APPROVER, false);
         const records = [...impl.storage.actions.list()].filter(record => record.type === "action");
         expect(records).toHaveLength(2);
         expect(records[0]).toMatchObject({state: "approved", followupActionIds: [records[1]!.id]});
         expect(records[1]).toMatchObject({state: "pending", gatekeeperId: 31, action: 43,
           caller: {from: "agent", chatId: 1}, integrationOrigin: records[0]!.integrationOrigin,
-          description: {autoApprovable: false, awaitDecision: true}});
+          description: {autoApprovable: false, awaitDecision: awaitedChild}});
+        expect(impl.continuations.get(1)?.status).toMatchObject({phase: "paused", ready: !awaitedChild,
+          wait: {kind: "approval", actionIds: awaitedChild ? records.map(record => record.id) : [records[0]!.id]}});
         expect([...impl.storage.chats.list()].filter(message => message.type === "action" &&
           message.actionId === records[1]!.id)).toHaveLength(1);
         await expect(impl.submitAction(31, 44, {title: "Late", description: "Late", implementsRevert: false},
@@ -232,6 +238,47 @@ describe("durable approved-action recovery", () => {
         } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
       });
     });
+
+  it("restarts an auto follow-up committed just before eviction when its parent replays", async () => {
+    const stub = env.TEST_OVERSEER.getByName(crypto.randomUUID());
+    const description = {title: "Network", description: "Exact destination", implementsRevert: false,
+      autoApprovable: true, actionKind: {tag: "network", label: "Network"}, awaitDecision: true};
+    await runInDurableObject(stub, async ({impl}) => {
+      await prepare(impl, true, true);
+      impl.drainAutoApprovals = async () => {}; // Reset after child publication, before dispatch.
+      impl.storage.autoApproveTags.put({gatekeeperId: 31, actionKind: description.actionKind, enabledBy: APPROVER});
+      const parent = action(impl);
+      impl.storage.actionApplications.put({id: parent.id, phase: "apply", resolvedBy: APPROVER,
+        autoApproved: false, retryAt: Date.now() + 60_000});
+      await impl.submitAction(31, 43, description, parent.caller, parent.integrationOrigin, parent.id);
+      expect([...impl.storage.actionApplications.list()]).toHaveLength(1);
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, async ({impl}) => {
+      impl.env.AGENT_INTEGRATION_GRANTS = GRANT;
+      try {
+        impl.resumePausedAgent = async () => {};
+        const handler = facet(impl);
+        await handler.setFollowup(description);
+        impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+          if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+            await target.applyActionInContext(...args);
+            if (args[0] === 42) {
+              await vi.waitFor(async () => expect((await handler.calls()).map(call => call.action)).toContain(43));
+            }
+          };
+          return Reflect.get(target, key);
+        }});
+        await impl.applyPendingAction(action(impl), APPROVER, false);
+        await impl.drainAutoApprovals(31);
+        expect([...impl.storage.actions.list()]).toHaveLength(2);
+        expect([...impl.storage.chats.list()].filter(message => message.type === "action")).toHaveLength(2);
+        expect([...impl.storage.actions.list()].map(record => record.state)).toEqual(["approved", "approved"]);
+        expect((await handler.calls()).map(call => call.action)).toEqual([42, 43]);
+      } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
+    });
+  });
 
   it("deduplicates a committed follow-up after real kernel eviction, even if the child was approved", async () => {
     const stub = env.TEST_OVERSEER.getByName(crypto.randomUUID());

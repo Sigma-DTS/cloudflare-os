@@ -152,6 +152,56 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(apply.calls).toEqual([3]);
   });
 
+  it.each([false, true])("serializes sibling follow-ups and stops behind a failed predecessor=%s", async fails => {
+    const storage = makeStorage();
+    enableRule(storage);
+    putAction(storage, 1, {autoApprovable: false});
+    putAction(storage, 2);
+    putAction(storage, 3);
+    storage.actions.put({...getAction(storage, 1), followupActionIds: [2, 3]});
+    storage.actionApplications.put({id: 1, phase: "apply", resolvedBy: ENABLER,
+      autoApproved: false, retryAt: Date.now() + 60_000});
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const apply = makeImmediateApply(storage), calls: number[] = [];
+    const drainer = new AutoApprovalDrainer(storage, async (...args) => {
+      calls.push(args[0].id);
+      if (args[0].id === 2) {
+        await barrier;
+        if (fails) throw new Error("First sibling failed");
+      }
+      await apply.applyFn(...args);
+    });
+    const first = drainer.drain(GK), concurrent = drainer.drain(GK);
+    try {
+      await flush();
+      expect(calls).toEqual([2]);
+    } finally { release(); await Promise.all([first, concurrent]); }
+    expect(apply.calls).toEqual(fails ? [] : [2, 3]);
+    expect(getAction(storage, 3).state).toBe(fails ? "pending" : "approved");
+  });
+
+  it("lets a nested child unblock an earlier sibling without waiting for a later sibling", async () => {
+    const storage = makeStorage();
+    enableRule(storage);
+    for (const id of [1, 2, 3, 4]) putAction(storage, id);
+    storage.actions.put({...getAction(storage, 1), description: {...getAction(storage, 1).description, autoApprovable: false},
+      followupActionIds: [2, 3]});
+    storage.actions.put({...getAction(storage, 2), followupActionIds: [4]});
+    for (const id of [1, 2]) storage.actionApplications.put({id, phase: "apply", resolvedBy: ENABLER,
+      autoApproved: false, retryAt: Date.now() + 60_000});
+    let release!: () => void;
+    const child = new Promise<void>(resolve => { release = resolve; });
+    const apply = makeImmediateApply(storage);
+    const drainer = new AutoApprovalDrainer(storage, async (...args) => {
+      if (args[0].id === 2) await child;
+      await apply.applyFn(...args);
+      if (args[0].id === 4) release();
+    });
+    await drainer.drain(GK);
+    expect(apply.calls).toEqual([4, 2, 3]);
+  });
+
   it("applies all eligible pending actions in ascending id order", async () => {
     let storage = makeStorage();
     enableRule(storage);

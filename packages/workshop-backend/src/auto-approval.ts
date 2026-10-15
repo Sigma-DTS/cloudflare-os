@@ -106,14 +106,20 @@ export class AutoApprovalDrainer {
     let pending = [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)];
 
     const ancestors = new Set<number>();
+    const predecessors = new Set<number>();
     if (followupId !== undefined) {
       // Child IDs are allocated after their parents. Walk backwards to find exactly this child's
       // ancestry, including nested follow-ups; never skip another command's approval journal.
       const descendants = new Set([followupId]);
       for (const record of pending.toReversed()) {
-        if (record.type === "action" && record.followupActionIds?.some(id => descendants.has(id))) {
+        if (record.type !== "action") continue;
+        const child = record.followupActionIds?.find(id => descendants.has(id));
+        if (child !== undefined) {
           ancestors.add(record.id);
           descendants.add(record.id);
+          // Earlier siblings must finish first, but a later sibling must not block a
+          // nested child needed by its own predecessor.
+          for (const id of record.followupActionIds!) if (id < child) predecessors.add(id);
         }
       }
     }
@@ -136,7 +142,7 @@ export class AutoApprovalDrainer {
         return;
       }
       // A child may bypass its already-authorized ancestors, not unrelated queued work.
-      if (followupId !== undefined && fresh.id !== followupId) continue;
+      if (followupId !== undefined && fresh.id !== followupId && !predecessors.has(fresh.id)) continue;
 
       try {
         // Attribute the auto-approval to the user who enabled the rule -- it runs under their

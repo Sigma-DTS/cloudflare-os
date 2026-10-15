@@ -21,6 +21,57 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each(["contextualActions", "recoverableActions"] as const)(
+    "defers interrupted action replay while %s is revoked without closing the originating turn", async revoked => {
+      const s = await recoveryScenario(), requests = inference();
+      let grant: ReturnType<typeof vi.spyOn> | undefined, apply: ReturnType<typeof vi.spyOn> | undefined;
+      let turnId: string;
+      try {
+        await s.visit(async impl => {
+          const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+          turnId = record.turnId;
+          await impl.beginAgentIntegrationTurn(CHAT, record.continuationId);
+          const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+          await handler.setRecoverable();
+          impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+            actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+          impl.storage.actions.put({id: 7, gatekeeperId: GATEKEEPER, type: "action", action: 42, createdAt: new Date(),
+            state: "pending", caller: {from: "agent", chatId: CHAT}, contextualApply: true, integrationOrigin: origin(impl),
+            description: {title: "Run", description: "Command", implementsRevert: false,
+              awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}}});
+          impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}]);
+          // The resume driver must reconcile this even before the alarm's retry deadline.
+          impl.storage.actionApplications.put({id: 7, resolvedBy: APPROVER, autoApproved: true,
+            phase: "apply", retryAt: Date.now() + 60_000});
+          grant = vi.spyOn(Object.getPrototypeOf(impl), "integrationGrant").mockReturnValue({
+            lifecycle: true, contextualActions: true, recoverableActions: true, [revoked]: false,
+          });
+          apply = vi.spyOn(Object.getPrototypeOf(impl), "applyPendingAction");
+          await impl.ctx.storage.sync();
+        });
+        await evictDurableObject(s.stub);
+        await expect(s.visit(async impl => {
+          await vi.waitFor(() => expect(apply).toHaveBeenCalled());
+          await expect(apply!.mock.results[0].value).rejects.toThrow(/revoked/);
+          expect(impl.continuations.get(CHAT)).toMatchObject({turnId, status: {phase: "running"}});
+          expect(impl.storage.actionApplications.get(7)).toMatchObject({phase: "apply", autoApproved: true});
+          expect(requests()).toBe(0);
+          grant!.mockRestore();
+          await impl.ctx.storage.sync();
+          impl.ctx.abort("Injected reset during deferred action replay");
+        })).rejects.toThrow(/Injected reset/);
+        await s.visit(async impl => {
+          await impl.waitForAllAgentsToComplete();
+          expect(impl.continuations.get(CHAT)).toMatchObject({turnId, status: {phase: "finished", reason: "completed"}});
+          expect(impl.storage.actions.get(7)?.state).toBe("approved");
+          expect(impl.storage.actionApplications.get(7)).toBeUndefined();
+          const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+          expect(await handler.calls()).toMatchObject([{action: 42, turn: {turnId}}]);
+          expect(requests()).toBe(1);
+        });
+      } finally { grant?.mockRestore(); apply?.mockRestore(); }
+    });
+
   it("recovers other step approvals committed after a late child started suspension", async () => {
     const s = await recoveryScenario(), requests = inference();
     await s.visit(async impl => {

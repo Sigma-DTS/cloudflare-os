@@ -16,7 +16,9 @@ not new permission. Contextual dispatch never falls back to legacy application a
 failure whose effects may already have happened.
 Revoking an integration grant blocks dispatch but retains unresolved approved intent: a lost reply
 does not prove the effect failed. Such an action cannot be rejected as unexecuted; restoring the
-grant permits receipt reconciliation under the original approval.
+grant permits receipt reconciliation under the original approval. Replay failures defer the
+originating turn; they are not treated as model lookup failures. Recovering a cleared queue gate
+restarts auto-approval, and replaying a deduplicated pending follow-up restarts its drain too.
 
 ## One continuation machine
 
@@ -37,11 +39,14 @@ Each pause names exactly the action IDs or connection requests it awaits. A matc
 sets `ready` durably **before** message-preparation I/O, even if suspension cleanup is still
 running. Cleanup or recovery consumes that ready pause once. A decision arriving before the
 pause needs no wake-up flag: the transition reads its persisted result. Duplicate decisions
-cannot authorize a later wait. Nested approvals extend the parent's wait in the same transaction
+cannot authorize a later wait. Awaited nested approvals extend the parent's wait in the same transaction
 that publishes the child. A manual follow-up from an auto-approved, still-running parent records
 that pause immediately; the agent consumes it at its next step barrier rather than finishing the
 logical turn. Cancellation, chat deletion, and superseding prompts terminate the
 old continuation; stale cleanup is fenced by execution identity.
+
+Follow-up drains preserve earlier sibling order and stop behind failures. They can bypass their
+authorized ancestors, but do not run unrelated queued actions ahead of those ancestors.
 
 Lifecycle notifications are an output of these transitions, not another turn state machine.
 The transition and its participant outbox writes commit together. Delivery is at-least-once:
