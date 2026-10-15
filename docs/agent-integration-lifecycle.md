@@ -14,6 +14,9 @@ recoverable application requires durable effect deduplication in the receiver; l
 actions are not automatically repeated. Nested approvals remain explicit queued actions,
 not new permission. Contextual dispatch never falls back to legacy application after a
 failure whose effects may already have happened.
+Revoking an integration grant blocks dispatch but retains unresolved approved intent: a lost reply
+does not prove the effect failed. Such an action cannot be rejected as unexecuted; restoring the
+grant permits receipt reconciliation under the original approval.
 
 ## One continuation machine
 
@@ -35,7 +38,9 @@ sets `ready` durably **before** message-preparation I/O, even if suspension clea
 running. Cleanup or recovery consumes that ready pause once. A decision arriving before the
 pause needs no wake-up flag: the transition reads its persisted result. Duplicate decisions
 cannot authorize a later wait. Nested approvals extend the parent's wait in the same transaction
-that publishes the child. Cancellation, chat deletion, and superseding prompts terminate the
+that publishes the child. A manual follow-up from an auto-approved, still-running parent records
+that pause immediately; the agent consumes it at its next step barrier rather than finishing the
+logical turn. Cancellation, chat deletion, and superseding prompts terminate the
 old continuation; stale cleanup is fenced by execution identity.
 
 Lifecycle notifications are an output of these transitions, not another turn state machine.

@@ -46,6 +46,14 @@ export class AgentContinuations {
   suspend(chatId: number, continuationId: string, wait: AgentContinuationWait,
       ready: boolean): AgentContinuation | undefined {
     const record = this.get(chatId);
+    // A command's late child can start suspension before the current model/tool step
+    // commits its own action cards. The barrier must include those waits without a second event.
+    if (record?.continuationId === continuationId && record.status.phase === "suspending" &&
+        record.status.wait.kind === "approval" && wait.kind === "approval") {
+      const actionIds = [...new Set([...record.status.wait.actionIds, ...wait.actionIds])];
+      if (actionIds.length === record.status.wait.actionIds.length) return;
+      return this.#put({...record, status: {...record.status, wait: {kind: "approval", actionIds}, ready}});
+    }
     if (!record || record.continuationId !== continuationId || record.status.phase !== "running") return;
     const event = { eventId: this.id(), turnId: record.turnId, segmentId: record.segmentId,
       kind: "suspended" as const, reason: wait.kind };
@@ -72,9 +80,13 @@ export class AgentContinuations {
     return true;
   }
 
-  /** A nested approval extends its parent's wait before the child can complete. */
-  addFollowup(chatId: number, parent: number, child: number): void {
+  /** A manual follow-up pauses a running turn; otherwise extend an existing parent wait. */
+  addFollowup(chatId: number, parent: number, child: number, requiresDecision: boolean): void {
     const record = this.get(chatId), status = record?.status;
+    if (record && status?.phase === "running" && requiresDecision) {
+      this.suspend(chatId, record.continuationId, {kind: "approval", actionIds: [parent, child]}, false);
+      return;
+    }
     if (!record || !status || (status.phase !== "paused" && status.phase !== "suspending") ||
         status.wait.kind !== "approval" || !status.wait.actionIds.includes(parent)) return;
     this.#put({...record, status: {...status, ready: false,

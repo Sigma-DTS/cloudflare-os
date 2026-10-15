@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { OverseerDurableObject } from "../src/overseer";
 import type { ActionRecord } from "../src/storage-schema/overseer-storage";
 import type { IntegrationTestActionGatekeeper } from "./test-worker";
+import { openFakeOverseer } from "./fixtures";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv { TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>; }
@@ -37,6 +38,49 @@ async function prepare(impl: Impl, recoverable = true, awaited = false) {
 const reset = () => Object.assign(new Error("Injected lost reply"), { durableObjectReset: true });
 
 describe("durable approved-action recovery", () => {
+  it.each(["contextualActions", "recoverableActions"] as const)(
+    "preserves a lost effect receipt while %s is revoked, then reconciles without repeating the effect", revoked => inKernel(async impl => {
+      const handler = await prepare(impl);
+      impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+        if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+          await target.applyActionInContext(...args);
+          throw reset();
+        };
+        return Reflect.get(target, key);
+      }});
+      await expect(impl.applyPendingAction(action(impl), APPROVER, false)).rejects.toThrow("lost reply");
+      expect(await handler.calls()).toHaveLength(1);
+      facet(impl);
+      impl.env.AGENT_INTEGRATION_GRANTS = JSON.stringify({container: {
+        lifecycle: true, contextualActions: true, recoverableActions: true, [revoked]: false,
+      }});
+      const application = impl.storage.actionApplications.get(action(impl).id)!;
+      impl.storage.actionApplications.put({...application, retryAt: Date.now()});
+      await impl.recoverActionApplications();
+      expect(impl.storage.actionApplications.get(application.id)).toMatchObject({
+        phase: "apply", resolvedBy: APPROVER, autoApproved: false,
+      });
+      expect(impl.storage.actionApplications.get(application.id)!.retryAt).toBeGreaterThan(Date.now() + 25_000);
+      expect(action(impl).state).toBe("pending");
+      expect(await handler.calls()).toHaveLength(1);
+      using client = await openFakeOverseer(impl.storage, {impl: {
+        getGatekeeperFacet: impl.getGatekeeperFacet.bind(impl),
+      }});
+      await expect(client.rejectAction(application.id)).rejects.toThrow(/execution receipt/);
+      impl.env.AGENT_INTEGRATION_GRANTS = GRANT;
+      // Another failed reconciliation is still not evidence that the original effect failed.
+      impl.getGatekeeperFacet = async () => { throw new Error("Receiver unavailable"); };
+      impl.storage.actionApplications.put({...application, retryAt: Date.now()});
+      await impl.recoverActionApplications();
+      expect(impl.storage.actionApplications.get(application.id)).toMatchObject({phase: "apply"});
+      facet(impl);
+      impl.storage.actionApplications.put({...application, retryAt: Date.now()});
+      await impl.recoverActionApplications();
+      expect(action(impl)).toMatchObject({state: "approved", resolvedBy: APPROVER, autoApproved: false});
+      expect(await handler.calls()).toHaveLength(1);
+      expect(impl.storage.actionApplications.get(application.id)).toBeUndefined();
+    }));
+
   it("refreshes a delayed action's context within its original turn, not its old segment", () => inKernel(async impl => {
     const first = await start(impl);
     await impl.submitAction(31, 42, {title: "Run", description: "Command", implementsRevert: false},
@@ -138,7 +182,7 @@ describe("durable approved-action recovery", () => {
         const handler = await impl.getGatekeeperFacet(31) as Fetcher<IntegrationTestActionGatekeeper>;
         expect(await handler.calls()).toEqual([]);
         expect(action(impl).state).toBe("pending");
-        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+        expect([...impl.storage.actionApplications.list()]).toMatchObject([{phase: "apply"}]);
       });
     } finally { grantSpy?.mockRestore(); delete env.AGENT_INTEGRATION_GRANTS; }
   });
@@ -290,7 +334,8 @@ describe("durable approved-action recovery", () => {
         await impl.recoverActionApplications();
         expect(action(impl).state).toBe("pending");
         expect(await handler.calls()).toEqual([]);
-        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+        expect([...impl.storage.actionApplications.list()]).toEqual(mode === "legacy" ? [] :
+          [expect.objectContaining({phase: "apply"})]);
       } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
     });
   });

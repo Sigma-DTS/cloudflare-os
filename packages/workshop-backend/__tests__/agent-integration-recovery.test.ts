@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openFakeOverseer } from "./fixtures";
+import type { IntegrationTestActionGatekeeper } from "./test-worker";
 import { APPROVER, CHAT, GATEKEEPER, MODEL, RUN, flush, origin, providerReply, recoveryScenario } from "./agent-integration-fixture";
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); delete env.AGENT_INTEGRATION_GRANTS; });
@@ -20,6 +21,97 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it("recovers other step approvals committed after a late child started suspension", async () => {
+    const s = await recoveryScenario(), requests = inference();
+    await s.visit(async impl => {
+      const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      await impl.beginAgentIntegrationTurn(CHAT, record.continuationId);
+      for (const id of [7, 8, 9]) impl.storage.actions.put({
+        id, gatekeeperId: GATEKEEPER, type: "action", action: id, createdAt: new Date(),
+        state: id === 7 ? "approved" : "pending", caller: {from: "agent", chatId: CHAT},
+        description: {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true},
+      });
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}, {type: "action", actionId: 8}]);
+      impl.continuations.suspend(CHAT, record.continuationId, {kind: "approval", actionIds: [7, 8]}, false);
+      // Another awaited tool result committed at the step barrier; its finalizer has not run.
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 9}]);
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({
+        phase: "paused", ready: false, wait: {kind: "approval", actionIds: [7, 8, 9]},
+      });
+      const child = impl.storage.actions.get(8)!;
+      impl.storage.actions.put({...child, state: "approved"});
+      await impl.resumeAfterActionDecision(CHAT, 8, APPROVER);
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "paused", ready: false});
+      expect(requests()).toBe(0);
+    });
+  });
+
+  it.each([false, true])("pauses a running parent's late manual follow-up with another awaited action=%s", async anotherWait => {
+    const s = await recoveryScenario();
+    await s.visit(async impl => {
+      const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+      await handler.setRecoverable();
+      await handler.setFollowup({title: "Network", description: "Exact destination", implementsRevert: false,
+        awaitDecision: true, autoApprovable: false});
+      impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+        actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+      let release!: () => void, entered = false;
+      const dispatch = new Promise<void>(resolve => { release = resolve; });
+      impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+        if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+          if (args[0] === 42) { entered = true; await dispatch; }
+          return target.applyActionInContext(...args);
+        };
+        return Reflect.get(target, key);
+      }});
+      const requests = inference(async () => {
+        if (requests() !== 1) return;
+        await impl.submitAction(GATEKEEPER, 42, {title: "Run", description: "Command", implementsRevert: false,
+          awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}},
+          {from: "agent", chatId: CHAT}, origin(impl));
+        await vi.waitFor(() => expect(entered).toBe(true));
+        // The tool step already continued without pausing and committed the parent's card.
+        const captured = impl.consumeCapturedActions(CHAT)!;
+        expect(captured.awaitDecision).toBe(false);
+        impl.addChatMessages(CHAT, MODEL.profile, captured.actions.map(actionId => ({type: "action", actionId})));
+        if (anotherWait) await impl.submitAction(GATEKEEPER, 44,
+          {title: "Other", description: "Another manual action", implementsRevert: false, awaitDecision: true},
+          {from: "agent", chatId: CHAT}, origin(impl));
+        release();
+        await impl.drainAutoApprovals(GATEKEEPER);
+      });
+      try {
+        impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+        const turnId = impl.continuations.get(CHAT)!.turnId;
+        await impl.waitForAllAgentsToComplete();
+        const records = [...impl.storage.actions.list()].filter(record => record.type === "action");
+        expect(records).toHaveLength(anotherWait ? 3 : 2);
+        expect(impl.continuations.get(CHAT)).toMatchObject({turnId,
+          status: {phase: "paused", ready: false,
+            wait: {kind: "approval", actionIds: expect.arrayContaining(records.map(record => record.id))}}});
+        expect(requests()).toBe(1);
+        expect([...impl.storage.chats.list()].filter(message => message.type === "action")).toHaveLength(records.length);
+        await impl.applyPendingAction(records.find(record => record.action === 43)!, APPROVER, false);
+        if (anotherWait) {
+          expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "paused", ready: false});
+          expect(requests()).toBe(1);
+          await impl.applyPendingAction(records.find(record => record.action === 44)!, APPROVER, false);
+        }
+        await impl.waitForAllAgentsToComplete();
+        await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status.phase).toBe("finished"));
+        expect(requests()).toBe(2);
+        expect(impl.continuations.get(CHAT)?.turnId).toBe(turnId);
+        expect((await handler.calls()).map(call => ({action: call.action, turnId: call.turn?.turnId})))
+          .toEqual([42, 43, ...(anotherWait ? [44] : [])].map(action => ({action, turnId})));
+      } finally { release(); }
+    });
+  });
+
   it("retains approval during actual suspension cleanup and never wakes the next undecided segment", async () => {
     const s = await recoveryScenario();
     await s.visit(async (impl, participant) => {
