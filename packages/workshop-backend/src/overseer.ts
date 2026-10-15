@@ -4909,7 +4909,7 @@ class OverseerImpl implements AgentHooks {
       if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
       if (message.type === "action") {
         const action = this.storage.actions.get(message.actionId);
-        if (action?.type === "action" && action.description.awaitDecision) actions.push(action.id);
+        if (action?.type === "action" && action.caller.from === "agent" && action.description.awaitDecision) actions.push(action.id);
       }
       if (message.type === "connectionRequest") connections.push(message.requestId);
     }

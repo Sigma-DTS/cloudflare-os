@@ -21,6 +21,41 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each([false, true])("does not wait on a gadget preview action approved before the agent action=%s", async gadgetFirst => {
+    const s = await recoveryScenario(), requests = inference();
+    const description = {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true};
+    const agentAction = {id: 7, gatekeeperId: GATEKEEPER, type: "action" as const, action: 42,
+      createdAt: new Date(), state: "pending" as const, description,
+      caller: {from: "agent" as const, chatId: CHAT}};
+    const gadgetAction = {...agentAction, id: 8, action: 43,
+      caller: {from: "gadget" as const, gadgetId: 100, chatId: CHAT}};
+    await s.visit(async impl => {
+      const turn = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      impl.continuations.enter(CHAT, turn.continuationId);
+      impl.storage.actions.put(agentAction);
+      impl.storage.actions.put(gadgetAction);
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}, {type: "action", actionId: 8}]);
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({
+        phase: "paused", ready: false, wait: {kind: "approval", actionIds: [agentAction.id]},
+      });
+      vi.spyOn(impl, "getGatekeeperFacet").mockResolvedValue({applyAction: async () => {}} as
+        Awaited<ReturnType<typeof impl.getGatekeeperFacet>>);
+      if (gadgetFirst) await impl.applyPendingAction(gadgetAction, APPROVER, false);
+      await impl.applyPendingAction(agentAction, APPROVER, false);
+      await impl.resumeAfterActionDecision(CHAT, agentAction.id, APPROVER);
+      await impl.waitForAllAgentsToComplete();
+      expect(requests()).toBe(1);
+      expect(impl.continuations.get(CHAT)?.status.phase).toBe("finished");
+      if (!gadgetFirst) await impl.applyPendingAction(gadgetAction, APPROVER, false);
+      expect(requests()).toBe(1);
+    });
+  });
+
   it("cleans up canceled agents when workspace deletion fails after destroying live contexts", async () => {
     const s = await recoveryScenario();
     let release!: () => void;
