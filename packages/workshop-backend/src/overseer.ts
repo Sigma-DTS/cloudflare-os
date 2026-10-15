@@ -968,6 +968,20 @@ class OverseerImpl implements AgentHooks {
   // rethrown once everything else has settled, so the platform retries the alarm.
   async runAlarmTasks(): Promise<void> {
     this.#inAlarmHandler = true;
+    // The alarm keeps live work open, but a parent command may be waiting on a child
+    // whose reply was lost. Pump due receipts without joining those already applying.
+    const recovery = new AbortController();
+    const pumping = (async () => {
+      try {
+        for (;;) {
+          await scheduler.wait(1_000, {signal: recovery.signal});
+          if (recovery.signal.aborted) return;
+          this.ctx.waitUntil(this.recoverActionApplications(true));
+        }
+      } catch (error) {
+        if (!recovery.signal.aborted) throw error;
+      }
+    })();
     try {
       do {
         this.#resumeInterruptedAgents();
@@ -983,6 +997,8 @@ class OverseerImpl implements AgentHooks {
         }
       } while (this.#runningAgents.size > 0 || this.#pendingCallDrains.size > 0);
     } finally {
+      recovery.abort();
+      await pumping;
       this.#inAlarmHandler = false;
       this.#agentKeepAliveTime = undefined;
       this.#updateAlarm();
@@ -4823,7 +4839,11 @@ class OverseerImpl implements AgentHooks {
     const promise = Promise.resolve().then(async () => {
       const current = this.storage.actions.get(record.id);
       if (!current || current.type !== "action") throw new Error("Action no longer exists.");
-      if (current.state === "approved") return;
+      if (current.state === "approved") {
+        const application = this.storage.actionApplications.get(record.id);
+        if (application) await this.#finishActionApplication(application);
+        return;
+      }
       if (current.state !== "pending") throw new Error("Action is not pending.");
       let application = this.storage.actionApplications.get(record.id);
       const recovering = application !== undefined;
@@ -4935,16 +4955,15 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Alarm-driven recovery of already-authorized actions, never approval of pending requests.
-  async recoverActionApplications(): Promise<void> {
+  async recoverActionApplications(skipRunning = false): Promise<void> {
     const due = [...this.storage.actionApplications.retryAt.list({ end: Date.now() + 1 })];
     await Promise.all(due.map(async application => {
+      if (skipRunning && this.#actionApplications.has(application.id)) return;
       const started = performance.now();
       try {
         const record = this.storage.actions.get(application.id);
         if (!record || record.type !== "action" || record.state === "rejected") {
           this.storage.actionApplications.delete(application.id);
-        } else if (record.state === "approved" || application.phase === "resume") {
-          await this.#finishActionApplication(application);
         } else {
           await this.applyPendingAction(record, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
         }
@@ -7033,6 +7052,50 @@ class OverseerImpl implements AgentHooks {
         callbackInitiated, liveChat));
   }
 
+  // A final model response is not the end of a contextual command dispatched in the
+  // background. Keep its authority alive until application completes, unless a manual
+  // follow-up suspends the turn (or cancellation/supersession ends that authority).
+  async #waitForAgentActions(record: AgentContinuation, signal: AbortSignal): Promise<boolean> {
+    const stopped = Promise.withResolvers<void>();
+    const check = () => {
+      const current = this.continuations.get(record.chatId);
+      if (signal.aborted || current?.continuationId !== record.continuationId || current.status.phase !== "running") {
+        stopped.resolve();
+      }
+    };
+    // Collection subscribers run before the write; observe the committed transition.
+    const changed = () => queueMicrotask(check);
+    const subscriber = {add: changed, update: changed, remove: changed};
+    this.storage.agentContinuations.subscribe(subscriber);
+    signal.addEventListener("abort", check);
+    try {
+      check();
+      const ids = new Set(this.#actionApplications.keys());
+      for (const message of this.storage.chats.list({prefix: chatKeyPrefix(record.chatId), reverse: true})) {
+        if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
+        if (message.type === "action") ids.add(message.actionId);
+      }
+      const actions = [...ids].map(id => this.storage.actions.get(id))
+        .filter((action): action is ActionRecord & {type: "action"} => action?.type === "action" &&
+          action.contextualApply === true && action.state === "pending" && action.integrationOrigin?.turnId === record.turnId);
+      const gatekeepers = new Set(actions.map(action => action.gatekeeperId));
+      await Promise.race([
+        Promise.allSettled([
+          ...actions.flatMap(action => this.#actionApplications.get(action.id) ?? []),
+          ...[...gatekeepers].map(id => this.drainAutoApprovals(id)),
+        ]),
+        stopped.promise,
+      ]);
+      // An uncertain effect must reconcile before closing its context. The ordinary resume
+      // driver will retry its durable receipt; this is not permission to replay a shell command.
+      return this.continuations.get(record.chatId)?.status.phase !== "running" ||
+        !actions.some(action => this.storage.actionApplications.get(action.id));
+    } finally {
+      this.storage.agentContinuations.unsubscribe(subscriber);
+      signal.removeEventListener("abort", check);
+    }
+  }
+
   async #runAgentTurnWithContext(chatId: number, aiModel: UserAiModelRecord,
                                  initiator: AiChatAuthorInfo,
                                  initiatorUserId: string,
@@ -7181,10 +7244,17 @@ class OverseerImpl implements AgentHooks {
 
       this.postAgentErrorMessage(chatId, aiModel.profile, errorMessage);
     } finally {
+      if (!interrupted && this.continuations.owns(chatId, continuationId) &&
+          !["approval", "connection"].includes(integrationOutcome) &&
+          !liveChat.cancelController.signal.aborted) {
+        interrupted = !await this.#waitForAgentActions(this.continuations.get(chatId)!, liveChat.cancelController.signal);
+      }
       if (interrupted) {
         const active = this.continuations.get(chatId);
         if (active?.continuationId === continuationId) this.#deferAgentResume(active, liveChat, entered ? 1_000 : 30_000);
       } else if (this.continuations.owns(chatId, continuationId)) {
+        const status = this.continuations.get(chatId)!.status;
+        if (status.phase === "suspending") integrationOutcome = status.wait.kind;
         this.#closeAgentContinuation(chatId, integrationOutcome);
         // If this turn billed the user's own Cloudflare account, refresh their cached balance now (in
         // the background) so the next turn's billing decision reflects the spend just incurred. Runs
@@ -11104,7 +11174,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
     }
 
+    // Paused turns have no live context. Close every persisted turn, and drain even
+    // older/deleted chats' terminal outboxes before erasing their retry receipts.
+    const chats = new Set([
+      ...Array.from(this.impl.storage.agentContinuations.list(), record => record.chatId),
+      ...Array.from(this.impl.storage.agentIntegrationParticipants.list(), record => record.chatId),
+    ]);
+    await Promise.all([...chats].map(chatId => this.impl.closeAgentIntegrationTurn(chatId, "canceled")));
+
     await this.impl.ctx.blockConcurrencyWhile(async () => {
+      // A new prompt may have arrived during callback I/O; don't erase its work or receipts.
+      if ([...this.impl.storage.agentContinuations.list()].some(record =>
+          record.status.phase !== "finishing" && record.status.phase !== "finished") ||
+          [...this.impl.storage.agentIntegrationParticipants.list({limit: 1})].length) {
+        throw new Error("Workspace changed during lifecycle cleanup; retry deletion.");
+      }
       await this.#owner.deleteGadget(this.impl.ctx.id.toString());
       await this.impl.ctx.storage.deleteAll();
       this.impl.recordGadgetAnalytics({

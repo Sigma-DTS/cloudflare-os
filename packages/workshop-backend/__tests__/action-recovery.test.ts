@@ -38,6 +38,53 @@ async function prepare(impl: Impl, recoverable = true, awaited = false) {
 const reset = () => Object.assign(new Error("Injected lost reply"), { durableObjectReset: true });
 
 describe("durable approved-action recovery", () => {
+  it("retries a child's lost reply while the alarm is waiting on its parent", () => inKernel(async impl => {
+    const handler = await prepare(impl, true, true);
+    impl.resumePausedAgent = async () => {};
+    await handler.setFollowup({title: "Network", description: "Destination", implementsRevert: false, awaitDecision: true});
+    let release!: () => void, tick: (() => void) | undefined, childAttempts = 0;
+    const childDone = new Promise<void>(resolve => { release = resolve; });
+    const wait = vi.spyOn(scheduler, "wait").mockImplementation((_ms, options) =>
+      new Promise<void>((resolve, reject) => {
+        tick = resolve;
+        options?.signal?.addEventListener("abort", () => reject(options.signal!.reason), {once: true});
+      }));
+    impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+      if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+        await target.applyActionInContext(...args);
+        if (args[0] === 42) await childDone;
+        else if (++childAttempts === 1) throw reset();
+        else release();
+      };
+      return Reflect.get(target, key);
+    }});
+    const parent = impl.applyPendingAction(action(impl), APPROVER, false);
+    let alarm: Promise<void> | undefined, now: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await vi.waitFor(() => expect([...impl.storage.actions.list()].filter(r => r.type === "action")).toHaveLength(2));
+      const [application] = [...impl.storage.actionApplications.list()];
+      impl.storage.actionApplications.put({...application, retryAt: Date.now()});
+      const recovering = vi.spyOn(impl, "recoverActionApplications");
+      alarm = impl.runAlarmTasks();
+      await vi.waitFor(() => expect(recovering).toHaveBeenCalled());
+      const child = [...impl.storage.actions.list()].find(r => r.type === "action" && r.action === 43);
+      if (child?.type !== "action") throw new Error("Missing follow-up");
+      await expect(impl.applyPendingAction(child, APPROVER, false)).rejects.toThrow("lost reply");
+      const retryAt = impl.storage.actionApplications.get(child.id)!.retryAt;
+      now = vi.spyOn(Date, "now").mockReturnValue(retryAt + 1);
+      tick?.();
+      await vi.waitFor(() => expect(impl.storage.actions.get(child.id)?.state).toBe("approved"), {timeout: 500});
+      await Promise.all([parent, alarm]);
+      expect(childAttempts).toBe(2);
+      expect((await handler.calls()).map(call => call.action)).toEqual([42, 43]);
+      expect([...impl.storage.actionApplications.list()]).toEqual([]);
+    } finally {
+      release();
+      await Promise.allSettled([parent, ...(alarm ? [alarm] : [])]);
+      now?.mockRestore(); wait.mockRestore();
+    }
+  }));
+
   it("drains auto-approved work behind a manual gate whose apply reply was lost", () => inKernel(async impl => {
     const handler = facet(impl);
     await handler.setRecoverable();

@@ -3,7 +3,7 @@ import { evictDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openFakeOverseer } from "./fixtures";
 import type { IntegrationTestActionGatekeeper } from "./test-worker";
-import { APPROVER, CHAT, GATEKEEPER, MODEL, RUN, flush, origin, providerReply, recoveryScenario } from "./agent-integration-fixture";
+import { APPROVER, CHAT, GATEKEEPER, MODEL, RUN, flush, origin, pause, providerReply, recoveryScenario, start, type Impl } from "./agent-integration-fixture";
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); delete env.AGENT_INTEGRATION_GRANTS; });
 
@@ -20,7 +20,148 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
   return () => requests;
 }
 
+function deletionClient(impl: Impl) {
+  return openFakeOverseer(impl.storage, {impl: {
+    // The fixture's close notification is a local RPC; don't hold an input lock around it.
+    ctx: {id: impl.ctx.id, storage: impl.ctx.storage, exports: impl.ctx.exports,
+      blockConcurrencyWhile: (callback: () => Promise<unknown>) => callback()},
+    logger: impl.logger, continuations: impl.continuations,
+    destroyAllLiveChats: impl.destroyAllLiveChats.bind(impl),
+    closeAgentIntegrationTurn: impl.closeAgentIntegrationTurn.bind(impl),
+    scheduleAccessRestart: () => {},
+    users: {idFromString: (id: string) => id, get: () => ({
+      id: {toString: () => "owner-id"}, whoami: async () => APPROVER, deleteGadget: async () => {},
+    })},
+  }});
+}
+
 describe("continuation driver across real DO eviction", () => {
+  it.each(["queued commands", "manual follow-up", "lost reply"])("keeps final-response cleanup behind contextual applies: %s", async scenario => {
+    const followup = scenario === "manual follow-up";
+    const s = await recoveryScenario();
+    await s.visit(async (impl, participant) => {
+      const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+      await handler.setRecoverable();
+      if (followup) await handler.setFollowup({title: "Network", description: "Exact destination",
+        implementsRevert: false, awaitDecision: true, autoApprovable: false});
+      impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+        actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+      let release!: () => void, finishParent!: () => void, entered = false, attempts = 0;
+      const dispatch = new Promise<void>(resolve => { release = resolve; });
+      const childApplied = new Promise<void>(resolve => { finishParent = resolve; });
+      impl.getGatekeeperFacet = async () => new Proxy(handler, {get(target, key) {
+        if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
+          if (args[0] === 42) { entered = true; await dispatch; }
+          if (args[0] === 42 && scenario === "lost reply" && attempts === 2) await childApplied;
+          await target.applyActionInContext(...args);
+          if (args[0] === 42 && followup) await childApplied;
+          if (args[0] === 42 && ++attempts <= 2 && scenario === "lost reply") {
+            throw Object.assign(new Error("Injected lost reply"), {durableObjectReset: true});
+          }
+        };
+        return Reflect.get(target, key);
+      }});
+      const requests = inference(async () => {
+        if (requests() !== 1) return;
+        await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+        for (const action of followup ? [42] : [42, 44]) {
+          await impl.submitAction(GATEKEEPER, action, {title: "Run", description: "Command", implementsRevert: false,
+            awaitDecision: true, autoApprovable: true, actionKind: {tag: "run", label: "Run"}},
+            {from: "agent", chatId: CHAT}, origin(impl));
+        }
+        await vi.waitFor(() => expect(entered).toBe(true));
+        const captured = impl.consumeCapturedActions(CHAT)!;
+        expect(captured.awaitDecision).toBe(false);
+        impl.addChatMessages(CHAT, MODEL.profile, captured.actions.map(actionId => ({type: "action", actionId})));
+      });
+      try {
+        impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+        await vi.waitFor(() => expect([...impl.storage.chats.list()]).toContainEqual(
+          expect.objectContaining({type: "message", message: "Recovered."})));
+        // The final response is durable, but its approved command has not reached the receiver.
+        expect(impl.continuations.get(CHAT)?.status.phase).toBe("running");
+        expect((await participant.calls()).some(call => call.event.kind === "finished")).toBe(false);
+        release();
+        if (scenario === "lost reply") {
+          await vi.waitFor(() => expect(attempts).toBe(2));
+          expect(impl.continuations.get(CHAT)?.status.phase).toBe("running");
+          expect([...impl.storage.actionApplications.list()]).toContainEqual(expect.objectContaining({phase: "apply"}));
+          finishParent();
+        }
+        await impl.waitForAllAgentsToComplete();
+        if (followup) {
+          expect(impl.continuations.get(CHAT)?.status.phase).toBe("paused");
+          expect((await participant.calls()).some(call => call.event.kind === "finished")).toBe(false);
+          const child = [...impl.storage.actions.list()].find(record => record.type === "action" && record.action === 43);
+          if (child?.type !== "action") throw new Error("Missing follow-up");
+          await impl.applyPendingAction(child, APPROVER, false);
+          finishParent();
+          await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status.phase).toBe("finished"));
+        }
+        expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "finished", reason: "completed"});
+        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+        expect((await handler.calls()).map(call => call.action)).toEqual(followup ? [42, 43] : [42, 44]);
+        expect(requests()).toBe(followup ? 2 : 1);
+        if (scenario === "lost reply") expect(attempts).toBe(3);
+      } finally { release(); finishParent(); }
+    });
+  });
+
+  it("does not erase a successor started while workspace cleanup awaits its ACK", async () => {
+    const s = await recoveryScenario();
+    await s.visit(async (impl, participant) => {
+      await start(impl);
+      await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+      await pause(impl);
+      await participant.block("finished");
+      using client = await deletionClient(impl);
+      const deleting = client.deleteSelf();
+      try {
+        await vi.waitFor(async () => expect((await participant.calls()).at(-1)?.event.kind).toBe("finished"));
+        const next = impl.continuations.start(RUN);
+        await participant.releaseBlock();
+        await expect(deleting).rejects.toThrow(/changed during lifecycle cleanup/);
+        expect(impl.continuations.get(CHAT)?.continuationId).toBe(next.continuationId);
+        expect(impl.storage.chatMeta.get(CHAT)).toBeDefined();
+      } finally { await participant.releaseBlock(); await deleting.catch(() => {}); }
+    });
+  });
+
+  it.each(["paused", "deleted chat"])("retains a %s's failed deletion cleanup across eviction, then deletes after ACK", async state => {
+    const s = await recoveryScenario();
+    let eventId: string;
+    await s.visit(async (impl, participant) => {
+      await start(impl);
+      await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+      await pause(impl);
+      if (state === "deleted chat") {
+        impl.continuations.close(CHAT, "canceled");
+        impl.storage.agentContinuations.delete(CHAT);
+        impl.storage.chatMeta.delete(CHAT);
+      }
+      await participant.setFailure(true);
+      using client = await deletionClient(impl);
+      await expect(client.deleteSelf()).rejects.toThrow(/unavailable/);
+      expect(!!impl.storage.chatMeta.get(CHAT)).toBe(state === "paused");
+      const saved = [...impl.storage.agentIntegrationParticipants.list()][0];
+      expect(saved.pending.at(-1)).toMatchObject({kind: "finished", reason: "canceled"});
+      eventId = saved.pending.at(-1)!.eventId;
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async (impl, participant) => {
+      await participant.setFailure(false);
+      await flush(impl);
+      const terminal = (await participant.calls()).filter(call => call.event.kind === "finished");
+      expect(terminal.length).toBeGreaterThanOrEqual(2);
+      expect(terminal.every(call => call.event.eventId === eventId)).toBe(true);
+      expect([...impl.storage.agentIntegrationParticipants.list()]).toEqual([]);
+      using client = await deletionClient(impl);
+      await client.deleteSelf();
+      expect(impl.storage.chatMeta.get(CHAT)).toBeUndefined();
+    });
+  });
+
   it.each(["canceled", "superseded"] as const)(
     "resumes a newer turn independently of unresolved approved intent from a %s turn", async outcome => {
       const s = await recoveryScenario(), requests = inference();

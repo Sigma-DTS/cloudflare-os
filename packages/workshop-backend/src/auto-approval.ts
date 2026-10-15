@@ -107,6 +107,7 @@ export class AutoApprovalDrainer {
 
     const ancestors = new Set<number>();
     const predecessors = new Set<number>();
+    const laterSiblings = new Set<number>();
     if (followupId !== undefined) {
       // Child IDs are allocated after their parents. Walk backwards to find exactly this child's
       // ancestry, including nested follow-ups; never skip another command's approval journal.
@@ -119,7 +120,10 @@ export class AutoApprovalDrainer {
           descendants.add(record.id);
           // Earlier siblings must finish first, but a later sibling must not block a
           // nested child needed by its own predecessor.
-          for (const id of record.followupActionIds!) if (id < child) predecessors.add(id);
+          for (const id of record.followupActionIds!) {
+            if (id < child) predecessors.add(id);
+            if (id > child) laterSiblings.add(id);
+          }
         }
       }
     }
@@ -135,6 +139,7 @@ export class AutoApprovalDrainer {
         continue;
       }
       if (ancestors.has(fresh.id) && this.storage.actionApplications.get(fresh.id)?.phase === "apply") continue;
+      if (laterSiblings.has(fresh.id)) continue;
 
       let rule = autoApprovalRule(this.storage, gatekeeperId, fresh.description);
       if (rule === undefined) {

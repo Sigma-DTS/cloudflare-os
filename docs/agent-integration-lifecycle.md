@@ -44,6 +44,9 @@ that publishes the child. A manual follow-up from an auto-approved, still-runnin
 that pause immediately; the agent consumes it at its next step barrier rather than finishing the
 logical turn. Cancellation, chat deletion, and superseding prompts terminate the
 old continuation; stale cleanup is fenced by execution identity.
+On normal model completion, contextual applications finish before terminal cleanup. A late manual
+follow-up can still suspend that wait; an uncertain application keeps its durable recovery receipt
+and the turn's authority alive until reconciliation.
 
 Follow-up drains preserve earlier sibling order and stop behind failures. They can bypass their
 authorized ancestors, but do not run unrelated queued actions ahead of those ancestors.
@@ -60,6 +63,13 @@ Durable alarms recover runnable continuations, pending callback deliveries and a
 receipts without an open browser. Effects are retried only under the receiver's explicit durable
 deduplication contract. This does not make arbitrary shell commands or other unjournalled
 effects exactly-once.
+While an alarm is holding a live turn or command open, an abortable one-second pump also dispatches
+due action receipts. It skips in-flight applications: a parent waiting on a follow-up must not
+prevent the follow-up's own lost-response retry from running.
+
+Workspace deletion closes persisted turns (including paused turns) and drains lifecycle outboxes
+before deleting storage. A failed delivery fails deletion without erasing its retry receipts;
+alarms can still deliver cleanup across eviction, and the owner can then retry deletion.
 
 Tests separate synchronous transition rules, native persistent-RPC delivery, receiver-deduplicated
 action application, and a small real-eviction matrix covering suspension, durable wake-up and

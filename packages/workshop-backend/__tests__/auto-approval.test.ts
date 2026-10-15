@@ -181,10 +181,12 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(getAction(storage, 3).state).toBe(fails ? "pending" : "approved");
   });
 
-  it("lets a nested child unblock an earlier sibling without waiting for a later sibling", async () => {
+  it.each([false, true])("lets a nested child unblock an earlier sibling with a manual later sibling=%s", async manual => {
     const storage = makeStorage();
     enableRule(storage);
     for (const id of [1, 2, 3, 4]) putAction(storage, id);
+    if (manual) storage.actions.put({...getAction(storage, 3),
+      description: {...getAction(storage, 3).description, autoApprovable: false}});
     storage.actions.put({...getAction(storage, 1), description: {...getAction(storage, 1).description, autoApprovable: false},
       followupActionIds: [2, 3]});
     storage.actions.put({...getAction(storage, 2), followupActionIds: [4]});
@@ -198,8 +200,12 @@ describe("AutoApprovalDrainer.drain", () => {
       await apply.applyFn(...args);
       if (args[0].id === 4) release();
     });
-    await drainer.drain(GK);
-    expect(apply.calls).toEqual([4, 2, 3]);
+    const draining = drainer.drain(GK);
+    try {
+      await flush();
+      expect(apply.calls).toEqual(manual ? [4, 2] : [4, 2, 3]);
+    } finally { release(); await draining; }
+    expect(getAction(storage, 3).state).toBe(manual ? "pending" : "approved");
   });
 
   it("applies all eligible pending actions in ascending id order", async () => {
