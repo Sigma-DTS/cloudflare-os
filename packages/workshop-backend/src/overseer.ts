@@ -1035,7 +1035,8 @@ class OverseerImpl implements AgentHooks {
       for (const application of Array.from(this.storage.actionApplications.list())) {
         const action = this.storage.actions.get(application.id);
         if (action?.type === "action" && action.caller.from === "agent" &&
-            action.caller.chatId === record.chatId && action.state === "pending") {
+            action.caller.chatId === record.chatId && action.integrationOrigin?.turnId === record.turnId &&
+            action.state === "pending") {
           await this.applyPendingAction(action, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
         }
       }

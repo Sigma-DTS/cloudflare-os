@@ -21,6 +21,53 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each(["canceled", "superseded"] as const)(
+    "resumes a newer turn independently of unresolved approved intent from a %s turn", async outcome => {
+      const s = await recoveryScenario(), requests = inference();
+      let oldTurnId: string, newTurnId: string;
+      await s.visit(async impl => {
+        const first = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+        oldTurnId = first.turnId;
+        await impl.beginAgentIntegrationTurn(CHAT, first.continuationId);
+        await impl.submitAction(GATEKEEPER, 42,
+          {title: "Old command", description: "Original approved intent", implementsRevert: false, awaitDecision: true},
+          {from: "agent", chatId: CHAT}, origin(impl));
+        const [action] = [...impl.storage.actions.list()];
+        impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: action.id}]);
+        impl.storage.actionApplications.put({id: action.id, resolvedBy: APPROVER, autoApproved: false,
+          phase: "apply", retryAt: Date.now() + 60_000});
+        if (outcome === "canceled") {
+          impl.continuations.close(CHAT, "canceled");
+          impl.continuations.settle(CHAT, first.continuationId);
+        }
+        impl.addChatMessages(CHAT, APPROVER, [{type: "message", message: "New prompt"}]);
+        const second = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+        newTurnId = second.turnId;
+        await impl.beginAgentIntegrationTurn(CHAT, second.continuationId);
+        await impl.ctx.storage.sync();
+      });
+      await evictDurableObject(s.stub);
+      await s.visit(async impl => {
+        await vi.waitFor(() => expect(requests()).toBe(1));
+        await impl.waitForAllAgentsToComplete();
+        expect(impl.continuations.get(CHAT)).toMatchObject({turnId: newTurnId, status: {phase: "finished", reason: "completed"}});
+        const [application] = [...impl.storage.actionApplications.list()];
+        expect(application).toMatchObject({resolvedBy: APPROVER, autoApproved: false, phase: "apply"});
+        expect(impl.storage.actions.get(application.id)).toMatchObject({
+          state: "pending", integrationOrigin: {turnId: oldTurnId},
+        });
+        // Independent reconciliation still fails closed on the expired origin, without
+        // borrowing the newer turn's authority or deleting the unresolved receipt.
+        impl.storage.actionApplications.put({...application, retryAt: Date.now()});
+        await impl.recoverActionApplications();
+        expect(impl.storage.actionApplications.get(application.id)).toMatchObject({phase: "apply", resolvedBy: APPROVER});
+        expect(impl.continuations.get(CHAT)).toMatchObject({turnId: newTurnId, status: {phase: "finished"}});
+        const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+        expect(await handler.calls()).toEqual([]);
+        expect(requests()).toBe(1);
+      });
+    });
+
   it.each(["contextualActions", "recoverableActions"] as const)(
     "defers interrupted action replay while %s is revoked without closing the originating turn", async revoked => {
       const s = await recoveryScenario(), requests = inference();
