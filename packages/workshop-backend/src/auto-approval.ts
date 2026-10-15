@@ -145,6 +145,10 @@ export class AutoApprovalDrainer {
       }
       if (ancestors.has(fresh.id) && this.storage.actionApplications.get(fresh.id)?.phase === "apply") continue;
       if (laterSiblings.has(fresh.id)) continue;
+      // A failed contextual effect is not fresh queue work after eviction or another drain.
+      // Only its durable reconciliation receipt (or an explicit manual apply) may retry it.
+      if (fresh.contextualDispatch === "attempted" && !this.storage.actionApplications.get(fresh.id) &&
+          !this.#applying.has(fresh.id)) return;
 
       let rule = autoApprovalRule(this.storage, gatekeeperId, fresh.description);
       if (rule === undefined) {

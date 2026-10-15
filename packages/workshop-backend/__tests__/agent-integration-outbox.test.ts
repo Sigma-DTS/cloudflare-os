@@ -6,6 +6,17 @@ import type { IntegrationTestActionGatekeeper } from "./test-worker";
 import { CHAT, GATEKEEPER, RUN, finish, flush, inKernel, origin, pause, resume, start } from "./agent-integration-fixture";
 
 describe("lifecycle delivery over persistent native RPC", () => {
+  it("allows idempotent setup to register again inside started and resumed callbacks", () => inKernel(async (impl, participant) => {
+    await participant.setReregister();
+    await start(impl);
+    await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+    await pause(impl);
+    await resume(impl);
+    await finish(impl);
+    expect((await participant.calls()).map(call => call.event.kind)).toEqual(["started", "suspended", "resumed", "finished"]);
+    expect([...impl.storage.agentIntegrationParticipants.list()]).toEqual([]);
+  }));
+
   it("commits the state transition and outbox together", () => inKernel(async (impl, participant) => {
     await start(impl);
     await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);

@@ -48,11 +48,14 @@ export class AgentContinuations {
     const record = this.get(chatId);
     // A command's late child can start suspension before the current model/tool step
     // commits its own action cards. The barrier must include those waits without a second event.
-    if (record?.continuationId === continuationId && record.status.phase === "suspending" &&
-        record.status.wait.kind === "approval" && wait.kind === "approval") {
-      const actionIds = [...new Set([...record.status.wait.actionIds, ...wait.actionIds])];
-      if (actionIds.length === record.status.wait.actionIds.length) return;
-      return this.#put({...record, status: {...record.status, wait: {kind: "approval", actionIds}, ready}});
+    if (record?.continuationId === continuationId && record.status.phase === "suspending") {
+      const previous = record.status.wait;
+      const actionIds = [...new Set([...(previous.actionIds ?? []), ...(wait.actionIds ?? [])])];
+      const requestIds = [...new Set([...(previous.requestIds ?? []), ...(wait.requestIds ?? [])])];
+      if (actionIds.length === (previous.actionIds?.length ?? 0) &&
+          requestIds.length === (previous.requestIds?.length ?? 0)) return;
+      return this.#put({...record, status: {...record.status, ready,
+        wait: {...previous, ...(actionIds.length ? {actionIds} : {}), ...(requestIds.length ? {requestIds} : {})}}});
     }
     if (!record || record.continuationId !== continuationId || record.status.phase !== "running") return;
     const event = { eventId: this.id(), turnId: record.turnId, segmentId: record.segmentId,
@@ -72,9 +75,8 @@ export class AgentContinuations {
   wake(chatId: number, source: number | string): boolean {
     const record = this.get(chatId), status = record?.status;
     if (!record || !status || (status.phase !== "suspending" && status.phase !== "paused") || status.ready) return false;
-    const matches = status.wait.kind === "approval"
-      ? typeof source === "number" && status.wait.actionIds.includes(source)
-      : typeof source === "string" && status.wait.requestIds.includes(source);
+    const matches = typeof source === "number"
+      ? status.wait.actionIds?.includes(source) : status.wait.requestIds?.includes(source);
     if (!matches) return false;
     this.#put({ ...record, status: { ...status, ready: true } });
     return true;
@@ -88,9 +90,9 @@ export class AgentContinuations {
       return;
     }
     if (!record || !status || (status.phase !== "paused" && status.phase !== "suspending") ||
-        status.wait.kind !== "approval" || !status.wait.actionIds.includes(parent)) return;
+        !status.wait.actionIds?.includes(parent)) return;
     this.#put({...record, status: {...status, ready: false,
-      wait: {kind: "approval", actionIds: [...status.wait.actionIds, child]}}});
+      wait: {...status.wait, actionIds: [...status.wait.actionIds, child]}}});
   }
 
   /** Cleanup's ACK settles exactly the execution that requested it. */

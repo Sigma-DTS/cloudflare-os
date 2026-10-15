@@ -121,7 +121,7 @@ export class FakeGatekeeperAccount
   }
 }
 
-const integrationCallbacks = new Map<string, { fail: boolean;
+const integrationCallbacks = new Map<string, { fail: boolean; reregister?: boolean;
   blocked?: {kind: AgentTurnEvent["kind"]; wait: Promise<void>; release: () => void};
   calls: { event: AgentTurnEvent; turn: AgentTurnInfo }[] }>();
 
@@ -137,11 +137,18 @@ export class IntegrationTestParticipant extends WorkerEntrypoint<unknown, { name
     using borrowed = context;
     const call = {event, turn: await borrowed.getTurn()};
     this.#state().calls.push(call);
+    if (this.#state().reregister && (event.kind === "started" || event.kind === "resumed")) {
+      const exports = this.ctx.exports as typeof this.ctx.exports & {
+        IntegrationTestParticipant(options: {props: {name: string}}): Fetcher<IntegrationTestParticipant>;
+      };
+      await borrowed.participate(exports.IntegrationTestParticipant({props: this.ctx.props}));
+    }
     const blocked = this.#state().blocked;
     if (blocked?.kind === event.kind) await blocked.wait;
     if (this.#state().fail) throw new Error("participant unavailable");
   }
   setFailure(fail: boolean): void { this.#state().fail = fail; }
+  setReregister(): void { this.#state().reregister = true; }
   block(kind: AgentTurnEvent["kind"]): void {
     let release!: () => void;
     const wait = new Promise<void>(resolve => { release = resolve; });

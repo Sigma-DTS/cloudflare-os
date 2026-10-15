@@ -36,6 +36,119 @@ function deletionClient(impl: Impl) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each(["approval", "connection"] as const)("retains both a late follow-up and a connection wait, resolving %s first", async firstDecision => {
+    const s = await recoveryScenario(), requests = inference();
+    let turnId: string;
+    await s.visit(async (impl, participant) => {
+      const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+      turnId = record.turnId;
+      await impl.beginAgentIntegrationTurn(CHAT, record.continuationId);
+      await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+      for (const id of [7, 8]) impl.storage.actions.put({id, gatekeeperId: GATEKEEPER,
+        type: "action", action: id, state: id === 7 ? "approved" : "pending", createdAt: new Date(),
+        caller: {from: "agent", chatId: CHAT}, contextualApply: true, integrationOrigin: origin(impl),
+        description: {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true}});
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "action", actionId: 7}, {type: "action", actionId: 8}]);
+      impl.continuations.addFollowup(CHAT, 7, 8, true);
+      // The same model step requests a connection after the receiver's child began suspension.
+      impl.addChatMessages(CHAT, MODEL.profile, [{type: "connectionRequest", requestId: "1:repo",
+        vendorId: "github", vendorName: "GitHub", reason: "Repository", state: "pending"}]);
+      await impl.closeAgentIntegrationTurn(CHAT, "connection");
+      impl.continuations.settle(CHAT, record.continuationId);
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "paused", ready: false,
+        wait: {actionIds: [7, 8], requestIds: ["1:repo"]}});
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      const approve = async () => {
+        const action = impl.storage.actions.get(8);
+        if (action?.type !== "action") throw new Error("Missing child");
+        await impl.applyPendingAction(action, APPROVER, false);
+      };
+      const connect = async () => {
+        const message = [...impl.storage.chats.list()].find(card => card.type === "connectionRequest");
+        if (message?.type !== "connectionRequest") throw new Error("Missing request");
+        impl.storage.transaction(() => {
+          impl.storage.chats.put({...message, state: "accepted", gatekeeperId: GATEKEEPER});
+          impl.wakeAgentContinuation(CHAT, "1:repo");
+        });
+        await impl.resumePausedAgent(CHAT, "1:repo");
+      };
+      await (firstDecision === "approval" ? approve() : connect());
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)?.status).toMatchObject({phase: "paused", ready: false});
+      expect(requests()).toBe(0);
+      await (firstDecision === "approval" ? connect() : approve());
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.continuations.get(CHAT)).toMatchObject({turnId, status: {phase: "finished", reason: "completed"}});
+      expect(requests()).toBe(1);
+    });
+  });
+
+  it.each(["eligible", "rule revoked", "failed predecessor"] as const)(
+    "recovers never-dispatched contextual work after its predecessor's receipt was cleared: %s", async scenario => {
+      const s = await recoveryScenario(), requests = inference();
+      let turnId: string;
+      await expect(s.visit(async impl => {
+        const record = impl.continuations.start({...RUN, initiatorUserId: s.user.id.toString(), modelId: MODEL.profile.id});
+        turnId = record.turnId;
+        await impl.beginAgentIntegrationTurn(CHAT, record.continuationId);
+        const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+        await handler.setRecoverable();
+        impl.storage.autoApproveTags.put({gatekeeperId: GATEKEEPER,
+          actionKind: {tag: "run", label: "Run"}, enabledBy: APPROVER});
+        // Stop the volatile queue driver exactly before its next dispatch, not the durable writes.
+        const drain = vi.spyOn(impl, "drainAutoApprovals").mockResolvedValue();
+        for (const action of [42, 44]) await impl.submitAction(GATEKEEPER, action,
+          {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true,
+            autoApprovable: true, actionKind: {tag: "run", label: "Run"}},
+          {from: "agent", chatId: CHAT}, origin(impl));
+        const captured = impl.consumeCapturedActions(CHAT)!;
+        impl.addChatMessages(CHAT, MODEL.profile, captured.actions.map(actionId => ({type: "action", actionId})));
+        const [first, second] = [...impl.storage.actions.list()];
+        if (first.type !== "action") throw new Error("Missing first action");
+        if (scenario === "failed predecessor") await handler.setFailure(true);
+        const applied = impl.applyPendingAction(first, APPROVER, true);
+        if (scenario === "failed predecessor") await expect(applied).rejects.toThrow(/handler failed/);
+        else await applied;
+        expect([...impl.storage.actionApplications.list()]).toEqual([]);
+        expect(impl.storage.actions.get(second.id)).toMatchObject({state: "pending", contextualDispatch: "queued"});
+        if (scenario === "rule revoked") impl.storage.autoApproveTags.delete(`${GATEKEEPER}:run`);
+        // A final response can already be committed when that dispatch boundary loses its driver.
+        impl.addChatMessages(CHAT, MODEL.profile, [{type: "message", message: "Finished."}]);
+        drain.mockRestore();
+        await impl.ctx.storage.sync();
+        impl.ctx.abort("Injected reset between contextual dispatches");
+      })).rejects.toThrow(/Injected reset between contextual dispatches/);
+      await s.visit(async impl => {
+        await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status.phase)
+          .toBe(scenario === "eligible" ? "finished" : "paused"));
+        await impl.waitForAllAgentsToComplete();
+        const handler = await impl.getGatekeeperFacet(GATEKEEPER) as Fetcher<IntegrationTestActionGatekeeper>;
+        const actions = [...impl.storage.actions.list()];
+        expect((await handler.calls()).map(call => call.action)).toEqual(scenario === "eligible" ? [42, 44] : [42]);
+        expect(actions[1].state).toBe(scenario === "eligible" ? "approved" : "pending");
+        expect(impl.continuations.get(CHAT)).toMatchObject({turnId, status: {
+          phase: scenario === "eligible" ? "finished" : "paused",
+        }});
+        expect(requests()).toBe(0);
+        if (scenario !== "eligible") {
+          // The retained turn still supplies a valid context for explicit manual handling.
+          await handler.setFailure(false);
+          const pending = actions.find(action => action.type === "action" && action.state === "pending");
+          if (pending?.type !== "action") throw new Error("Missing pending command");
+          await impl.applyPendingAction(pending, APPROVER, false);
+          await impl.drainAutoApprovals(GATEKEEPER);
+          await impl.waitForAllAgentsToComplete();
+          expect(impl.continuations.get(CHAT)).toMatchObject({turnId, status: {phase: "finished"}});
+          expect((await handler.calls()).map(call => call.action))
+            .toEqual(scenario === "failed predecessor" ? [42, 42, 44] : [42, 44]);
+          expect(requests()).toBe(1);
+        }
+      });
+    });
+
   it("keeps late auto-approved descendants inside the finalization barrier", async () => {
     const s = await recoveryScenario();
     await s.visit(async (impl, participant) => {

@@ -1124,8 +1124,8 @@ class OverseerImpl implements AgentHooks {
     // A step's cards may commit just before eviction, after a late child began suspension.
     // Include those waits before settling the pause on recovery too.
     const status = this.continuations.get(record.chatId)!.status;
-    if (status.phase === "suspending" && status.wait.kind === "approval") {
-      this.#closeAgentContinuation(record.chatId, "approval");
+    if (status.phase === "suspending") {
+      this.#closeAgentContinuation(record.chatId, status.wait.kind);
     }
     try { await this.#deliverChatIntegrationEvents(record.chatId); }
     catch (error) {
@@ -4851,7 +4851,7 @@ class OverseerImpl implements AgentHooks {
     const running = this.#actionApplications.get(record.id);
     if (running) return running;
     const promise = Promise.resolve().then(async () => {
-      const current = this.storage.actions.get(record.id);
+      let current = this.storage.actions.get(record.id);
       if (!current || current.type !== "action") throw new Error("Action no longer exists.");
       if (current.state === "approved") {
         const application = this.storage.actionApplications.get(record.id);
@@ -4866,8 +4866,13 @@ class OverseerImpl implements AgentHooks {
           phase: "apply", retryAt: Date.now() + 1_000 };
         this.storage.actionApplications.put(application);
         this.#updateAlarm();
-        await this.ctx.storage.sync();
       }
+      if (current.contextualDispatch === "queued") {
+        current = {...current, contextualDispatch: "attempted"};
+        this.storage.actions.put(current);
+      }
+      // Commit dispatch intent before even a nonrecoverable handler can perform an effect.
+      if (application || current.contextualDispatch) await this.ctx.storage.sync();
       try {
         await this.#applyPendingAction(current, application?.resolvedBy ?? resolvedBy,
           application?.autoApproved ?? autoApproved, creation);
@@ -5032,7 +5037,7 @@ class OverseerImpl implements AgentHooks {
     }
     const status = this.continuations.get(chatId)?.status;
     if (status && (status.phase === "paused" || status.phase === "suspending") &&
-        status.wait.kind === "approval" && status.wait.actionIds.includes(approvedId) && this.#waitIsReady(chatId, status.wait)) {
+        status.wait.actionIds?.includes(approvedId) && this.#waitIsReady(chatId, status.wait)) {
       await this.resumePausedAgent(chatId, approvedId, author);
     }
   }
@@ -5055,7 +5060,7 @@ class OverseerImpl implements AgentHooks {
     if ((status.phase === "paused" || status.phase === "suspending") &&
         this.#waitIsReady(chatId, status.wait)) {
       this.storage.transaction(() => {
-        if (this.continuations.wake(chatId, source) && status.wait.kind === "approval") {
+        if (this.continuations.wake(chatId, source)) {
           this.#noteApprovedWait(chatId, status.wait, author ?? record.initiator);
         }
       });
@@ -5065,7 +5070,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   #noteApprovedWait(chatId: number, wait: AgentContinuationWait, author: AiChatAuthorInfo): void {
-    if (wait.kind !== "approval") return;
+    if (!wait.actionIds?.length) return;
     const titles = wait.actionIds.map(id => this.storage.actions.get(id))
       .filter((record): record is ActionRecord & {type: "action"} => record?.type === "action")
       .map(record => JSON.stringify(record.description.title));
@@ -5074,10 +5079,11 @@ class OverseerImpl implements AgentHooks {
   }
 
   #waitIsReady(chatId: number, wait: AgentContinuationWait): boolean {
-    if (wait.kind === "approval") return wait.actionIds.length > 0 &&
-      wait.actionIds.every(id => this.storage.actions.get(id)?.state === "approved");
+    if (!(wait.actionIds?.length || wait.requestIds?.length)) return false;
+    if (wait.actionIds?.some(id => this.storage.actions.get(id)?.state !== "approved")) return false;
+    if (!wait.requestIds?.length) return true;
     const messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
-    return wait.requestIds.length > 0 && wait.requestIds.every(id =>
+    return wait.requestIds.every(id =>
       messages.some(message => message.type === "connectionRequest" && message.requestId === id && message.state === "accepted"));
   }
 
@@ -5092,7 +5098,9 @@ class OverseerImpl implements AgentHooks {
       }
       if (message.type === "connectionRequest") connections.push(message.requestId);
     }
-    return kind === "approval" ? {kind, actionIds: actions.toReversed()} : {kind, requestIds: connections.toReversed()};
+    return kind === "approval"
+      ? {kind, actionIds: actions.toReversed(), ...(connections.length ? {requestIds: connections.toReversed()} : {})}
+      : {kind, requestIds: connections.toReversed(), ...(actions.length ? {actionIds: actions.toReversed()} : {})};
   }
 
   // Traces an approval step for an action an agent turn submitted.
@@ -5749,6 +5757,8 @@ class OverseerImpl implements AgentHooks {
       description,
       integrationOrigin,
       contextualApply: this.integrationGrant(gatekeeperId).contextualActions === true,
+      ...(integrationOrigin && this.integrationGrant(gatekeeperId).contextualActions
+        ? {contextualDispatch: "queued" as const} : {}),
     };
 
     // The marking walk stamps the verified push closure "pending push" -- the read grant that
@@ -7099,6 +7109,7 @@ class OverseerImpl implements AgentHooks {
   // follow-up suspends the turn (or cancellation/supersession ends that authority).
   async #waitForAgentActions(record: AgentContinuation, signal: AbortSignal): Promise<boolean> {
     const ids = new Set(this.#actionApplications.keys());
+    const restartedDrains = new Set<number>();
     for (const application of this.storage.actionApplications.list()) ids.add(application.id);
     for (const message of this.storage.chats.list({prefix: chatKeyPrefix(record.chatId), reverse: true})) {
       if (message.type === "agentCallback" || message.type === "message" && message.author.type !== "agent") break;
@@ -7127,6 +7138,19 @@ class OverseerImpl implements AgentHooks {
       for (;;) {
         changed = Promise.withResolvers<void>();
         const actions = pending();
+        // A reset can lose the queue driver before its next dispatch. Only untouched cards
+        // may start a fresh drain: failed effects need manual retry or their existing journal.
+        const queued = actions.filter(action => action.contextualDispatch === "queued");
+        if (queued.some(action => this.#requiresManualDecision(action))) {
+          this.#closeAgentContinuation(record.chatId, "approval");
+          return true;
+        }
+        for (const id of new Set(queued.map(action => action.gatekeeperId))) {
+          if (!this.#autoApprovalDrainer.running(id) && !restartedDrains.has(id)) {
+            restartedDrains.add(id);
+            this.ctx.waitUntil(this.drainAutoApprovals(id));
+          }
+        }
         const gatekeepers = new Set(actions.map(action => action.gatekeeperId));
         const work = [
           ...actions.flatMap(action => this.#actionApplications.get(action.id) ?? []),
@@ -7134,8 +7158,9 @@ class OverseerImpl implements AgentHooks {
           ...[...gatekeepers].flatMap(id => this.#autoApprovalDrainer.running(id) ?? []),
         ];
         // An uncertain effect must reconcile before closing its context. The ordinary resume
-        // driver retries its journal; this observer never starts another effect attempt.
-        if (!work.length) return !actions.some(action => this.storage.actionApplications.get(action.id));
+        // driver retries its journal; never start another attempt for an already-dispatched card.
+        if (!work.length) return !actions.some(action => action.contextualDispatch === "queued" ||
+          this.storage.actionApplications.get(action.id));
         if (!await this.#waitForAgentWork(record, signal, () => Promise.race([
           Promise.allSettled(work), changed.promise,
         ]))) return true;
@@ -8988,10 +9013,13 @@ class OverseerImpl implements AgentHooks {
   // Match submission's suspension decision: an auto-eligible action waits only if an
   // earlier manual gate prevents the in-order drain from reaching it.
   #requiresManualDecision(record: ActionRecord & {type: "action"}): boolean {
-    return autoApprovalRule(this.storage, record.gatekeeperId, record.description) === undefined ||
+    const manual = (action: ActionRecord & {type: "action"}) =>
+      autoApprovalRule(this.storage, action.gatekeeperId, action.description) === undefined ||
+      action.contextualDispatch === "attempted" && !this.storage.actionApplications.get(action.id) &&
+        !this.#actionApplications.has(action.id);
+    return manual(record) ||
       [...this.storage.actions.pendingByGatekeeper.get(record.gatekeeperId)].some(queued =>
-        queued.id < record.id && queued.type === "action" &&
-        autoApprovalRule(this.storage, record.gatekeeperId, queued.description) === undefined);
+        queued.id < record.id && queued.type === "action" && manual(queued));
   }
 
   // --- Connection-request hooks ---
@@ -13407,6 +13435,14 @@ class AgentContextImpl extends NativeRpcTarget implements AgentContext {
 
   async participate(participant: Fetcher<AgentTurnParticipant>): Promise<void> {
     const turn = await this.getTurn();
+    if (this.delivery) {
+      if (!this.impl.integrationGrant(this.gatekeeperId).lifecycle || turn.phase !== "running") {
+        throw new Error("Cannot register a participant without lifecycle authority in a running turn.");
+      }
+      // This binding already registered the callback now awaiting us. Joining its delivery
+      // would await ourselves; ordinary registration still waits for the entry ACK.
+      return;
+    }
     await this.impl.registerIntegrationParticipant(this.gatekeeperId, this.origin, turn.phase, participant);
   }
 

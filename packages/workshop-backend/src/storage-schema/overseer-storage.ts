@@ -39,10 +39,10 @@ import type {
   AgentTurnEvent, AgentTurnParticipant,
 } from "@gadgets/workshop-shared/agent-integration";
 
-/** The exact decision set a suspended execution is waiting for. */
+/** Named decisions that must all settle; kind is the original suspension reason. */
 export type AgentContinuationWait =
-  | { kind: "approval"; actionIds: number[] }
-  | { kind: "connection"; requestIds: string[] };
+  | { kind: "approval"; actionIds: number[]; requestIds?: string[] }
+  | { kind: "connection"; requestIds: string[]; actionIds?: number[] };
 
 /** One authoritative execution record, including its lifecycle and any authorized wake-up. */
 export type AgentContinuation = ActiveAgentRecord & {
@@ -469,6 +469,8 @@ export type ActionRecord = {
   integrationOrigin?: AgentIntegrationOrigin;
   /** Dispatches through the administrator-granted contextual action interface. */
   contextualApply?: boolean;
+  /** Durable dispatch boundary for contextual agent work; absent on legacy/non-agent actions. */
+  contextualDispatch?: "queued" | "attempted";
   /** Child approval IDs, persisted with submission for lost-ACK deduplication. */
   followupActionIds?: number[];
 } | {
