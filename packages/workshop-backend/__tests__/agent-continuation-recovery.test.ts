@@ -21,6 +21,68 @@ function inference(onRequest: () => void | Promise<void> = () => {}) {
 }
 
 describe("continuation driver across real DO eviction", () => {
+  it.each([false, true])("fences failed chat deletion across eviction with callback lookup in flight=%s", async lookupInFlight => {
+    const s = await recoveryScenario();
+    const request = Promise.withResolvers<void>(), removal = Promise.withResolvers<void>(), lookup = Promise.withResolvers<void>();
+    const requests = inference(() => request.promise);
+    await s.visit(async impl => {
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(CHAT)!, activeAgent: MODEL.profile});
+      impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString());
+      await vi.waitFor(() => expect(requests()).toBe(1));
+      impl.storage.pendingAgentCalls.put({chatId: CHAT, callId: 0, methodName: "notify", args: [], argsSummary: "",
+        initiatorUserId: s.user.id.toString(), initiatorModelId: MODEL.profile.id});
+      let drain: Promise<void> | undefined;
+      if (lookupInFlight) {
+        let entered = false;
+        const get = UserDurableObject.prototype.getChatContext;
+        vi.spyOn(UserDurableObject.prototype, "getChatContext").mockImplementation(async function(id) {
+          entered = true; await lookup.promise; return get.call(this, id);
+        });
+        drain = impl.drainPendingAgentCalls(CHAT);
+        await vi.waitFor(() => expect(entered).toBe(true));
+      }
+      using client = await openFakeOverseer(impl.storage, {impl: {
+        cancelAgent: impl.cancelAgent.bind(impl),
+        removeChatWorkpieces: () => removal.promise,
+      }});
+      const deleting = client.deleteChat(CHAT);
+      try {
+        request.resolve();
+        await vi.waitFor(() => expect(impl.continuations.get(CHAT)?.status)
+          .toMatchObject({phase: "finished", reason: "canceled"}));
+        await impl.waitForAllAgentsToComplete();
+        lookup.resolve();
+        await drain;
+        expect(requests()).toBe(1);
+        expect([...impl.storage.pendingAgentCalls.list()]).toEqual([]);
+        impl.ownerId = s.user.id.toString();
+        await expect(impl.deliverAgentCallback(CHAT, "notify", [], s.user.id.toString(), MODEL.profile.id))
+          .rejects.toThrow(/being deleted/);
+        expect(() => impl.assertChatNotActive(CHAT)).toThrow(/being deleted/);
+        removal.reject(new Error("Workpiece removal failed"));
+        await expect(deleting).rejects.toThrow("Workpiece removal failed");
+        await impl.ctx.storage.sync();
+      } finally {
+        request.resolve(); lookup.resolve(); removal.reject(new Error("Test cleanup"));
+        await deleting.catch(() => {}); await drain;
+      }
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect(requests()).toBe(1);
+      expect(() => impl.startAgent(CHAT, MODEL, APPROVER, s.user.id.toString())).toThrow(/being deleted/);
+      using client = await openFakeOverseer(impl.storage, {impl: {
+        cancelAgent: impl.cancelAgent.bind(impl), removeChatWorkpieces: impl.removeChatWorkpieces.bind(impl),
+        deleteAllChatChanges: impl.deleteAllChatChanges.bind(impl), destroyLiveChat: impl.destroyLiveChat.bind(impl),
+        logger: impl.logger, ctx: impl.ctx,
+      }});
+      await client.deleteChat(CHAT);
+      expect(impl.storage.chatMeta.get(CHAT)).toBeUndefined();
+      expect(requests()).toBe(1);
+    });
+  });
+
   it.each([false, true])("does not wait on a gadget preview action approved before the agent action=%s", async gadgetFirst => {
     const s = await recoveryScenario(), requests = inference();
     const description = {title: "Run", description: "Command", implementsRevert: false, awaitDecision: true};

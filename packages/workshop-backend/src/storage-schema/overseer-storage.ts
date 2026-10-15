@@ -537,7 +537,11 @@ export function chatKeyPrefix(chatId: number, ...leading: number[]): string {
  * writes or reads it anymore, but old rows still hold stale values, so the stored shape admits
  * it and chatMetaForClient strips it from deliveries.
  */
-export type StoredChatMetadata = AiChatMetadata & {hasProposedChanges?: boolean};
+export type StoredChatMetadata = AiChatMetadata & {
+  hasProposedChanges?: boolean;
+  /** Stops new work while deletion awaits external cleanup; retained if cleanup fails. */
+  deleting?: boolean;
+};
 
 /**
  * A stored "changes" message. Those written before git-backed code storage carry the retired

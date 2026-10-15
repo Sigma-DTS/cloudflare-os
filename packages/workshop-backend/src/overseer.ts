@@ -2298,6 +2298,7 @@ class OverseerImpl implements AgentHooks {
   chatMetaForClient(stored: StoredChatMetadata): AiChatMetadata {
     let meta: StoredChatMetadata = {...stored};
     delete meta.hasProposedChanges;
+    delete meta.deleting;
     let proposed = this.proposedChangeWorkpieceIds(stored.id, stored);
     if (proposed.length > 0) {
       meta.proposedChangeWorkpieces = proposed;
@@ -6054,7 +6055,7 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  getChatMetaOrThrow(chatId: number): AiChatMetadata {
+  getChatMetaOrThrow(chatId: number): StoredChatMetadata {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) {
       throw new Error("No such chatId: " + chatId);
@@ -6064,6 +6065,7 @@ class OverseerImpl implements AgentHooks {
 
   assertChatNotActive(chatId: number, allowMessagePreparation = false): AiChatMetadata {
     let meta = this.getChatMetaOrThrow(chatId);
+    if (meta.deleting) throw new Error("Chat is being deleted.");
     if (meta.activeAgent || !allowMessagePreparation && this.isPreparingChatMessage(chatId)) {
       throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
     }
@@ -6690,6 +6692,7 @@ class OverseerImpl implements AgentHooks {
              initiator: AiChatAuthorInfo, initiatorUserId: string,
              callbackInitiated: boolean = false,
              keepAlive: boolean = false): void {
+    if (this.storage.chatMeta.get(chatId)?.deleting) throw new Error("Chat is being deleted.");
     // Register before starting the turn so registration always precedes the turn's teardown
     // (`#unregisterRunningAgent`, in `#runAgentTurn`'s finally).
     const record = this.continuations.start({
@@ -6912,6 +6915,7 @@ class OverseerImpl implements AgentHooks {
 
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) throw new Error("No such chatId: " + chatId);
+    if (meta.deleting) throw new Error("Chat is being deleted.");
 
     let callId = this.storage.nextAgentCallId.get();
     try {
@@ -6993,6 +6997,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   async #drainPendingAgentCalls(chatId: number): Promise<void> {
+    if (this.storage.chatMeta.get(chatId)?.deleting) return;
     let author: AiChatAuthorInfo | undefined;
     try {
       let [first] = Array.from(this.storage.pendingAgentCalls.list(
@@ -7026,7 +7031,7 @@ class OverseerImpl implements AgentHooks {
         preparation = this.waitForChatMessagePreparation(chatId);
       }
       let meta = this.storage.chatMeta.get(chatId);
-      if (!meta) return;  // deleted meanwhile; deleteChat removed the calls too
+      if (!meta || meta.deleting) return;  // deletion also discards queued calls
       if (meta.activeAgent) return;
 
       // Move every recorded call into the chat log. No awaits from here to the turn start, so a
@@ -11714,8 +11719,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async deleteChat(chatId: number): Promise<void> {
     let startedAt = Date.now();
-    // Termination is durable before any deletion I/O.
-    this.impl.cancelAgent(chatId);
+    // Fence new work and discard callbacks before cancellation can hand off to a drain.
+    // Keep the fence across failed cleanup/eviction; another deleteChat retries cleanup.
+    this.impl.storage.transaction(() => {
+      const meta = this.impl.storage.chatMeta.get(chatId);
+      if (meta) this.impl.storage.chatMeta.put({...meta, deleting: true});
+      for (const call of Array.from(this.impl.storage.pendingAgentCalls.list(
+          {prefix: chatKeyPrefix(chatId)}))) this.impl.storage.pendingAgentCalls.deleteRecord(call);
+      this.impl.cancelAgent(chatId);
+    });
     let response = this.impl.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
     if (response?.status === "waiting") {
       this.impl.deliverExternalMessageResponse(response, "The chat was deleted before the agent responded.");
@@ -11762,14 +11774,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
     });
 
-    // Clean up agentCallbackArgs for this chat, and any calls to its agent not yet delivered.
+    // Clean up arguments from callbacks already delivered before deletion began.
     for (let entry of this.impl.storage.agentCallbackArgs.list(
         {prefix: chatKeyPrefix(chatId)})) {
       this.impl.storage.agentCallbackArgs.deleteRecord(entry);
-    }
-    for (let entry of Array.from(this.impl.storage.pendingAgentCalls.list(
-        {prefix: chatKeyPrefix(chatId)}))) {
-      this.impl.storage.pendingAgentCalls.deleteRecord(entry);
     }
 
     // Clean up the chat's model-facing snapshots.
