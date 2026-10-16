@@ -25,7 +25,7 @@ import {
   AiChatAuthorInfo,
 } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
-import ShareModal from '../../ShareModal'
+import { WorkspaceInviteModal } from '../../features/sharing/WorkspaceInviteModal'
 import DeleteConfirmationDialog from '../DeleteConfirmationDialog'
 import SidebarGadgetRow from './SidebarGadgetRow'
 
@@ -246,7 +246,7 @@ export function SidebarWorkspacesProvider({ children }: { children: ReactNode })
 
       {/* Share modal */}
       {shareOverseer && shareTarget && (
-        <ShareModal
+        <WorkspaceInviteModal
           open
           onClose={() => setShareTarget(null)}
           overseer={shareOverseer.stub}

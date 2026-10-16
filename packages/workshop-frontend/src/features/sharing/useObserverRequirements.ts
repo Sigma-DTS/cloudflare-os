@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react'
 import type { RpcStub } from 'capnweb'
-import type { CollaboratorRole, ObserverBindingNeed, Overseer } from '@gadgets/workshop-shared/api'
+import type { ObserverBindingNeed, Overseer, WorkpieceId } from '@gadgets/workshop-shared/api'
 
 /**
- * The connected systems a viewer must have their own access to, for each access level. Refreshed
+ * The connected systems a gadget viewer must have their own access to. Refreshed
  * on focus as well as on open: bindings cannot change in the share dialog, but they can change in
  * another tab while it remains open. A failed refresh is informational and never blocks sharing.
  */
-export const useObserverRequirements = (overseer: RpcStub<Overseer>, open: boolean) => {
+export const useObserverRequirements = (overseer: RpcStub<Overseer>, open: boolean, gadgetId: WorkpieceId) => {
   const [requirements, setRequirements] =
-    useState<Record<CollaboratorRole, ObserverBindingNeed[]> | null>(null)
+    useState<ObserverBindingNeed[] | null>(null)
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
@@ -20,12 +20,9 @@ export const useObserverRequirements = (overseer: RpcStub<Overseer>, open: boole
     const refresh = () => {
       const thisRequest = ++requestId
       setFailed(false)
-      Promise.all([
-        overseer.listObserverRequirements('use'),
-        overseer.listObserverRequirements('build'),
-      ])
-        .then(([use, build]) => {
-          if (!cancelled && thisRequest === requestId) setRequirements({ use, build })
+      overseer.listObserverRequirements('use', gadgetId)
+        .then(needs => {
+          if (!cancelled && thisRequest === requestId) setRequirements(needs)
         })
         .catch(err => {
           console.error('Failed to load observer requirements:', err)
@@ -38,7 +35,7 @@ export const useObserverRequirements = (overseer: RpcStub<Overseer>, open: boole
       cancelled = true
       window.removeEventListener('focus', refresh)
     }
-  }, [open, overseer])
+  }, [open, overseer, gadgetId])
 
   return { requirements, failed }
 }

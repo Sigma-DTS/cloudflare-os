@@ -3,6 +3,7 @@ import { useParams, useNavigate, useSearch, Link } from '@tanstack/react-router'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import {
   ShareNetwork,
+  UserPlus,
   Pencil,
   Check,
   X,
@@ -54,7 +55,8 @@ import ChatInterface, {
 } from './ChatInterface'
 import { formatOf } from './components/format/formats'
 import { FormatGlyph } from './components/format/FormatVisuals'
-import ShareModal from './ShareModal'
+import { WorkspaceInviteModal } from './features/sharing/WorkspaceInviteModal'
+import { GadgetShareModal } from './features/sharing/GadgetShareModal'
 import { GadgetPresence } from './components/GadgetPresence'
 import BlueprintModal from './BlueprintModal'
 import { UpdateFromBlueprintDialog } from './features/blueprint-updates/UpdateFromBlueprintDialog'
@@ -539,6 +541,7 @@ export default function GadgetEditor() {
   const [activityView, setActivityView] = useState<ActivityView>('history')
   const [activityClosing, setActivityClosing] = useState(false)
   const [shareModalOpen, setShareModalOpen] = useState(false)
+  const [gadgetShareModalOpen, setGadgetShareModalOpen] = useState(false)
   const [blueprintModalOpen, setBlueprintModalOpen] = useState(false)
   const [blueprintUpdateDialogOpen, setBlueprintUpdateDialogOpen] = useState(false)
   const [previewMode, _setPreviewMode] = useState(false)
@@ -1615,10 +1618,10 @@ export default function GadgetEditor() {
 
           <WorkshopIconButton
             onClick={() => setShareModalOpen(true)}
-            title="Share workspace"
-            aria-label="Share workspace"
+            title="Invite to workspace"
+            aria-label="Invite to workspace"
           >
-            <ShareNetwork size={15} />
+            <UserPlus size={15} />
           </WorkshopIconButton>
 
           <DropdownMenu>
@@ -1776,8 +1779,11 @@ export default function GadgetEditor() {
               Rename workspace
             </DropdownMenu.Item>
             <DropdownMenu.Item onClick={() => setShareModalOpen(true)} className={MENU_ITEM}>
-              Share workspace
+              Invite to workspace
             </DropdownMenu.Item>
+            {selectedGadgetSummary && <DropdownMenu.Item disabled={selectedGadgetSummary.chatId !== undefined} onClick={() => setGadgetShareModalOpen(true)} className={MENU_ITEM}>
+              Share gadget
+            </DropdownMenu.Item>}
             {/* App-only actions are left out for a worktree rather than shown disabled, as the
                 desktop header leaves out its full-screen button. */}
             {selectedWorkpieceSummary?.type !== 'worktree' && (
@@ -1975,6 +1981,12 @@ export default function GadgetEditor() {
                 />
               )}
 
+              {!paneShowsActivity && selectedGadgetSummary && (
+                <WorkshopIconButton aria-label="Share gadget" title="Share gadget" disabled={selectedGadgetSummary.chatId !== undefined} onClick={() => setGadgetShareModalOpen(true)}>
+                  <ShareNetwork size={16} />
+                </WorkshopIconButton>
+              )}
+
               {!paneShowsActivity && selectedWorkpieceSummary?.type !== 'worktree' && (
                 <WorkshopIconButton
                   aria-label="Enter full screen"
@@ -2155,7 +2167,7 @@ export default function GadgetEditor() {
       {/* Share modal */}
       {overseer && metadata && (
         <>
-          <ShareModal
+          <WorkspaceInviteModal
             open={shareModalOpen}
             onClose={() => setShareModalOpen(false)}
             overseer={overseer.stub}
@@ -2163,6 +2175,16 @@ export default function GadgetEditor() {
             currentUser={userInfo}
             authenticatedApi={authenticatedApi}
           />
+          {selectedGadgetSummary && <GadgetShareModal
+            key={selectedGadgetSummary.id}
+            open={gadgetShareModalOpen}
+            onClose={() => setGadgetShareModalOpen(false)}
+            overseer={overseer.stub}
+            metadata={metadata}
+            gadget={selectedGadgetSummary}
+            currentUser={userInfo}
+            authenticatedApi={authenticatedApi}
+          />}
           {selectedGadgetStub && (
             <BlueprintModal
               open={blueprintModalOpen}

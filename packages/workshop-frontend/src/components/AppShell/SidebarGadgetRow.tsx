@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { DotsThree, Star, ShareNetwork, Trash, Pencil } from '@phosphor-icons/react'
+import { DotsThree, Star, UserPlus, Trash, Pencil } from '@phosphor-icons/react'
 import { DropdownMenu } from '@cloudflare/kumo'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from '../menuStyles'
 import { useState, useEffect, useRef } from 'react'
@@ -123,7 +123,7 @@ export default function SidebarGadgetRow({
                   onClick={() => onShare(gadget)}
                   className={MENU_ITEM}
                 >
-                  <ShareNetwork size={13} className="mr-2" /> Share
+                  <UserPlus size={13} className="mr-2" /> Invite to workspace
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator />
                 <DropdownMenu.Item

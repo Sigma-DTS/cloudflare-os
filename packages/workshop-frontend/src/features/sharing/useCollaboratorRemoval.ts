@@ -7,7 +7,7 @@ type Removal = {
   profileId: string
   dependents: AffectedCollaborator[]
   previewing: boolean
-  /** Downstream people the remover chose to keep. */
+  /** Downstream people to keep; everyone is kept unless explicitly selected for removal. */
   keepSet: Set<string>
 }
 
@@ -33,7 +33,12 @@ export const useCollaboratorRemoval = ({ overseer, open, collaborators, onRemove
     setRemoval({ profileId, dependents: [], previewing: true, keepSet: new Set() })
     try {
       const dependents = await overseer.previewRemoveCollaborator(profileId)
-      setRemoval(current => current?.profileId === profileId ? { ...current, dependents, previewing: false } : current)
+      setRemoval(current => current?.profileId === profileId ? {
+        ...current,
+        dependents,
+        previewing: false,
+        keepSet: new Set(dependents.filter(person => person.profile.id !== profileId).map(person => person.profile.id)),
+      } : current)
     } catch (err: any) {
       setRemoval(current => current?.profileId === profileId ? null : current)
       toasts.add({ title: err.message || 'Failed to preview collaborator removal.', variant: 'error' })

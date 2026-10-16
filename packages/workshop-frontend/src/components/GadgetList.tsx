@@ -1,11 +1,11 @@
 import { Link } from '@tanstack/react-router'
-import { Clock, MagnifyingGlass, Hexagon, DotsThreeVertical, ShareNetwork, Trash, Info, Star, Pencil, ArrowRight } from '@phosphor-icons/react'
+import { Clock, MagnifyingGlass, Hexagon, DotsThreeVertical, UserPlus, Trash, Info, Star, Pencil, ArrowRight } from '@phosphor-icons/react'
 import { useState, useEffect, useRef } from 'react'
 import { DropdownMenu, Dialog, Button, useKumoToastManager } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { useAuthenticatedApi } from '../AuthContext'
 import { GadgetMetadataWithTimestamps, BlueprintPublicInfo, Overseer, AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
-import ShareModal from '../ShareModal'
+import { WorkspaceInviteModal } from '../features/sharing/WorkspaceInviteModal'
 import { BindingBadge, getGradient as getBlueprintGradient, uniqueBindingBadges } from './BlueprintCard'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './menuStyles'
 import { BlueprintPreviewImage } from './BlueprintPreviewImage'
@@ -149,8 +149,8 @@ function AppRow({
             Information
           </DropdownMenu.Item>
           <DropdownMenu.Item onClick={() => onShare(gadget)} className={MENU_ITEM}>
-            <ShareNetwork size={13} className="mr-2" />
-            Share
+            <UserPlus size={13} className="mr-2" />
+            Invite to workspace
           </DropdownMenu.Item>
           <DropdownMenu.Separator />
           <DropdownMenu.Item
@@ -466,7 +466,7 @@ export default function GadgetList({ showHeader = true }: { showHeader?: boolean
 
       {/* Share modal */}
       {shareOverseer && shareTarget && (
-        <ShareModal
+        <WorkspaceInviteModal
           open={true}
           onClose={handleShareClose}
           overseer={shareOverseer.stub}

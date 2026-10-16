@@ -1,13 +1,11 @@
 import { useId, useState, type MouseEvent, type Ref } from 'react'
 import { Autocomplete, InputGroup } from '@cloudflare/kumo'
-import type { PortalContainer } from '@cloudflare/kumo'
 import { Autocomplete as AutocompletePrimitive } from '@cloudflare/kumo/primitives/autocomplete'
 import type { RpcStub } from 'capnweb'
-import type { AuthenticatedApi, CollaboratorRole, UserDirectoryRecord } from '@gadgets/workshop-shared/api'
+import type { AuthenticatedApi, UserDirectoryRecord } from '@gadgets/workshop-shared/api'
 import { PersonAvatar } from '../../components/PersonAvatar'
 import { WorkshopButton } from '../../components/WorkshopControls'
 import { isImeComposing } from '../../keyboardEvent'
-import { RoleMenu } from './RoleMenu'
 import { useUserDirectorySearch } from './useUserDirectorySearch'
 
 type Props = {
@@ -20,13 +18,11 @@ type Props = {
   excludeIds: string[]
   value: string
   onValueChange: (value: string) => void
-  role: CollaboratorRole
-  onRoleChange: (role: CollaboratorRole) => void
+  action: 'Invite' | 'Share'
   adding: boolean
   error: string | null
   onInvite: (userId: string) => void
   inputRef: Ref<HTMLInputElement>
-  menuContainer: PortalContainer
 }
 
 /** Invites one person at a time: Enter, choosing a result, or Invite submits immediately. */
@@ -37,13 +33,11 @@ export const InviteComposer = ({
   excludeIds,
   value,
   onValueChange,
-  role,
-  onRoleChange,
+  action,
   adding,
   error,
   onInvite,
   inputRef,
-  menuContainer,
 }: Props) => {
   const errorId = useId()
   // The result popover is dismissed when focus leaves the combobox or on Escape; typing or
@@ -83,7 +77,7 @@ export const InviteComposer = ({
     }
   }
 
-  const inviteLabel = adding ? 'Inviting…' : 'Invite'
+  const inviteLabel = adding ? (action === 'Invite' ? 'Inviting…' : 'Sharing…') : action
   // Keep the visible result highlighted until the click handler chooses it.
   const keepResultHighlighted = (event: MouseEvent) => {
     if (open) event.preventDefault()
@@ -149,13 +143,6 @@ export const InviteComposer = ({
             className="text-sm [&::-webkit-search-cancel-button]:hidden"
           />
           <InputGroup.Addon align="end">
-            <RoleMenu
-              ariaLabel="Access to grant"
-              value={role}
-              onValueChange={onRoleChange}
-              disabled={adding}
-              container={menuContainer}
-            />
             <InputGroup.Button
               className='hidden rounded-lg sm:flex'
               variant="secondary"
@@ -179,8 +166,9 @@ export const InviteComposer = ({
               <Autocomplete.Item key={user.id} value={user}>
                 <div className="flex min-w-0 items-center gap-2">
                   <PersonAvatar api={authenticatedApi} userId={user.id} name={user.name} size={26} />
-                  <span className="min-w-0 truncate text-sm font-medium tracking-[-0.25px] text-kumo-default">
-                    {user.name}
+                  <span className="min-w-0 text-sm text-kumo-default">
+                    <span className="block truncate font-medium">{user.name}</span>
+                    <span className="block truncate text-xs text-kumo-subtle">{user.id}</span>
                   </span>
                 </div>
               </Autocomplete.Item>
