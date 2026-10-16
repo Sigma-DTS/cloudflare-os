@@ -24,7 +24,7 @@ import {
   type ActionState, type AgentSpawnerConfig, type AiChatAuthorInfo, type AiChatMessage,
   type AiChatMetadata, type BlueprintBindingAnnotation, type BlueprintMetadata,
   type BlueprintOutput, type ChatGadgetPinRecord, type CollaboratorRole, type GadgetUpstream,
-  type GatekeeperCreationSpec, type PermissionEdge, type WorkpieceId,
+  type GatekeeperCreationSpec, type GadgetSharingInfo, type PermissionEdge, type WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { CodeChange } from "@gadgets/workshop-shared/code-change";
 import type { ChatGatewayRpcTarget } from "@gadgets/workshop-shared/external-message-gateway";
@@ -138,6 +138,9 @@ export type GadgetRecord = {
   id: WorkpieceId;
   title: string;
   created: Date;
+
+  /** Viewer permissions for this gadget alone; absent means no access beyond workspace grants. */
+  sharing?: GadgetSharingInfo;
 
   /**
    * The output format this gadget was built as, copied from the blueprint it was instantiated

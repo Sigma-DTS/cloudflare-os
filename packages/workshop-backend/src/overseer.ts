@@ -1,5 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
+import type { GadgetSharingInfo } from '@gadgets/workshop-shared/api';
+import { canViewSharedGadget } from './gadget-sharing';
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api'
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
   MAX_CODE_CHANGE_SIZE, transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
@@ -1715,7 +1717,7 @@ class OverseerImpl implements AgentHooks {
   // record write re-delivers the summary, which is how a worktree's `pinBase` (advanced by an
   // accept) and `headCommit` (an explicit commit, or its rollback) reach clients.
   subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>,
-                        includePending: boolean): RpcStub<{}> {
+                        includePending: boolean, gadgetIds?: ReadonlySet<WorkpieceId>): RpcStub<{}> {
     let gadgets = this.storage.gadgets;
     subscriber = subscriber.dup();  // keep stub after return
 
@@ -1761,7 +1763,8 @@ class OverseerImpl implements AgentHooks {
 
     // Whether the record is published to this subscriber (see above for what is withheld).
     let published = (record: WorkpieceRecord): boolean =>
-        includePending || (record.type === "gadget" && !record.pending);
+        (!gadgetIds || gadgetIds.has(record.id)) &&
+        (includePending || (record.type === "gadget" && !record.pending));
 
     let dbSubscriber = {
       add(record: WorkpieceRecord) {
@@ -5108,6 +5111,9 @@ class OverseerImpl implements AgentHooks {
     this.#associateAction(caller, actionId);
 
     if (sharing && baseline) {
+      // Independent gadget viewers can also lose access when this policy first narrows.
+      this.scheduleAccessRestart(
+          "Gadget restarted to apply owner-only invitation permissions.");
       let affected = sharing.computeAffectedByOwnerInvitesOnly(baseline);
       if (affected.length > 0) {
         // Anyone who joined through a link or through another collaborator just lost access (or
@@ -5115,8 +5121,6 @@ class OverseerImpl implements AgentHooks {
         // above. The cleanup is best-effort and not awaited: the observation shouldn't wait on
         // gatekeeper and User-DO round trips, and whatever the restart cuts off self-heals (see
         // removeCollaborator).
-        this.scheduleAccessRestart(
-            "Gadget restarted to revoke access for people the owner did not add directly.");
         this.tearDownLostObservers(affected)
             .then(() => this.refreshAffectedCollaboratorListings(affected))
             .catch(err => {
@@ -5242,6 +5246,7 @@ class OverseerImpl implements AgentHooks {
   // then all issued together and awaited at once.
   async #enforceExcludeObservers(gatekeeperId: number, observerIds: string[]): Promise<void> {
     let sharing = await this.getSharingManager();
+    let ownerProfileId = await this.getOwnerProfileId();
 
     let unauthorized: ObserverRecord[] = [];
     let outOfScope: string[] = [];
@@ -5252,7 +5257,8 @@ class OverseerImpl implements AgentHooks {
       // unknown and the observation is admitted. Fix: an in-memory pending-id map consulted
       // here, failing closed.
       if (!observer) continue;  // not an active observer -> ignore
-      let role = sharing.getEffectiveRole(observer.profileId);
+      let role = sharing.getEffectiveRole(observer.profileId) ??
+          (this.viewerGadgetIds(observer.profileId, ownerProfileId).size > 0 ? "use" : undefined);
       if (!role) {
         unauthorized.push(observer);
       } else if (this.#inRoleVerificationScope(gatekeeperId, role)) {
@@ -8769,12 +8775,13 @@ class OverseerImpl implements AgentHooks {
   // (getEnvForLoader), and spawn/spawnCallable seeds the spawned agent's bindings from
   // config.env (spawnAgent), handing the collaborator an agent that reads those connections
   // with the creator's authority and returns their data.
-  #useScopeGatekeeperIds(): Set<WorkpieceId> {
+  #useScopeGatekeeperIds(gadgetIds?: ReadonlySet<WorkpieceId>): Set<WorkpieceId> {
     let ids = new Set<WorkpieceId>();
     for (let gadget of this.storage.gadgets.list()) {
       // Provisional gadgets and binding edges aren't visible to "use" collaborators, so they
       // don't bring gatekeepers into scope. (Worktrees have no binding edges at all.)
       if (gadget.type !== "gadget" || gadget.pending) continue;
+      if (gadgetIds && !gadgetIds.has(gadget.id)) continue;
       for (let [, edge] of this.visibleBindings(gadget)) {
         ids.add(edge.target);
       }
@@ -8796,8 +8803,8 @@ class OverseerImpl implements AgentHooks {
     // and chat bindings, and chats are owner/build-only), and a spawner's env is fixed at
     // creation -- so every widening lands on the diffs around the sites that grow the roots
     // (bindWorkpiece, mergeChatChanges, enableHookRecord), with no dedicated trigger.
-    // Spawner-to-spawner env edges are legal, hence the worklist; an env target that is a gadget
-    // is skipped -- env gadgets are non-pending, so their bindings are covered by the first loop.
+    // Follow both spawner and gadget targets: a gadget-scoped viewer's roots do not necessarily
+    // include gadgets reachable indirectly through a spawner's env.
     //
     // The env is also the ceiling, not just the seed: a spawned chat's agent has no
     // requestConnection tool (agent.ts restricts spawned agents to describeBinding/executeCode),
@@ -8806,10 +8813,14 @@ class OverseerImpl implements AgentHooks {
     // this closure must learn about accepted requests too.
     let pending = [...ids];
     while (pending.length > 0) {
-      let spec = this.storage.gatekeepers.get(pending.pop()!)?.creationSpec;
-      if (spec?.type !== "agentSpawner") continue;
-      for (let target of Object.values(spec.config.env)) {
-        if (ids.has(target) || !this.storage.gatekeepers.get(target)) continue;
+      let id = pending.pop()!;
+      let spec = this.storage.gatekeepers.get(id)?.creationSpec;
+      let gadget = this.storage.gadgets.get(id);
+      let targets = spec?.type === "agentSpawner" ? Object.values(spec.config.env)
+          : gadget?.type === "gadget" && !gadget.pending
+            ? [...this.visibleBindings(gadget)].map(([, edge]) => edge.target) : [];
+      for (let target of targets) {
+        if (ids.has(target)) continue;
         ids.add(target);
         pending.push(target);
       }
@@ -8851,8 +8862,8 @@ class OverseerImpl implements AgentHooks {
   //   scope, yet restricted data read from it can reach gadget state they see, because provenance
   //   is not tracked past the observation. Accepted for v1; see "Known security risk -- never-bound
   //   producers" in plans/restricted-data-sharing.md.
-  #inScopeGatekeepers(role: CollaboratorRole): GatekeeperRecord[] {
-    let boundIds = role === "use" ? this.#useScopeGatekeeperIds() : undefined;
+  #inScopeGatekeepers(role: CollaboratorRole, gadgetIds?: ReadonlySet<WorkpieceId>): GatekeeperRecord[] {
+    let boundIds = role === "use" ? this.#useScopeGatekeeperIds(gadgetIds) : undefined;
 
     let result: GatekeeperRecord[] = [];
     for (let gk of this.storage.gatekeepers.list()) {
@@ -8866,8 +8877,18 @@ class OverseerImpl implements AgentHooks {
     return result.filter(gk => !this.#creationPending(gk.id));
   }
 
-  listObserverRequirements(role: CollaboratorRole): ObserverBindingNeed[] {
-    return this.#inScopeGatekeepers(role).map(observerBindingNeed);
+  listObserverRequirements(role: CollaboratorRole, gadgetId?: WorkpieceId): ObserverBindingNeed[] {
+    if (gadgetId !== undefined) this.getGadgetRecord(gadgetId);
+    return this.#inScopeGatekeepers(role, gadgetId === undefined ? undefined : new Set([gadgetId]))
+        .map(observerBindingNeed);
+  }
+
+  viewerGadgetIds(profileId: string, ownerProfileId: string): Set<WorkpieceId> {
+    return new Set([...this.storage.gadgets.list()]
+        .filter(record => record.type === "gadget" && !record.pending &&
+            canViewSharedGadget(record.sharing, profileId,
+                this.storage.ownerInvitesOnly.get() === true, ownerProfileId))
+        .map(record => record.id));
   }
 
   // Tail of the in-flight addObserver/removeObserver chain per `${observerId}/${gatekeeperId}`
@@ -8924,9 +8945,11 @@ class OverseerImpl implements AgentHooks {
   // never a data leak: a registration is what admits an open, and every open re-runs addObserver,
   // so a stale one grants nothing on its own. See observers-implementation-plan.md §5 Step 6.
   async tearDownLostObservers(affected: AffectedCollaborator[]): Promise<void> {
+    let ownerProfileId = await this.getOwnerProfileId();
     let gatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
     for (let entry of affected) {
       if (entry.newRole !== null) continue;  // downgraded but still has access -> keep record
+      if (this.viewerGadgetIds(entry.profile.id, ownerProfileId).size > 0) continue;
       let observer = this.storage.observers.get(entry.profile.id);
       if (!observer) continue;
       this.storage.observers.delete(observer.profileId);
@@ -8976,9 +8999,10 @@ class OverseerImpl implements AgentHooks {
       opts: {
         configureCb?: RpcStub<ObserverConfigCallback>;
         requireRole?: CollaboratorRole;
+        gadgetIds?: ReadonlySet<WorkpieceId>;
       } = {}): Promise<CollaboratorRole | null> {
     let sharing = await this.getSharingManager();
-    let role = sharing.getEffectiveRole(profileId);
+    let role = sharing.getEffectiveRole(profileId) ?? (opts.gadgetIds?.size ? "use" : undefined);
     if (!role || (opts.requireRole && roleRank(role) < roleRank(opts.requireRole))) return null;
 
     // A session-to-be counts as a session for its role from the moment its role is resolved:
@@ -8991,7 +9015,7 @@ class OverseerImpl implements AgentHooks {
     // observe the count dip to zero across the handoff.
     let leaveSession = this.joinSession(role);
     try {
-      await this.ensureObserver(profileId, clientUser, role, opts.configureCb);
+      await this.ensureObserver(profileId, clientUser, role, opts.configureCb, opts.gadgetIds);
     } finally {
       leaveSession();
     }
@@ -9013,11 +9037,12 @@ class OverseerImpl implements AgentHooks {
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
       role: CollaboratorRole,
-      configureCb?: RpcStub<ObserverConfigCallback>): Promise<void> {
+      configureCb?: RpcStub<ObserverConfigCallback>,
+      gadgetIds?: ReadonlySet<WorkpieceId>): Promise<void> {
     // 1. Select in-scope gatekeepers. If none require an account, there is nothing to verify and
     //    no observer record is needed (built-in gatekeepers never name observers in
     //    excludeObservers).
-    let inScope = this.#inScopeGatekeepers(role);
+    let inScope = this.#inScopeGatekeepers(role, gadgetIds);
     if (inScope.length === 0) return;
 
     // 2. Load any existing observer record, and build a working copy of its account choices.
@@ -9524,6 +9549,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // The caller's effective role. The owner always has "build".
     let role: CollaboratorRole = "build";
+    let viewerGadgetIds: Set<WorkpieceId> | undefined;
 
     if (!isOwner) {
       let sharing = await this.impl.getSharingManager();
@@ -9536,6 +9562,13 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
           profileId,
           fetchProfile: () => clientUser.whoami(),
         });
+      }
+
+      // Gadget viewers have no workspace grant. Freeze their permitted gadget set into the
+      // restricted capability; revocations restart sessions before these capabilities can persist.
+      if (!sharing.getEffectiveRole(profileId)) {
+        let ownerProfileId = await this.impl.getOwnerProfileId();
+        viewerGadgetIds = this.impl.viewerGadgetIds(profileId, ownerProfileId);
       }
 
       // Ambient reconciliation may attach Gatekeepers after open() starts. Finish it before taking
@@ -9552,7 +9585,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // distinct denial without workspace metadata. A removed collaborator who reconnects after
       // their session is force-restarted lands here and sees the terminal access-denied page.
       let effectiveRole = await this.impl.authorizeCollaborator(
-          profileId, clientUser, {configureCb: configureObservers});
+          profileId, clientUser, {configureCb: configureObservers, gadgetIds: viewerGadgetIds});
       if (!effectiveRole) {
         throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceAccessDenied);
       }
@@ -9562,7 +9595,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // (or is refreshed on) their home page.
       let title = this.impl.storage.title.get();
       let gadgetId = this.impl.ctx.id.toString();
-      void (async () => {
+      if (!viewerGadgetIds) void (async () => {
         try {
           const ownerProfile = await owner.whoami();
           await clientUser.recordSharedGadgetOpen(gadgetId, title, ownerProfile, role);
@@ -9587,7 +9620,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
-          this.impl, profileId, userId, notifyClosed.dup());
+          this.impl, profileId, userId, notifyClosed.dup(), viewerGadgetIds);
     }
 
     return new OverseerClientInterface(
@@ -11793,8 +11826,64 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // the RPC-bound pieces (resolving profiles via User DOs) and delegate the rest.
 
   async listObserverRequirements(
-      role: CollaboratorRole): Promise<ObserverBindingNeed[]> {
-    return this.impl.listObserverRequirements(role);
+      role: CollaboratorRole, gadgetId?: WorkpieceId): Promise<ObserverBindingNeed[]> {
+    return this.impl.listObserverRequirements(role, gadgetId);
+  }
+
+  #editableGadgetSharing(gadgetId: WorkpieceId): GadgetRecord {
+    let record = this.impl.getGadgetRecord(gadgetId);
+    if (record.pending) throw new Error("Accept this gadget before sharing it.");
+    if (!this.isOwner && this.impl.storage.ownerInvitesOnly.get()) {
+      throw new Error("Only the owner can share gadgets in this workspace.");
+    }
+    return record;
+  }
+
+  async getGadgetSharing(gadgetId: WorkpieceId): Promise<GadgetSharingInfo> {
+    return this.impl.getGadgetRecord(gadgetId).sharing ?? {allUsersCanView: false, viewers: []};
+  }
+
+  async setGadgetAllUsersAccess(gadgetId: WorkpieceId, canView: boolean): Promise<void> {
+    let record = this.#editableGadgetSharing(gadgetId);
+    if (canView && this.impl.storage.ownerInvitesOnly.get()) {
+      throw new Error("Link access is disabled for this workspace's protected resources.");
+    }
+    let sharing = record.sharing ?? {allUsersCanView: false, viewers: []};
+    record.sharing = {...sharing, allUsersCanView: canView};
+    this.impl.storage.gadgets.put(record);
+    if (!canView && sharing.allUsersCanView) {
+      this.impl.scheduleAccessRestart("Gadget restarted to apply a link access change.");
+    }
+  }
+
+  async addGadgetViewer(gadgetId: WorkpieceId, username: string): Promise<CollaboratorInfo | null> {
+    this.#editableGadgetSharing(gadgetId);
+    let profile = await this.impl.users.get(this.impl.users.idFromName(username)).whoamiIfExists();
+    if (!profile) return null;
+    // Re-read after profile lookup so concurrent shares and data-policy changes are respected.
+    let record = this.#editableGadgetSharing(gadgetId);
+    let sharing = record.sharing ?? {allUsersCanView: false, viewers: []};
+    let viewer = sharing.viewers.find(person => person.profile.id === profile.id) ??
+        {profile, role: "use" as const, addedBy: []};
+    if (!viewer.addedBy.some(edge => edge.type === "user" && edge.sharer === this.clientProfileId)) {
+      viewer.addedBy.push({type: "user", sharer: this.clientProfileId, role: "use", created: new Date()});
+    }
+    record.sharing = {...sharing, viewers: [...sharing.viewers.filter(person => person.profile.id !== profile.id), viewer]};
+    this.impl.storage.gadgets.put(record);
+    return viewer;
+  }
+
+  async removeGadgetViewer(gadgetId: WorkpieceId, profileId: string): Promise<void> {
+    let record = this.#editableGadgetSharing(gadgetId);
+    if (!record.sharing) return;
+    record.sharing.viewers = record.sharing.viewers.flatMap(viewer => {
+      if (viewer.profile.id !== profileId) return [viewer];
+      let addedBy = this.isOwner ? [] : viewer.addedBy.filter(edge =>
+          edge.type !== "user" || edge.sharer !== this.clientProfileId);
+      return addedBy.length > 0 ? [{...viewer, addedBy}] : [];
+    });
+    this.impl.storage.gadgets.put(record);
+    this.impl.scheduleAccessRestart("Gadget restarted to remove a viewer's access.");
   }
 
   async listCollaborators(): Promise<CollaboratorInfo[]> {
@@ -11956,13 +12045,14 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   constructor(private impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
-              private notifyClosed: NativeRpcStub<() => void>) {
+              private notifyClosed: NativeRpcStub<() => void>,
+              private gadgetIds?: ReadonlySet<WorkpieceId>) {
     super();
     this.#leaveSession = this.impl.joinSession("use");
-    this.#leavePresence = joinSessionPresence(
+    this.#leavePresence = this.gadgetIds ? () => {} : joinSessionPresence(
         this.impl, this.clientProfileId, "use",
         () => retryOnDoReset(() => this.#clientUser.whoami(), this.impl.logger));
-    this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+    this.#leaveOutputsFanout = this.gadgetIds ? () => {} : this.impl.joinOutputsFanout(this.clientUserId);
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -12018,7 +12108,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       title: this.impl.storage.title.get(),
       owner: await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger),
       role: "use",
-      defaultGadgetId: this.impl.defaultGadgetId,
+      defaultGadgetId: this.gadgetIds ? this.gadgetIds.values().next().value : this.impl.defaultGadgetId,
     };
   }
 
@@ -12035,7 +12125,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       title: this.impl.storage.title.get(),
       owner,
       role: "use",
-      defaultGadgetId: this.impl.defaultGadgetId,
+      defaultGadgetId: this.gadgetIds ? this.gadgetIds.values().next().value : this.impl.defaultGadgetId,
     };
 
     let titleSubscriber = {
@@ -12064,19 +12154,25 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   async subscribeToPresence(
       subscriber: RpcStub<PresenceSubscriber>): Promise<RpcStub<{}>> {
+    if (this.gadgetIds) {
+      await subscriber.init([]);
+      // @ts-expect-error Native RPC stubs implement this capability at runtime.
+      return this.#subscriptionLease(new NativeRpcStub<{}>({}));
+    }
     return this.#subscriptionLease(this.impl.addPresenceSubscriber(subscriber));
   }
 
-  // The gadget list is visible to "use" collaborators (v1 shares the whole workspace), and each
-  // gadget is exposed through a restricted UseGadgetClientInterface that only permits rendering
+  // Legacy workspace-wide "use" grants see every gadget; independent viewers see only their
+  // permitted gadget set. Each is exposed through a UseGadgetClientInterface that permits rendering
   // its deployed UI. Gadgets still provisional to a chat are withheld: they are proposals within
   // the owner's chats, and their mainline code is empty anyway. Worktrees are withheld likewise,
   // being chat-private (and readable only through the build-only commit reads).
   async subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>> {
-    return this.#subscriptionLease(this.impl.subscribeToWorkpieces(subscriber, false));
+    return this.#subscriptionLease(this.impl.subscribeToWorkpieces(subscriber, false, this.gadgetIds));
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
+    if (this.gadgetIds && !this.gadgetIds.has(id)) this.#deny();
     if (this.impl.getGadgetRecord(id).pending) {  // also validates it exists
       throw new Error(`No such gadget: ${id}`);
     }
@@ -12086,6 +12182,11 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
 
   // --- Denied methods (build-only) ---
+
+  async getGadgetSharing(_gadgetId: WorkpieceId): Promise<GadgetSharingInfo> { this.#deny(); }
+  async setGadgetAllUsersAccess(_gadgetId: WorkpieceId, _canView: boolean): Promise<void> { this.#deny(); }
+  async addGadgetViewer(_gadgetId: WorkpieceId, _username: string): Promise<CollaboratorInfo | null> { this.#deny(); }
+  async removeGadgetViewer(_gadgetId: WorkpieceId, _profileId: string): Promise<void> { this.#deny(); }
 
   async setTitle(_title: string): Promise<void> { this.#deny(); }
   async setPinned(_pinned: boolean): Promise<void> { this.#deny(); }

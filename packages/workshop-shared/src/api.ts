@@ -3004,8 +3004,21 @@ export interface Overseer extends RpcTarget {
    * List the connections a recipient with `role` must verify before opening this workspace, in
    * the order the connections were created. Reports what sharing will cost the recipient; it
    * grants nothing and mints no capability.
+   * With `gadgetId`, limit the UI-viewer's requirements to that gadget's reachable connections.
    */
-  listObserverRequirements(role: CollaboratorRole): Promise<ObserverBindingNeed[]>;
+  listObserverRequirements(role: CollaboratorRole, gadgetId?: WorkpieceId): Promise<ObserverBindingNeed[]>;
+
+  /** Read a gadget's independent viewer grants and signed-in link access. Workspace members always edit. */
+  getGadgetSharing(gadgetId: WorkpieceId): Promise<GadgetSharingInfo>;
+
+  /** Enable or disable viewing this gadget by any signed-in user. Grants no workspace membership. */
+  setGadgetAllUsersAccess(gadgetId: WorkpieceId, canView: boolean): Promise<void>;
+
+  /** Share just this gadget with an existing account, View only; null means the account was not found. */
+  addGadgetViewer(gadgetId: WorkpieceId, username: string): Promise<CollaboratorInfo | null>;
+
+  /** Remove viewer grants for this gadget (all grants for the owner, only the caller's otherwise). */
+  removeGadgetViewer(gadgetId: WorkpieceId, profileId: string): Promise<void>;
 
   /** List all collaborators. Available to owner and all collaborators. */
   listCollaborators(): Promise<CollaboratorInfo[]>;
@@ -5451,6 +5464,14 @@ export type CollaboratorInfo = {
    * "build" for backwards compatibility.
    */
   role?: CollaboratorRole;
+};
+
+/** Independent gadget access, in addition to the workspace's existing member permissions. */
+export type GadgetSharingInfo = {
+  /** Whether any signed-in user with the gadget URL can view it. Defaults to false. */
+  allUsersCanView: boolean;
+  /** Individually shared viewers. These grants never confer workspace membership or edit access. */
+  viewers: CollaboratorInfo[];
 };
 
 /**
