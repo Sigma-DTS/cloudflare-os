@@ -4,7 +4,7 @@
 // Everything a workspace persists in its Overseer is declared in this one file, so that a change
 // to the stored shape of a workspace shows up as a change here. Declare new collections,
 // singletons, and record types here even when the code operating on them lives in another module
-// (git-store.ts, git-cache.ts, sharing.ts, agent.ts, ...). The exception is types that are also
+// (git-cache.ts, sharing.ts, agent.ts, ...). The exception is types that are also
 // part of the wire API (e.g. BlueprintMetadata): those are defined in workshop-shared and stored
 // as-is. Where old records still hold something the wire type has since dropped, the stored
 // shape is declared here as a `Stored*` type extending it (or a `Legacy*` type, for a shape no
@@ -160,7 +160,7 @@ export type GadgetRecord = {
 
   /**
    * The gadget's head commit (40-hex oid) in the workspace's git object store -- its committed
-   * mainline code (see git-store.ts and the `gitObjects` collection). This field is the gadget's
+   * mainline code (see git-cache.ts and the `gitObjects` collection). This field is the gadget's
    * "ref": the store itself has no ref layer. It advances only in mergeChanges(), which requires
    * the accepting chat to have already merged this commit (accepts are fast-forward only), and is
    * surfaced to clients as WorkpieceSummary.commitId.
@@ -973,7 +973,7 @@ type ChatDraftUpdateRecord = {
 /**
  * One incremental update in the workspace-wide Yjs code log (the `code` and `snapshots`
  * collections). Formerly the public `CodeUpdate` wire type; the git-storage transition removed it
- * from the API along with `subscribeToCode()` (mainline code becomes commits; see git-store.ts),
+ * from the API along with `subscribeToCode()` (mainline code becomes commits; see git-cache.ts),
  * leaving it as the internal record type of the retired log, whose one remaining reader is the
  * git-storage migration's replay (overseer-git-migration.ts).
  */
@@ -1260,7 +1260,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // GadgetRecord.commitId pointing at its head (superseding the `code`/`snapshots` Yjs log).
       // There is deliberately no ref layer: gadget/blueprint records and chats' pinned commits
       // are the refs, and all gadgets' histories share this one content-addressed store. See
-      // git-store.ts.
+      // git-cache.ts.
       gitObjects: collection<GitObjectRecord>()({
         primaryKey: "oid",
       }),

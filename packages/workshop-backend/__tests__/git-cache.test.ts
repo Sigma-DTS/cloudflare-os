@@ -12,9 +12,9 @@ import {
   WorkspaceGitCache,
 } from "../src/git-cache";
 import { buildSnapshotRelease } from "../src/blueprint-release";
-import { GITDIR, GitStore, blobOid, makeGitObjectsFs } from "../src/git-store";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
 import {
+  blobOid,
   buildPackBytes,
   concatBytes,
   encodeGitTree,
@@ -158,13 +158,20 @@ const ARRIVALS: {
     deliver: (t, object) => t.cache.importObjects([object]),
   },
   {
-    // As isomorphic-git writes a loose object, through the fs that GitStore hands it.
-    route: "a GitStore write",
+    // As a commit authored here writes a tree: by rebuilding a base that lacks one of the tree's
+    // regular files, adding the file back.
+    route: "a commit written here",
     deliver: async (t, object) => {
-      let oid = await gitObjectOid(object.type, object.payload);
-      await makeGitObjectsFs(t.storage.gitObjects).promises.writeFile(
-          `${GITDIR}/objects/${oid.slice(0, 2)}/${oid.slice(2)}`,
-          encodeLooseObject(object.type, object.payload));
+      let entries = parseGitTree(object.payload);
+      let file = entries.find(entry => entry.mode === "100644")!;
+      let rest = encodeGitTree(entries.filter(entry => entry !== file));
+      await t.cache.importObjects([{ type: "tree", payload: rest }]);
+      let base = await t.cache.writeCommitForTree(await gitObjectOid("tree", rest), {
+        parents: [], author: { name: "A", email: "a@b" }, message: "m", timestamp: new Date(0),
+      });
+      let text = new TextDecoder().decode(fixture(file.oid).payload);
+      expect(await t.cache.writeChangedTree(base, new Map([[file.name, text]])))
+          .toBe(await gitObjectOid("tree", object.payload));
     },
   },
 ];
@@ -369,8 +376,7 @@ describe("puts and metadata recording", () => {
   it("records nothing about what an object refers to when nothing is recorded about it",
       async () => {
     let t = makeCache();
-    let store = new GitStore(t.storage.gitObjects);
-    await store.writeFilesAsCommit(new Map([["a.txt", "a\n"], ["dir/b.txt", "b\n"]]), {
+    await t.cache.writeFilesAsCommit(new Map([["a.txt", "a\n"], ["dir/b.txt", "b\n"]]), {
       parents: [], author: { name: "A", email: "a@b" }, message: "m", timestamp: new Date(0),
     });
     expect(Array.from(t.storage.gitObjects.list())).toHaveLength(5);
@@ -1291,20 +1297,21 @@ describe("importObjects", () => {
 // =======================================================================================
 
 describe("lazy walker reads", () => {
-  it("reads files and listings that isomorphic-git wrote (codec cross-verification)", async () => {
+  it("reads files and listings that the local history writers wrote", async () => {
     let t = makeCache();
-    let store = new GitStore(t.storage.gitObjects);
     let files = new Map([
       ["README.md", "# Hello\n"],
       ["src/app.js", "console.log('hi');\n"],
       ["src/lib/util.js", "export const x = 1;\n"],
     ]);
-    let commit = await store.writeFilesAsCommit(files, {
+    let commit = await t.cache.writeFilesAsCommit(files, {
       parents: [],
       author: { name: "Alice Example", email: "alice@example.com" },
       message: "initial commit",
       timestamp: new Date(1700000000_000),
     });
+    // The id isomorphic-git, which once wrote these, wrote for them.
+    expect(commit).toBe("1def0e8e0b443f6fa2b3a9c84f25eb469979ecd1");
 
     for (let [path, text] of files) {
       expect(await t.cache.readFileAtCommit(commit, path)).toBe(text);

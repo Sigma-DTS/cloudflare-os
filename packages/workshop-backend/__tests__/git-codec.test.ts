@@ -10,6 +10,7 @@ import {
   encodeGitTree,
   encodeLooseObject,
   gitObjectOid,
+  parseGitCommit,
   parseGitCommitRefs,
   parseGitTree,
   readGitCommitHeader,
@@ -20,10 +21,7 @@ import {
   type GitTreeEntry,
   type PackableObject,
 } from "../src/git-codec";
-import { writeCommit } from "isomorphic-git";
-import { GITDIR, GitStore, makeGitObjectsFs } from "../src/git-store";
-import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
-import { makeMockStorage } from "./mock-storage";
+import { makeLocalGitCache } from "./local-git-cache";
 import {
   BAD_NAME_TREE,
   COMMIT_1,
@@ -47,10 +45,6 @@ function fixture(oid: string): PackableObject {
   return { type: object.type, payload: b64Bytes(object.payload) };
 }
 
-function newGitStore(): GitStore {
-  return new GitStore(makeOverseerStorage(makeMockStorage()).gitObjects);
-}
-
 const ALICE = { name: "Alice Example", email: "alice@example.com" };
 const BOB = { name: "Bob Builder", email: "bob@localhost" };
 
@@ -71,7 +65,7 @@ function at(seconds: number, utcOffsetMinutes = 0) {
 }
 
 /**
- * Encodes a `path -> text` map as nested trees, laid out as `GitStore.writeFilesAsCommit()`
+ * Encodes a `path -> text` map as nested trees, laid out as `WorkspaceGitCache.writeFilesAsCommit()`
  * lays them out, and returns the root tree's oid.
  */
 async function fileTreeOid(files: ReadonlyMap<string, string>): Promise<string> {
@@ -202,9 +196,8 @@ describe("tree encoder", () => {
 
   it("sorts names by their UTF-8 bytes, not their UTF-16 code units", async () => {
     // U+1F600 is f0 9f 98 80 in UTF-8 but the surrogates d83d de00 in UTF-16, so it follows
-    // U+FF5E (ef bd 9e) in git's order and precedes it in JavaScript's. isomorphic-git sorts by
-    // the latter, so GitStore writes this tree in an order real git rejects: the one input for
-    // which the two encoders are not meant to agree. Oid from real `git mktree`.
+    // U+FF5E (ef bd 9e) in git's order and precedes it in JavaScript's. Oid from real
+    // `git mktree`.
     let payload = encodeGitTree([
       { mode: "100644", name: "\u{1F600}", oid: X_BLOB },
       { mode: "100644", name: "\uFF5E", oid: X_BLOB },
@@ -213,7 +206,7 @@ describe("tree encoder", () => {
     expect(await gitObjectOid("tree", payload)).toBe("bb40f9cf9c37cab4cee8cbe15ff5dd0df3ddbb9e");
   });
 
-  it("writes the same tree ids as GitStore", async () => {
+  it("writes the same tree ids as the git store", async () => {
     let files = new Map([
       ["README.md", "# Test Gadget\n"],
       // Names that sort differently as files and as directories, at two depths.
@@ -228,9 +221,11 @@ describe("tree encoder", () => {
       ["docs/na\u00efve.md", "caf\u00e9\n"],
       ["empty.txt", ""],
     ]);
-    let store = newGitStore();
+    let store = makeLocalGitCache();
     let commit = await store.writeFilesAsCommit(
         files, { parents: [], author: ALICE, message: "files", timestamp: new Date(0) });
+    // Which isomorphic-git's tree writer wrote for the same files, frozen when it was dropped.
+    expect(await store.commitTree(commit)).toBe("9ec6a82169e39db089693f084d2159caa2175e8b");
     expect(await fileTreeOid(files)).toBe(await store.commitTree(commit));
   });
 
@@ -267,6 +262,58 @@ describe("commit parser", () => {
   it("rejects a commit without a tree header", () => {
     let payload = new TextEncoder().encode("author A <a@b> 1 +0000\n\nmessage\n");
     expect(() => parseGitCommitRefs(payload, "0".repeat(40))).toThrow(/missing tree header/);
+  });
+
+  it("reads every field of real-git commits, past a multi-line gpgsig", () => {
+    expect(parseGitCommit(fixture(COMMIT_3).payload, COMMIT_3)).toStrictEqual({
+      tree: "d8aa5286650240f9fc758910506e5cc39d3eef2c",
+      parents: [COMMIT_2],
+      author: { ...ALICE, ...at(1700000200) },
+      committer: { ...ALICE, ...at(1700000200) },
+      message: "third commit\n",
+    });
+    expect(parseGitCommit(fixture(GPGSIG_COMMIT).payload, GPGSIG_COMMIT)).toStrictEqual({
+      tree: TREE_1,
+      parents: [COMMIT_1],
+      author: { ...ALICE, ...at(1700000300) },
+      committer: { ...ALICE, ...at(1700000300) },
+      message: "signed commit\n",
+    });
+  });
+
+  it("reads back what the encoder writes, UTC offsets included", () => {
+    let commit: GitCommit = {
+      tree: TREE_1,
+      parents: [COMMIT_1, COMMIT_2],
+      author: { ...ALICE, ...at(1700000100, -300) },
+      committer: { ...BOB, ...at(1700000200, 330) },
+      headers: [{ name: "x-extra", value: "ignored" }],
+      message: "Merge things\n\nBody line.\n",
+    };
+    let { headers: _, ...fields } = commit;
+    expect(parseGitCommit(encodeGitCommit(commit))).toStrictEqual(fields);
+  });
+
+  it("normalizes the message and an offset of -0000 as git does", () => {
+    let payload = new TextEncoder().encode(
+        `tree ${TREE_1}\nauthor A <a@b> 1 -0000\ncommitter B <> 2 -0130\n\n\n\r\nsubject\r\n\n\n`);
+    expect(parseGitCommit(payload)).toStrictEqual({
+      tree: TREE_1,
+      parents: [],
+      author: { name: "A", email: "a@b", timestamp: new Date(1000), utcOffsetMinutes: 0 },
+      committer: { name: "B", email: "", timestamp: new Date(2000), utcOffsetMinutes: -90 },
+      message: "subject\n",
+    });
+    expect(Object.is(parseGitCommit(payload).author.utcOffsetMinutes, -0)).toBe(false);
+  });
+
+  it("rejects a commit whose author or committer cannot be read", () => {
+    let noCommitter = `tree ${TREE_1}\nauthor A <a@b> 1 +0000\n\nmessage\n`;
+    expect(() => parseGitCommit(new TextEncoder().encode(noCommitter), "0".repeat(40)))
+        .toThrow(/0{40}: malformed committer header/);
+    let noBrackets = `tree ${TREE_1}\nauthor A a@b 1 +0000\ncommitter A <a@b> 1 +0000\n\nm\n`;
+    expect(() => parseGitCommit(new TextEncoder().encode(noBrackets)))
+        .toThrow(/malformed author header/);
   });
 });
 
@@ -308,31 +355,35 @@ describe("commit encoder", () => {
   });
 
   it("writes the same commit ids as isomorphic-git", async () => {
-    let fs = makeGitObjectsFs(makeOverseerStorage(makeMockStorage()).gitObjects);
+    // The ids isomorphic-git 1.42's writer wrote for the same commits, frozen when it was
+    // dropped: every commit written before then keeps its id.
     let timestamp = new Date(1700000000_999);  // recorded in whole seconds, rounded down
-    let cases: { parents: string[], message: string, committer?: typeof BOB }[] = [
-      { parents: [], message: "root" },
-      { parents: [COMMIT_1], message: "one parent\n" },
-      { parents: [COMMIT_2, COMMIT_1], message: "two parents", committer: BOB },
-      { parents: [COMMIT_1, COMMIT_2, COMMIT_3], message: "subject\n\nbody one\nbody two\n" },
-      // Every way a message is normalized.
-      { parents: [], message: "" },
-      { parents: [], message: "\n\n" },
-      { parents: [], message: "trailing blank lines\n\n\n" },
-      { parents: [], message: "\n\nleading blank lines" },
-      { parents: [], message: "windows\r\n\r\nline endings\r\n" },
-      { parents: [], message: "  spaces and a \t tab are kept  \n" },
-      { parents: [], message: "caf\u00e9 \u{1F600}" },
+    let cases: { parents: string[], message: string, committer?: typeof BOB, oid: string }[] = [
+      { parents: [], message: "root",
+        oid: "2a90a3e550c357e8e84229cb70af6349572c0d5f" },
+      { parents: [COMMIT_1], message: "one parent\n",
+        oid: "1da9157898656d60eaec98e2fbed4a3430586ec6" },
+      { parents: [COMMIT_2, COMMIT_1], message: "two parents", committer: BOB,
+        oid: "cc3afcecfc28e6520ce817093ea52f2921fd7e6c" },
+      { parents: [COMMIT_1, COMMIT_2, COMMIT_3], message: "subject\n\nbody one\nbody two\n",
+        oid: "7ce81be0fa8e066165003af6f5ba0ba67202d8ec" },
+      { parents: [], message: "",
+        oid: "0aff7a588695e4d435bef93621a004e65f9502b5" },
+      { parents: [], message: "\n\n",
+        oid: "0aff7a588695e4d435bef93621a004e65f9502b5" },
+      { parents: [], message: "trailing blank lines\n\n\n",
+        oid: "945786dfed9d28fa643ddc56a3273f6a190eaa51" },
+      { parents: [], message: "\n\nleading blank lines",
+        oid: "7feb2b83c97380eceb98ac092f0336b844322819" },
+      { parents: [], message: "windows\r\n\r\nline endings\r\n",
+        oid: "5c97ef83a94a333a240aad01828bd26da3ca4cda" },
+      { parents: [], message: "  spaces and a \t tab are kept  \n",
+        oid: "89331460b88453f44dfff7d79728e8e065e00271" },
+      { parents: [], message: "caf\u00e9 \u{1F600}",
+        oid: "917211f2ade148e59060eb2c444df86708a2962a" },
     ];
-    for (let { parents, message, committer } of cases) {
-      let when = { timestamp: Math.floor(timestamp.getTime() / 1000), timezoneOffset: 0 };
-      let viaIsomorphicGit = await writeCommit({ fs, gitdir: GITDIR, commit: {
-        message,
-        tree: TREE_1,
-        parent: parents,
-        author: { ...ALICE, ...when },
-        committer: { ...(committer ?? ALICE), ...when },
-      } });
+    // Every way a message is normalized is among them.
+    for (let { parents, message, committer, oid } of cases) {
       let payload = encodeGitCommit({
         tree: TREE_1,
         parents,
@@ -340,8 +391,7 @@ describe("commit encoder", () => {
         committer: { ...(committer ?? ALICE), timestamp, utcOffsetMinutes: 0 },
         message,
       });
-      expect(await gitObjectOid("commit", payload), JSON.stringify(message))
-          .toBe(viaIsomorphicGit);
+      expect(await gitObjectOid("commit", payload), JSON.stringify(message)).toBe(oid);
     }
   });
 

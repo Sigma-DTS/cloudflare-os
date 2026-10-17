@@ -76,7 +76,7 @@ function addChat(impl: any, id: number): void {
 
 async function commitFiles(
     impl: any, files: Record<string, string>, parents: string[] = []): Promise<string> {
-  return await impl.gitStore.writeFilesAsCommit(new Map(Object.entries(files)), {
+  return await impl.gitCache.writeFilesAsCommit(new Map(Object.entries(files)), {
     parents,
     author: { name: "Alice", email: "alice@example.com" },
     message: "test commit",
@@ -438,9 +438,9 @@ describe("mergeChanges", () => {
 
     let head = impl.storage.gadgets.get(1)!.commitId!;
     expect(head).not.toBe(c1);
-    expect(await impl.gitStore.readCommitFiles(head))
+    expect(await impl.gitCache.readCommitFiles(head))
         .toEqual(new Map([["a.txt", "one\nedited\n"]]));
-    expect((await impl.gitStore.readCommitLog(head, { depth: 1 }))[0].parents).toEqual([c1]);
+    expect((await impl.gitCache.readCommitLog(head, { depth: 1 }))[0].parents).toEqual([c1]);
 
     let merges = chatMessages(impl, 1).filter(msg => msg.type === "merge");
     expect(merges).toHaveLength(1);
@@ -483,9 +483,9 @@ describe("mergeChanges", () => {
     // pre-reset generation (no lock, no log append), so the accept must neither discard it with
     // the epoch reset nor silently sweep the mid-keystroke state -- it gives up, leaving the
     // chat untouched.
-    let origWrite = impl.gitStore.writeFilesAsCommit.bind(impl.gitStore);
+    let origWrite = impl.gitCache.writeFilesAsCommit.bind(impl.gitCache);
     let injected = false;
-    impl.gitStore.writeFilesAsCommit = async (...args: unknown[]) => {
+    impl.gitCache.writeFilesAsCommit = async (...args: unknown[]) => {
       if (!injected) {
         injected = true;
         await submit(impl, 1, {
@@ -506,7 +506,7 @@ describe("mergeChanges", () => {
     expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
         .toEqual({ outcome: "merged" });
     let head = impl.storage.gadgets.get(1)!.commitId!;
-    expect(await impl.gitStore.readCommitFiles(head))
+    expect(await impl.gitCache.readCommitFiles(head))
         .toEqual(new Map([["a.txt", "late\none\nfirst\n"]]));
   }));
 });
@@ -550,7 +550,7 @@ describe("straggler bridge", () => {
     expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
         .toEqual({ outcome: "merged" });
     let newHead = impl.storage.gadgets.get(1)!.commitId!;
-    expect((await impl.gitStore.readCommitLog(newHead, { depth: 1 }))[0].parents)
+    expect((await impl.gitCache.readCommitLog(newHead, { depth: 1 }))[0].parents)
         .toEqual([head]);
   }));
 
@@ -902,11 +902,11 @@ function mainlineMerges(impl: any, chatId: number): any[] {
 }
 
 async function commitObject(impl: any, commitId: string) {
-  return await impl.gitStore.readCommitObject(commitId);
+  return await impl.gitCache.readCommitObject(commitId);
 }
 
 async function filesAt(impl: any, commitId: string): Promise<Record<string, string>> {
-  return Object.fromEntries(await impl.gitStore.readCommitFiles(commitId));
+  return Object.fromEntries(await impl.gitCache.readCommitFiles(commitId));
 }
 
 // A gadget at c1 and a chat that edited it, pinned there, with mainline since moved on to c2.
@@ -981,12 +981,12 @@ describe("updateChatFromMainline", () => {
     // result, on mainline and then `S`.
     expect(await filesAt(impl, snapshot)).toEqual(CHAT);
     expect(await commitObject(impl, snapshot)).toMatchObject({
-      parent: [c1], message: "Chat before update: Chat\n",
+      parents: [c1], message: "Chat before update: Chat\n",
       author: { name: "Alice", email: "alice@example.com" },
     });
     expect(await filesAt(impl, merge)).toEqual(MERGED);
     expect(await commitObject(impl, merge)).toMatchObject({
-      parent: [c2, snapshot], message: "Merge latest changes into chat: Chat\n",
+      parents: [c2, snapshot], message: "Merge latest changes into chat: Chat\n",
       author: { name: "Alice", email: "alice@example.com" },
     });
 
@@ -1060,8 +1060,8 @@ describe("updateChatFromMainline", () => {
     let { c2 } = await staleChat(impl, C1, CHAT, CHAT);
     await impl.updateChatFromMainline(1, USER);
     let merge = pinOf(impl, 1, 1).baseCommit;
-    expect((await commitObject(impl, merge)).parent[0]).toBe(c2);
-    expect(await impl.gitStore.commitTree(merge)).toBe(await impl.gitStore.commitTree(c2));
+    expect((await commitObject(impl, merge)).parents[0]).toBe(c2);
+    expect(await impl.gitCache.commitTree(merge)).toBe(await impl.gitCache.commitTree(c2));
     // The chat's files are then mainline's, so accepting has nothing to do.
     expect(await impl.mergeChanges(1, USER_META, "user-do-id")).toEqual({ outcome: "merged" });
     expect(impl.storage.gadgets.get(1)!.commitId).toBe(c2);
@@ -1084,10 +1084,10 @@ describe("updateChatFromMainline", () => {
     let [, message] = mainlineMerges(impl, 1);
     let [{ baseCommit, chatCommit }] = message.mainlineMerge.gadgets;
     expect(baseCommit).toBe(c2);
-    expect((await commitObject(impl, chatCommit)).parent).toEqual([first]);
+    expect((await commitObject(impl, chatCommit)).parents).toEqual([first]);
     expect(await filesAt(impl, chatCommit)).toEqual(edited);
     let second = pinOf(impl, 1, 1).baseCommit;
-    expect((await commitObject(impl, second)).parent).toEqual([c3, chatCommit]);
+    expect((await commitObject(impl, second)).parents).toEqual([c3, chatCommit]);
     expect(await filesAt(impl, second)).toEqual({ ...edited, "c.txt": "sea\n" });
   }));
 
@@ -1195,7 +1195,7 @@ describe("updateChatFromMainline", () => {
     expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
         .toEqual({ outcome: "merged" });
     expect(impl.storage.gadgets.get(1)!.commitId).toBe(merge);
-    expect((await commitObject(impl, merge)).parent[0]).toBe(c1);
+    expect((await commitObject(impl, merge)).parents[0]).toBe(c1);
   }));
 
   describe("enforces no file size of its own", () => {

@@ -1,26 +1,19 @@
-// Hand-rolled git object and packfile codec, used by the git cache (git-cache.ts).
+// Hand-rolled git object and packfile codec: every git object the workspace reads or writes is
+// parsed or encoded here, by the git store (git-cache.ts) and by blueprint releases
+// (blueprint-release.ts), along with the packs of `GitCache.buildPack()`/`consumePack()`.
 //
-// This is the *read-side* codec for the cache's lazy paths plus the pack codec for
-// `GitCache.buildPack()`/`consumePack()`. It deliberately does not use isomorphic-git:
-// - The lazy walker needs to parse objects it fetched by bare oid, attributing errors to the
-//   object (e.g. a tree with a non-UTF-8 entry name must fail naming the tree), and to see all
-//   five tree entry modes -- isomorphic-git's fs-shaped API fits neither well.
-// - Pack *decoding* is hostile-input parsing (any gatekeeper can feed `consumePack()` anything),
-//   so it must bound allocations and fail loudly. isomorphic-git's pack machinery is not
-//   reachable from its exports map in 1.40 (verified), and the public `indexPack` route both
-//   silently *skips* objects whose delta chain fails to resolve and trusts claimed sizes.
-// isomorphic-git remains the engine for the existing full-materialization reads and for
-// GitStore's tree writes (git-store.ts); tests cross-verify the two codecs over the same store.
-// Every commit is written by the commit encoder here, GitStore's included: it is the one writer
-// that can add a header (see GitCommit.headers), and the one place that decides what a commit's
-// fields may hold. The tree encoder serves writers with no object store to hand isomorphic-git.
+// Parsers attribute their errors to the object (a tree with a non-UTF-8 entry name fails naming
+// the tree) and see all five tree entry modes. Encoders refuse anything that would not parse
+// back as given, so the encoder is the one place that decides what an object's fields may hold.
+// Pack *decoding* is hostile-input parsing (any gatekeeper can feed `consumePack()` anything),
+// so it bounds allocations and fails loudly.
 //
 // Everything here is pure computation over bytes (the pack decoder reads a stream): no storage,
 // no RPC. Loose objects use workerd's native node:zlib: storing a mount pack deflates every object
 // it carries, and pako's deflate takes about twice the CPU of the native one. The pack decoder
-// uses pako (the same library isomorphic-git bundles) because pack entries are concatenated zlib
-// streams with no recorded lengths -- finding where one ends requires a streaming inflater that
-// reports unconsumed input, which DecompressionStream cannot do.
+// uses pako because pack entries are concatenated zlib streams with no recorded lengths --
+// finding where one ends requires a streaming inflater that reports unconsumed input, which
+// DecompressionStream cannot do.
 
 import { constants, deflateSync, inflateSync } from "node:zlib";
 import { createHash } from "node:crypto";
@@ -77,15 +70,24 @@ export function concatBytes(parts: Uint8Array[]): Uint8Array {
 //
 // A loose object is zlib(`<type> <size>\0` + payload); its oid is the SHA-1 of the *inflated*
 // whole. These helpers are the raw codec behind GitObjectRecord.data (see
-// storage-schema/overseer-storage.ts) -- byte-compatible with what isomorphic-git reads and
-// writes there, though the compressed bytes need not be bit-identical (the store is keyed by
-// oid; readers inflate).
+// storage-schema/overseer-storage.ts) -- byte-compatible with git's own loose objects, though
+// the compressed bytes need not be bit-identical (the store is keyed by oid; readers inflate).
 
 /** Computes the oid of an object from its type and headerless payload. */
 export async function gitObjectOid(type: GitObjectType, payload: Uint8Array): Promise<GitOid> {
   let header = ENCODER.encode(`${type} ${payload.byteLength}\0`);
   let digest = await crypto.subtle.digest("SHA-1", concatBytes([header, payload]));
   return toHex(new Uint8Array(digest));
+}
+
+/**
+ * The oid a blob holding `text` (UTF-8) has or would have -- git's content address, computed
+ * without writing anything. Equal text always yields an equal oid, so this is how content the
+ * agent knows from a chat's session is compared against a committed file without reading the
+ * committed blob (see the agent's read-before-edit stamps).
+ */
+export async function blobOid(text: string): Promise<GitOid> {
+  return await gitObjectOid("blob", ENCODER.encode(text));
 }
 
 /**
@@ -135,6 +137,12 @@ export type GitTreeEntryMode = "100644" | "100755" | "40000" | "120000" | "16000
 
 const TREE_ENTRY_MODES: readonly GitTreeEntryMode[] =
     ["100644", "100755", "40000", "120000", "160000"];
+
+/**
+ * The oid of the tree with no entries. Like git, which answers for it in every repository, the
+ * git store treats it as always present, whether or not it was ever stored.
+ */
+export const EMPTY_TREE_OID: GitOid = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /** The object type a tree entry of the given mode references. */
 export function treeEntryObjectType(mode: GitTreeEntryMode): GitObjectType {
@@ -257,6 +265,21 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
   return a.byteLength - b.byteLength;
 }
 
+/**
+ * Whether git tooling refuses a tree entry of this name, as git's own `verify_path()` and `fsck`
+ * do (and with them hosts such as GitHub, which refuse a push carrying one): a name containing a
+ * backslash, or one that some filesystem would resolve to `.`, `..` or `.git` -- ignoring case,
+ * HFS+'s ignorable characters, NTFS's trailing dots and spaces, its `:stream` suffixes and its
+ * `git~1` short names. `encodeGitTree()` writes such names, since a tree from elsewhere may hold
+ * one; it is for writers to refuse a name of their own choosing.
+ */
+export function isReservedTreeEntryName(name: string): boolean {
+  let hfs = name.replace(/[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g, "");
+  let ntfs = hfs.split(":")[0].toLowerCase().replace(/[. ]+$/, "");
+  return name.includes("\\") || hfs === "." || hfs === ".." || ntfs === ".git" ||
+      /^\.?git~[1-9]$/.test(ntfs);
+}
+
 // =======================================================================================
 // Commit objects
 
@@ -342,23 +365,67 @@ export interface GitCommitHeader {
 const GIT_COMMIT_HEADERS = new Set(
     ["tree", "parent", "author", "committer", "encoding", "gpgsig", "gpgsig-sha256", "mergetag"]);
 
-/** A whole commit, as `encodeGitCommit()` writes it. */
-export interface GitCommit extends GitCommitRefs {
+/** A commit's fields, as `parseGitCommit()` reads them: all but its extra headers. */
+export interface GitCommitFields extends GitCommitRefs {
   /** Who wrote the change, and when. */
   author: CommitSignature;
 
   /** Who created the commit, and when. */
   committer: CommitSignature;
 
-  /** Further headers, written after `committer` in the order given. See `readGitCommitHeader()`. */
-  headers?: readonly GitCommitHeader[];
-
   /**
-   * The commit message. Normalized exactly as `GitStore` normalizes one, so that the same
-   * message yields the same oid through either writer: carriage returns are removed, leading
+   * The commit message, normalized as git normalizes one: carriage returns are removed, leading
    * newlines dropped, and the result ends with exactly one newline.
    */
   message: string;
+}
+
+/** A whole commit, as `encodeGitCommit()` writes it. */
+export interface GitCommit extends GitCommitFields {
+  /** Further headers, written after `committer` in the order given. See `readGitCommitHeader()`. */
+  headers?: readonly GitCommitHeader[];
+}
+
+// The normalization of GitCommitFields.message.
+function normalizeCommitMessage(message: string): string {
+  message = message.replaceAll("\r", "");
+  let start = 0;
+  let end = message.length;
+  while (start < end && message[start] === "\n") start++;
+  while (end > start && message[end - 1] === "\n") end--;
+  return `${message.slice(start, end)}\n`;
+}
+
+/**
+ * Parses a commit payload into its fields; `readGitCommitHeader()` reads any others. Names,
+ * emails and the message are decoded leniently, as git displays them, and the message is
+ * normalized (see `GitCommitFields.message`). Throws on a commit whose tree, parents, author or
+ * committer cannot be read.
+ */
+export function parseGitCommit(payload: Uint8Array, commitOid?: GitOid): GitCommitFields {
+  let where = commitOid ?? "(unidentified)";
+  let text = new TextDecoder().decode(payload);
+  let blank = text.indexOf("\n\n");
+  let headerLines = (blank < 0 ? text : text.slice(0, blank)).split("\n");
+  let signature = (name: string): CommitSignature => {
+    let line = headerLines.find(header => header.startsWith(`${name} `));
+    let match = line && /^(.*) <(.*)> (\d+) ([+-])(\d\d)(\d\d)$/.exec(line.slice(name.length + 1));
+    if (!match) throw new Error(`corrupt commit object ${where}: malformed ${name} header`);
+    let [, personName, email, seconds, sign, hours, minutes] = match;
+    let offset = Number(hours) * 60 + Number(minutes);
+    return {
+      name: personName,
+      email,
+      timestamp: new Date(Number(seconds) * 1000),
+      utcOffsetMinutes: sign === "-" && offset !== 0 ? -offset : offset,
+    };
+  };
+  return {
+    ...parseGitCommitRefs(payload, commitOid),
+    author: signature("author"),
+    committer: signature("committer"),
+    message: normalizeCommitMessage(blank < 0 ? "" : text.slice(blank + 2)),
+  };
 }
 
 /**
@@ -385,13 +452,7 @@ export function encodeGitCommit(commit: GitCommit): Uint8Array {
     }
     lines.push(`${name} ${value}`);
   }
-
-  let message = commit.message.replaceAll("\r", "");
-  let start = 0;
-  let end = message.length;
-  while (start < end && message[start] === "\n") start++;
-  while (end > start && message[end - 1] === "\n") end--;
-  return ENCODER.encode(`${lines.join("\n")}\n\n${message.slice(start, end)}\n`);
+  return ENCODER.encode(`${lines.join("\n")}\n\n${normalizeCommitMessage(commit.message)}`);
 }
 
 // The characters a signature's name or email cannot hold.
@@ -629,7 +690,7 @@ export async function* decodePackStream(
 }
 
 // The Inflate internals this codec relies on beyond @types/pako's declarations, all stable pako
-// API in practice (isomorphic-git's own pack parser relies on `strm.avail_in` the same way):
+// API in practice (isomorphic-git's pack parser relies on `strm.avail_in` the same way):
 // `ended` flips when the zlib stream completes mid-input, and `strm.avail_in` is how many bytes
 // of the last push() the stream did not consume -- together they locate the entry boundary.
 interface InflateWithInternals {

@@ -10,7 +10,6 @@ import { WorktreeSessionImpl, type WorktreeSessionHost } from "../src/worktree-s
 import type { WorktreeTurnAccess } from "../src/agent";
 import { formatUnifiedDiff } from "../src/agent";
 import { MAX_GIT_OBJECT_SIZE, WorkspaceGitCache } from "../src/git-cache";
-import { GitStore } from "../src/git-store";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
 import { concatBytes } from "../src/git-codec";
 import { makeMockStorage } from "./mock-storage";
@@ -149,7 +148,7 @@ async function createWorktreeSession(impl: any, chatId: number, commitId: string
 
 async function commitFiles(
     impl: any, files: Record<string, string>, parents: string[] = []): Promise<string> {
-  return await impl.gitStore.writeFilesAsCommit(new Map(Object.entries(files)), {
+  return await impl.gitCache.writeFilesAsCommit(new Map(Object.entries(files)), {
     parents,
     author: { name: "Alice", email: "alice@example.com" },
     message: "test commit",
@@ -166,11 +165,9 @@ function makeLocalHarness(
   let cache: WorkspaceGitCache = new WorkspaceGitCache(storage, {
     pull: (_gatekeeperId, oids, hints) => pull(cache, oids, hints),
   });
-  let gitStore = new GitStore(storage.gitObjects);
   let session = (pinBase: string): WorktreeSessionImpl => {
     let host: WorktreeSessionHost = {
       gitCache: cache,
-      gitStore,
       getWorktreeRecord: () => ({ headCommit: pinBase }),
     };
     let access: WorktreeTurnAccess = {
@@ -184,7 +181,7 @@ function makeLocalHarness(
     };
     return new WorktreeSessionImpl(host, 5, access, async () => USER);
   };
-  return { cache, gitStore, session };
+  return { cache, session };
 }
 
 describe("listFiles", () => {
@@ -196,11 +193,11 @@ describe("listFiles", () => {
     expect(await new Response(await session.readBytes("a.txt")).bytes()).toEqual(new TextEncoder().encode(text));
     expect(turn.access.getOverlayFiles(id).has("a.txt")).toBe(false);
     expect(await session.readFile("a.txt")).toBe(text);
-    expect(await impl.gitStore.readCommitFiles(base)).toEqual(new Map([["a.txt", text]]));
+    expect(await impl.gitCache.readCommitFiles(base)).toEqual(new Map([["a.txt", text]]));
     await session.writeFile("a.txt", text + "edited\n");
     const commit = await session.commit("text after raw read");
     await turn.barrier();
-    expect(await impl.gitStore.readCommitFiles(commit)).toEqual(new Map([["a.txt", text + "edited\n"]]));
+    expect(await impl.gitCache.readCommitFiles(commit)).toEqual(new Map([["a.txt", text + "edited\n"]]));
   }));
 
   it("resolves byte identities without copying the Git object or adding permission records", () => withImpl(async impl => {
@@ -215,7 +212,7 @@ describe("listFiles", () => {
     const {session} = await createWorktreeSession(impl, 1, commit);
     expect(await new Response(await session.readBytes("a.txt")).text()).toBe("same text\n");
     expect([...impl.storage.gitObjects.list()]).toEqual(before);
-    expect(await impl.gitStore.readCommitFiles(commit)).toEqual(new Map([["a.txt", "same text\n"]]));
+    expect(await impl.gitCache.readCommitFiles(commit)).toEqual(new Map([["a.txt", "same text\n"]]));
   }));
 
   it("bounds byte writes and ranges without changing the file on failure", () => withImpl(async impl => {
@@ -250,7 +247,7 @@ describe("listFiles", () => {
     await turn.barrier();
     expect(impl.getWorktreeRecord(id).headCommit).toBe(commit);
     const value = await impl.gitCache.fileBytesAtCommit(commit, "image.bin");
-    expect(impl.gitStore.readBlob(value.oid, value.byteLength)).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
+    expect(impl.gitCache.readBlob(value.oid, value.byteLength)).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
     await expect(session.readFile("image.bin")).rejects.toThrow(/Binary/);
     await session.deleteFile("image.bin");
     const deleted = await session.commit("delete binary");
@@ -611,7 +608,7 @@ describe("commit and diff", () => {
 
     // Identity is the turn's initiator; the parent is the previous head; the tree is the
     // overlay over the pin base.
-    let [info] = await impl.gitStore.readCommitLog(commit, { depth: 1 });
+    let [info] = await impl.gitCache.readCommitLog(commit, { depth: 1 });
     expect(info.parents).toEqual([c1]);
     expect(info.author).toEqual({ name: "Alice", email: "alice@example.com" });
     expect(info.message).toBe("tweak a.txt\n");
@@ -634,7 +631,7 @@ describe("commit and diff", () => {
 
     // No writes: the commit's tree is the accepted commit's, parented on the head.
     let commit = await session.commit("empty");
-    expect(await impl.gitStore.commitTree(commit)).toBe(await impl.gitStore.commitTree(c1));
+    expect(await impl.gitCache.commitTree(commit)).toBe(await impl.gitCache.commitTree(c1));
     await turn.barrier();
     expect(impl.storage.gadgets.get(id)!.headCommit).toBe(commit);
     expect(impl.storage.chatMeta.get(1)!.codeBase!.pins).toEqual(
@@ -677,7 +674,7 @@ describe("commit and diff", () => {
     expect(await session2.readFile("a.txt")).toBe("three\n");
     await session2.writeFile("a.txt", "four\n");
     let second = await session2.commit("second");
-    let [info] = await impl.gitStore.readCommitLog(second, { depth: 1 });
+    let [info] = await impl.gitCache.readCommitLog(second, { depth: 1 });
     expect(info.parents).toEqual([first]);
     expect(await impl.readFileAtCommit(second, "a.txt")).toBe("four\n");
     await turn2.barrier();
@@ -773,7 +770,7 @@ describe("commit and diff", () => {
       throw new Error("simulated pull outage");
     });
     let cache = harness.cache;
-    let base = await harness.gitStore.writeFilesAsCommit(new Map([["a.txt", "one\n"]]), {
+    let base = await harness.cache.writeFilesAsCommit(new Map([["a.txt", "one\n"]]), {
       parents: [],
       author: { name: "Alice", email: "alice@example.com" },
       message: "base",

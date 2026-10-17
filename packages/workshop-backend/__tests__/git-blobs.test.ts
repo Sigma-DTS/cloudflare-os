@@ -2,15 +2,13 @@ import {createHash} from "node:crypto";
 import {expect, it, vi} from "vitest";
 import {makeMockStorage} from "./mock-storage";
 import {makeOverseerStorage} from "../src/storage-schema/overseer-storage";
-import {GitStore} from "../src/git-store";
 import {MAX_GIT_OBJECT_SIZE, WorkspaceGitCache} from "../src/git-cache";
 import {buildPackStream, decodeLooseObject, decodePackStream} from "../src/git-codec";
 
 function fixture() {
   const storage = makeOverseerStorage(makeMockStorage());
-  const git = new GitStore(storage.gitObjects);
   const cache = new WorkspaceGitCache(storage, {async pull() {throw new Error("unexpected pull");}});
-  return {storage, git, cache};
+  return {storage, git: cache, cache};
 }
 const options = {parents: [], author: {name: "Test", email: "test@example.com"},
   message: "files", timestamp: new Date(0)};

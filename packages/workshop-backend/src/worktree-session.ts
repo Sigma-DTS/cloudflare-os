@@ -6,8 +6,8 @@
 // every operation resolves against the running turn's state through WorktreeTurnAccess
 // (agent.ts), so binding operations and file-tool operations see one consistent worktree, and
 // writes and commits buffer into the same step and become durable at the same barrier. The git
-// side -- base-tree walks, blob reads, commit writes -- goes through the host's WorkspaceGitCache
-// and GitStore, the same plumbing the file tools' lazy reads use.
+// side -- base-tree walks, blob reads, commit writes -- goes through the host's WorkspaceGitCache,
+// the same plumbing the file tools' lazy reads use.
 //
 // The env.GIT binding (git-binding.ts) serves this same class for its in-memory worktrees,
 // substituting a single object holding the worktree's state for both the turn and the host.
@@ -29,8 +29,7 @@ import type {
 import type { AiChatAuthorInfo, WorkpieceId } from "@gadgets/workshop-shared/api";
 import { diffFiles, validateCodeChangeSchema, type FileChange, type FileContent } from "@gadgets/workshop-shared/code-change";
 
-import { UnreadableContentError, type WorkspaceGitCache } from "./git-cache";
-import { commitIdentityForAuthor, type GitStore } from "./git-store";
+import { UnreadableContentError, commitIdentityForAuthor, type WorkspaceGitCache } from "./git-cache";
 import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
 import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
 
@@ -40,7 +39,6 @@ import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
  */
 export interface WorktreeSessionHost {
   gitCache: WorkspaceGitCache;
-  gitStore: GitStore;
   getWorktreeRecord(id: WorkpieceId): WorktreeRecordView;
 }
 
@@ -178,7 +176,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     this.#pinBase();
     const value = await this.#byteValue(path);
     const bytes = typeof value === "string" ? new TextEncoder().encode(value)
-      : this.host.gitStore.readBlob(value.oid, value.byteLength);
+      : this.host.gitCache.readBlob(value.oid, value.byteLength);
     const offset = range?.offset ?? 0, length = range?.length ?? bytes.length;
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 ||
         offset > bytes.length || length > bytes.length - offset) throw new Error("Invalid byte range.");
@@ -190,7 +188,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
   async writeBytes(path: string, content: Uint8Array): Promise<void> {
     await this.host.gitCache.assertWorktreePathWritable(this.#pinBase(), path);
     this.#pinBase();
-    const value = await this.host.gitStore.writeBlob(content);
+    const value = await this.host.gitCache.writeBlob(content);
     const change = {setBytes: value};
     validateCodeChangeSchema({[this.worktreeId]: [[path, change]]});
     this.#pinBase();
@@ -283,7 +281,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     for (let path of this.turn.getRemovedPaths(this.worktreeId)) {
       changes.set(path, null);
     }
-    let commit = await this.host.gitStore.writeChangedFilesAsCommit(changes, {
+    let commit = await this.host.gitCache.writeChangedFilesAsCommit(changes, {
       treeBase: base,
       parents: [previousHead],
       author,
@@ -385,7 +383,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
       let newSide: DiffSide;
       if (overlay.has(path)) {
         // An overlay file keeps its base entry's mode (the one a commit would write, see
-        // GitStore.writeChangedFilesAsCommit); a new one is a regular file.
+        // WorkspaceGitCache.writeChangedFilesAsCommit); a new one is a regular file.
         let baseEntry = await this.host.gitCache.pathEntryAtCommit(base, path);
         const value = overlay.get(path);
         newSide = typeof value === "string" ? { text: value,
