@@ -32,6 +32,16 @@ const visibility = (value: DocumentVisibilityState) => {
   document.dispatchEvent(new Event("visibilitychange"));
 };
 
+const deferred = () => {
+  let resolve!: () => void;
+  let reject!: (cause: Error) => void;
+  const promise = new Promise<void>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+};
+
 const Commands = () => {
   const unread = useUnreadState();
   const chat = unread?.state?.chats[0];
@@ -210,7 +220,7 @@ describe("UnreadStateBridge", () => {
   });
 
   it("recovers when the subscriber is released before the subscribe ACK arrives", async () => {
-    const ack = Promise.withResolvers<void>();
+    const ack = deferred();
     subscribeToUnreadState.mockImplementationOnce((subscriber) => {
       subscribers.push(subscriber);
       return Object.assign(ack.promise, { [Symbol.dispose]: dispose });
@@ -226,7 +236,7 @@ describe("UnreadStateBridge", () => {
 
   it("reports failed read commands without leaking an old account's failure into its replacement", async () => {
     using _ = vi.spyOn(console, "error").mockImplementation(() => {});
-    const failed = Promise.withResolvers<void>();
+    const failed = deferred();
     markChatRead.mockReturnValueOnce(failed.promise);
     await render();
     await update(snapshot(1));

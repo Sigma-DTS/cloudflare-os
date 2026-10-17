@@ -308,7 +308,7 @@ describe("durable unread delivery checkpoints", () => {
         const user = impl.users.get(impl.users.idFromString(recipientId));
         const fetched = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
         // Model the cold recipient's callback as a real RPC event addressed to this DO. The
-        // dispatch boundary is held until deleteSelf enters its actual blockConcurrencyWhile.
+        // dispatch boundary is held until deleteSelf persists its deletion intent.
         const callback = impl.ctx.exports.OverseerDurableObject.get(impl.ctx.id);
         const dispatch = interceptDispatch(impl, async (recipient, args) => {
           fetched.resolve();
@@ -338,25 +338,37 @@ describe("durable unread delivery checkpoints", () => {
     });
   });
 
-  it("deleteSelf succeeds after owner cleanup even if another recipient is unhealthy", async () => {
+  it.each([false, true])("deleteSelf closes sessions and recovers failed cleanup (owner unavailable: %s)", async ownerUnavailable => {
     const {stub, recipientId} = await setup();
     await runInDurableObject(stub, async instance => {
       const impl = instance.impl;
       using _capsules = vi.spyOn(impl, "ensureAmbientCapsules").mockResolvedValue(undefined);
       using _restart = vi.spyOn(impl, "scheduleAccessRestart").mockResolvedValue(undefined);
-      using notify = new NativeRpcStub(() => {});
+      const notified = vi.fn<() => void>();
+      using notify = new NativeRpcStub(notified);
       const client = await instance.open(recipientId, "owner@example.com", notify);
       await impl.deliverChatTimelines(true);
+      const deletedOwners: (string | undefined)[] = [];
+      using _analytics = vi.spyOn(impl, "recordGadgetAnalytics").mockImplementation(event => {
+        if (event.event_name === "gadget_deleted") deletedOwners.push(impl.ownerId);
+      });
       const readerId = impl.users.idFromName(crypto.randomUUID()).toString();
       impl.storage.unreadReaders.put({userId: readerId, profileId: "reader@example.com"});
       const restore = interceptRemoval(impl, async (user, id) => {
+        if (ownerUnavailable && user.id.toString() === recipientId) throw new Error("Owner unavailable");
         if (user.id.toString() === readerId) throw new Error("Collaborator unavailable");
         await user.deleteGadget(id);
       });
       try {
-        await expect(client.deleteSelf()).resolves.toBeUndefined();
-        await expect(impl.deliverChatTimelines(true)).rejects.toThrow("Collaborator unavailable");
-        expect(await impl.users.get(impl.users.idFromString(recipientId)).getGadget(impl.ctx.id.toString())).toBeNull();
+        if (ownerUnavailable) await expect(client.deleteSelf()).rejects.toThrow("Owner unavailable");
+        else await expect(client.deleteSelf()).resolves.toBeUndefined();
+        expect(deletedOwners).toEqual([recipientId]);
+        expect(notified).toHaveBeenCalledOnce();
+        expect(_restart).toHaveBeenCalledOnce();
+        await expect(impl.deliverChatTimelines(true)).rejects.toThrow(/unavailable/);
+        if (!ownerUnavailable) {
+          expect(await impl.users.get(impl.users.idFromString(recipientId)).getGadget(impl.ctx.id.toString())).toBeNull();
+        }
         expect(impl.storage.deletingWorkspace.get()).toBe(true);
         expect(impl.storage.unreadReaders.get(readerId)).toBeDefined();
         expect(impl.storage.chatTimelineRetryAt.get()).toBeGreaterThan(Date.now());

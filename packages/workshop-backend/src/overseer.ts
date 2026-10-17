@@ -1211,7 +1211,7 @@ class OverseerImpl implements AgentHooks {
     this.storage.deletingWorkspace.put(true);
     this.destroyAllLiveChats();
     this.queueUnreadSnapshot();
-    // Start cleanup after the gate returns, without inheriting an older metadata retry delay.
+    // Start cleanup asynchronously, without inheriting an older metadata retry delay.
     this.#scheduleTimelineDelivery(true);
   }
 
@@ -1407,10 +1407,11 @@ class OverseerImpl implements AgentHooks {
       if ([...this.storage.activeAgents.list()].some(r => this.storage.chatMeta.get(r.chatId)?.activeAgent)) {
         this.#agentKeepAliveTime = this.#scheduledAlarm ?? undefined;
       }
+      // Initialization failures must reset the DO, not skip agent recovery with tracking half-set-up.
+      this.#initializeReadTracking();
     // Resume outside the critical section, before blocked events are delivered. On failure,
     // blockConcurrencyWhile already aborted the object; consume its rejection and retry on wake.
     }).then(() => {
-      this.#initializeReadTracking();
       if (!this.storage.deletingWorkspace.get()) this.#resumeInterruptedAgents();
     }, () => {});
   }
@@ -11528,19 +11529,22 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
     }
 
-    await this.impl.ctx.blockConcurrencyWhile(async () => {
-      this.impl.deleteWorkspace();
-    });
-    // A cold recipient may call back into this workspace during an older delivery. Do not join
-    // that drain while holding the input gate, or make deletion depend on collaborator health.
-    await this.#clientUser.deleteGadget(this.impl.ctx.id.toString());
+    // Record the event synchronously with the deletion intent, before cleanup can clear ownerId.
+    this.impl.deleteWorkspace();
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_deleted",
       user_id: this.#clientUser.id.toString(),
     });
-    // Cleanup of other recipients continues through the durable outbox after this restart.
-    await this.notifyClosed().catch(() => {});
-    this.impl.scheduleAccessRestart("Gadget restarted because the workspace was deleted.");
+    try {
+      // A cold recipient may call back during an older delivery. Never join that drain under an
+      // input gate, or make this request depend on collaborator health.
+      await this.#clientUser.deleteGadget(this.impl.ctx.id.toString());
+    } finally {
+      // Deletion is committed even if the owner RPC fails; close sessions in either case.
+      // The durable delivery checkpoints finish recipient cleanup after the restart.
+      await this.notifyClosed().catch(() => {});
+      this.impl.scheduleAccessRestart("Gadget restarted because the workspace was deleted.");
+    }
 
     this.impl.logger.info("deleted workspace", {
       event: "workspace.delete.completed", durationMs: Date.now() - startedAt,
