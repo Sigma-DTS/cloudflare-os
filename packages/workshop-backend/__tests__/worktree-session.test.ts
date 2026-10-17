@@ -193,11 +193,11 @@ describe("listFiles", () => {
     expect(await new Response(await session.readBytes("a.txt")).bytes()).toEqual(new TextEncoder().encode(text));
     expect(turn.access.getOverlayFiles(id).has("a.txt")).toBe(false);
     expect(await session.readFile("a.txt")).toBe(text);
-    expect(await impl.gitCache.readCommitFiles(base)).toEqual(new Map([["a.txt", text]]));
+    expect(impl.gitCache.readCommitFiles(base)).toEqual(new Map([["a.txt", text]]));
     await session.writeFile("a.txt", text + "edited\n");
     const commit = await session.commit("text after raw read");
     await turn.barrier();
-    expect(await impl.gitCache.readCommitFiles(commit)).toEqual(new Map([["a.txt", text + "edited\n"]]));
+    expect(impl.gitCache.readCommitFiles(commit)).toEqual(new Map([["a.txt", text + "edited\n"]]));
   }));
 
   it("resolves byte identities without copying the Git object or adding permission records", () => withImpl(async impl => {
@@ -212,7 +212,7 @@ describe("listFiles", () => {
     const {session} = await createWorktreeSession(impl, 1, commit);
     expect(await new Response(await session.readBytes("a.txt")).text()).toBe("same text\n");
     expect([...impl.storage.gitObjects.list()]).toEqual(before);
-    expect(await impl.gitCache.readCommitFiles(commit)).toEqual(new Map([["a.txt", "same text\n"]]));
+    expect(impl.gitCache.readCommitFiles(commit)).toEqual(new Map([["a.txt", "same text\n"]]));
   }));
 
   it("bounds byte writes and ranges without changing the file on failure", () => withImpl(async impl => {
@@ -608,7 +608,7 @@ describe("commit and diff", () => {
 
     // Identity is the turn's initiator; the parent is the previous head; the tree is the
     // overlay over the pin base.
-    let [info] = await impl.gitCache.readCommitLog(commit, { depth: 1 });
+    let [info] = impl.gitCache.readCommitLog(commit, { depth: 1 });
     expect(info.parents).toEqual([c1]);
     expect(info.author).toEqual({ name: "Alice", email: "alice@example.com" });
     expect(info.message).toBe("tweak a.txt\n");
@@ -631,7 +631,7 @@ describe("commit and diff", () => {
 
     // No writes: the commit's tree is the accepted commit's, parented on the head.
     let commit = await session.commit("empty");
-    expect(await impl.gitCache.commitTree(commit)).toBe(await impl.gitCache.commitTree(c1));
+    expect(impl.gitCache.commitTree(commit)).toBe(impl.gitCache.commitTree(c1));
     await turn.barrier();
     expect(impl.storage.gadgets.get(id)!.headCommit).toBe(commit);
     expect(impl.storage.chatMeta.get(1)!.codeBase!.pins).toEqual(
@@ -674,7 +674,7 @@ describe("commit and diff", () => {
     expect(await session2.readFile("a.txt")).toBe("three\n");
     await session2.writeFile("a.txt", "four\n");
     let second = await session2.commit("second");
-    let [info] = await impl.gitCache.readCommitLog(second, { depth: 1 });
+    let [info] = impl.gitCache.readCommitLog(second, { depth: 1 });
     expect(info.parents).toEqual([first]);
     expect(await impl.readFileAtCommit(second, "a.txt")).toBe("four\n");
     await turn2.barrier();

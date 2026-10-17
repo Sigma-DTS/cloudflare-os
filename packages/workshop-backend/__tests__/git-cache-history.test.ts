@@ -84,8 +84,8 @@ describe("local history", () => {
     let store = makeStore().store;
     await writeFixtureHistory(store);
 
-    expect(await store.readCommitFiles(INITIAL_COMMIT_OID)).toEqual(INITIAL_FILES);
-    expect(await store.readCommitFiles(SECOND_COMMIT_OID)).toEqual(SECOND_FILES);
+    expect(store.readCommitFiles(INITIAL_COMMIT_OID)).toEqual(INITIAL_FILES);
+    expect(store.readCommitFiles(SECOND_COMMIT_OID)).toEqual(SECOND_FILES);
   });
 
   it("survives Cap'n Web in Overseer.readFilesAtCommit's entry-list shape", async () => {
@@ -101,7 +101,7 @@ describe("local history", () => {
       parents: [], author: ALICE, message: "exotic names", timestamp: new Date(1700000000_000),
     });
 
-    let wire: [path: string, content: string][] = [...await store.readCommitFiles(oid)];
+    let wire: [path: string, content: string][] = [...store.readCommitFiles(oid)];
     expect(new Map(deserialize(serialize(wire)) as typeof wire)).toEqual(files);
   });
 
@@ -124,7 +124,7 @@ describe("local history", () => {
     let store = makeStore().store;
     await writeFixtureHistory(store);
 
-    let history = await store.readCommitLog(SECOND_COMMIT_OID);
+    let history = store.readCommitLog(SECOND_COMMIT_OID);
     expect(history).toEqual([
       {
         oid: SECOND_COMMIT_OID,
@@ -142,7 +142,7 @@ describe("local history", () => {
       },
     ]);
 
-    let limited = await store.readCommitLog(SECOND_COMMIT_OID, { depth: 1 });
+    let limited = store.readCommitLog(SECOND_COMMIT_OID, { depth: 1 });
     expect(limited.map(entry => entry.oid)).toEqual([SECOND_COMMIT_OID]);
   });
 
@@ -155,7 +155,7 @@ describe("local history", () => {
           parents, author: ALICE, message, timestamp: new Date(seconds * 1000),
         });
     let messages = async (oid: string, depth?: number) =>
-        (await store.readCommitLog(oid, { depth })).map(entry => entry.message.trimEnd());
+        store.readCommitLog(oid, { depth }).map(entry => entry.message.trimEnd());
 
     // Written within one second of each other, as publishing and then instantiating can be. Of
     // commits no newer than one another, the first that the walk reached comes first.
@@ -184,7 +184,7 @@ describe("local history", () => {
       parents: [], author: ALICE, message: "create gadget", timestamp: new Date(1700000000_000),
     });
     expect(oid).toBe("bb4cb778675f2b2a4e442e89256aa6da72fd09a2");  // real `git commit-tree` oid
-    expect((await store.readCommitFiles(oid)).size).toBe(0);
+    expect(store.readCommitFiles(oid).size).toBe(0);
   });
 
   it("writes the commit ids isomorphic-git's writer wrote for the same inputs", async () => {
@@ -224,15 +224,15 @@ describe("local history", () => {
     let payload = decodeLooseObject(objects.get(marked)!.data).payload;
     expect(readGitCommitHeader(payload, "x-merged")).toEqual([INITIAL_COMMIT_OID]);
 
-    let commit = await store.readCommitObject(marked);
+    let commit = store.readCommitObject(marked);
     expect(commit.parents).toEqual([SECOND_COMMIT_OID, INITIAL_COMMIT_OID]);
     expect(commit.message).toBe("merge\n");
     expect(commit.author)
         .toStrictEqual({ ...ALICE, timestamp: new Date(1700000200_000), utcOffsetMinutes: 0 });
-    expect(await store.readCommitFiles(marked)).toEqual(SECOND_FILES);
-    expect((await store.readCommitLog(marked)).map(entry => entry.oid))
+    expect(store.readCommitFiles(marked)).toEqual(SECOND_FILES);
+    expect(store.readCommitLog(marked).map(entry => entry.oid))
         .toEqual([marked, SECOND_COMMIT_OID, INITIAL_COMMIT_OID]);
-    expect((await store.readCommitLog(marked))[0]).toEqual({
+    expect(store.readCommitLog(marked)[0]).toEqual({
       oid: marked,
       parents: [SECOND_COMMIT_OID, INITIAL_COMMIT_OID],
       message: "merge\n",
@@ -274,7 +274,7 @@ describe("local history", () => {
 
   it("rejects reads of unknown commits", async () => {
     let store = makeStore().store;
-    await expect(store.readCommitFiles("deadbeef".repeat(5))).rejects.toThrow();
+    expect(() => store.readCommitFiles("deadbeef".repeat(5))).toThrow();
   });
 
   it("rejects malformed file paths", async () => {
@@ -314,7 +314,7 @@ describe("local history", () => {
     let commit = await store.writeFilesAsCommit(
         new Map([["\u{1F600}", "x\n"], ["\uFF5E", "x\n"]]),
         { parents: [], author: ALICE, message: "m", timestamp: new Date(0) });
-    expect(await store.commitTree(commit)).toBe("bb40f9cf9c37cab4cee8cbe15ff5dd0df3ddbb9e");
+    expect(store.commitTree(commit)).toBe("bb40f9cf9c37cab4cee8cbe15ff5dd0df3ddbb9e");
   });
 
   it("holds the empty tree whether or not it was ever stored", async () => {
@@ -324,8 +324,8 @@ describe("local history", () => {
       parents: [], author: ALICE, message: "release 0", timestamp: new Date(0),
     });
     expect(objects.get(EMPTY_TREE_OID)).toBeUndefined();
-    expect(await store.readCommitFilesIfHeld(commit)).toStrictEqual(new Map());
-    expect(await store.readCommitFiles(commit)).toStrictEqual(new Map());
+    expect(store.readCommitFilesIfHeld(commit)).toStrictEqual(new Map());
+    expect(store.readCommitFiles(commit)).toStrictEqual(new Map());
     expect(store.readLocalObject(EMPTY_TREE_OID)).toStrictEqual(
         { type: "tree", payload: new Uint8Array() });
   });
@@ -334,13 +334,13 @@ describe("local history", () => {
     let { objects, store } = makeStore();
     await writeFixtureHistory(store);
     let readme = parseGitTree(decodeLooseObject(objects.get(
-        await store.commitTree(INITIAL_COMMIT_OID))!.data).payload)
+        store.commitTree(INITIAL_COMMIT_OID))!.data).payload)
         .find(entry => entry.name === "README.md")!;
     objects.delete(readme.oid);
-    expect(await store.readCommitFilesIfHeld(INITIAL_COMMIT_OID)).toBeUndefined();
-    await expect(store.readCommitFiles(INITIAL_COMMIT_OID))
-        .rejects.toThrow(/not in the workspace's git store/);
-    expect(await store.readCommitFilesIfHeld("deadbeef".repeat(5))).toBeUndefined();
+    expect(store.readCommitFilesIfHeld(INITIAL_COMMIT_OID)).toBeUndefined();
+    expect(() => store.readCommitFiles(INITIAL_COMMIT_OID))
+        .toThrow(/not in the workspace's git store/);
+    expect(store.readCommitFilesIfHeld("deadbeef".repeat(5))).toBeUndefined();
   });
 });
 
@@ -508,7 +508,7 @@ describe("writeChangedFilesAsCommit", () => {
     let base = await store.writeCommitForTree(await gitObjectOid("tree", tree), OPTIONS);
     let rebuilt = await store.writeChangedFilesAsCommit(
         new Map([["a\\b.txt", "edited\n"], ["b.txt", "b\n"]]), { ...OPTIONS, treeBase: base });
-    expect(await store.readCommitFiles(rebuilt))
+    expect(store.readCommitFiles(rebuilt))
         .toStrictEqual(new Map([["a\\b.txt", "edited\n"], ["b.txt", "b\n"]]));
     await expect(store.writeChangedFilesAsCommit(
         new Map([["c\\d.txt", "x"]]), { ...OPTIONS, treeBase: base }))
@@ -530,7 +530,7 @@ describe("writeChangedFilesAsCommit", () => {
         new Map([...INITIAL_FILES.keys()].map(path => [path, null])),
         { parents: [INITIAL_COMMIT_OID], author: ALICE, message: "wipe",
           timestamp: new Date(1700001000_000), treeBase: INITIAL_COMMIT_OID });
-    expect((await store.readCommitFiles(commit)).size).toBe(0);
+    expect(store.readCommitFiles(commit).size).toBe(0);
   });
 });
 

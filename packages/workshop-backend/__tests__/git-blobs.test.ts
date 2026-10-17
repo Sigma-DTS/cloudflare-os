@@ -90,12 +90,12 @@ it("decodes UTF-8 blobs by content and preserves old blob contents across replac
   const text = "\ufeffhello😀\n", bytes = new TextEncoder().encode(text);
   const ref = await git.writeBlob(bytes);
   const commit = await git.writeFilesAsCommit(new Map([["a.txt", ref]]), options);
-  expect(await git.readCommitFiles(commit)).toEqual(new Map([["a.txt", text]]));
+  expect(git.readCommitFiles(commit)).toEqual(new Map([["a.txt", text]]));
   expect(await cache.readFileAtCommit(commit, "a.txt")).toBe(text);
   const replacement = await git.writeBlob(Uint8Array.of(0, 255));
   const next = await git.writeChangedFilesAsCommit(new Map([["a.txt", replacement]]),
     {...options, treeBase: commit, parents: [commit]});
-  await expect(git.readCommitFiles(next)).rejects.toThrow("not a text file");
+  expect(() => git.readCommitFiles(next)).toThrow("not a text file");
   expect(git.readBlob(ref.oid)).toEqual(bytes);
   expect(await cache.fileBytesAtCommit(commit, "a.txt")).toEqual(ref);
 });

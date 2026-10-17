@@ -130,7 +130,7 @@ export class GitImpl extends RpcTarget implements Git {
     let oid = this.host.gitCache.resolveCommitId(commitId);
     // Pulls only the commit object itself, if absent -- unlike newWorktree, which wants the tree.
     await this.host.gitCache.ensureObject(oid, { type: "commit" });
-    let { parents, message, author, committer } = await this.host.gitCache.readCommitObject(oid);
+    let { parents, message, author, committer } = this.host.gitCache.readCommitObject(oid);
     return { parents, message, author, committer };
   }
 }

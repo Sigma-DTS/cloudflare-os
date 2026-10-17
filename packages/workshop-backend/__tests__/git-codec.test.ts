@@ -225,8 +225,8 @@ describe("tree encoder", () => {
     let commit = await store.writeFilesAsCommit(
         files, { parents: [], author: ALICE, message: "files", timestamp: new Date(0) });
     // Which isomorphic-git's tree writer wrote for the same files, frozen when it was dropped.
-    expect(await store.commitTree(commit)).toBe("9ec6a82169e39db089693f084d2159caa2175e8b");
-    expect(await fileTreeOid(files)).toBe(await store.commitTree(commit));
+    expect(store.commitTree(commit)).toBe("9ec6a82169e39db089693f084d2159caa2175e8b");
+    expect(await fileTreeOid(files)).toBe(store.commitTree(commit));
   });
 
   it("rejects entries that would not parse back as given", () => {

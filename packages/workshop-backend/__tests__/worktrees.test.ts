@@ -989,7 +989,7 @@ describe("epoch reset advances the accepted commit", () => {
     expect(await impl.readFileAtCommit(record.pinBase, "a.txt")).toBe("one!\n");
     expect(await impl.readFileAtCommit(record.pinBase, "new.txt")).toBe("fresh\n");
     expect(await impl.readFileAtCommit(record.pinBase, "src/b.txt")).toBeUndefined();
-    let [autoCommit] = await impl.gitCache.readCommitLog(record.pinBase, { depth: 1 });
+    let [autoCommit] = impl.gitCache.readCommitLog(record.pinBase, { depth: 1 });
     expect(autoCommit.parents).toEqual([c1]);
     expect(autoCommit.author.name).toBe(USER.name);
 
@@ -1095,7 +1095,7 @@ describe("epoch reset advances the accepted commit", () => {
         new Map(), { treeBase: record.pinBase, parents: [record.headCommit],
                      author: { name: "A", email: "a@x" }, message: "explicit",
                      timestamp: new Date(1700000003_000) });
-    let [info] = await impl.gitCache.readCommitLog(explicit, { depth: 1 });
+    let [info] = impl.gitCache.readCommitLog(explicit, { depth: 1 });
     expect(info.parents).toEqual([c1]);
     expect(await impl.readFileAtCommit(explicit, "a.txt")).toBe("three\n");
   }));

@@ -272,7 +272,7 @@ describe("scratch worktree attachment ingress", () => {
       oid = ref!.oid;
       expect(impl.gitCache.readLocalObject(oid)?.payload.byteLength).toBe(text.length);
       expect(await impl.readFileAtCommit(commit, "large.txt")).toBe(text);
-      expect((await impl.gitCache.readCommitFiles(commit)).get("large.txt")).toBe(text);
+      expect(impl.gitCache.readCommitFiles(commit).get("large.txt")).toBe(text);
       await impl.ctx.storage.sync();
     });
     await abortAllDurableObjects();
@@ -280,7 +280,7 @@ describe("scratch worktree attachment ingress", () => {
       expect(impl.storage.gitObjects.get(oid)).toBeDefined();
       expect(impl.gitCache.readLocalObject(oid)?.payload.byteLength).toBe(text.length);
       expect(await impl.readFileAtCommit(commit, "large.txt")).toBe(text);
-      expect((await impl.gitCache.readCommitFiles(commit)).get("large.txt")).toBe(text);
+      expect(impl.gitCache.readCommitFiles(commit).get("large.txt")).toBe(text);
     });
   });
 

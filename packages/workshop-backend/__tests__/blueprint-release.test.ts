@@ -250,7 +250,7 @@ describe("snapshot releases", () => {
 
     let { commitId, objects } = await buildSnapshotRelease(files);
     expect(parseGitCommitRefs(objects.get(commitId)!.payload).tree)
-        .toBe(await store.commitTree(viaStore));
+        .toBe(store.commitTree(viaStore));
     validateReleaseObjects(objects, commitId);
     expect(listReleaseFiles(objects, commitId)).toStrictEqual(files);
   });

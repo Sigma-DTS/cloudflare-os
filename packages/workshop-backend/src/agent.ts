@@ -382,9 +382,9 @@ export interface AgentHooks {
 
   /**
    * Read a commit's full file map from the workspace's git object store. Commits are immutable,
-   * so results are cacheable by oid (and the store's parse cache makes repeats cheap).
+   * so results are cacheable by oid.
    */
-  readCommitFiles(oid: string): Promise<Map<string, string>>;
+  readCommitFiles(oid: string): Map<string, string>;
 
   /**
    * The paths of the files whose entry differs between two commits' trees, added and removed
@@ -1980,7 +1980,7 @@ async function runAgentPass(
       pinnedGadgets.add(pin.gadgetId);
       return [];
     }
-    let files = await hooks.readCommitFiles(pin.baseCommit);
+    let files = hooks.readCommitFiles(pin.baseCommit);
     let known = filesRead.get(pin.gadgetId);
     let forgotten: string[] = [];
     if (pinnedGadgets.has(pin.gadgetId) && known !== undefined) {
@@ -3062,7 +3062,7 @@ async function runAgentPass(
         let files: string[];
         let unpinnedHead = !pinnedGadgets.has(info.id) ? observeHead(info.id) : undefined;
         if (unpinnedHead !== undefined) {
-          files = [...(await hooks.readCommitFiles(unpinnedHead)).keys()];
+          files = [...hooks.readCommitFiles(unpinnedHead).keys()];
         } else {
           files = [...(sessionContent.get(info.id)?.keys() ?? [])];
         }
@@ -3384,7 +3384,7 @@ async function runAgentPass(
           if (!pinnedGadgets.has(resolved.workpieceId)) {
             let head = hooks.getGadgetHead(resolved.workpieceId);
             if (head !== undefined) {
-              pin = {baseCommit: head, baseFiles: await hooks.readCommitFiles(head)};
+              pin = {baseCommit: head, baseFiles: hooks.readCommitFiles(head)};
             }
           }
 
@@ -3461,7 +3461,7 @@ async function runAgentPass(
                     "Re-read the file and try again.");
               }
               if (!hooks.isWorktree(resolved.workpieceId)) {
-                pin = {baseCommit: head, baseFiles: await hooks.readCommitFiles(head)};
+                pin = {baseCommit: head, baseFiles: hooks.readCommitFiles(head)};
               }
             }
           }

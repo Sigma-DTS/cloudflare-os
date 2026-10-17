@@ -165,7 +165,7 @@ export class LegacyWorkspace {
     let conversion = this.conversionMessage(chatId);
     let content: CodeContent = new Map();
     for (let pin of conversion.pins ?? []) {
-      content.set(pin.gadgetId, await this.gitCache.readCommitFiles(pin.baseCommit));
+      content.set(pin.gadgetId, this.gitCache.readCommitFiles(pin.baseCommit));
     }
     return conversion.change !== undefined ? applyCodeChange(content, conversion.change) : content;
   }
@@ -218,6 +218,6 @@ export async function expectHeadsMatchDoc(
     }
     let root = gadget.id === defaultGadgetId ? "" : `${gadget.id}`;
     expect(gadget.commitId).toBeDefined();
-    expect(await gitCache.readCommitFiles(gadget.commitId!)).toEqual(readDocFiles(doc, root));
+    expect(gitCache.readCommitFiles(gadget.commitId!)).toEqual(readDocFiles(doc, root));
   }
 }

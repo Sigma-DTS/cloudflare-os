@@ -469,8 +469,8 @@ export class WorkspaceGitCache {
    * which we never write, but an imported history could contain -- are rejected rather than
    * misread. Throws if the store does not hold the commit with its whole tree.
    */
-  async readCommitFiles(oid: string): Promise<Map<string, string>> {
-    let files = await this.readCommitFilesIfHeld(oid);
+  readCommitFiles(oid: string): Map<string, string> {
+    let files = this.readCommitFilesIfHeld(oid);
     if (files === undefined) {
       throw new Error(`The files of commit ${oid} are not in the workspace's git store.`);
     }
@@ -482,7 +482,7 @@ export class WorkspaceGitCache {
    * its whole tree. A blueprint release's ancestors arrive as commits alone, most of them, so
    * holding a commit says nothing about holding its files.
    */
-  async readCommitFilesIfHeld(oid: string): Promise<Map<string, string> | undefined> {
+  readCommitFilesIfHeld(oid: string): Map<string, string> | undefined {
     let commit = this.#heldPayload(oid, "commit");
     if (commit === undefined) return undefined;
     let files = new Map<string, string>();
@@ -511,13 +511,13 @@ export class WorkspaceGitCache {
    * to `depth` commits' metadata, each commit once. Traversal order for merge commits follows
    * git log's default (reverse chronological).
    */
-  async readCommitLog(oid: string, options: { depth?: number } = {}): Promise<CommitInfo[]> {
+  readCommitLog(oid: string, options: { depth?: number } = {}): CommitInfo[] {
     // A commit that two parents of a merge both lead to is listed once, however its date
     // compares with the commits between: commits written in the same second tie. A gadget that
     // has merged releases of blueprints has such commits: the releases that those were built on.
     let entries: CommitInfo[] = [];
     let reached = new Set([oid]);
-    let tips = [{ oid, commit: await this.readCommitObject(oid) }];
+    let tips = [{ oid, commit: this.readCommitObject(oid) }];
     while (tips.length > 0) {
       // The newest by commit date, as git orders them, and of several the first reached.
       let next = tips.reduce((newest, tip) =>
@@ -535,14 +535,14 @@ export class WorkspaceGitCache {
       for (let parent of next.commit.parents) {
         if (reached.has(parent)) continue;
         reached.add(parent);
-        tips.push({ oid: parent, commit: await this.readCommitObject(parent) });
+        tips.push({ oid: parent, commit: this.readCommitObject(parent) });
       }
     }
     return entries;
   }
 
   /** The tree oid of a locally held commit. */
-  async commitTree(oid: string): Promise<string> {
+  commitTree(oid: string): string {
     return parseGitCommitRefs(this.#requireHeld(oid, "commit"), oid).tree;
   }
 
@@ -550,7 +550,7 @@ export class WorkspaceGitCache {
    * Reads a locally held commit object's fields. Unlike `readCommitLog()`, carries the committer
    * and timezone offsets, and never touches any other object.
    */
-  async readCommitObject(oid: string): Promise<GitCommitFields> {
+  readCommitObject(oid: string): GitCommitFields {
     return parseGitCommit(this.#requireHeld(oid, "commit"), oid);
   }
 
@@ -559,10 +559,9 @@ export class WorkspaceGitCache {
    * line's previous state and any other is something merged into it, so this is a gadget's own
    * history, or one blueprint's releases. Reads commit objects only.
    */
-  async *firstParentChain(oid: string)
-      : AsyncGenerator<{ oid: string, commit: GitCommitFields }> {
+  *firstParentChain(oid: string): Generator<{ oid: string, commit: GitCommitFields }> {
     for (let next: string | undefined = oid; next !== undefined;) {
-      let commit: GitCommitFields = await this.readCommitObject(next);
+      let commit: GitCommitFields = this.readCommitObject(next);
       yield { oid: next, commit };
       next = commit.parents[0];
     }

@@ -1939,7 +1939,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   // AgentHooks implementation: read a commit's file map (see WorkspaceGitCache.readCommitFiles).
-  readCommitFiles(oid: string): Promise<Map<string, string>> {
+  readCommitFiles(oid: string): Map<string, string> {
     return this.gitCache.readCommitFiles(oid);
   }
 
@@ -2041,7 +2041,7 @@ class OverseerImpl implements AgentHooks {
           worktreeBases.set(pin.gadgetId, pin.baseCommit);
           content.set(pin.gadgetId, new Map());
         } else {
-          content.set(pin.gadgetId, await this.gitCache.readCommitFiles(pin.baseCommit));
+          content.set(pin.gadgetId, this.gitCache.readCommitFiles(pin.baseCommit));
         }
       }
       if (msg.change !== undefined) {
@@ -2179,7 +2179,7 @@ class OverseerImpl implements AgentHooks {
           // Lazy, like buildChatContent's worktree pins.
           if (!content.has(pin.gadgetId)) content.set(pin.gadgetId, new Map());
         } else {
-          content.set(pin.gadgetId, await this.gitCache.readCommitFiles(pin.baseCommit));
+          content.set(pin.gadgetId, this.gitCache.readCommitFiles(pin.baseCommit));
         }
       }
 
@@ -2837,7 +2837,7 @@ class OverseerImpl implements AgentHooks {
       for (let {pin} of step.changes) {
         if (pin !== undefined && !baseFilesByCommit.has(pin.baseCommit)) {
           baseFilesByCommit.set(pin.baseCommit,
-                                await this.gitCache.readCommitFiles(pin.baseCommit));
+                                this.gitCache.readCommitFiles(pin.baseCommit));
         }
       }
     }
@@ -3018,7 +3018,7 @@ class OverseerImpl implements AgentHooks {
       let content = await this.getCurrentChatContent(chatId, meta);
       let pinData = new Map<string, {head: string, recentHeads: string[],
                                      baseFiles: Map<string, string>}>();
-      let prefetchPin = async (gadgetId: WorkpieceId, baseCommit: string) => {
+      let prefetchPin = (gadgetId: WorkpieceId, baseCommit: string) => {
         if (pinData.has(`${gadgetId}:${baseCommit}`)) return;
         let record = this.storage.gadgets.get(gadgetId);
         let head = record?.type === "gadget" ? record.commitId : undefined;
@@ -3029,21 +3029,21 @@ class OverseerImpl implements AgentHooks {
         // other parents (a merged release, a chat's snapshot) were never this gadget's head.
         let recentHeads = [head];
         while (recentHeads.length < 3 && recentHeads.at(-1) !== baseCommit) {
-          let parent = (await this.gitCache.readCommitObject(recentHeads.at(-1)!)).parents[0];
+          let parent = this.gitCache.readCommitObject(recentHeads.at(-1)!).parents[0];
           if (parent === undefined) break;
           recentHeads.push(parent);
         }
         pinData.set(`${gadgetId}:${baseCommit}`, {
-          head, recentHeads, baseFiles: await this.gitCache.readCommitFiles(baseCommit),
+          head, recentHeads, baseFiles: this.gitCache.readCommitFiles(baseCommit),
         });
       };
       for (let decl of submission.pins ?? []) {
-        await prefetchPin(decl.gadgetId, decl.baseCommit);
+        prefetchPin(decl.gadgetId, decl.baseCommit);
       }
       if (bridge !== undefined) {
         for (let boundary of bridge.boundaries) {
           if (boundary.commitId !== null) {
-            await prefetchPin(boundary.gadgetId, boundary.commitId);
+            prefetchPin(boundary.gadgetId, boundary.commitId);
           }
         }
       }
@@ -3408,8 +3408,8 @@ class OverseerImpl implements AgentHooks {
                  chatFiles: Map<string, string>, mainlineFiles: Map<string, string>,
                  result: MergeResult}[] = [];
     for (let {record, pin} of stale) {
-      let base = await this.gitCache.readCommitFiles(pin.mergedCommit);
-      let mainlineFiles = await this.gitCache.readCommitFiles(record.commitId!);
+      let base = this.gitCache.readCommitFiles(pin.mergedCommit);
+      let mainlineFiles = this.gitCache.readCommitFiles(record.commitId!);
       let chatFiles = requireTextFiles(content.get(pin.gadgetId) ?? new Map());
       let result = threeWayMerge(base, mainlineFiles, chatFiles,
           {base: "merged base", ours: "mainline", theirs: "this chat"});
@@ -3428,7 +3428,7 @@ class OverseerImpl implements AgentHooks {
     let gadgets: MainlineMergeGadget[] = [];
     let conflictPaths: string[] = [];
     for (let {pin, head, bindingName, chatFiles, mainlineFiles, result} of merges) {
-      let chatCommit = filesEqual(chatFiles, await this.gitCache.readCommitFiles(pin.baseCommit))
+      let chatCommit = filesEqual(chatFiles, this.gitCache.readCommitFiles(pin.baseCommit))
           ? pin.baseCommit
           : await this.gitCache.writeFilesAsCommit(chatFiles, {
               parents: [pin.baseCommit],
@@ -3541,12 +3541,12 @@ class OverseerImpl implements AgentHooks {
         return {outcome: "upToDate"};
       }
     } else {
-      let base = await this.#blueprintMergeBase(record.upstream, head, release, blueprintId);
+      let base = this.#blueprintMergeBase(record.upstream, head, release, blueprintId);
       if (base === undefined) return {outcome: "baseUnavailable"};
       if (base.unverified && !options.allowUnrelated) return {outcome: "unrelated"};
 
-      let ours = await this.gitCache.readCommitFiles(head);
-      let theirs = await this.gitCache.readCommitFiles(release);
+      let ours = this.gitCache.readCommitFiles(head);
+      let theirs = this.gitCache.readCommitFiles(release);
       let result = threeWayMerge(base.files, ours, theirs,
           {base: "base", ours: "this gadget", theirs: "blueprint"});
 
@@ -3636,42 +3636,42 @@ class OverseerImpl implements AgentHooks {
   // so its releases are versions of one thing even where they are not chained to one another,
   // as a bundled blueprint's are not. Otherwise the base is `unverified`, unless it has no
   // files to be wrong about or the release's history holds the very same tree.
-  async #blueprintMergeBase(upstream: GadgetUpstream | undefined, head: string, release: string,
-                            blueprintId: string)
-      : Promise<{commitId: string, files: Map<string, string>, unverified: boolean} | undefined> {
+  #blueprintMergeBase(upstream: GadgetUpstream | undefined, head: string, release: string,
+                      blueprintId: string)
+      : {commitId: string, files: Map<string, string>, unverified: boolean} | undefined {
     let common = this.gitCache.mergeBases(head, release);
     if (common.length === 0) {
-      let commitId = upstream?.commitId ?? await this.#firstCommitWithFiles(head);
-      let files = await this.gitCache.readCommitFilesIfHeld(commitId);
+      let commitId = upstream?.commitId ?? this.#firstCommitWithFiles(head);
+      let files = this.gitCache.readCommitFilesIfHeld(commitId);
       if (files === undefined) return undefined;
       let taken = upstream?.blueprintId === blueprintId && upstream.commitId !== undefined;
       let unverified = !taken && files.size > 0 &&
-          !await this.#historyHoldsTree(release, await this.gitCache.commitTree(commitId));
+          !this.#historyHoldsTree(release, this.gitCache.commitTree(commitId));
       return {commitId, files, unverified};
     }
 
     let held: {commitId: string, files: Map<string, string>, unverified: boolean}[] = [];
     for (let commitId of common) {
-      let files = await this.gitCache.readCommitFilesIfHeld(commitId);
+      let files = this.gitCache.readCommitFilesIfHeld(commitId);
       if (files !== undefined) held.push({commitId, files, unverified: false});
     }
     if (held.length <= 1) return held[0];
 
-    for await (let {oid} of this.gitCache.firstParentChain(release)) {
+    for (let {oid} of this.gitCache.firstParentChain(release)) {
       let inLineage = held.find(base => base.commitId === oid);
       if (inLineage !== undefined) return inLineage;
     }
-    let times = await Promise.all(held.map(async base =>
-        (await this.gitCache.readCommitObject(base.commitId)).committer.timestamp.getTime()));
+    let times = held.map(base =>
+        this.gitCache.readCommitObject(base.commitId).committer.timestamp.getTime());
     return held[times.indexOf(Math.max(...times))];
   }
 
   // The oldest commit of a gadget's own history to have any files, or the oldest of all if
   // none has. `head` is the gadget's head.
-  async #firstCommitWithFiles(head: string): Promise<string> {
+  #firstCommitWithFiles(head: string): string {
     let first: string | undefined;
     let root = head;
-    for await (let {oid, commit} of this.gitCache.firstParentChain(head)) {
+    for (let {oid, commit} of this.gitCache.firstParentChain(head)) {
       root = oid;
       if (commit.tree !== EMPTY_TREE_OID) first = oid;
     }
@@ -3680,13 +3680,13 @@ class OverseerImpl implements AgentHooks {
 
   // Whether `commit` or any commit in its history has the tree `tree`. The whole history has
   // to be held, as a blueprint release's is.
-  async #historyHoldsTree(commit: string, tree: string): Promise<boolean> {
+  #historyHoldsTree(commit: string, tree: string): boolean {
     let seen = new Set<string>();
     let pending = [commit];
     for (let oid of pending) {  // sees the parents pushed below
       if (seen.has(oid)) continue;
       seen.add(oid);
-      let object = await this.gitCache.readCommitObject(oid);
+      let object = this.gitCache.readCommitObject(oid);
       if (object.tree === tree) return true;
       pending.push(...object.parents);
     }
@@ -3782,7 +3782,7 @@ class OverseerImpl implements AgentHooks {
     if (isFirstChange) {
       for (let gadget of this.storage.gadgets.list()) {
         if (gadget.type === "gadget" && gadget.commitId !== undefined &&
-            (await this.gitCache.readCommitFiles(gadget.commitId)).size > 0) {
+            this.gitCache.readCommitFiles(gadget.commitId).size > 0) {
           isFirstChange = false;
           break;
         }
@@ -3823,7 +3823,7 @@ class OverseerImpl implements AgentHooks {
       let pin = pins.get(record.id);
       let mergedCommit = pin?.mergedCommit;
       let baseFiles = mergedCommit !== undefined
-          ? await this.gitCache.readCommitFiles(mergedCommit)
+          ? this.gitCache.readCommitFiles(mergedCommit)
           : new Map<string, string>();
       // A record still pending here is a covered creation (uncovered ones were skipped above),
       // and a covered creation always gets its first commit -- an empty tree if the gadget has
@@ -3857,7 +3857,7 @@ class OverseerImpl implements AgentHooks {
       // update from before re-roots advanced past its base) commits on the head itself.
       let parent = mergedCommit;
       if (pin !== undefined && pin.baseCommit !== pin.mergedCommit &&
-          (await this.gitCache.readCommitObject(pin.baseCommit)).parents[0] === pin.mergedCommit) {
+          this.gitCache.readCommitObject(pin.baseCommit).parents[0] === pin.mergedCommit) {
         parent = pin.baseCommit;
       }
 
@@ -3869,7 +3869,7 @@ class OverseerImpl implements AgentHooks {
         if (parentRelease !== undefined && this.gitCache.isAncestor(parentRelease, parent!)) {
           parentRelease = undefined;
         }
-        baseFiles = await this.gitCache.readCommitFiles(parent!);
+        baseFiles = this.gitCache.readCommitFiles(parent!);
       }
       let reuseParent = parent !== undefined && parentRelease === undefined &&
           filesEqual(files, baseFiles);
@@ -3950,8 +3950,8 @@ class OverseerImpl implements AgentHooks {
           } catch (err) {
             throw acceptWriteError(record.title, err);
           }
-          if (flattened !== await this.gitCache.commitTree(record.pinBase)) {
-            newPinBase = flattened === await this.gitCache.commitTree(record.headCommit)
+          if (flattened !== this.gitCache.commitTree(record.pinBase)) {
+            newPinBase = flattened === this.gitCache.commitTree(record.headCommit)
                 ? record.headCommit
                 : await this.gitCache.writeCommitForTree(flattened, {
                     parents: [record.pinBase],
@@ -4467,7 +4467,7 @@ class OverseerImpl implements AgentHooks {
       } else {
         let commitId = this.getGadgetHead(gadgetId);
         files = commitId !== undefined
-            ? await this.gitCache.readCommitFiles(commitId)
+            ? this.gitCache.readCommitFiles(commitId)
             : new Map();
       }
 
@@ -4679,7 +4679,7 @@ class OverseerImpl implements AgentHooks {
       return (await this.buildChatContent(chatId!)).get(gadgetId) ?? new Map();
     }
     let commitId = this.getGadgetHead(gadgetId);
-    return commitId !== undefined ? await this.gitCache.readCommitFiles(commitId) : new Map();
+    return commitId !== undefined ? this.gitCache.readCommitFiles(commitId) : new Map();
   }
 
   async getGadgetUiBundle(gadgetId: WorkpieceId, chatId?: number): Promise<UiBundle | null> {
@@ -8257,9 +8257,9 @@ class OverseerImpl implements AgentHooks {
   // the head is absent (a permanent gadget created outside any chat, before its first accept)
   // *or* an empty tree (an accepted creation with no files yet -- a legitimate head, just not a
   // publishable one): either way the archive would be empty, which instantiation refuses.
-  async assertPublishableCommit(commitId: string | undefined): Promise<string> {
+  assertPublishableCommit(commitId: string | undefined): string {
     if (commitId !== undefined &&
-        (await this.gitCache.readCommitFiles(commitId)).size > 0) {
+        this.gitCache.readCommitFiles(commitId).size > 0) {
       return commitId;
     }
     throw new Error("This gadget has no code to publish. Accept some code first.");
@@ -8282,12 +8282,12 @@ class OverseerImpl implements AgentHooks {
   // before those gets an empty one: release 0, the root of its lineage.
   async mintBlueprintRelease(record: BlueprintGadgetRecord, sourceCommit: string)
       : Promise<Uint8Array | undefined> {
-    let tree = await this.gitCache.commitTree(sourceCommit);
+    let tree = this.gitCache.commitTree(sourceCommit);
     let previous = record.releases?.at(-1)?.releaseCommit;
-    let unchanged = previous !== undefined && await this.gitCache.commitTree(previous) === tree;
+    let unchanged = previous !== undefined && this.gitCache.commitTree(previous) === tree;
     if (previous === undefined && record.commitId !== undefined) {
       let snapshot = await buildSnapshotRelease(
-          await this.gitCache.readCommitFiles(record.commitId));
+          this.gitCache.readCommitFiles(record.commitId));
       await this.gitCache.importObjects(snapshot.objects.values());
       previous = snapshot.commitId;
     }
@@ -9322,7 +9322,7 @@ class OverseerImpl implements AgentHooks {
 
     // Null prototype so a hostile filename like "__proto__" is an ordinary key.
     let files: Record<string, string> = Object.create(null);
-    for (let [file, content] of await this.gitCache.readCommitFiles(commitId)) {
+    for (let [file, content] of this.gitCache.readCommitFiles(commitId)) {
       files[file] = content;
     }
 
@@ -10434,7 +10434,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // code-less gadget: blueprints of such gadgets cannot be created (see createBlueprint), so
     // one can only arrive corrupted or hand-crafted.
     let release = await this.impl.loadBlueprint(blueprintId, metadata);
-    if ((await this.impl.gitCache.readCommitFiles(release)).size === 0) {
+    if (this.impl.gitCache.readCommitFiles(release).size === 0) {
       throw new Error("This blueprint's code archive is empty.");
     }
     let ownerId = this.impl.ownerId;
@@ -10461,7 +10461,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       message: `Create gadget: ${title}`,
     });
     let commitId = await this.impl.gitCache.writeCommitForTree(
-        await this.impl.gitCache.commitTree(release), {
+        this.impl.gitCache.commitTree(release), {
       ...authorship,
       parents: [root, release],
       message: `Instantiate blueprint: ${title}`,
@@ -11290,7 +11290,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (depth !== undefined && (!Number.isInteger(depth) || depth <= 0)) {
       throw new Error("Invalid depth.");
     }
-    return await this.impl.gitCache.readCommitLog(validateOid(fromCommit), {depth});
+    return this.impl.gitCache.readCommitLog(validateOid(fromCommit), {depth});
   }
 
   async updateChatFromMainline(chatId: number): Promise<{conflictPaths: string[]}> {
@@ -12198,10 +12198,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         title: record.metadata.title,
         description: record.metadata.description,
         version: record.metadata.version,
-        codeVersionDate: await this.#blueprintCodeDate(record),
+        codeVersionDate: this.#blueprintCodeDate(record),
         screenshotUrl: blueprintScreenshotUrl(record.id, record.metadata),
         dirty: record.dirty,
-        ...(await this.#hasUnpublishedChanges(record) ? {unpublishedChanges: true} : {}),
+        ...(this.#hasUnpublishedChanges(record) ? {unpublishedChanges: true} : {}),
       });
     }
     return result;
@@ -12215,22 +12215,22 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // The trees are what is compared, not the commits: publishing an unchanged tree mints nothing
   // and leaves `commitId` where it was (see mintBlueprintRelease), so a head that has moved on
   // to the same files would otherwise count as a change that no publish could clear.
-  async #hasUnpublishedChanges(record: BlueprintGadgetRecord): Promise<boolean> {
+  #hasUnpublishedChanges(record: BlueprintGadgetRecord): boolean {
     let gadgetId = record.gadgetId ?? this.impl.defaultGadgetId;
     let gadget = gadgetId === undefined ? undefined : this.impl.storage.gadgets.get(gadgetId);
     let head = gadget?.type === "gadget" ? gadget.commitId : undefined;
     let published = record.commitId;
     if (head === undefined || published === undefined || head === published) return false;
     let store = this.impl.gitCache;
-    return await store.commitTree(head) !== await store.commitTree(published);
+    return store.commitTree(head) !== store.commitTree(published);
   }
 
   // The timestamp of the code exported into a blueprint: the exported commit's author date, or
   // for legacy (pre-git-storage) records the legacy log entry's, falling back to the metadata's
   // own last-updated time.
-  async #blueprintCodeDate(record: BlueprintGadgetRecord): Promise<Date> {
+  #blueprintCodeDate(record: BlueprintGadgetRecord): Date {
     if (record.commitId !== undefined) {
-      return (await this.impl.gitCache.readCommitLog(record.commitId, {depth: 1}))[0].timestamp;
+      return this.impl.gitCache.readCommitLog(record.commitId, {depth: 1})[0].timestamp;
     }
     if (record.codeVersion !== undefined) {
       let codeUpdate = this.impl.storage.code.get(record.codeVersion);
@@ -12267,7 +12267,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       let gadgetId = this.impl.resolveGadgetId(record.gadgetId);
       record.metadata.bindings = this.impl.collectBindingMetadata(gadgetId);
       if (options.updateCode) {
-        let commitId = await this.impl.assertPublishableCommit(
+        let commitId = this.impl.assertPublishableCommit(
             this.impl.getGadgetRecord(gadgetId).commitId);
         pack = await this.impl.mintBlueprintRelease(record, commitId);
       }
@@ -12953,7 +12953,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     // The blueprint exports the gadget's committed code, keyed by its head commit. (Re-read the
     // record after the awaits above so the head is current.) A blueprint of a code-less gadget
     // would be useless, so refuse rather than publish an empty archive.
-    let commitId = await this.impl.assertPublishableCommit(
+    let commitId = this.impl.assertPublishableCommit(
         this.impl.getGadgetRecord(this.id).commitId);
     let now = new Date();
 
@@ -12993,7 +12993,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 
     // Derive codeVersionDate from the exported commit.
     let codeVersionDate =
-        (await this.impl.gitCache.readCommitLog(commitId, {depth: 1}))[0].timestamp;
+        this.impl.gitCache.readCommitLog(commitId, {depth: 1})[0].timestamp;
 
     return {
       id,

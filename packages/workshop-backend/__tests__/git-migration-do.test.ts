@@ -110,13 +110,13 @@ describe("git-storage migration via the Overseer constructor", () => {
       // Chain sanity: an empty parentless root, the pre-gap batch (v1-v3), and the final
       // version, linearly chained and authored as the ownerless fallback identity.
       let head = impl.storage.gadgets.get(1)!.commitId!;
-      let log = await impl.gitCache.readCommitLog(head);
+      let log = impl.gitCache.readCommitLog(head);
       expect(log.length).toBe(3);
       expect(log[0].parents).toEqual([log[1].oid]);
       expect(log[1].parents).toEqual([log[2].oid]);
       expect(log[2].parents).toEqual([]);
-      expect(await impl.gitCache.readCommitFiles(log[2].oid)).toEqual(new Map());
-      expect(await impl.gitCache.readCommitFiles(log[1].oid)).toEqual(new Map([
+      expect(impl.gitCache.readCommitFiles(log[2].oid)).toEqual(new Map());
+      expect(impl.gitCache.readCommitFiles(log[1].oid)).toEqual(new Map([
         ["app.js", "hello\n"],
         ["util.js", "util one\n"],
       ]));
@@ -162,7 +162,7 @@ describe("git-storage migration via the Overseer constructor", () => {
       // Non-pollution: each chain is the empty root plus that gadget's own commit points,
       // regardless of the others' activity, and carries only its own filenames.
       let logOf = async (gadgetId: number) =>
-          await impl.gitCache.readCommitLog(impl.storage.gadgets.get(gadgetId)!.commitId!);
+          impl.gitCache.readCommitLog(impl.storage.gadgets.get(gadgetId)!.commitId!);
       let appLog = await logOf(1);
       let leftLog = await logOf(2);
       let rightLog = await logOf(3);
@@ -170,12 +170,12 @@ describe("git-storage migration via the Overseer constructor", () => {
       expect(leftLog.length).toBe(2);   // empty root + merge point v3
       expect(rightLog.length).toBe(3);  // empty root + pre-gap batch (v6) + final (v7)
 
-      expect(await impl.gitCache.readCommitFiles(appLog[1].oid))
+      expect(impl.gitCache.readCommitFiles(appLog[1].oid))
           .toEqual(new Map([["app.js", "a one\n"]]));
-      expect(await impl.gitCache.readCommitFiles(leftLog[0].oid))
+      expect(impl.gitCache.readCommitFiles(leftLog[0].oid))
           .toEqual(new Map([["left.js", "l one\n"]]));
       // Gadget 3's intermediate commit is the batch's end state, checked against the replay.
-      expect(await impl.gitCache.readCommitFiles(rightLog[1].oid))
+      expect(impl.gitCache.readCommitFiles(rightLog[1].oid))
           .toEqual(readDocFiles(ws.docAt(6), "3"));
     });
   });
