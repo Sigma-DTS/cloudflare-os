@@ -3012,41 +3012,9 @@ class OverseerImpl implements AgentHooks {
         throw chatStreamGoneError();
       }
 
-      // Prefetch: current content, and the git data pin validation needs. Which pins apply
-      // depends on the transform below, but transforms only ever drop file changes, so prefetching
-      // for every *declared* pin (plus every bridge boundary commit) covers all cases.
+      // Prefetch the current content. (Pin validation reads git directly in the synchronous
+      // tail: the gadgets' own history is always held locally, so those reads never await.)
       let content = await this.getCurrentChatContent(chatId, meta);
-      let pinData = new Map<string, {head: string, recentHeads: string[],
-                                     baseFiles: Map<string, string>}>();
-      let prefetchPin = (gadgetId: WorkpieceId, baseCommit: string) => {
-        if (pinData.has(`${gadgetId}:${baseCommit}`)) return;
-        let record = this.storage.gadgets.get(gadgetId);
-        let head = record?.type === "gadget" ? record.commitId : undefined;
-        if (head === undefined) return;  // validated (and rejected) in the sync tail
-        // The head and up to two first-parent steps back, stopping at the declared base. One
-        // accept that writes on a merge commit moves the head two steps (`C = [M]`, `M = [H,
-        // ...]`), so a client that raced it still declares `H`. First parents only: a head's
-        // other parents (a merged release, a chat's snapshot) were never this gadget's head.
-        let recentHeads = [head];
-        while (recentHeads.length < 3 && recentHeads.at(-1) !== baseCommit) {
-          let parent = this.gitCache.readCommitObject(recentHeads.at(-1)!).parents[0];
-          if (parent === undefined) break;
-          recentHeads.push(parent);
-        }
-        pinData.set(`${gadgetId}:${baseCommit}`, {
-          head, recentHeads, baseFiles: this.gitCache.readCommitFiles(baseCommit),
-        });
-      };
-      for (let decl of submission.pins ?? []) {
-        prefetchPin(decl.gadgetId, decl.baseCommit);
-      }
-      if (bridge !== undefined) {
-        for (let boundary of bridge.boundaries) {
-          if (boundary.commitId !== null) {
-            prefetchPin(boundary.gadgetId, boundary.commitId);
-          }
-        }
-      }
 
       // Prefetch any worktree edit bases the change needs (worktree content is lazy; see
       // seedWorktreeEditBases). Transforms only ever drop file changes, so prefetching for the
@@ -3110,7 +3078,7 @@ class OverseerImpl implements AgentHooks {
       content = cached.content;
 
       let result = this.#applyValidatedSubmission(
-          chatId, fresh, freshBase, submission, author, content, pinData, bridge,
+          chatId, fresh, freshBase, submission, author, content, bridge,
           worktreeBases, worktreeSeeds);
       if (result === "retry") {
         if (attempt < 3) continue;
@@ -3138,14 +3106,26 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // The synchronous core of submitCodeChange: transform, validate, and append, using only
-  // prefetched git data. Returns "retry" when prefetched state (a pin's validated head) no
-  // longer matches storage.
+  // A gadget's head and up to two first-parent steps back, stopping at `baseCommit`: the heads a
+  // pin declaration may name. One accept that writes on a merge commit moves the head two steps
+  // (`C = [M]`, `M = [H, ...]`), so a client that raced it still declares `H`. First parents
+  // only: a head's other parents (a merged release, a chat's snapshot) were never this gadget's
+  // head.
+  #recentGadgetHeads(head: string, baseCommit: string): string[] {
+    let recentHeads = [head];
+    while (recentHeads.length < 3 && recentHeads.at(-1) !== baseCommit) {
+      let parent = this.gitCache.readCommitObject(recentHeads.at(-1)!).parents[0];
+      if (parent === undefined) break;
+      recentHeads.push(parent);
+    }
+    return recentHeads;
+  }
+
+  // The synchronous core of submitCodeChange: transform, validate, and append. Returns "retry"
+  // when a prefetched worktree edit base is missing (see #applyPrefetchedWorktreeSeeds).
   #applyValidatedSubmission(
       chatId: number, meta: AiChatMetadata, codeBase: ChatCodeBase,
       submission: CodeChangeSubmission, author: AiChatAuthorInfo, content: CodeContent,
-      pinData: Map<string, {head: string, recentHeads: string[],
-                            baseFiles: Map<string, string>}>,
       bridge: ChatChangeBoundaryRecord | undefined,
       worktreeBases: Map<WorkpieceId, string>,
       worktreeSeeds: Map<string, string | null>)
@@ -3243,16 +3223,12 @@ class OverseerImpl implements AgentHooks {
         // empty tree -- see GadgetRecord.commitId); a pending gadget's changes need no pin.
         throw new Error("Cannot pin a gadget that has no committed code.");
       }
-      let prefetched = pinData.get(`${gadgetId}:${baseCommit}`);
-      if (prefetched === undefined || prefetched.head !== record.commitId) {
-        return "retry";  // the head moved during the prefetches; re-resolve
-      }
-      if (!prefetched.recentHeads.includes(baseCommit)) {
+      if (!this.#recentGadgetHeads(record.commitId, baseCommit).includes(baseCommit)) {
         throw new Error("Pin declaration does not match the gadget's current head.");
       }
       newPins.push({gadgetId, baseCommit, mergedCommit: baseCommit});
       if (validationContent === content) validationContent = new Map(content);
-      validationContent.set(gadgetId, prefetched.baseFiles);
+      validationContent.set(gadgetId, this.gitCache.readCommitFiles(baseCommit));
     }
 
     // Every gadget the transformed change still touches must have its content in the stream: a pin

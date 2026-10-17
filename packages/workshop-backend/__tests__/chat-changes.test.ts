@@ -182,6 +182,19 @@ describe("submitCodeChange", () => {
     expect(impl.storage.chatMeta.get(1)!.codeBase!.pins[0].baseCommit).toBe(c2);
   }));
 
+  it("rejects a pin at a commit the workspace does not hold, as not the head",
+      () => withImpl(async impl => {
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+
+    await expect(submit(impl, 1, {
+      generation: 0, revision: 0, clientId: "cli-a", seq: 1,
+      pins: [{ gadgetId: 1, baseCommit: "0".repeat(40) }],
+      change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "xone\n" }),
+    })).rejects.toThrow(/does not match the gadget's current head/);
+  }));
+
   it("rejects a pin at a blueprint release the head merged, which was never the head",
       () => withImpl(async impl => {
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
