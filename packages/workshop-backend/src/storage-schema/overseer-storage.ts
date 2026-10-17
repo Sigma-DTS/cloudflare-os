@@ -1142,7 +1142,6 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     singletons: {
       // Monotonic source ordering and persisted retry deadline for the user's unread projection.
       chatTimelineVersion: 0,
-      chatTimelineDirty: false,
       chatTimelineRetryAt: 0,
       // Retain deletion intent and recipient cleanup until every User DO acknowledges it.
       deletingWorkspace: false,
@@ -1244,7 +1243,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     },
 
     collections: {
-      // Only established build-role readers receive chat metadata. Reverified before delivery.
+      // A missing/older checkpoint is pending delivery. Deleting a reader acknowledges cleanup.
+      // Only established build-role readers receive chat metadata; reverified before delivery.
       unreadReaders: collection<{
         userId: string; profileId: string; timelineVersion?: number;
       }>()({primaryKey: "userId"}),
@@ -1255,12 +1255,6 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         // when a subscriber updates this record inside another collection's scan.
         uniqueIndexes: {byVersion: (record: {version: number}) => record.version},
       }),
-      chatTimelineOutbox: collection<{
-        sequence: number;
-        userId: string;
-        /** Last acknowledged source version; absent means an initial full catch-up. */
-        afterVersion?: number;
-      }>()({ primaryKey: "userId" }),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
       // mainline code lives in `gitObjects` as commits -- and it is read only by the git-storage
