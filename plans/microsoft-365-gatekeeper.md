@@ -81,7 +81,11 @@ is issued by the resource tenant.
 **Scopes.** Every connection requests `openid profile email offline_access User.Read`. SharePoint adds
 `Sites.Read.All Files.Read.All` or the ReadWrite variants, by the ceiling. The **effective access** is the lower of
 the ceiling and what the grant actually holds (`write` only with both ReadWrite scopes, since an admin may consent
-to less than was asked). A connection made under `write` keeps only `read` once the ceiling is lowered. A
+to less than was asked). A connection made under `write` keeps only `read` once the ceiling is lowered. A file,
+folder or library binding is also lowered to `read` when the user's own role on it is only `read`, as for something
+shared with them to view. Graph reports that role as `shared.effectiveRoles`, which isn't documented, so it is only
+ever used to lower access: where it's absent, the binding keeps `write` and SharePoint refuses what the user can't
+do when the change is applied. A
 read-only binding's session is a `SharePointReaderImpl`, a separate class with no write methods at all.
 
 ## The SharePoint resource
@@ -260,17 +264,10 @@ Verified against the live test tenant (see [Test tenant](#test-tenant)):
 
 ## Test tenant
 
-The contract suite (`__tests__/contract/`, `vitest.contract.config.ts`) runs against a test tenant with three
-licensed users, signed in interactively so MFA and Conditional Access keep working:
-
-- **Engineering**: a private team site. Phillip owns it, Sarah is a member, Bob is not (`403` on the site, its
-  drive, folders and list). It holds `Documents/Specs/…` and the `Issue Tracker` list (Status choice, Priority
-  number).
-- **Marketing**: a communication site with Sarah and Bob as visitors. It holds `Documents/Launch/…`, a
-  `Confidential/` folder with broken inheritance and Visitors removed (both visitors get `404` on it and its
-  contents, and its name is missing from their listings), and the `Launch Plan` page.
-- **Phillip's OneDrive**: `GadgetsSpike/Apollo`, shared read-only with Sarah, and `GadgetsSpike/Private`, not
-  shared. Sarah gets `200` on Apollo and `404` on Private; Bob gets `403` on both.
+The optional live suite (`__tests__/contract/`, `vitest.contract.config.ts`) runs against a test tenant with
+three licensed users, signed in interactively so MFA and Conditional Access keep working. The package README's
+"Live suite" section lists every fixture it needs (sites, OneDrive shares, calendars, mailbox permissions) and how
+to set one up.
 
 ## Tests
 

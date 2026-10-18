@@ -5,10 +5,14 @@ import { describe, expect, it } from "vitest";
 import type {
   SharePointBrowserPage, SharePointConfiguratorStatus, SharePointLocated,
 } from "../../src/configurator/sharepoint-configurator-types";
-import { connect, failure, hooks, live, oneDrive, origin, unwrap } from "./tenant";
+import { connect, failure, hooks, live, oneDrive, origin, unwrap, type Label } from "./tenant";
 
 async function ui<T>(method: string, ...args: unknown[]): Promise<T> {
-  return unwrap<T>(await hooks().configurator(await connect("phillip"), "write", method, ...args));
+  return await uiAs<T>("phillip", method, ...args);
+}
+
+async function uiAs<T>(label: Label, method: string, ...args: unknown[]): Promise<T> {
+  return unwrap<T>(await hooks().configurator(await connect(label), "write", method, ...args));
 }
 
 const titles = (page: SharePointBrowserPage) => page.items.map(item => item.title);
@@ -50,12 +54,35 @@ describe.skipIf(!live)("configurator", () => {
     expect(page.items[1].subtitle).toMatch(/^Modified .+ by /);
   });
 
-  it("shows the OneDrive tab as one place to open or choose", async () => {
+  it("shows the OneDrive tab as My files to open or choose, and Shared with you to open", async () => {
     const page = await ui<SharePointBrowserPage>("loadItems", { tab: "onedrive" });
-    expect(page.items).toHaveLength(1);
+    expect(page.items).toHaveLength(2);
     expect(page.items[0]).toMatchObject({ title: "My files", subtitle: "Your OneDrive", icon: "onedrive", navigable: true });
+    expect(page.items[1]).toMatchObject({ value: "shared", title: "Shared with you", navigable: true, selectable: false });
     const inside = await ui<SharePointBrowserPage>("loadItems", { tab: "onedrive", container: page.items[0].value });
     expect(titles(inside)).toContain("GadgetsSpike");
+    expect(failure(await hooks().configurator(await connect("phillip"), "write", "resourceUrlFor", "shared"))).toMatch(/Choose one of the things shared/);
+  });
+
+  // The tenant's fixture shares Phillip's `Shared with Sarah` folder with Sarah.
+  it("lists what others shared from their OneDrives, outermost first, under Shared with you", async () => {
+    const shared = await uiAs<SharePointBrowserPage>("sarah", "loadItems", { tab: "onedrive", container: "shared" });
+    const folder = shared.items.find(item => item.title === "Shared with Sarah");
+    expect(folder).toMatchObject({ icon: "folder", navigable: true, value: expect.stringMatching(/^folder:/) });
+    expect(folder!.path?.[0]).toMatchObject({ value: "shared", title: "Shared with you" });
+    // What's inside a shared folder is left to opening it, and Sarah's own files aren't there at all.
+    expect(titles(shared)).not.toContain("Inside the shared folder.docx");
+    for (const item of shared.items) expect(item.subtitle ?? "").not.toMatch(/by you$/);
+    const inside = await uiAs<SharePointBrowserPage>("sarah", "loadItems", { tab: "onedrive", container: folder!.value });
+    expect(titles(inside)).toEqual(["Inside the shared folder.docx"]);
+
+    const searched = await uiAs<SharePointBrowserPage>("sarah", "loadItems", { tab: "onedrive", container: "shared", query: "Inside" });
+    expect(titles(searched)).toContain("Inside the shared folder.docx");
+
+    // A pasted link into someone else's OneDrive sits under Shared with you, not their OneDrive.
+    const located = await uiAs<SharePointLocated>("sarah", "locate", `${await oneDrive()}/Documents/Shared%20with%20Sarah`);
+    expect(located).toMatchObject({ title: "Shared with Sarah", tab: "onedrive" });
+    expect(located.path[0]).toMatchObject({ value: "shared", title: "Shared with you" });
   });
 
   it("resolves a pasted link to one row with its breadcrumb", async () => {

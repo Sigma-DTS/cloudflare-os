@@ -99,6 +99,26 @@ describe("read-only access", () => {
     expect(unwrap(await hooks().autoApprovable(name, binding))).toEqual([]);
   });
 
+  it("binds what's shared with the user to view read-only, though the grant could write", async () => {
+    const graph = new FakeGraph().install();
+    const id = await seedAccount(graph);
+    graph.items.get(SPECS)!.shared = { effectiveRoles: ["read"], scope: "users" };
+    const binding = folderProps(id);
+    const name = facet("shared-to-view");
+    expect(unwrap(await hooks().describe(name, binding))).toMatchObject({ tsType: "SharePointReader" });
+    expect(unwrap<SharePointScopeInfo>(await hooks().run(name, binding, [["getScope"]]))).toMatchObject({ can: { write: false } });
+    expect(unwrap(await hooks().autoApprovable(name, binding))).toEqual([]);
+  });
+
+  it("keeps write where the user's role allows it, or Graph doesn't say", async () => {
+    const graph = new FakeGraph().install();
+    const id = await seedAccount(graph);
+    graph.items.get(SPECS)!.shared = { effectiveRoles: ["write"], scope: "users" };
+    expect(unwrap(await hooks().describe(facet("shared-to-edit"), folderProps(id)))).toMatchObject({ tsType: "SharePointSession" });
+    graph.items.get(SPECS)!.shared = { scope: "users" };
+    expect(unwrap(await hooks().describe(facet("shared-unsaid"), folderProps(id)))).toMatchObject({ tsType: "SharePointSession" });
+  });
+
   it("refuses a binding whose connection no longer grants SharePoint", async () => {
     const graph = new FakeGraph().install();
     const id = await seedAccount(graph, PHILLIP, { scopes: ["https://graph.microsoft.com/User.Read"] });

@@ -36,9 +36,13 @@ const TABS = { sites: "sites", onedrive: "onedrive" } as const;
 /** What the frame calls everything; the frame's own copy must match. */
 const ALL_TITLE = "All of SharePoint & OneDrive";
 
-/** A ref, parsed. The grammar is `SharePointConfiguratorValues.ref`'s, plus `pages:` for a site's pages. */
+/**
+ * A ref, parsed. The grammar is `SharePointConfiguratorValues.ref`'s, plus `pages:` for a site's
+ * pages and `shared` for what others have shared with the user, neither of which can be chosen.
+ */
 type Ref =
   | { kind: "all" }
+  | { kind: "shared" }
   | { kind: "site"; siteId: string }
   | { kind: "drive"; driveId: string }
   | { kind: "folder" | "file"; driveId: string; itemId: string }
@@ -53,6 +57,7 @@ const ITEM_ID = /^[A-Za-z0-9!_-]{1,200}$/;
 /** Parses a ref, refusing anything that would put more than an ID into a Graph path. */
 export function parseRef(ref: string): Ref {
   if (ref === "all") return { kind: "all" };
+  if (ref === "shared") return { kind: "shared" };
   const colon = ref.indexOf(":");
   const kind = ref.slice(0, colon);
   const rest = ref.slice(colon + 1);
@@ -167,6 +172,16 @@ function driveRow(drive: GraphDrive, viewer?: string): SharePointBrowserItem {
   };
 }
 
+/**
+ * OneDrive's "Shared with you", beside "My files". It's a place to open, not to choose: what it
+ * holds changes with every share, and a binding covers one thing.
+ */
+const SHARED_ROW: SharePointBrowserItem = {
+  value: "shared", title: "Shared with you", icon: "shared-folder", navigable: true,
+  subtitle: "What others have shared from their OneDrive", selectable: false,
+  unselectableReason: "Open it to choose one of the things shared with you.",
+};
+
 /** A drive as a breadcrumb outside the OneDrive tab, where "My files" alone would not say whose. */
 function driveCrumb(drive: GraphDrive, viewer: string | undefined): SharePointBrowserCrumb {
   const crumb = crumbOf(driveRow(drive, viewer));
@@ -252,17 +267,24 @@ function rootPath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
+/** Whether an item is in a OneDrive other than the user's own, so reached through a share. */
+function inOthersOneDrive(item: GraphDriveItem, myDriveId: string | undefined): boolean {
+  return item.siteHost?.includes("-my.") === true && item.driveId !== myDriveId;
+}
+
 /**
  * Breadcrumbs for items found outside a listing (search results, pasted links): their site, their
- * library, and every folder between, looked up together.
+ * library, and every folder between, looked up together. What's in someone else's OneDrive sits
+ * under "Shared with you", since the user can't open that OneDrive itself, only what was shared.
  */
-async function crumbsFor(api: GraphApi, items: readonly GraphDriveItem[], viewer: string | undefined): Promise<Map<GraphDriveItem, SharePointBrowserCrumb[]>> {
+async function crumbsFor(api: GraphApi, items: readonly GraphDriveItem[], viewer: string | undefined,
+                         myDriveId: string | undefined): Promise<Map<GraphDriveItem, SharePointBrowserCrumb[]>> {
   const requests = new Map<string, string>();
   const want = (id: string, url: string) => requests.set(id, url);
   for (const item of items) {
     const siteId = itemSiteId(item);
     if (siteId && !item.siteHost?.includes("-my.")) want(`s|${siteId}`, `sites/${siteId}?$select=${SITE_SELECT}`);
-    want(`d|${item.driveId}`, `drives/${item.driveId}?$select=${DRIVE_SELECT}`);
+    if (!inOthersOneDrive(item, myDriveId)) want(`d|${item.driveId}`, `drives/${item.driveId}?$select=${DRIVE_SELECT}`);
     const segments = (item.parentPath ?? "").split("/").filter(Boolean);
     for (let depth = 1; depth <= segments.length; depth++) {
       const prefix = segments.slice(0, depth).join("/");
@@ -277,7 +299,8 @@ async function crumbsFor(api: GraphApi, items: readonly GraphDriveItem[], viewer
     const siteBody = siteId ? answers.get(`s|${siteId}`) : undefined;
     if (siteBody !== undefined) path.push(crumbOf(siteRow(parseSite(siteBody))));
     const driveBody = answers.get(`d|${item.driveId}`);
-    if (driveBody !== undefined) path.push(driveCrumb(parseDrive(driveBody), viewer));
+    if (inOthersOneDrive(item, myDriveId)) path.push(crumbOf(SHARED_ROW));
+    else if (driveBody !== undefined) path.push(driveCrumb(parseDrive(driveBody), viewer));
     const segments = (item.parentPath ?? "").split("/").filter(Boolean);
     for (let depth = 1; depth <= segments.length; depth++) {
       const folder = answers.get(`f|${item.driveId}|${segments.slice(0, depth).join("/")}`) as { id?: unknown; name?: unknown } | undefined;
@@ -297,6 +320,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
   readonly #access: SharePointAccess;
   readonly #creds;
   #status?: { at: number; value: Promise<{ identity: StoredIdentity; granted: boolean }> };
+  #oneDrive?: Promise<GraphDrive | null>;
 
   constructor(exports: Cloudflare.Exports, userObjectId: string, access: SharePointAccess) {
     super();
@@ -333,6 +357,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
         case "drive": return await this.#folder(api, container.driveId, "root", query, token);
         case "folder": return await this.#folder(api, container.driveId, container.itemId, query, token);
         case "pages": return await this.#pages(api, container.siteId, query, token);
+        case "shared": return await this.#shared(api, query, token);
         default: throw new Error("That can't be opened.");
       }
     });
@@ -359,6 +384,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
           return new URL(page.page.webUrl, (await reads.getSite(api, parsed.siteId))?.webUrl ?? "https://invalid/").href;
         }
         case "pages": throw new Error("Choose one page, or the whole site.");
+        case "shared": throw new Error("Choose one of the things shared with you.");
       }
     });
   }
@@ -389,13 +415,51 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
     return { items, ...(page.nextFrom !== undefined ? { nextPageToken: `from:${page.nextFrom}` } : {}), ...(notice ? { notice } : {}) };
   }
 
-  /** The OneDrive tab: the user's own OneDrive, as one place to open or choose. */
+  /** The OneDrive tab: the user's own OneDrive, to open or choose, and what others have shared. */
   async #oneDriveRoot(api: GraphApi, query: string | undefined): Promise<SharePointBrowserPage> {
-    const drive = await api.find<unknown>("/me/drive", { query: { $select: DRIVE_SELECT } });
-    if (drive === null) return { items: [], notice: "You don't have a OneDrive." };
-    const parsed = parseDrive(drive);
-    if (query === undefined) return { items: [driveRow(parsed, await this.#viewer())] };
-    return await this.#folder(api, parsed.id, "root", query, undefined);
+    const drive = await this.#myOneDrive(api);
+    if (drive === null) return { items: [SHARED_ROW], notice: "You don't have a OneDrive of your own." };
+    if (query === undefined) return { items: [driveRow(drive, await this.#viewer()), SHARED_ROW] };
+    return await this.#folder(api, drive.id, "root", query, undefined);
+  }
+
+  /**
+   * What others have shared with the user from their OneDrives, newest first; searched, the matches.
+   * Unsearched, a shared folder's contents are left to opening it, as OneDrive shows them, though
+   * only within a page: Search can put a folder and what's in it on different pages.
+   */
+  async #shared(api: GraphApi, query: string | undefined, token: string | undefined): Promise<SharePointBrowserPage> {
+    const from = token === undefined ? 0 : Number(token.replace(/^from:/, ""));
+    if (!Number.isInteger(from) || from < 0) throw new Error("That page has expired. Open Shared with you again.");
+    const [mine, viewer, { identity }] = await Promise.all([this.#myOneDrive(api), this.#viewer(), this.#state()]);
+    // Every OneDrive lives beside the user's own; without one, where the tenant's usually do.
+    const oneDrives = mine === null ? undefined : /^(https:\/\/[^/]+\/personal\/)[^/]+/.exec(mine.webUrl);
+    const base = oneDrives?.[1] ?? (identity.sharePointTenant ? `https://${identity.sharePointTenant}-my.sharepoint.com/personal/` : undefined);
+    if (base === undefined) return { items: [], notice: "This Microsoft 365 account has no SharePoint." };
+    let page;
+    try {
+      page = await reads.searchSharedWithMe(api, base, oneDrives?.[0], query, from, SEARCH_PAGE_SIZE);
+    } catch (error) {
+      const unavailable = searchUnavailable(error);
+      if (unavailable === undefined) throw error;
+      return { items: [], notice: unavailable };
+    }
+    const found = (await reads.getItems(api, page.hits)).filter((item): item is GraphDriveItem => item !== null);
+    const folders = new Set(found.filter(item => item.kind === "folder" && !item.isPackage)
+      .map(item => `${item.driveId}|${[item.parentPath, item.name].filter(Boolean).join("/")}`));
+    const shown = query !== undefined ? found : found.filter(item => {
+      const segments = (item.parentPath ?? "").split("/").filter(Boolean);
+      return !segments.some((_, depth) => folders.has(`${item.driveId}|${segments.slice(0, depth + 1).join("/")}`));
+    });
+    const crumbs = await crumbsFor(api, shown, viewer, mine?.id);
+    const notice = shown.length === 0 && from === 0 && query === undefined
+      ? "Nothing has been shared with you from anyone's OneDrive yet. Something shared in the last few minutes can take a while to appear here: paste its link to choose it now."
+      : undefined;
+    return {
+      items: shown.map(item => ({ ...itemRow(item, viewer), path: crumbs.get(item) ?? [] })),
+      ...(page.nextFrom !== undefined ? { nextPageToken: `from:${page.nextFrom}` } : {}),
+      ...(notice ? { notice } : {}),
+    };
   }
 
   /** A site's libraries, lists, pages and subsites; or, searched, the ones named so and its files. */
@@ -429,7 +493,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
       const hits = await reads.searchAll(api, query, site.webUrl, from, SEARCH_PAGE_SIZE);
       const found = (await reads.getItems(api, hits.hits)).filter((item): item is GraphDriveItem => item !== null);
       const viewer = await this.#viewer();
-      const crumbs = await crumbsFor(api, found, viewer);
+      const crumbs = await crumbsFor(api, found, viewer, (await this.#myOneDrive(api))?.id);
       return {
         items: [...named, ...found.map(item => ({ ...itemRow(item, viewer), path: crumbs.get(item) ?? [] }))],
         ...(hits.nextFrom !== undefined ? { nextPageToken: `from:${hits.nextFrom}` } : {}),
@@ -464,7 +528,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
     }
     const found = page.items.filter(item => !item.isRoot && (prefix === undefined
       || item.parentPath === prefix || (item.parentPath ?? "").startsWith(`${prefix}/`)));
-    const crumbs = await crumbsFor(api, found, viewer);
+    const crumbs = await crumbsFor(api, found, viewer, (await this.#myOneDrive(api))?.id);
     return {
       items: found.map(item => ({ ...itemRow(item, viewer), path: crumbs.get(item) ?? [] })),
       ...(page.nextLink ? { nextPageToken: page.nextLink } : {}),
@@ -536,7 +600,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
         case "file": {
           const item = await reads.getItem(api, scope);
           if (item === null) throw new UnresolvableUrlError();
-          const path = (await crumbsFor(api, [item], identity.name)).get(item) ?? [];
+          const path = (await crumbsFor(api, [item], identity.name, (await this.#myOneDrive(api))?.id)).get(item) ?? [];
           const oneDrive = item.siteHost?.includes("-my.") === true;
           return { row: itemRow(item, identity.name), tab: oneDrive ? TABS.onedrive : TABS.sites, path };
         }
@@ -575,6 +639,19 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
       this.#status = entry;
     }
     return this.#status.value;
+  }
+
+  /** The user's own OneDrive, or null if they have none, read once while the frame is open. */
+  #myOneDrive(api: GraphApi): Promise<GraphDrive | null> {
+    if (this.#oneDrive === undefined) {
+      const drive = api.find<unknown>("/me/drive", { query: { $select: DRIVE_SELECT } }).then(body => body === null ? null : parseDrive(body));
+      // A failure isn't kept, so the next request asks again.
+      drive.catch(() => {
+        if (this.#oneDrive === drive) this.#oneDrive = undefined;
+      });
+      this.#oneDrive = drive;
+    }
+    return this.#oneDrive;
   }
 
   /** The connected user's display name, for "Modified by you". */

@@ -8,13 +8,13 @@ import { defineConfig } from "vitest/config";
 /**
  * The live contract suite: the gatekeeper against a real Microsoft 365 tenant, as real users. It is
  * opt-in and never part of `test`, since it needs an app registration, signed-in test users, and a
- * tenant seeded to match (plans/microsoft-365-gatekeeper.md, "Test tenant").
+ * tenant set up to match: see the README's "Live suite".
  *
  * The app's `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` and `MICROSOFT_TENANT_ID` come from the
  * root `.dev.vars`; each user's refresh token from the 0600 file `MICROSOFT_CONTRACT_TOKENS` names
- * (default `~/.config/gadgets-microsoft-contract/tokens.json`). Tokens are redeemed here, in Node, and the
- * rotated refresh tokens written back, so the suite never needs a browser. With either missing, the
- * suite skips.
+ * (default `~/.config/gadgets-microsoft-contract/tokens.json`), which `contract:sign-in` writes.
+ * Tokens are redeemed here, in Node, and the rotated refresh tokens written back, so the suite never
+ * needs a browser. With either missing, the suite skips.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");

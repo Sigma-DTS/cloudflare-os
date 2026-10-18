@@ -39,7 +39,7 @@ working. `plans/microsoft-365-gatekeeper.md` is the design record.
 | `CLIENT_SECRET` | secret | The client secret's **Value**, not its ID. |
 | `MICROSOFT_TENANT_ID` | secret | The Directory (tenant) ID, or a verified domain. Only accounts in this tenant can connect. It isn't a credential, but the deploy wizard only collects secrets. |
 | `MICROSOFT_ALLOWED_TENANT_IDS` | var, optional | For a multitenant app. Set `MICROSOFT_TENANT_ID=organizations` and list the tenant IDs (GUIDs) that may connect, comma-separated. `organizations` without this list is refused. `common` and `consumers` are always refused, because personal Microsoft accounts have no SharePoint. |
-| `MICROSOFT_SHAREPOINT_ACCESS` | var, optional | `write` (the default) or `read`. This caps what agents may do whatever the app was granted: the effective access is the lower of this and the connection's own grant. |
+| `MICROSOFT_SHAREPOINT_ACCESS` | var, optional | `write` (the default) or `read`. This caps what agents may do whatever the app was granted: the effective access is the lowest of this, the connection's own grant and, for a file, folder or library, the user's own role on it, so something shared with them to view binds read-only. |
 | `MICROSOFT_OUTLOOK_ACCESS` | var, optional | `send` (the default), `draft`, `organize` or `read`, capping Outlook bindings the same way. Unrecognized values mean `read`. |
 | `MICROSOFT_CALENDAR_ACCESS` | var, optional | `schedule` (the default), `edit` or `read`, capping Calendar bindings the same way. Unrecognized values mean `read`. |
 
@@ -76,7 +76,10 @@ folder's whole ancestry. Paths are measured from the top of the binding, so a fo
 reveals the library around it.
 
 The configurator starts at **All of SharePoint & OneDrive**. The user can open a site or their
-OneDrive to choose one part of it, search, or paste any SharePoint or OneDrive link.
+OneDrive to choose one part of it, search, or paste any SharePoint or OneDrive link. The OneDrive tab
+also lists what others have shared with the user from their OneDrives, as **Shared with you**. Graph's
+`sharedWithMe` is deprecated, so that list comes from Microsoft Search, which takes minutes to show a
+new share and doesn't include files shared from a site; a link pasted into the picker always works.
 
 ### SharePoint approvals
 
@@ -330,28 +333,65 @@ the index catches up, the site list falls back to the user's home and followed s
 
 ```sh
 pnpm --filter @gadgets/microsoft-gatekeeper test:run    # Node, then workerd against a fake Graph
-npx vitest run -c vitest.contract.config.ts             # workerd, against a live tenant
 ```
 
-The contract suite runs only when `.dev.vars` holds the app credentials and a tokens file exists at
-`MICROSOFT_CONTRACT_TOKENS` (default `~/.config/gadgets-microsoft-contract/tokens.json`). The file holds the
-refresh tokens of three test users:
+These are the tests CI runs, and all a change normally needs: they cover the logic against fakes of
+Entra and Graph.
 
-- `phillip` owns the content
-- `sarah` is a member of the private Engineering site
-- `bob` is a visitor
+### Live suite (optional)
 
-The suite rotates the tokens in place. Its file writes happen in a scratch folder it creates and
-deletes. `office.test.ts` also has Microsoft 365 render each Office file it writes to PDF, which
-proves Office for the web opens it; the slide count checks a deck's structure.
+A second suite runs the gatekeeper against a real Microsoft 365 tenant, as real users, for the
+behaviour a fake can only assume. It is never part of `test` or CI, and skips itself unless set up as
+below. Run it when you change how the gatekeeper talks to Microsoft. It applies real changes in the
+test tenant and cleans up after itself, so use a tenant kept for the purpose, never a production one.
 
-`outlook.test.ts` has the three users mail one another, and deletes what it sent. Its hooks test
-makes a real Graph subscription when `MICROSOFT_CONTRACT_BASE_URL` is a public `https` URL (a
-`cloudflared` tunnel will do; only the validation handshake needs answering), and polls otherwise.
-`calendar.test.ts` uses Phillip's "Gadgets Spike Team" calendar, shared `read` with Sarah and
-`freeBusyRead` with Bob, and Bob's main calendar shared with nobody, not even as free/busy; it makes
-its events five weeks out and deletes them afterwards. `outlook.test.ts` needs Sarah as a Reviewer of
-Phillip's Inbox and of no other folder.
+**1. A test tenant with three licensed users** (Microsoft 365 with Exchange Online and SharePoint),
+known to the suite as `phillip`, `sarah` and `bob`:
 
-`MICROSOFT_LIVE=1 npx vitest run __tests__/outlook-configurator.live.test.ts` checks the Outlook
-configurator's listings and URLs against the live mailbox.
+| Fixture | Set up as | What it tests |
+|---|---|---|
+| **Engineering** team site | Private. Phillip owns it, Sarah is a member, Bob isn't. `Documents/Specs/` holds `apollo-brief.docx`, `apollo-budget.xlsx` and `Deep/notes.txt`; an `Issue Tracker` list has a Status choice column and a Priority number column | reads, list queries, observers refusing a non-member |
+| **Marketing** communication site | Sarah and Bob are visitors. `Documents/Launch/` holds `roster.csv`; `Documents/Confidential/` has inheritance broken and Visitors removed; a `Launch Plan` page | observers, hidden folders, pages |
+| **Phillip's OneDrive** | `GadgetsSpike/Apollo` shared read-only with Sarah; `GadgetsSpike/Private/secret.txt` shared with nobody; a top-level `Shared with Sarah` folder holding one Word document, the folder shared read-only with Sarah (Share, "Can view") | OneDrive sharing, shortcuts, the configurator's Shared with you |
+| **Phillip's calendars** | A calendar named `Gadgets Spike Team`, shared with Sarah as "Can view all details" and with Bob as "Can view when I'm busy" | calendar bindings and observers by detail level |
+| **Bob's calendar** | His main calendar shared with nobody, not even free/busy (Outlook: Calendar permissions, "My Organization": none) | unknown availability never reads as free |
+| **Phillip's mailbox** | Sarah is a Reviewer of his Inbox and of no other folder (Outlook: Inbox, Sharing and permissions) | observers of a folder-only delegate |
+
+**2. An app registration** in that tenant, made as the deploy wizard describes (`deploy-inputs.json`),
+with admin consent granted, plus `http://localhost:8765/callback` as a second Web redirect URI for
+signing the test users in. Its credentials go in the repository's root `.dev.vars`, the same ones
+`pnpm dev-server` uses:
+
+```
+MICROSOFT_CLIENT_ID=…
+MICROSOFT_CLIENT_SECRET=…
+MICROSOFT_TENANT_ID=…
+```
+
+**3. Sign each user in once,** in a browser, so MFA and Conditional Access apply as for anyone:
+
+```sh
+pnpm --filter @gadgets/microsoft-gatekeeper contract:sign-in phillip   # then sarah, then bob
+```
+
+This saves each user's refresh token to `~/.config/gadgets-microsoft-contract/tokens.json` (or the
+file `MICROSOFT_CONTRACT_TOKENS` names), readable only by you. The suite rotates the tokens in place,
+so a user needs signing in again only if their token is revoked or goes unused for 90 days. A team
+can share one tenant by sharing `.dev.vars` and the tokens file through a password manager.
+
+**4. Run it:**
+
+```sh
+pnpm --filter @gadgets/microsoft-gatekeeper test:contract                       # 67 tests, a few minutes
+MICROSOFT_LIVE=1 npx vitest run __tests__/outlook-configurator.live.test.ts __tests__/calendar-configurator.live.test.ts
+```
+
+What it does to the tenant: file writes happen in a scratch folder it creates and deletes;
+`office.test.ts` also has Microsoft 365 render each Office file it writes to PDF, which proves Office
+for the web opens it. `outlook.test.ts` has the three users mail one another and deletes what it
+sent. `calendar.test.ts` makes its events five weeks out and deletes them. The hooks test makes a
+real Graph subscription when `MICROSOFT_CONTRACT_BASE_URL` is a public `https` URL (a `cloudflared`
+tunnel will do), and polls otherwise.
+
+`node scripts/office-render.ts <file>...` uses the same credentials to render any Office file the
+way Microsoft 365 does, for looking at what the writers produce.

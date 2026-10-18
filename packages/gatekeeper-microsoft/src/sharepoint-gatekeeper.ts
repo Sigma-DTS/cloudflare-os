@@ -36,6 +36,7 @@ import {
   type SharePointActionHost,
 } from "./sharepoint-actions";
 import { sharePointObservers } from "./sharepoint-observers";
+import { effectiveRoles } from "./sharepoint-reads";
 import type { ScopeKind } from "./sharepoint-scope";
 import { ScopeReader, SessionContext, SharePointReaderImpl, SharePointSessionImpl, type SessionHost } from "./sharepoint-session";
 import type { SharePointReader, SharePointSession } from "./types";
@@ -45,6 +46,8 @@ import type { SharePointReader, SharePointSession } from "./types";
 const PENDING_FILE_BYTES = 128 * 1024 * 1024;
 /** How long captured bytes may go unreferenced before they are swept: past any submit in flight. */
 const FILE_GRACE_MS = 60 * 60 * 1000;
+/** How long the user's own role on the bound item is reused. A share changed in OneDrive applies within this long. */
+const ROLE_TTL_MS = 2 * 60 * 1000;
 
 // Storage keys of this class's own. binding.ts owns `pinnedUser` and `housekeptAt`; the kit modules
 // own theirs: `sp:` and the journal's `retained:`/`applied:` tiers, `refs:`, `cache:@sharepoint:`,
@@ -225,13 +228,33 @@ export class SharePointGatekeeper extends DurableObject<Env, SharePointGatekeepe
     return this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
   }
 
-  /** What the deployment and the connection's grant together allow: never more than either. */
+  /**
+   * What the deployment, the connection's grant and the user's own role on the bound item together
+   * allow: never more than any of them. So a file shared with the user to view binds read-only.
+   */
   async #access(): Promise<SharePointAccess> {
     const access = effectiveAccess(this.env, await this.#account().getGrantedScopes());
     if (access === null) {
       throw new Error("This Microsoft 365 connection no longer grants SharePoint access. Reconnect the Microsoft 365 account.");
     }
-    return access;
+    return access === "write" && !await this.#mayChange() ? "read" : access;
+  }
+
+  /**
+   * Whether the user's role on the bound file, folder or library lets them change it. The role is
+   * only lowered on Graph's word (`effectiveRoles`): where Graph is silent, or the read fails, the
+   * binding keeps write and SharePoint refuses a change the user can't make, when it's applied.
+   */
+  async #mayChange(): Promise<boolean> {
+    const scope = this.ctx.props.scope;
+    if (scope.kind !== "folder" && scope.kind !== "file" && scope.kind !== "library") return true;
+    const ref = scope.kind === "library" ? { driveId: scope.driveId } : { driveId: scope.driveId, itemId: scope.itemId };
+    try {
+      const roles = await this.#cache.cached("roles", ROLE_TTL_MS, () => this.#graph(api => effectiveRoles(api, ref), true));
+      return roles === null || roles.some(role => role === "write" || role === "owner");
+    } catch {
+      return true;
+    }
   }
 
 

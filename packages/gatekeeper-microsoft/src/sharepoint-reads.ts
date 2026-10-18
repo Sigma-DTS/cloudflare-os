@@ -33,6 +33,18 @@ async function page<T>(api: GraphApi, token: string | undefined, path: string, q
 
 // -- items --------------------------------------------------------------------------------------
 
+/**
+ * The user's own roles on an item or a drive's root (`write`, `read`, `owner`), or null when Graph
+ * doesn't say. Graph reports them as `shared.effectiveRoles` on whatever is shared, which isn't
+ * documented, so a caller may use them only to lower what it allows.
+ */
+export async function effectiveRoles(api: GraphApi, ref: { driveId: string; itemId?: string }): Promise<string[] | null> {
+  const path = ref.itemId === undefined ? `/drives/${ref.driveId}/root` : `/drives/${ref.driveId}/items/${ref.itemId}`;
+  const body = await api.find<{ shared?: { effectiveRoles?: unknown } }>(path, { query: { $select: "id,shared" } });
+  const roles = body?.shared?.effectiveRoles;
+  return Array.isArray(roles) && roles.length > 0 && roles.every(role => typeof role === "string") ? roles : null;
+}
+
 /** An item by ID, or null when it does not exist or the user cannot open it. */
 export async function getItem(api: GraphApi, ref: ItemRef): Promise<GraphDriveItem | null> {
   const body = await api.find<unknown>(`/drives/${ref.driveId}/items/${ref.itemId}`, { query: { $select: ITEM_SELECT } });
@@ -109,9 +121,30 @@ export type SearchHit = ItemRef;
 export async function searchAll(api: GraphApi, query: string, pathFilter: string | undefined, from: number, size: number):
     Promise<{ hits: SearchHit[]; nextFrom?: number }> {
   const words = searchWords(query);
-  const queryString = pathFilter ? `(${words}) path:"${pathFilter.replace(/"/g, "")}"` : words;
+  return await searchDriveItems(api, pathFilter ? `(${words}) path:"${pathFilter.replace(/"/g, "")}"` : words, from, size);
+}
+
+/**
+ * One page of what other people's OneDrives hold that the user can open: what they have shared
+ * with the user, as OneDrive's "Shared with you" lists it, newest first, or matching `query`. Graph's
+ * own `sharedWithMe` is deprecated, so this is Microsoft Search, which lags a new share by minutes.
+ * Files shared from a site rather than a OneDrive aren't included.
+ * @param oneDrives Where the tenant's OneDrives live, e.g. `https://contoso-my.sharepoint.com/personal/`.
+ * @param mine The user's own OneDrive under it, if they have one.
+ */
+export async function searchSharedWithMe(api: GraphApi, oneDrives: string, mine: string | undefined, query: string | undefined,
+                                         from: number, size: number): Promise<{ hits: SearchHit[]; nextFrom?: number }> {
+  const places = `path:"${oneDrives.replace(/"/g, "")}"${mine ? ` -path:"${mine.replace(/"/g, "")}"` : ""}`;
+  const words = query === undefined ? "" : searchWords(query);
+  return await searchDriveItems(api, words ? `(${words}) ${places}` : places, from, size,
+    words ? undefined : [{ name: "LastModifiedTime", isDescending: true }]);
+}
+
+async function searchDriveItems(api: GraphApi, queryString: string, from: number, size: number,
+                                sortProperties?: { name: string; isDescending: boolean }[]): Promise<{ hits: SearchHit[]; nextFrom?: number }> {
   const body = await api.request<{ value?: unknown }>("POST", "/search/query", {
-    body: { requests: [{ entityTypes: ["driveItem"], query: { queryString }, from, size, fields: ["id", "parentReference"] }] },
+    body: { requests: [{ entityTypes: ["driveItem"], query: { queryString }, from, size, fields: ["id", "parentReference"],
+      ...(sortProperties ? { sortProperties } : {}) }] },
   });
   const container = Array.isArray(body?.value) ? body.value[0] as Record<string, unknown> | undefined : undefined;
   const containers = Array.isArray(container?.hitsContainers) ? container.hitsContainers as Record<string, unknown>[] : [];
