@@ -2745,7 +2745,7 @@ class OverseerImpl implements AgentHooks {
     for (const [id, entries] of Object.entries(change)) for (const [, file] of entries) {
       if (!("setBytes" in file)) continue;
       if (!this.isWorktree(Number(id))) throw new Error("Binary mutations require a worktree.");
-      this.gitCache.readBlob(file.setBytes.oid, file.setBytes.byteLength);
+      this.gitCache.assertBlob(file.setBytes.oid, file.setBytes.byteLength);
     }
   }
 

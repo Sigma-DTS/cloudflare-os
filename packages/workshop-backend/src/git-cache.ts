@@ -14,13 +14,20 @@
 // histories coexist freely in the same collection.
 //
 // Storage notes:
-// - Loose objects only, one collection record per object, keyed by oid. Packs a gatekeeper
-//   sends are unpacked as they are consumed, so each record is a zlib'd whole object. Dedup
-//   comes from content addressing, not deltas.
-// - Remote and raw-byte ingress are bounded to MAX_GIT_OBJECT_SIZE. Text writes keep their
-//   storage-record cap on the deflated object: a file whose blob doesn't fit throws an error
-//   naming it (see `#writeFileBlob`). Every caller writes objects before moving any record to
-//   name them, so a failure only leaves earlier objects dangling.
+// - One collection record per object, keyed by oid: a loose object (a zlib'd whole object), or,
+//   for a blob over CHUNK_MAX_SIZE (1 MiB), a chunked blob -- an index row naming chunks that
+//   are themselves ordinary loose blob rows (see git-chunked-blob.ts). Packs a gatekeeper sends
+//   are unpacked as they are consumed. Dedup comes from content addressing, not deltas; chunks,
+//   whose boundaries are content-defined, extend it to the unchanged parts of an edited file.
+// - Chunking is invisible above `#putObject` and the local reads: a chunked blob's oid is the
+//   whole blob's, and chunks carry no metadata. A chunk's oid gets a `gitObjectMetadata` row
+//   only if some gatekeeper sent a real blob with exactly its bytes, which is then the same
+//   object; so no gatekeeper's scoped view answers for a chunk merely because it is one.
+// - Remote ingress is bounded to MAX_GIT_OBJECT_SIZE; local writes are not bounded, and no read
+//   is: whatever is stored is returned, inline or chunked, whatever its size. What bounds a row
+//   is chunking, which keeps every row written now within about CHUNK_MAX_SIZE. Every caller
+//   writes objects before moving any record to name them, and a chunked blob's chunks are
+//   written before its index row, so a failure only leaves earlier objects dangling.
 // - No GC. Uploads and discarded raw-byte writes can leave blobs dangling, as can accepted
 //   merges, imports, migration, loading a blueprint's release (whose objects are stored whether
 //   or not anything comes to refer to them), and the merge commits of a chat that is then
@@ -34,7 +41,9 @@
 //   them), and the `observedOid` blob stamps (and legacy `observedCommit` stamps) on chats'
 //   readFile tool calls, attachment originals, and whole-file `setBytes` references in live chat
 //   changes. A future GC must root read stamps or let agent replay tolerate a missing object by
-//   eliding the read. Objects pulled from remotes are re-pullable through their metadata.
+//   eliding the read. Objects pulled from remotes are re-pullable through their metadata. A
+//   chunked blob's index row keeps its chunk rows alive: a chunk is live iff it is reachable
+//   as an object in its own right, or is named by a live index row.
 //
 // Reads come in two kinds. The *local history* reads (`readCommitFiles`, `readCommitLog`, ...)
 // serve the workspace's own history, which is always wholly held, and never pull. The *lazy*
@@ -112,6 +121,7 @@ import {
   type GitTreeEntry,
   type PackableObject,
 } from "./git-codec";
+import { BlobReader, BlobWriter, CHUNK_MAX_SIZE, isChunkedBlobRecord } from "./git-chunked-blob";
 import { createWorkshopLogger } from "./observability";
 
 const logger = createWorkshopLogger("workshop.git-cache");
@@ -121,15 +131,13 @@ const logger = createWorkshopLogger("workshop.git-cache");
 
 /**
  * Maximum payload size of a single git object the cache will accept from a gatekeeper (a put(),
- * or a pack entry). The git store writes each object, deflated, as one row of
- * Durable Object SQLite storage, and the platform caps a row at 8 MiB (8,388,608 bytes). Even
- * incompressible content deflates to barely more than its own size, so an object of up to
- * 8,000,000 bytes always fits, with room to spare. A put() beyond this is rejected -- but measured
- * first, so the size lands in metadata and later reads of the object fail fast instead of
- * re-downloading it.
+ * or a pack entry). Storage no longer needs it, since a large blob is stored chunked; it remains
+ * only because the ingress paths still hold a whole object in memory. A put() beyond this is
+ * rejected -- but measured first, so the size lands in metadata and later reads of the
+ * object fail fast instead of re-downloading it.
  *
  * This bounds only what is brought in from remotes. It is never applied to an object the store
- * already holds: whatever storage accepted is readable.
+ * already holds, nor to local writes.
  */
 export const MAX_GIT_OBJECT_SIZE = 8_000_000;
 
@@ -246,6 +254,10 @@ const MODE_KINDS: Record<GitTreeEntry["mode"], GitTreeEntryKind> = {
 // =======================================================================================
 // WorkspaceGitCache
 
+// A locally held object as `#readLocalShallow()` returns it: whole, but for a chunked blob,
+// which has no payload here.
+type ShallowObject = PackableObject | { type: "blob", payload?: undefined };
+
 const TEXT_DECODER_STRICT = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
@@ -261,23 +273,96 @@ export class WorkspaceGitCache {
 
   /**
    * Whether the store holds the object locally (no view scoping, no pulls). The empty tree is
-   * always held (see EMPTY_TREE_OID).
+   * always held (see EMPTY_TREE_OID). For a chunked blob this reads only the index row.
    */
   hasLocalObject(oid: GitOid): boolean {
     return oid === EMPTY_TREE_OID || this.storage.gitObjects.get(oid) !== undefined;
   }
 
-  /** Reads and decodes a locally-held object, or undefined (no view scoping, no pulls). */
-  readLocalObject(oid: GitOid): PackableObject | undefined {
-    let record = this.storage.gitObjects.get(oid);
-    if (record !== undefined) return decodeLooseObject(record.data);
-    return oid === EMPTY_TREE_OID ? { type: "tree", payload: new Uint8Array() } : undefined;
+  /** The type of a locally held object, or undefined (no view scoping, no pulls). */
+  localObjectType(oid: GitOid): GitObjectType | undefined {
+    return this.#statLocal(oid)?.type;
   }
 
-  // Every write to `gitObjects` is this one (callers wrap it in a transaction): it stores the
-  // object and extends what is recorded about it to its referents (see `#extendToReferents`).
+  /**
+   * The payload size of a locally held blob, or undefined if the store does not hold it (no
+   * view scoping, no pulls). Throws if the object is not a blob.
+   */
+  blobSize(oid: GitOid): number | undefined {
+    let stat = this.#statLocal(oid);
+    if (stat !== undefined && stat.type !== "blob") {
+      throw new Error(`git object ${oid} is a ${stat.type}, not a blob`);
+    }
+    return stat?.size;
+  }
+
+  /**
+   * Opens a locally held blob for reading in pieces, whatever its size, or returns undefined if
+   * the store does not hold it (no view scoping, no pulls). Throws if the object is not a blob.
+   */
+  openLocalBlob(oid: GitOid): BlobReader | undefined {
+    if (oid === EMPTY_TREE_OID) throw new Error(`git object ${oid} is a tree, not a blob`);
+    let record = this.storage.gitObjects.get(oid);
+    return record === undefined ? undefined : BlobReader.open(this.storage.gitObjects, record);
+  }
+
+  /**
+   * Reads and decodes a locally-held object, or undefined (no view scoping, no pulls). A
+   * chunked blob is assembled whole, whatever its size.
+   */
+  readLocalObject(oid: GitOid): PackableObject | undefined {
+    let local = this.#readLocalShallow(oid);
+    return local === undefined ? undefined : this.#wholeObject(oid, local);
+  }
+
+  // A locally held object, for a walk that follows commits and trees and needs only to know a
+  // blob is one: decoded once, but a chunked blob is never materialized and comes back without
+  // its payload, and no blob is refused for its size.
+  #readLocalShallow(oid: GitOid): ShallowObject | undefined {
+    let record = this.storage.gitObjects.get(oid);
+    if (record === undefined) {
+      return oid === EMPTY_TREE_OID ? { type: "tree", payload: new Uint8Array() } : undefined;
+    }
+    return isChunkedBlobRecord(record) ? { type: "blob" } : decodeLooseObject(record.data);
+  }
+
+  // The whole object behind a shallow read: a chunked blob is assembled.
+  #wholeObject(oid: GitOid, local: ShallowObject): PackableObject {
+    if (local.payload !== undefined) return local;
+    let reader = this.openLocalBlob(oid)!;
+    return { type: "blob", payload: reader.read(0, reader.size) };
+  }
+
+  // The type and payload size of a locally held object, never materializing a chunked blob. An
+  // inline row is decoded whole for its header; such rows are at most CHUNK_MAX_SIZE when
+  // written now, and at most 8 MB when legacy, so that is acceptable.
+  #statLocal(oid: GitOid): { type: GitObjectType, size: number } | undefined {
+    let record = this.storage.gitObjects.get(oid);
+    if (record === undefined) return oid === EMPTY_TREE_OID ? { type: "tree", size: 0 } : undefined;
+    if (isChunkedBlobRecord(record)) return { type: "blob", size: record.size };
+    let { type, payload } = decodeLooseObject(record.data);
+    return { type, size: payload.byteLength };
+  }
+
+  // Every write of an object's row to `gitObjects` is this one (callers wrap it in a
+  // transaction): it stores the object and extends what is recorded about it to its referents
+  // (see `#extendToReferents`). A blob over CHUNK_MAX_SIZE is stored chunked: a BlobWriter puts
+  // its chunk rows through the chunk store, before this puts the index row. Those chunk puts
+  // land inside the caller's transaction, which stays bounded only because every payload
+  // reaching here is already whole in memory -- a buffered local write, or an ingress bounded
+  // by MAX_GIT_OBJECT_SIZE.
   #putObject(oid: GitOid, object: PackableObject): void {
-    this.storage.gitObjects.put({ oid, data: encodeLooseObject(object.type, object.payload) });
+    if (object.type === "blob" && object.payload.byteLength > CHUNK_MAX_SIZE) {
+      let writer = new BlobWriter(this.storage.gitObjects, object.payload.byteLength);
+      writer.write(object.payload);
+      let blob = writer.finish();
+      if (blob.record === undefined || blob.oid !== oid) {
+        throw new Error(`chunking blob ${oid} produced ${blob.oid}`);
+      }
+      this.storage.gitObjects.put(blob.record);
+    } else {
+      this.storage.gitObjects.put({ oid, data: encodeLooseObject(object.type, object.payload) });
+    }
     this.#extendToReferents(oid, object);
   }
 
@@ -301,31 +386,38 @@ export class WorkspaceGitCache {
   // as commits alone (hence the `IfHeld` variant). Writes are content-addressed, so rewriting
   // identical content is a cheap no-op that produces the same oids.
 
-  /** Store a bounded raw payload as an ordinary Git blob, returning its immutable reference. */
+  /**
+   * Store a raw payload, of any size, as an ordinary Git blob, returning its immutable
+   * reference.
+   */
   async writeBlob(content: Uint8Array): Promise<BytesRef> {
-    if (content.byteLength > MAX_GIT_OBJECT_SIZE) {
-      throw new Error(`Git blob is too large to store (over ${MAX_GIT_OBJECT_SIZE} bytes).`);
-    }
-    try {
-      return { oid: await this.#storeLocalObject("blob", content), byteLength: content.byteLength };
-    } catch (err) {
-      if (isTooBigForStorage(err)) throw new Error("Git blob is too large to store.", { cause: err });
-      throw err;
-    }
+    return { oid: await this.#storeLocalObject("blob", content), byteLength: content.byteLength };
   }
 
   /**
    * Read a locally held Git blob by its OID capability, optionally checking a whole-file OT's
-   * length. Never pulls.
+   * length (checked before the blob is read). Never pulls.
    */
   readBlob(oid: string, byteLength?: number): Uint8Array {
-    const object = this.readLocalObject(oid);
-    if (!object) throw new Error("Unknown Git blob.");
-    if (object.type !== "blob") throw new Error("Git object is not a blob.");
-    if (byteLength !== undefined && object.payload.byteLength !== byteLength) {
+    const reader = this.#openBlobRef(oid, byteLength);
+    return reader.read(0, reader.size);
+  }
+
+  /**
+   * Checks that a Git blob OID capability names a locally held blob of `byteLength` bytes, as
+   * `readBlob()` does, but without reading the blob whole. Never pulls.
+   */
+  assertBlob(oid: string, byteLength: number): void {
+    this.#openBlobRef(oid, byteLength);
+  }
+
+  #openBlobRef(oid: string, byteLength: number | undefined): BlobReader {
+    let reader = this.openLocalBlob(oid);
+    if (reader === undefined) throw new Error("Unknown Git blob.");
+    if (byteLength !== undefined && reader.size !== byteLength) {
       throw new Error("Git blob length does not match its reference.");
     }
-    return object.payload;
+    return reader;
   }
 
   /**
@@ -434,7 +526,7 @@ export class WorkspaceGitCache {
         if (existing !== undefined && existing.mode !== "100644" && existing.mode !== "100755") {
           throw new Error(`cannot write ${path}: not a regular file`);
         }
-        let oid = await this.#writeFileBlob(path, child);
+        let oid = await this.#writeFileBlob(child);
         // A changed file keeps its base entry's mode; only new files default to 100644.
         entries.set(name, { mode: existing?.mode ?? "100644", name, oid });
       }
@@ -443,22 +535,13 @@ export class WorkspaceGitCache {
     return await this.#storeLocalObject("tree", encodeGitTree([...entries.values()]));
   }
 
-  // Writes a file's text as a blob. The size limit is storage's own, on the deflated object; this
-  // only names the file in the error, and says what to do about it.
-  async #writeFileBlob(path: string, content: FileContent): Promise<GitOid> {
+  // Writes a file's text as a blob, or checks that a byte reference names a held blob.
+  async #writeFileBlob(content: FileContent): Promise<GitOid> {
     if (typeof content !== "string") {
-      this.readBlob(content.oid, content.byteLength);
+      this.assertBlob(content.oid, content.byteLength);
       return content.oid;
     }
-    try {
-      return await this.#storeLocalObject("blob", new TextEncoder().encode(content));
-    } catch (err) {
-      if (isTooBigForStorage(err)) {
-        throw new Error(`${path} is too large to store. Split it into smaller files (for ` +
-            `example, by moving code into modules it imports).`, { cause: err });
-      }
-      throw err;
-    }
+    return await this.#storeLocalObject("blob", new TextEncoder().encode(content));
   }
 
   /**
@@ -687,7 +770,8 @@ export class WorkspaceGitCache {
   // The scoped gatekeeper read view
 
   /**
-   * The single read behind `GitCache.get()`/`has()`/`stat()`: answers exactly
+   * The read behind `GitCache.get()` (and, via `statForGatekeeper()`, `has()`/`stat()`), the
+   * gatekeeper's scoped view: answers exactly
    * `onRemote(G) ∪ pendingPush(G)` for gatekeeper G and null for everything else. A pendingPush
    * object that is locally absent is pulled through from its recorded sources on demand (that
    * is what lets G simulate a queued cross-remote push); an absent onRemote object is not
@@ -695,19 +779,35 @@ export class WorkspaceGitCache {
    */
   async readForGatekeeper(gatekeeperId: WorkpieceId, oid: GitOid, hints?: GitPullHints)
       : Promise<PackableObject | null> {
+    return await this.#heldForGatekeeper(gatekeeperId, oid, hints)
+        ? this.readLocalObject(oid) ?? null : null;
+  }
+
+  /**
+   * `GitCache.stat()`/`has()`: `readForGatekeeper()`'s view, answering type and size without
+   * reading the object whole (a chunked blob's come from its index row).
+   */
+  async statForGatekeeper(gatekeeperId: WorkpieceId, oid: GitOid)
+      : Promise<{ type: GitObjectType, size: number } | null> {
+    return await this.#heldForGatekeeper(gatekeeperId, oid)
+        ? this.#statLocal(oid) ?? null : null;
+  }
+
+  // Whether an object is in the gatekeeper's view and held, after pulling it through if it is
+  // a pendingPush object (see readForGatekeeper).
+  async #heldForGatekeeper(gatekeeperId: WorkpieceId, oid: GitOid, hints?: GitPullHints)
+      : Promise<boolean> {
     validateGitOid(oid);
     let meta = this.storage.gitObjectMetadata.get(oid);
-    if (meta === undefined) return null;
+    if (meta === undefined) return false;
     let onRemote = meta.onRemote.includes(gatekeeperId);
     let pendingPush = meta.pendingPush.some(p => p.gatekeeperId === gatekeeperId);
-    if (!onRemote && !pendingPush) return null;
+    if (!onRemote && !pendingPush) return false;
 
-    let local = this.readLocalObject(oid);
-    if (local === undefined && pendingPush) {
+    if (!this.hasLocalObject(oid) && pendingPush) {
       await this.ensureGitObjects([oid], hints ?? this.#exactObjectHints(meta.type));
-      local = this.readLocalObject(oid);
     }
-    return local ?? null;
+    return this.hasLocalObject(oid);
   }
 
   // -------------------------------------------------------------------------------------
@@ -801,7 +901,7 @@ export class WorkspaceGitCache {
   async ensureObject(oid: GitOid,
                      expected: { type: GitObjectType, referencedBy?: GitOid, eagerTree?: boolean })
       : Promise<PackableObject> {
-    let local = this.readLocalObject(oid);
+    let local = this.#readLocalShallow(oid);
     if (local === undefined) {
       await this.ensureGitObjects([oid],
           expected.eagerTree && expected.type !== "blob"
@@ -811,7 +911,7 @@ export class WorkspaceGitCache {
                   commitHistory: { kind: "depth", depth: 1 },
                   filterBlobSize: EAGER_BLOB_LIMIT }
               : this.#exactObjectHints(expected.type, expected.referencedBy));
-      local = this.readLocalObject(oid);
+      local = this.#readLocalShallow(oid);
       if (local === undefined) {
         // ensureGitObjects throws on failure; this is a defensive backstop.
         throw new Error(`git object ${oid} is unavailable`);
@@ -820,7 +920,8 @@ export class WorkspaceGitCache {
     if (local.type !== expected.type) {
       throw new Error(`git object ${oid} is a ${local.type}, but a ${expected.type} was expected`);
     }
-    return local;
+    // A chunked blob is assembled only once it is known to be what was asked for.
+    return this.#wholeObject(oid, local);
   }
 
   // The pull-hint defaults for an exact-object fault: depth-1 (never deepen history), tree:0
@@ -865,7 +966,10 @@ export class WorkspaceGitCache {
     return (await this.readFileAtCommitWithOid(commitOid, path))?.text;
   }
 
-  /** Resolve one regular file to its existing immutable Git blob reference. */
+  /**
+   * Resolve one regular file to its existing immutable Git blob reference, fault-pulling the
+   * blob if missing but never reading it whole.
+   */
   async fileBytesAtCommit(commitOid: GitOid, path: string): Promise<BytesRef | undefined> {
     const {tree, entry} = await this.#resolveEntryAt(commitOid, path);
     if (!entry) return undefined;
@@ -874,8 +978,11 @@ export class WorkspaceGitCache {
     if (entry.mode === "120000") {
       throw new Error(symlinkMessage(path, await this.#ensureFileBlob(entry.oid, tree, path)));
     }
-    const payload = await this.#ensureFileBlob(entry.oid, tree, path);
-    return {oid: entry.oid, byteLength: payload.byteLength};
+    await this.#faultFileBlob(entry.oid, tree, path);
+    const byteLength = this.blobSize(entry.oid);
+    // #faultFileBlob throws on failure; this is a defensive backstop.
+    if (byteLength === undefined) throw new Error(`git object ${entry.oid} is unavailable`);
+    return {oid: entry.oid, byteLength};
   }
 
   /**
@@ -1185,10 +1292,10 @@ export class WorkspaceGitCache {
       throw new Error(
           `${JSON.stringify(id)} is not a full git commit id: expected 40 lowercase hex digits.`);
     }
-    let local = this.readLocalObject(id);
-    if (local !== undefined) {
-      if (local.type !== "commit") {
-        throw new Error(`${id} is a ${local.type}, not a commit.`);
+    let localType = this.localObjectType(id);
+    if (localType !== undefined) {
+      if (localType !== "commit") {
+        throw new Error(`${id} is a ${localType}, not a commit.`);
       }
       return id;
     }
@@ -1219,15 +1326,15 @@ export class WorkspaceGitCache {
         filterBlobSize: EAGER_BLOB_LIMIT,
       });
     }
-    let local = this.readLocalObject(commit);
-    if (local === undefined) {
+    let localType = this.localObjectType(commit);
+    if (localType === undefined) {
       // ensureGitObjects throws on failure; defensive backstop.
       throw new Error(`Commit ${commit} could not be fetched.`);
     }
-    if (local.type !== "commit") {
+    if (localType !== "commit") {
       // The reader rule let an assertion-grade metadata row through resolveCommitId; the pulled
       // bytes have now decided.
-      throw new Error(`${commit} is a ${local.type}, not a commit.`);
+      throw new Error(`${commit} is a ${localType}, not a commit.`);
     }
     return commit;
   }
@@ -1277,16 +1384,27 @@ export class WorkspaceGitCache {
   // brought in (see MAX_GIT_OBJECT_SIZE), never to reading what was stored.
   async #ensureFileBlob(oid: GitOid, referencedBy: GitOid | undefined, path: string)
       : Promise<Uint8Array> {
-    let blob: PackableObject;
+    return (await this.#asFileRead(path,
+        () => this.ensureObject(oid, { type: "blob", referencedBy }))).payload;
+  }
+
+  // Faults a file's blob in if missing, as #ensureFileBlob does, without reading it.
+  async #faultFileBlob(oid: GitOid, referencedBy: GitOid | undefined, path: string)
+      : Promise<void> {
+    if (this.hasLocalObject(oid)) return;
+    await this.#asFileRead(path,
+        () => this.ensureGitObjects([oid], this.#exactObjectHints("blob", referencedBy)));
+  }
+
+  async #asFileRead<T>(path: string, read: () => Promise<T>): Promise<T> {
     try {
-      blob = await this.ensureObject(oid, { type: "blob", referencedBy });
+      return await read();
     } catch (err) {
       if (err instanceof GitObjectTooLargeError) {
         throw new UnreadableContentError(tooLargeMessage(path), { cause: err });
       }
       throw err;
     }
-    return blob.payload;
   }
 
   // -------------------------------------------------------------------------------------
@@ -1313,13 +1431,13 @@ export class WorkspaceGitCache {
         // usually measured, but marks converted after an applied push carry the walk's
         // assertion-grade stamp, and an assertion must never decide this check when the
         // bytes themselves are on hand.
-        let type = this.readLocalObject(oid)?.type ?? meta.type;
+        let type = this.localObjectType(oid) ?? meta.type;
         if (type !== "commit") {
           throw new Error(`Cannot push ${oid}: it is a ${type}, not a commit.`);
         }
         continue;  // proven on the destination
       }
-      let local = this.readLocalObject(oid);
+      let local = this.#readLocalShallow(oid);
       if (local === undefined) {
         throw new Error(
             `Cannot push: commit ${oid} in the pushed history is not available in the ` +
@@ -1358,7 +1476,7 @@ export class WorkspaceGitCache {
   isAncestor(ancestor: GitOid, descendant: GitOid): boolean {
     validateGitOid(ancestor);
     validateGitOid(descendant);
-    let start = this.readLocalObject(descendant);
+    let start = this.#readLocalShallow(descendant);
     if (start === undefined || start.type !== "commit") {
       throw new Error(
           `Cannot check ancestry: ${descendant} is not a commit in the workspace's git cache.`);
@@ -1371,7 +1489,7 @@ export class WorkspaceGitCache {
       if (visited.has(oid)) continue;
       visited.add(oid);
       if (oid === ancestor) return true;
-      let local = this.readLocalObject(oid);
+      let local = this.#readLocalShallow(oid);
       // An absent or non-commit parent ends this path: the walk answers over cached commit
       // history only. (A non-commit parent oid means a forged commit; not this method's problem.)
       if (local === undefined || local.type !== "commit") continue;
@@ -1411,7 +1529,7 @@ export class WorkspaceGitCache {
     while (stack.length > 0) {
       let oid = stack.pop()!;
       if (ancestry.has(oid)) continue;
-      let local = this.readLocalObject(oid);
+      let local = this.#readLocalShallow(oid);
       let parents: GitOid[] = [];
       if (local?.type === "commit") {
         parents = parseGitCommitRefs(local.payload, oid).parents;
@@ -1460,7 +1578,8 @@ export class WorkspaceGitCache {
       }
       meta.pendingPush.push({ gatekeeperId, actionId });
       this.storage.gitObjectMetadata.put(meta);  // also lands in byPendingPushAction
-      let local = this.readLocalObject(oid);
+      // A chunked blob is never materialized for this: a blob refers to nothing.
+      let local = this.#readLocalShallow(oid);
       if (local !== undefined) stack.push(...this.#referentEntries(oid, local));
     }
   }
@@ -1468,7 +1587,7 @@ export class WorkspaceGitCache {
   // The containment edges of an object, for the marking walk and mark propagation: a commit
   // points at its tree and parents, a tree at its non-gitlink entries. Gitlink targets are
   // foreign repos' commits and are never walked, pulled, or pushed.
-  #referentEntries(oid: GitOid, object: PackableObject): { oid: GitOid, type: GitObjectType }[] {
+  #referentEntries(oid: GitOid, object: ShallowObject): { oid: GitOid, type: GitObjectType }[] {
     if (object.type === "commit") {
       let refs = parseGitCommitRefs(object.payload, oid);
       return [
@@ -1617,7 +1736,8 @@ export class WorkspaceGitCache {
         this.storage.gitObjectMetadata.put(meta);
       }
       if (wasSource) continue;
-      let local = this.readLocalObject(oid);
+      // A chunked blob is never materialized for this: a blob refers to nothing.
+      let local = this.#readLocalShallow(oid);
       if (local !== undefined) stack.push(...this.#referentEntries(oid, local));
     }
   }
@@ -1707,12 +1827,11 @@ export class GitCacheImpl extends RpcTarget implements GitCache {
   }
 
   async has(id: GitOid): Promise<boolean> {
-    return await this.cache.readForGatekeeper(this.gatekeeperId, id) !== null;
+    return await this.cache.statForGatekeeper(this.gatekeeperId, id) !== null;
   }
 
   async stat(id: GitOid): Promise<{ type: GitObjectType, size: number } | null> {
-    let object = await this.cache.readForGatekeeper(this.gatekeeperId, id);
-    return object === null ? null : { type: object.type, size: object.payload.byteLength };
+    return await this.cache.statForGatekeeper(this.gatekeeperId, id);
   }
 
   async put(type: GitObjectType, content: Uint8Array): Promise<GitOid> {
@@ -1815,11 +1934,6 @@ function buildChangeNode(changes: ReadonlyMap<string, FileContent | null>): Chan
     }
   }
   return root;
-}
-
-// Whether a write failed for storage's per-row size limit.
-function isTooBigForStorage(err: unknown): boolean {
-  return err instanceof Error && err.message.includes("SQLITE_TOOBIG");
 }
 
 // =======================================================================================

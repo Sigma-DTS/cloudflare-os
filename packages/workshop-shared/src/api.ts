@@ -2870,7 +2870,8 @@ export interface Overseer extends RpcTarget {
    * Retrying identical bytes returns the same OID. This does not change any worktree or message.
    * Use the OID in a chat attachment, or in a worktree's whole-file `setBytes` change together
    * with the payload's byte length. The blob must be present in this workspace's Git store.
-   * Limited to 8,000,000 bytes; larger-file support is deferred.
+   * The store sets no size limit, but the content travels in one RPC message; a streamed form
+   * for larger content is deferred.
    */
   uploadBlob(content: Uint8Array): Promise<GitOid>;
 

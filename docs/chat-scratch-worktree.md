@@ -16,11 +16,10 @@ Attachment limits and MIME signatures are checked when sending, independently of
 blob storage. Removing an unsent attachment only discards the client reference; immutable
 Git objects are not deleted while another attachment or worktree may still reference them.
 Uploaded bytes, Git-fetched files, and authored files share the existing `gitObjects` collection:
-one zlib-compressed loose Git object per OID. There is no chunk store or upload-grant system.
-As with other Git APIs, knowing an OID allows access to that object if it exists in the workspace.
-Raw-byte uploads and writes accept at most 8,000,000 bytes, conservatively below the existing
-8 MiB compressed storage-record limit. Larger-file storage is deferred to a separate change;
-existing text-write and local-read behavior is unchanged.
+one zlib-compressed loose Git object per OID, except that a blob over 1 MiB is stored as an index
+of chunks that are themselves loose blobs (see `git-chunked-blob.ts`). There is no upload-grant
+system. As with other Git APIs, knowing an OID allows access to that object if it exists in the
+workspace. Raw-byte uploads and writes have no size limit, and reads return whatever is stored.
 The shared Git store has no GC. Removing an attachment from an unsent draft does not reclaim
 its uploaded blob; retention/quota needs a generic policy that also protects objects referenced
 by messages and worktree changes, not attachment-specific deletion by OID.

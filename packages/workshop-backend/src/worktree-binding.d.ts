@@ -119,8 +119,8 @@ export interface Worktree {
   /** Stream current file bytes, preserving binary contents; absence is an error. */
   readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>>;
   /**
-   * Create/replace a file with raw bytes using whole-file replacement semantics.
-   * Limited to 8,000,000 bytes; larger files are not supported.
+   * Create/replace a file with raw bytes using whole-file replacement semantics. There is no
+   * size limit.
    */
   writeBytes(path: string, content: Uint8Array): Promise<void>;
 

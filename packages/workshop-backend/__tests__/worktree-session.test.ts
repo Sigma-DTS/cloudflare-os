@@ -9,7 +9,7 @@ import type { OverseerDurableObject } from "../src/overseer.js";
 import { WorktreeSessionImpl, type WorktreeSessionHost } from "../src/worktree-session";
 import type { WorktreeTurnAccess } from "../src/agent";
 import { formatUnifiedDiff } from "../src/agent";
-import { MAX_GIT_OBJECT_SIZE, WorkspaceGitCache } from "../src/git-cache";
+import { WorkspaceGitCache } from "../src/git-cache";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
 import { concatBytes } from "../src/git-codec";
 import { makeMockStorage } from "./mock-storage";
@@ -228,8 +228,12 @@ describe("listFiles", () => {
       {offset: 4, length: 0}, {offset: 0.5, length: 1}, {offset: Number.MAX_SAFE_INTEGER, length: 1}]) {
       await expect(session.readBytes("data.bin", range)).rejects.toThrow("Invalid byte range");
     }
-    await expect(session.writeBytes("data.bin", new Uint8Array(MAX_GIT_OBJECT_SIZE + 1)))
-      .rejects.toThrow("too large");
+    // Bytes of any size can be written and read back.
+    const large = new Uint8Array(9 * 1024 * 1024);
+    for (let i = 0; i < large.length; i += 4093) large[i] = i & 0xff;
+    await session.writeBytes("large.bin", large);
+    expect(await new Response(await session.readBytes("large.bin", {offset: 4093 * 1000, length: 3}))
+      .bytes()).toEqual(large.slice(4093 * 1000, 4093 * 1000 + 3));
     expect(await new Response(await session.readBytes("data.bin")).bytes()).toEqual(Uint8Array.of(0, 255, 7));
     await session.writeBytes("empty.bin", new Uint8Array());
     expect(await new Response(await session.readBytes("empty.bin")).bytes()).toEqual(new Uint8Array());

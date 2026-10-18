@@ -250,26 +250,15 @@ describe("local history", () => {
     })).rejects.toThrow(/name or email contains/);
   });
 
-  it("writes a file storage cannot hold as an error naming it, and stores no tree", async () => {
-    // The limit is storage's own (here the mock's, mimicking SQLite's error), on the deflated
-    // object: nothing checks a file's length before the write.
+  it("writes a file of any size, chunking a large one's blob", async () => {
     let { objects, store } = makeStore();
-    let put = objects.put.bind(objects);
-    objects.put = record => {
-      if (record.data.byteLength > 64 * 1024) throw new Error("string or blob too big: SQLITE_TOOBIG");
-      put(record);
-    };
-    let random = Array.from({ length: 128 * 1024 }, () => Math.random().toString(36)[2]).join("");
+    let random = Array.from({ length: 3 * 1024 * 1024 },
+        () => Math.random().toString(36)[2]).join("");
     let options = { parents: [], author: ALICE, message: "m", timestamp: new Date(0) };
-    await expect(store.writeFilesAsCommit(new Map([["lib/big.js", random]]), options))
-        .rejects.toThrow(/^lib\/big\.js is too large to store\. Split it into smaller files/);
-    expect([...objects.list()]).toEqual([]);
-    // Compressible text of the same length fits.
-    let fits = await store.writeFilesAsCommit(
-        new Map([["lib/big.js", "x".repeat(128 * 1024)]]), options);
-    await expect(store.writeChangedFilesAsCommit(new Map([["lib/big.js", random]]),
-                                                 { ...options, treeBase: fits }))
-        .rejects.toThrow("lib/big.js is too large to store");
+    let commit = await store.writeFilesAsCommit(new Map([["lib/big.js", random]]), options);
+    expect(store.readCommitFiles(commit)).toEqual(new Map([["lib/big.js", random]]));
+    let blob = await blobOid(random);
+    expect(objects.get(blob)).toHaveProperty("chunks");
   });
 
   it("rejects reads of unknown commits", async () => {

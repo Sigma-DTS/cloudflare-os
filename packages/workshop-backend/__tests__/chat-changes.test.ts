@@ -1239,43 +1239,6 @@ describe("updateChatFromMainline", () => {
       expect(await impl.gitCache.readFileAtCommit(head, "big.txt")).toBe(merged);
     }));
   });
-
-  it("refuses an accept whose file storage cannot hold, naming it and changing nothing",
-      () => withImpl(async impl => {
-    let c1 = await commitFiles(impl, { "server.js": "one\n" });
-    addGadget(impl, 1, "APP", c1);
-    addChat(impl, 1);
-    // Incompressible, so that its stored object is as large as the text.
-    let big = Array.from({ length: 200 * 1024 }, () => Math.random().toString(36)[2]).join("");
-    await submit(impl, 1, {
-      generation: 0, revision: 0, clientId: "cli", seq: 1,
-      pins: [{ gadgetId: 1, baseCommit: c1 }],
-      change: { 1: [["server.js", { set: big }]] },
-    });
-    impl.materializeChatChanges(1);
-    let before = { meta: impl.storage.chatMeta.get(1), messages: chatMessages(impl, 1) };
-
-    // The limit is storage's own, on the stored (deflated) object. This one stands in for the
-    // record cap, so the test needn't write past the real cap, which may yet be raised.
-    let objects = impl.storage.gitObjects;
-    let put = objects.put;
-    objects.put = (record: { data: Uint8Array }) => {
-      if (record.data.byteLength > 1024) {
-        throw new Error("string or blob too big: SQLITE_TOOBIG");
-      }
-      put.call(objects, record);
-    };
-    try {
-      await expect(impl.mergeChanges(1, USER_META, "user-do-id")).rejects.toThrow(
-          /^Cannot accept changes to APP: server\.js is too large to store\. Split it into/);
-    } finally {
-      objects.put = put;
-    }
-    expect(impl.storage.gadgets.get(1)!.commitId).toBe(c1);
-    expect(impl.storage.chatMeta.get(1)).toEqual(before.meta);
-    expect(chatMessages(impl, 1)).toEqual(before.messages);
-    expect(await gadgetContent(impl, 1, 1)).toEqual({ "server.js": big });
-  }));
 });
 
 describe("agent step barrier", () => {

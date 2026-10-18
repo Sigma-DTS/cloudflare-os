@@ -8,7 +8,6 @@ import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall, type Api, 
 import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
 import type {CodeChange} from "@gadgets/workshop-shared/code-change";
-import {MAX_GIT_OBJECT_SIZE} from "../src/git-cache";
 declare module "cloudflare:workers" { interface ProvidedEnv {
   TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
@@ -259,7 +258,8 @@ describe("scratch worktree attachment ingress", () => {
 
   it("keeps large local text readable after byte access and DO eviction", async () => {
     const name = crypto.randomUUID();
-    const text = "a".repeat(MAX_GIT_OBJECT_SIZE + 1);
+    // Over 8 MB, so stored chunked.
+    const text = "a".repeat(8_000_001);
     let commit: string, oid: string;
     await inKernel(name, async impl => {
       commit = await impl.gitCache.writeFilesAsCommit(new Map([["large.txt", text]]), {
@@ -277,7 +277,7 @@ describe("scratch worktree attachment ingress", () => {
     });
     await abortAllDurableObjects();
     await inKernel(name, async impl => {
-      expect(impl.storage.gitObjects.get(oid)).toBeDefined();
+      expect(impl.storage.gitObjects.get(oid)).toHaveProperty("chunks");
       expect(impl.gitCache.readLocalObject(oid)?.payload.byteLength).toBe(text.length);
       expect(await impl.readFileAtCommit(commit, "large.txt")).toBe(text);
       expect(impl.gitCache.readCommitFiles(commit).get("large.txt")).toBe(text);

@@ -19,7 +19,7 @@
 // entry's end (see PackReader.inflate()).
 
 import { constants, createInflate, deflateSync, inflateSync, type Inflate } from "node:zlib";
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import type { GitObjectType, GitOid } from "@gadgets/workshop-shared/gatekeeper";
 import type { CommitSignature } from "./worktree-binding";
 
@@ -75,11 +75,18 @@ export function concatBytes(parts: Uint8Array[]): Uint8Array {
 // storage-schema/overseer-storage.ts) -- byte-compatible with git's own loose objects, though
 // the compressed bytes need not be bit-identical (the store is keyed by oid; readers inflate).
 
+/**
+ * A SHA-1 hasher primed with the header of an object of `type` and payload length `size`: feed
+ * it exactly `size` payload bytes, in any number of updates, and its hex digest is the object's
+ * oid. This is the one place the hashed header's format is written.
+ */
+export function gitObjectHasher(type: GitObjectType, size: number): Hash {
+  return createHash("sha1").update(`${type} ${size}\0`);
+}
+
 /** Computes the oid of an object from its type and headerless payload. */
 export async function gitObjectOid(type: GitObjectType, payload: Uint8Array): Promise<GitOid> {
-  let header = ENCODER.encode(`${type} ${payload.byteLength}\0`);
-  let digest = await crypto.subtle.digest("SHA-1", concatBytes([header, payload]));
-  return toHex(new Uint8Array(digest));
+  return gitObjectHasher(type, payload.byteLength).update(payload).digest("hex");
 }
 
 /**
