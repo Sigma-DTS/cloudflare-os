@@ -371,7 +371,7 @@ export interface GitObjectMetadataRecord {
 
   /**
    * The object's type. Always known at write time: *measured* from hash-verified bytes
-   * (put/consumePack, including oversize rejections), or *asserted* by the referencing context
+   * (put/consumePack), or *asserted* by the referencing context
    * that introduced the oid (a tree entry's mode, a commit's tree/parent headers, an
    * advertisement) -- which is how it can exist for objects never fetched. The two grades are
    * distinguished by `size`: measured writers always record both together, so `size !==
@@ -384,12 +384,12 @@ export interface GitObjectMetadataRecord {
   type: GitObjectType;
 
   /**
-   * The payload byte size. Recorded ONLY from bytes actually measured: a stored put(), or a
-   * put()/pack entry rejected for exceeding MAX_GIT_OBJECT_SIZE (the content was in hand, so
-   * the measurement is proof-grade and lets later reads fail fast). Never inferred from an
-   * object's *absence* -- an omitted blob's size is unknowable, and an absence-based record
-   * would durably trust gatekeeper behavior as if it were a measurement. Doubles as `type`'s
-   * evidentiary grade (see its doc).
+   * The payload byte size. Recorded ONLY from bytes actually measured: a stored put() or pack
+   * entry. (Rows from before every size was stored may also carry the size of an object that
+   * was measured but declined for its size; such an object is pulled like any other.) Never
+   * inferred from an object's *absence* -- an omitted blob's size is unknowable, and an
+   * absence-based record would durably trust gatekeeper behavior as if it were a measurement.
+   * Doubles as `type`'s evidentiary grade (see its doc).
    */
   size?: number;
 

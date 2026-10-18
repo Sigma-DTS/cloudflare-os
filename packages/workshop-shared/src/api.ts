@@ -2295,8 +2295,8 @@ export type TreeNode =
  * One file's content at a commit, as returned by Overseer.readFilesAtCommit(). `text` carries
  * the file's UTF-8 content; `absent` means the path names no entry at that commit (or names a
  * directory); `unreadable` means the entry exists but cannot be presented as text -- a symlink,
- * a submodule, binary content, or a blob over the git store's per-object size cap -- and carries
- * a descriptive, path-flavored message suitable for display in place of the file.
+ * a submodule, or binary content (never a matter of size) -- and carries a descriptive,
+ * path-flavored message suitable for display in place of the file.
  */
 export type FileAtCommit =
   | { kind: "text"; text: string }
@@ -2313,8 +2313,7 @@ export const MAX_READ_FILES_PER_CALL = 64;
  * Text bytes after which Overseer.readFilesAtCommit() stops decoding and omits the remaining
  * requested paths from its response (the client re-requests them). Keeps one response well
  * under the RPC message ceiling even with the UTF-16 inflation of serialized text. The first
- * file is always returned whole, however large, so every call makes progress; its size is
- * bounded only by what the git store could hold.
+ * file is always returned whole, however large, so every call makes progress.
  */
 export const READ_FILES_RESPONSE_BUDGET = 8 * 1024 * 1024;
 
@@ -2559,7 +2558,7 @@ export interface Overseer extends RpcTarget {
    * the workspace's git store are pulled in one batch through the gatekeeper that provided the
    * commit; a pull failure fails the whole call, since it is transient or actionable rather than
    * a fact about any one file, whereas per-file conditions -- absent path, symlink, submodule,
-   * binary or oversized content -- are reported per entry (see FileAtCommit).
+   * binary content -- are reported per entry (see FileAtCommit). A file of any size is read.
    *
    * At most MAX_READ_FILES_PER_CALL paths per call. The server stops decoding once the
    * accumulated text exceeds READ_FILES_RESPONSE_BUDGET and omits the remaining paths from the

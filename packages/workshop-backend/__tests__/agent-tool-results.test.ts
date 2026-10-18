@@ -49,7 +49,7 @@ describe("grep", () => {
     let unreached = () => { throw new Error("not reached"); };
     let cache = {
       pathEntryAtCommit: unreached, listCommitTreePaths: unreached, readTextBlob: unreached,
-      ensureBlobs: async () => new Set<string>(),
+      ensureBlobs: async () => {},
     };
     let turn = {getOverlayFiles: () => new Map<string, string>(), getRemovedPaths: () => new Set<string>()};
     let scan = await scanWorkpieceForGrep(cache, turn, 1, undefined, undefined);

@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { createDeflate, createInflate, deflateSync, inflateSync } from "node:zlib";
 import {
   GIT_DEFLATE_LEVEL,
+  GitDeltaApplier,
   applyGitDelta,
+  bytesDeltaBase,
   buildPackBytes,
   concatBytes,
   decodeLooseObject,
@@ -19,9 +21,23 @@ import {
   signatureSafe,
   validateGitOid,
   type GitCommit,
+  type DecodedPackObject,
+  type DeltaBase,
   type GitTreeEntry,
   type PackableObject,
 } from "../src/git-codec";
+import {
+  BlobReader,
+  BlobWriter,
+  CHUNK_MAX_SIZE,
+  isChunkedBlobRecord,
+  type ChunkStore,
+} from "../src/git-chunked-blob";
+import type { GitObjectType, GitOid } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  GitInlineObjectRecord,
+  GitObjectRecord,
+} from "../src/storage-schema/overseer-storage";
 import { makeLocalGitCache } from "./local-git-cache";
 import {
   BAD_NAME_TREE,
@@ -37,6 +53,7 @@ import {
   PACK_REF_DELTA,
   TREE_1,
   b64Bytes,
+  byteStream,
   decodePack,
 } from "./git-cache-fixtures";
 
@@ -944,6 +961,368 @@ describe("applyGitDelta", () => {
   it("rejects the reserved zero op", () => {
     let delta = new Uint8Array([BASE.length, 1, 0]);
     expect(() => applyGitDelta(delta, BASE, 1024)).toThrow(/reserved zero op/);
+  });
+});
+
+// The delta applier as it was before GitDeltaApplier, whole-buffer: the reference the streaming
+// one must match byte for byte.
+function referenceApplyDelta(delta: Uint8Array, base: Uint8Array): Uint8Array {
+  let pos = 0;
+  let varint = () => {
+    let value = 0;
+    for (let factor = 1, byte = 0x80; byte & 0x80; factor *= 128) {
+      if (pos >= delta.length) throw new Error("invalid delta: truncated size");
+      byte = delta[pos++];
+      value += (byte & 0x7f) * factor;
+    }
+    return value;
+  };
+  if (varint() !== base.length) throw new Error("invalid delta: base size mismatch");
+  let target = new Uint8Array(varint());
+  let written = 0;
+  while (pos < delta.length) {
+    let op = delta[pos++];
+    if (op & 0x80) {
+      let offset = 0;
+      let size = 0;
+      for (let i = 0; i < 7; i++) {
+        if (!(op & (1 << i))) continue;
+        if (pos >= delta.length) throw new Error("invalid delta: truncated copy op");
+        if (i < 4) offset += delta[pos++] * 2 ** (8 * i);
+        else size += delta[pos++] * 2 ** (8 * (i - 4));
+      }
+      if (size === 0) size = 0x10000;
+      if (offset + size > base.length || written + size > target.length) {
+        throw new Error("invalid delta: copy out of range");
+      }
+      target.set(base.subarray(offset, offset + size), written);
+      written += size;
+    } else if (op > 0) {
+      if (pos + op > delta.length || written + op > target.length) {
+        throw new Error("invalid delta: insert out of range");
+      }
+      target.set(delta.subarray(pos, pos + op), written);
+      pos += op;
+      written += op;
+    } else {
+      throw new Error("invalid delta: reserved zero op");
+    }
+  }
+  if (written !== target.length) throw new Error("invalid delta: result size mismatch");
+  return target;
+}
+
+function deltaVarint(n: number): number[] {
+  let out: number[] = [];
+  do {
+    let byte = n % 128;
+    n = Math.floor(n / 128);
+    out.push(n > 0 ? byte | 0x80 : byte);
+  } while (n > 0);
+  return out;
+}
+
+// A copy instruction as git encodes one: only the nonzero bytes of offset and size are present,
+// and a size of 0x10000 may be written as none at all. Splits a copy git could not encode in one.
+function copyOps(offset: number, size: number): number[] {
+  let out: number[] = [];
+  while (size > 0) {
+    let take = Math.min(size, 0xffffff);
+    let op = 0x80;
+    let args: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      let byte = Math.floor(offset / 2 ** (8 * i)) & 0xff;
+      if (byte !== 0) { op |= 1 << i; args.push(byte); }
+    }
+    if (take !== 0x10000) {
+      for (let i = 0; i < 3; i++) {
+        let byte = (take >> (8 * i)) & 0xff;
+        if (byte !== 0) { op |= 0x10 << i; args.push(byte); }
+      }
+    }
+    out.push(op, ...args);
+    offset += take;
+    size -= take;
+  }
+  return out;
+}
+
+function insertOps(bytes: Uint8Array): number[] {
+  let out: number[] = [];
+  for (let pos = 0; pos < bytes.length; pos += 127) {
+    let piece = bytes.subarray(pos, pos + 127);
+    out.push(piece.length, ...piece);
+  }
+  return out;
+}
+
+// A delta turning `base` into `base` with `inserted` spliced in at `where`, and the target.
+function spliceDelta(base: Uint8Array, where: number, inserted: Uint8Array)
+    : { delta: Uint8Array, target: Uint8Array } {
+  let target = concatBytes([base.subarray(0, where), inserted, base.subarray(where)]);
+  let delta = Uint8Array.from([
+    ...deltaVarint(base.length), ...deltaVarint(target.length),
+    ...copyOps(0, where), ...insertOps(inserted), ...copyOps(where, base.length - where),
+  ]);
+  return { delta, target };
+}
+
+// A random valid delta over `base`: copies (some of 0x10000, encoded without size bytes) and
+// inserts, in random order.
+function randomDelta(base: Uint8Array, seed: number): Uint8Array {
+  let noise = randomBytes(4096, seed);
+  let n = 0;
+  let next = () => noise[n++ % noise.length];
+  let ops: number[] = [];
+  let targetSize = 0;
+  for (let i = 0; i < 60; i++) {
+    if (next() & 1) {
+      let size = next() % 7 === 0 && base.length >= 0x10000 ? 0x10000
+          : 1 + ((next() << 8 | next()) % Math.min(base.length, 3000));
+      let offset = (next() << 16 | next() << 8 | next()) % (base.length - size + 1);
+      ops.push(...copyOps(offset, size));
+      targetSize += size;
+    } else {
+      let inserted = randomBytes(1 + next() % 300, seed * 1000 + i);
+      ops.push(...insertOps(inserted));
+      targetSize += inserted.length;
+    }
+  }
+  return Uint8Array.from([...deltaVarint(base.length), ...deltaVarint(targetSize), ...ops]);
+}
+
+// Applies a delta through GitDeltaApplier, pushed in pieces of `step` bytes, collecting the
+// result (copied, as its pieces are borrowed).
+function applyInSteps(delta: Uint8Array, base: DeltaBase, step: number): Uint8Array {
+  let pieces: Uint8Array[] = [];
+  let applier = new GitDeltaApplier(base, () => piece => { pieces.push(piece.slice()); });
+  for (let pos = 0; pos < delta.length; pos += step) applier.push(delta.subarray(pos, pos + step));
+  applier.finish();
+  return concatBytes(pieces);
+}
+
+describe("GitDeltaApplier", () => {
+  const BASE = new TextEncoder().encode("The quick brown fox jumps over the lazy dog");
+  const VECTORS = [
+    new Uint8Array([BASE.length, 15, 0x91, 4, 5, 5, 0x20, 0x72, 0x65, 0x64, 0x20, 0x91, 10, 5]),
+    new Uint8Array([BASE.length, 0]),
+    new Uint8Array([BASE.length, BASE.length, 0x90, BASE.length]),
+  ];
+  const MALFORMED: [Uint8Array, RegExp][] = [
+    [new Uint8Array([1, 0]), /base size mismatch/],
+    [new Uint8Array([BASE.length, 10, 0x91, 40, 10]), /copy out of range/],
+    [new Uint8Array([BASE.length, 4, 0x90, 5]), /copy out of range/],
+    [new Uint8Array([BASE.length, 1, 0]), /reserved zero op/],
+    [new Uint8Array([BASE.length]), /truncated size/],
+    [new Uint8Array([BASE.length, 0x80]), /truncated size/],
+    [new Uint8Array([BASE.length, 5, 0x91, 4]), /truncated copy op/],
+    [new Uint8Array([BASE.length, 5, 5, 0x61, 0x62]), /insert out of range/],
+    [new Uint8Array([BASE.length, 2, 3, 0x61, 0x62, 0x63]), /insert out of range/],
+    [new Uint8Array([BASE.length, 6, 0x91, 4, 5]), /result size mismatch/],
+  ];
+
+  it("matches the whole-buffer applier on every split of the delta", () => {
+    let large = randomBytes(80_000, 3);
+    let cases = [
+      ...VECTORS.map(delta => ({ delta, base: BASE })),
+      ...[1, 2, 3, 4].map(seed => ({ delta: randomDelta(large, seed), base: large })),
+    ];
+    for (let { delta, base } of cases) {
+      let expected = referenceApplyDelta(delta, base);
+      for (let step of [1, 2, 7, delta.length]) {
+        expect(sameBytes(applyInSteps(delta, bytesDeltaBase(base), step), expected)).toBe(true);
+      }
+      expect(sameBytes(applyGitDelta(delta, base), expected)).toBe(true);
+    }
+  });
+
+  it("rejects every malformed delta the whole-buffer applier rejects, however split", () => {
+    for (let [delta, error] of MALFORMED) {
+      expect(() => referenceApplyDelta(delta, BASE)).toThrow(error);
+      for (let step of [1, delta.length]) {
+        expect(() => applyInSteps(delta, bytesDeltaBase(BASE), step)).toThrow(error);
+      }
+    }
+  });
+
+  it("knows the target size once the header is read, before any output", () => {
+    let sizes: number[] = [];
+    let applier = new GitDeltaApplier(bytesDeltaBase(BASE), size => {
+      sizes.push(size);
+      return () => {};
+    });
+    applier.push(VECTORS[0].subarray(0, 1));
+    expect(applier.targetSize).toBeUndefined();
+    applier.push(VECTORS[0].subarray(1, 2));
+    expect(applier.targetSize).toBe(15);
+    expect(sizes).toStrictEqual([15]);
+  });
+
+  it("copies from a chunked base, across chunk boundaries, in bounded pieces", () => {
+    let store = mapChunkStore();
+    let base = randomBytes(5 * 1024 * 1024, 4);
+    let writer = new BlobWriter(store, base.length);
+    writer.write(base);
+    let { record } = writer.finish();
+    let reader = BlobReader.open(store, record!);
+    let { delta, target } = spliceDelta(base, 2_500_001, randomBytes(1000, 5));
+    let pieces: number[] = [];
+    let out: Uint8Array[] = [];
+    let applier = new GitDeltaApplier(reader, () => piece => {
+      pieces.push(piece.length);
+      out.push(piece.slice());
+    });
+    applier.push(delta);
+    applier.finish();
+    expect(sameBytes(concatBytes(out), target)).toBe(true);
+    expect(Math.max(...pieces)).toBeLessThanOrEqual(1 << 20);
+  });
+});
+
+// Whether two byte arrays are equal. (toStrictEqual on a multi-megabyte array exhausts the
+// test's memory.)
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return Buffer.from(a.buffer, a.byteOffset, a.byteLength)
+      .equals(Buffer.from(b.buffer, b.byteOffset, b.byteLength));
+}
+
+function mapChunkStore(): ChunkStore & { rows: Map<string, GitObjectRecord> } {
+  let rows = new Map<string, GitObjectRecord>();
+  return { rows, get: oid => rows.get(oid), put: record => { rows.set(record.oid, record); } };
+}
+
+// Decodes as consumePack does: blobs over CHUNK_MAX_SIZE stream into `store`.
+async function decodeStreaming(pack: Uint8Array, store = mapChunkStore()) {
+  let held = new Map<GitOid, PackableObject>();
+  let out: DecodedPackObject[] = [];
+  for await (let object of decodePackStream(byteStream(pack, 65536), {
+    resolveBase: oid => held.get(oid),
+    resolveLargeBase: oid => {
+      let record = store.rows.get(oid);
+      return record === undefined ? undefined : BlobReader.open(store, record);
+    },
+    openBlobSink: size => {
+      if (size <= CHUNK_MAX_SIZE) return undefined;
+      let writer = new BlobWriter(store, size);
+      return {
+        write: piece => writer.write(piece),
+        finish: () => {
+          let { oid, record } = writer.finish();
+          store.put(record! as unknown as GitInlineObjectRecord);
+          return oid;
+        },
+      };
+    },
+  })) {
+    if (!object.stored) held.set(object.oid, object);
+    out.push(object);
+  }
+  return { out, store };
+}
+
+function readStored(store: ReturnType<typeof mapChunkStore>, oid: GitOid): Uint8Array {
+  let reader = BlobReader.open(store, store.rows.get(oid)!);
+  return reader.read(0, reader.size);
+}
+
+// Pack decoding with large blobs streamed into a chunk store, as the git store decodes.
+describe("pack decoding, streaming large blobs", () => {
+  const MiB = 1024 * 1024;
+
+  // Builds a pack whose entries may be deltas against earlier entries (by index, ofs or ref)
+  // or against an outside oid.
+  type Entry =
+    | { payload: Uint8Array, type?: GitObjectType }
+    | { delta: Uint8Array, ofs: number }
+    | { delta: Uint8Array, ref: GitOid };
+  async function buildPack(entries: Entry[]): Promise<Uint8Array> {
+    let header = new Uint8Array(12);
+    header.set(new TextEncoder().encode("PACK"));
+    new DataView(header.buffer).setUint32(4, 2);
+    new DataView(header.buffer).setUint32(8, entries.length);
+    let parts = [header];
+    let offsets: number[] = [];
+    let offset = 12;
+    for (let spec of entries) {
+      offsets.push(offset);
+      let bytes: Uint8Array;
+      if ("payload" in spec) {
+        let code = { commit: 1, tree: 2, blob: 3, tag: 4 }[spec.type ?? "blob"];
+        bytes = concatBytes([entryHeader(code, spec.payload.length), deflate(spec.payload)]);
+      } else if ("ofs" in spec) {
+        let rel = offset - offsets[spec.ofs];
+        let rev = [rel & 0x7f];
+        while ((rel = Math.floor(rel / 128)) > 0) {
+          rel--;
+          rev.push(0x80 | (rel & 0x7f));
+        }
+        bytes = concatBytes([entryHeader(6, spec.delta.length), Uint8Array.from(rev.toReversed()),
+          deflate(spec.delta)]);
+      } else {
+        bytes = concatBytes([entryHeader(7, spec.delta.length),
+          Uint8Array.from(spec.ref.match(/../g)!, h => parseInt(h, 16)), deflate(spec.delta)]);
+      }
+      parts.push(bytes);
+      offset += bytes.length;
+    }
+    let body = concatBytes(parts);
+    return concatBytes([body, new Uint8Array(await crypto.subtle.digest("SHA-1", body))]);
+  }
+
+  it("streams a 20 MiB blob into chunks, verifying its oid", async () => {
+    let big = randomBytes(20 * MiB, 6);
+    let small = new TextEncoder().encode("small\n");
+    let tree = encodeGitTree([{ mode: "100644", name: "small", oid: await gitObjectOid("blob", small) }]);
+    let pack = await buildPack([{ payload: big }, { payload: small }, { payload: tree, type: "tree" }]);
+    let { out, store } = await decodeStreaming(pack);
+    let bigOid = await gitObjectOid("blob", big);
+    expect(out[0]).toStrictEqual({ oid: bigOid, type: "blob", size: big.length, stored: true });
+    expect(isChunkedBlobRecord(store.rows.get(bigOid)!)).toBe(true);
+    expect(sameBytes(readStored(store, bigOid), big)).toBe(true);
+    // Small blobs and trees come back whole, as without a sink.
+    expect(out[1]).toStrictEqual({ oid: await gitObjectOid("blob", small), type: "blob", payload: small });
+    expect(out[2]).toStrictEqual({ oid: await gitObjectOid("tree", tree), type: "tree", payload: tree });
+  });
+
+  it("applies ofs- and ref-deltas, and a chain of them, against large blobs", async () => {
+    let b0 = randomBytes(6 * MiB, 7);
+    let d1 = spliceDelta(b0, 3 * MiB, randomBytes(100, 8));
+    let d2 = spliceDelta(d1.target, 17, randomBytes(5000, 9));
+    let d3 = spliceDelta(d2.target, d2.target.length - 3, randomBytes(1, 10));
+    let oids = await Promise.all([b0, d1.target, d2.target, d3.target]
+        .map(payload => gitObjectOid("blob", payload)));
+    let pack = await buildPack([
+      { payload: b0 },
+      { delta: d1.delta, ofs: 0 },
+      { delta: d2.delta, ref: oids[1] },
+      { delta: d3.delta, ofs: 2 },
+    ]);
+    let { out, store } = await decodeStreaming(pack);
+    expect(out.map(o => o.oid)).toStrictEqual(oids);
+    expect(out.every(o => o.stored)).toBe(true);
+    expect(sameBytes(readStored(store, oids[3]), d3.target)).toBe(true);
+  });
+
+  it("applies a delta against a large blob already in storage", async () => {
+    let base = randomBytes(3 * MiB, 11);
+    let baseOid = await gitObjectOid("blob", base);
+    let { store } = await decodeStreaming(await buildPack([{ payload: base }]));
+    let large = spliceDelta(base, 12345, randomBytes(10, 12));
+    // A small target from the large base is buffered.
+    let small = new Uint8Array([...deltaVarint(base.length), 16, ...copyOps(MiB, 16)]);
+    let pack = await buildPack([{ delta: large.delta, ref: baseOid }, { delta: small, ref: baseOid }]);
+    let { out } = await decodeStreaming(pack, store);
+    expect(out[0]).toStrictEqual(
+        { oid: await gitObjectOid("blob", large.target), type: "blob", size: large.target.length,
+          stored: true });
+    let target = base.subarray(MiB, MiB + 16);
+    expect(out[1]).toStrictEqual({ oid: await gitObjectOid("blob", target), type: "blob", payload: target });
+  });
+
+  it("still fails a trailer mismatch", async () => {
+    let pack = await buildPack([{ payload: randomBytes(2 * MiB, 13) }]);
+    pack[pack.length - 1] ^= 1;
+    await expect(decodeStreaming(pack)).rejects.toThrow(/trailer SHA-1 mismatch/);
   });
 });
 

@@ -2058,7 +2058,7 @@ class OverseerImpl implements AgentHooks {
   // the whole base tree had been materialized. Only edits need bases (a `set` is valid against
   // any state and a `remove` of an absent path is a no-op), so untouched files are never read. A
   // path absent from the base stays absent -- "edit of absent file" is then the change's own
-  // validation error -- while unreadable content (oversized/binary/symlink) throws its
+  // validation error -- while unreadable content (binary/symlink) throws its
   // descriptive error, which ingestion surfaces to the submitter. (One deliberate quirk falls
   // out for hand-rolled clients only: a row that edits a path an earlier row removed re-seeds
   // the base text rather than failing -- every fold applies the same rule in the same order, so
@@ -4785,7 +4785,9 @@ class OverseerImpl implements AgentHooks {
 
   // The git cache's pull delegate (see GitPullDelegate): reaches the gatekeeper through its
   // instantiated facet -- the same path every other invocation of an existing gatekeeper uses --
-  // and ingests its pack with that source's provenance and the DO cache's existing limits.
+  // and ingests its pack with that source's provenance. Every requested object must arrive: the
+  // cache stores objects of any size, and asks for a requested oid with no filter that could
+  // omit it (a filter applies only to what comes along with a commit or tree).
   async #pullGitObjects(gatekeeperId: WorkpieceId, oids: string[], hints: GitPullHints)
       : Promise<void> {
     if (this.storage.gatekeepers.get(gatekeeperId) === undefined) {
@@ -4816,7 +4818,7 @@ class OverseerImpl implements AgentHooks {
       throw new Error(`git fetch ended without a completed transfer (${status.state})`);
     }
     const missing = oids.filter(oid => !stored.has(oid));
-    if (missing.length > 0 && !(hints.type === "blob" && hints.filterBlobSize !== undefined)) {
+    if (missing.length > 0) {
       throw new Error(`git fetch did not provide the requested objects: ${missing.join(", ")}`);
     }
   }

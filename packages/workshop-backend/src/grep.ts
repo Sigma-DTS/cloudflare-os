@@ -27,13 +27,12 @@ type GrepCandidate = { path: string } | { path: string, oid: GitOid, base: strin
  * file tools read: the turn's session content over the workpiece's base commit (a worktree's pin
  * base or accepted commit; a gadget's pin or head; undefined for a gadget with no committed code,
  * whose files all live in the session). Each listed scope is a file or a directory to scan
- * recursively (undefined means the whole tree); unsearchable files -- symlinks, submodules,
- * oversized and binary blobs -- and listed paths that don't exist degrade to error entries, except
- * that when *every* listed scope fails, the whole call throws (so a lone bad path is an exception,
- * not an easily-missed one-line result). Missing base blobs are filled in one batched pull across
- * all scopes -- the reason the argument accepts an array -- never a serial walk-and-fetch; an
- * oversized blob (measured, or omitted by the pull's own filter) drops out of the batch with an
- * error entry rather than failing it.
+ * recursively (undefined means the whole tree); unsearchable files -- symlinks, submodules and
+ * binary blobs -- and listed paths that don't exist degrade to error entries, except that when
+ * *every* listed scope fails, the whole call throws (so a lone bad path is an exception, not an
+ * easily-missed one-line result). A file of any size is searched. Missing base blobs are filled
+ * in one batched pull across all scopes -- the reason the argument accepts an array -- never a
+ * serial walk-and-fetch.
  */
 export async function scanWorkpieceForGrep(
     gitCache: Pick<WorkspaceGitCache,
@@ -50,7 +49,7 @@ export async function scanWorkpieceForGrep(
   let candidates = new Map<string, GrepCandidate>();
   let errorByFile = new Map<string, string>();
   let failedScopes = new Map<string, string>();
-  // Scopes that named a base file directly: unreadable *content* (oversized/binary),
+  // Scopes that named a base file directly: unreadable *content* (binary),
   // discovered only after the batched pull, still counts as the scope failing.
   let namedFiles = new Set<string>();
   let single = false;
@@ -104,28 +103,16 @@ export async function scanWorkpieceForGrep(
     if (!found) failedScopes.set(scope, `${scope}: no such file or directory`);
   }
 
-  // One batched fetch for every missing base blob, across all scopes. Paths with identical
-  // content share one blob oid, so each oid maps to every path holding it: an oversized blob
-  // then notes each of those files, keeping the one-error-per-skipped-file promise.
-  let pathsByOid = new Map<GitOid, string[]>();
+  // One batched fetch for every missing base blob, across all scopes.
+  let oids = new Set<GitOid>();
   for (let candidate of candidates.values()) {
-    if ("oid" in candidate) {
-      let oidPaths = pathsByOid.get(candidate.oid);
-      if (oidPaths === undefined) pathsByOid.set(candidate.oid, oidPaths = []);
-      oidPaths.push(candidate.path);
-    }
+    if ("oid" in candidate) oids.add(candidate.oid);
   }
-  let skipped = await gitCache.ensureBlobs(pathsByOid.keys());
-  for (let oid of skipped) {
-    for (let skippedPath of pathsByOid.get(oid)!) {
-      errorByFile.set(skippedPath, `${skippedPath} is too large to read`);
-    }
-  }
+  await gitCache.ensureBlobs(oids);
 
   let files: GrepFile[] = [];
   for (let candidate of [...candidates.values()]
       .toSorted((a, b) => a.path < b.path ? -1 : 1)) {
-    if ("oid" in candidate && skipped.has(candidate.oid)) continue;
     try {
       let text: string;
       if ("oid" in candidate) {

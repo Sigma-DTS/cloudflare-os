@@ -127,7 +127,7 @@ export interface WorktreeTurnAccess {
    * Read a file exactly as the file tools do: session content first, else the pinned base
    * (faulting the text into the session content, so later edits apply against it). Returns
    * undefined for an absent (or removed) path; throws the descriptive symlink/submodule errors
-   * and UnreadableContentError for oversized/binary content.
+   * and UnreadableContentError for binary content.
    */
   readFile(worktreeId: WorkpieceId, path: string): Promise<string | undefined>;
 
@@ -445,7 +445,7 @@ export interface AgentHooks {
    * the path -- never a whole tree -- the lazy base resolver behind worktree session content and
    * the way every unpinned read is served, gadget or worktree. Returns undefined for an absent
    * path; throws descriptive, agent-visible errors for a symlink or submodule path (naming the
-   * target), oversized or binary content, and pull failures.
+   * target), binary content, and pull failures.
    */
   readFileAtCommit(commit: string, path: string): Promise<string | undefined>;
 
@@ -1646,7 +1646,7 @@ async function runAgentPass(
   // Lazily reads a worktree file's base text into the session content, so later edits (and
   // replayed changes) apply against it exactly as if the base tree had been materialized.
   // Returns undefined for a path absent from the base; throws readFileAtCommit's descriptive
-  // errors (symlink/submodule/oversized/binary/pull failure). No-ops for anything that is not a
+  // errors (symlink/submodule/binary/pull failure). No-ops for anything that is not a
   // worktree.
   let faultWorktreeBase = async (worktreeId: WorkpieceId, filename: string)
       : Promise<string | undefined> => {
@@ -1685,7 +1685,7 @@ async function runAgentPass(
   // code, whose files exist only in the chat's change stream -- read from the session content,
   // unstamped: it is never stale within an epoch. Worktree session content is lazy: a path not
   // yet touched or read resolves against the pinned base commit (with descriptive errors for
-  // symlinks, submodules, and oversized or binary content). A removed path stays removed
+  // symlinks, submodules, and binary content). A removed path stays removed
   // (readWorktreeBase).
   let readToolFile = async (id: WorkpieceId, filename: string)
       : Promise<{text: string, oid?: string} | undefined> => {

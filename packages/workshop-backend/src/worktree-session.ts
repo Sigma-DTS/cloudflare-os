@@ -14,7 +14,7 @@
 //
 // Content rules match the file tools': regular files of either mode are operable (an edited
 // executable keeps its bit), symlink/gitlink/directory paths throw their descriptive errors,
-// and unreadable *content* (oversized/binary) is distinguished from path-shape errors by
+// and unreadable *content* (binary) is distinguished from path-shape errors by
 // UnreadableContentError -- writeFile falls back to a whole-file `set` on it, while grep
 // reports it as a structured error entry (a "(skipped: ...)" note in the freeform format) and
 // diff likewise (a "(cannot diff ...)" note).
@@ -355,7 +355,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     for (let path of removed) paths.add(path);
 
     // A side that cannot be rendered as text -- a symlink or submodule entry, or unreadable
-    // (oversized/binary) content -- contributes a note carrying its descriptive error instead
+    // (binary) content -- contributes a note carrying its descriptive error instead
     // of a diff. Only those expected shapes degrade to notes: the entry's kind is resolved
     // first and the text read catches exactly UnreadableContentError, so an operational
     // failure (a pull outage, a corrupt object) still fails the diff rather than silently

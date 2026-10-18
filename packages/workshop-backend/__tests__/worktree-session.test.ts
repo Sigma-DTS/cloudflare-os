@@ -552,18 +552,20 @@ describe("grep", () => {
     ].toSorted());
   });
 
-  it("notes every path sharing one unobtainable oversized blob", async () => {
-    // Two paths with identical content share a single blob oid. The pull "succeeds" but
-    // delivers nothing, which the batched fetch's size filter reads as omitted-for-size: the
-    // skip must then report *each* file holding that blob, not just one of them.
+  it("notes every path sharing one binary blob, and searches a large file", async () => {
+    // Two paths with identical content share a single blob oid: the skip must report *each*
+    // file holding that blob, not just one of them. A file of any size is searched.
     let harness = makeLocalHarness(async () => {});
     let cache = harness.cache;
     let smallBlob = await cache.putFromGatekeeper(
         7, "blob", new TextEncoder().encode("x marks the spot\n"));
-    let sharedOid = "cd".repeat(20);
+    let sharedOid = await cache.putFromGatekeeper(7, "blob", new Uint8Array([0x78, 0, 0x78]));
+    let hugeBlob = await cache.putFromGatekeeper(7, "blob",
+        new TextEncoder().encode(`${"filler line\n".repeat(800_000)}x at the end\n`));
     let treeOid = await cache.putFromGatekeeper(7, "tree", treePayload([
       { mode: "100644", name: "big1.txt", oid: sharedOid },
       { mode: "100644", name: "big2.txt", oid: sharedOid },
+      { mode: "100644", name: "huge.txt", oid: hugeBlob },
       { mode: "100644", name: "small.txt", oid: smallBlob },
     ]));
     let commitOid = await cache.putFromGatekeeper(
@@ -572,25 +574,26 @@ describe("grep", () => {
 
     let result = await session.grep(/x/);
     expect(result).toContain("small.txt:1:x marks the spot");
-    expect(result).toContain("(skipped: big1.txt is too large to read)");
-    expect(result).toContain("(skipped: big2.txt is too large to read)");
+    expect(result).toContain("huge.txt:800001:x at the end");
+    expect(result).toContain("(skipped: big1.txt is not a text file)");
+    expect(result).toContain("(skipped: big2.txt is not a text file)");
 
     // structuredGrep reports the same skips as error entries.
-    expect(await session.structuredGrep(/x/)).toEqual({
+    expect(await session.structuredGrep(/x/, ["big1.txt", "big2.txt", "small.txt"])).toEqual({
       matches: [{ file: "small.txt", line: 1, text: "x marks the spot" }],
       errors: [
-        { file: "big1.txt", error: "big1.txt is too large to read" },
-        { file: "big2.txt", error: "big2.txt is too large to read" },
+        { file: "big1.txt", error: "big1.txt is not a text file" },
+        { file: "big2.txt", error: "big2.txt is not a text file" },
       ],
     });
 
     // A directly named file whose *content* is unreadable fails its scope: alone it throws,
     // beside a searchable path it degrades to a skip.
     await expect(session.grep(/x/, "big1.txt")).rejects.toThrow(
-        "big1.txt is too large to read");
+        "big1.txt is not a text file");
     expect(await session.grep(/x/, ["big1.txt", "small.txt"])).toBe(
         "small.txt:1:x marks the spot\n" +
-        "(skipped: big1.txt is too large to read)");
+        "(skipped: big1.txt is not a text file)");
   });
 });
 

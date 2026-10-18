@@ -18,7 +18,9 @@
 // and report the input they consumed as `bytesWritten`, which is how the pack decoder finds each
 // entry's end (see PackReader.inflate()).
 
-import { constants, createInflate, deflateSync, inflateSync, type Inflate } from "node:zlib";
+import {
+  constants, createDeflate, createInflate, deflateSync, inflateSync, type Inflate,
+} from "node:zlib";
 import { createHash, type Hash } from "node:crypto";
 import type { GitObjectType, GitOid } from "@gadgets/workshop-shared/gatekeeper";
 import type { CommitSignature } from "./worktree-binding";
@@ -545,8 +547,31 @@ export async function buildPackBytes(objects: readonly PackableObject[]): Promis
   return chunks;
 }
 
-/** Stream a known object closure with memory bounded by one object, not the whole pack. */
-export function buildPackStream(count: number, objects: AsyncIterable<PackableObject>): ReadableStream<Uint8Array> {
+/**
+ * A blob to pack from its pieces, never held whole: `buildPackStream()` deflates it as they
+ * arrive. For a blob too large to buffer (a stored chunked blob's `BlobReader.pieces()`).
+ */
+export interface StreamedBlobEntry {
+  type: "blob";
+
+  /** The payload's byte length: the total length of `pieces()`. */
+  size: number;
+
+  /** The payload, in order. Pieces may be borrowed; each is read before the next is asked for. */
+  pieces(): Iterable<Uint8Array>;
+}
+
+/** An object for `buildPackStream()` to pack: whole, or a blob streamed from its pieces. */
+export type PackEntrySource = PackableObject | StreamedBlobEntry;
+
+/**
+ * Streams an undeltified packfile of a known number of objects (see `buildPackBytes()`), pulled
+ * one output piece at a time, so memory stays bounded by one object rather than the whole pack:
+ * and by much less for a streamed blob, which is deflated a piece at a time, each piece's output
+ * emitted before the next piece is read.
+ */
+export function buildPackStream(count: number, objects: AsyncIterable<PackEntrySource>)
+    : ReadableStream<Uint8Array> {
   async function* chunks() {
     const hash = createHash("sha1");
     const header = new Uint8Array(12);
@@ -557,10 +582,17 @@ export function buildPackStream(count: number, objects: AsyncIterable<PackableOb
     yield header;
     let emitted = 0;
     for await (const object of objects) {
-      const entry = packEntryHeader(PACK_TYPE_CODES[object.type]!, object.payload.byteLength);
-      const bytes = deflateSync(object.payload, {level: GIT_DEFLATE_LEVEL});
-      hash.update(entry); hash.update(bytes);
-      yield entry; yield bytes;
+      const size = "pieces" in object ? object.size : object.payload.byteLength;
+      const entry = packEntryHeader(PACK_TYPE_CODES[object.type]!, size);
+      hash.update(entry);
+      yield entry;
+      const body = "pieces" in object
+          ? deflatePieces(object.pieces(), size)
+          : [deflateSync(object.payload, { level: GIT_DEFLATE_LEVEL })];
+      for await (const bytes of body) {
+        hash.update(bytes);
+        yield bytes;
+      }
       ++emitted;
     }
     if (emitted !== count) throw new Error("Git pack object count changed.");
@@ -575,6 +607,48 @@ export function buildPackStream(count: number, objects: AsyncIterable<PackableOb
     },
     async cancel() { await iterator.return(undefined); },
   }, {highWaterMark: 0});
+}
+
+// Deflates a payload arriving in pieces into one zlib stream, yielding its output as it is
+// produced. Each piece is written only once the previous one's output has been taken, so no more
+// than about one piece's output is ever queued. Throws if the pieces total other than `size`.
+async function* deflatePieces(pieces: Iterable<Uint8Array>, size: number)
+    : AsyncGenerator<Uint8Array> {
+  const deflater = createDeflate({ level: GIT_DEFLATE_LEVEL });
+  let output: Uint8Array[] = [];
+  let failure: unknown;
+  let wake: () => void = () => {};
+  deflater.on("data", (bytes: Uint8Array) => {
+    // Copied: a piece views zlib's output buffer, shared with the pieces after it, and the
+    // pack's byte stream transfers what it is given.
+    output.push(Uint8Array.prototype.slice.call(bytes));
+  });
+  deflater.on("end", () => wake());
+  deflater.on("error", err => {
+    failure ??= err;
+    wake();
+  });
+  // Resolves once the deflater has consumed what `start` wrote, or has ended, or failed.
+  const settle = (start: (done: () => void) => void) => new Promise<void>(resolve => {
+    wake = resolve;
+    start(resolve);
+  });
+  try {
+    let total = 0;
+    for (const piece of pieces) {
+      total += piece.byteLength;
+      if (total > size) throw new Error("Git pack blob is larger than its declared size.");
+      await settle(done => deflater.write(piece, () => done()));
+      if (failure !== undefined) throw failure;
+      yield* output.splice(0);
+    }
+    if (total !== size) throw new Error("Git pack blob is smaller than its declared size.");
+    await settle(() => deflater.end());
+    if (failure !== undefined) throw failure;
+    yield* output.splice(0);
+  } finally {
+    deflater.destroy();
+  }
 }
 
 // Encodes a pack entry header: 4 bits of size and the 3-bit type code in the first byte, then
@@ -594,40 +668,88 @@ function packEntryHeader(typeCode: number, size: number): Uint8Array {
 
 /** Options for `decodePackStream()`. */
 export interface DecodePackOptions {
-  /** Hard cap on the pack's total byte size, enforced as the bytes arrive. */
-  maxPackSize: number;
+  /** Hard cap on the pack's total byte size, enforced as the bytes arrive. Absent: no cap. */
+  maxPackSize?: number;
 
   /**
-   * Hard cap on any single inflated object or delta result. This bounds allocations against a
-   * hostile pack: claimed sizes are enforced *during* inflation, before the bytes materialize.
+   * Hard cap on any single inflated object or delta result, checked against its declared size
+   * before any of it is produced. Absent: no cap. Without one, an allocation is still never
+   * larger than an entry declares, since declared sizes are enforced *during* inflation, before
+   * the bytes materialize; and a blob streamed to `openBlobSink()` is never allocated whole.
    */
-  maxObjectSize: number;
+  maxObjectSize?: number;
 
   /**
    * Supplies a delta's base by oid. The decoder retains no objects, so this must return any it
    * has already yielded (see `decodePackStream()` on ordering) as well as any the caller already
-   * has. Undefined makes the delta a hard error.
+   * has -- but for a blob it can only read in ranges, which `resolveLargeBase` supplies.
+   * Undefined from both makes the delta a hard error.
    */
   resolveBase: (oid: GitOid) => PackableObject | undefined;
+
+  /**
+   * Supplies a delta's base, consulted when `resolveBase()` has none: a *blob*, read by range
+   * (a stored chunked blob's BlobReader). This is how a delta against a blob streamed to
+   * `openBlobSink()` finds its base.
+   */
+  resolveLargeBase?: (oid: GitOid) => DeltaBase | undefined;
+
+  /**
+   * Offered each blob the pack carries -- an entry, or a delta whose base is a blob -- with its
+   * size, before any of its payload is produced. A sink returned receives the payload in pieces
+   * instead of the decoder buffering it, and the entry is yielded without it (`stored: true`).
+   * The sink must have stored the blob when `finish()` returns, since a later delta may name it
+   * as its base. Undefined buffers the blob as any other object.
+   */
+  openBlobSink?: (size: number) => PackBlobSink | undefined;
 }
+
+/** A destination `decodePackStream()` streams one blob's payload to; see `openBlobSink`. */
+export interface PackBlobSink {
+  /** Appends payload bytes, which are borrowed: valid only during the call. */
+  write(piece: Uint8Array): void;
+
+  /** Ends the blob, storing it, and returns its oid, computed from the bytes written. */
+  finish(): GitOid;
+}
+
+/** An object `decodePackStream()` yields. */
+export type DecodedPackObject =
+  /** An object, whole. */
+  | PackableObject & { oid: GitOid, stored?: undefined }
+  /** A blob streamed to `openBlobSink()`, which has stored it: its payload is not here. */
+  | { oid: GitOid, type: "blob", size: number, stored: true, payload?: undefined };
 
 /**
  * Decodes a packfile stream into its objects and their oids, in pack order, in one pass that
  * retains none of them. This is hostile-input parsing: every size is enforced during inflation,
  * the object count and trailer SHA-1 must both check out, and any unresolved delta or trailing
  * garbage is a hard error -- an object can be misdescribed by its source, but it cannot make this
- * function allocate unboundedly or silently drop entries. Each oid is computed from the object's
- * bytes, but the pack as a whole verifies only when the generator completes, so an object acted
- * on earlier may belong to a pack that then fails.
+ * function allocate more than it declares or silently drop entries. Each oid is computed from the
+ * object's bytes, but the pack as a whole verifies only when the generator completes, so an
+ * object acted on earlier may belong to a pack that then fails.
+ *
+ * A blob of any size can pass through in bounded memory, given `openBlobSink()`: its entry is
+ * inflated, or its delta applied (see GitDeltaApplier), a piece at a time into the sink, and a
+ * delta's base is read by range where the delta copies from it.
  *
  * One pass means a delta must follow its base. Ofs-deltas point backward by format, and
  * `git pack-objects` writes ref-delta bases first too, so every pack upload-pack sends for a fetch
  * without `have`s -- the only kind this codec serves -- qualifies.
  */
+export function decodePackStream(
+    pack: ReadableStream<Uint8Array>, options: DecodePackOptions & { openBlobSink?: undefined })
+    : AsyncGenerator<PackableObject & { oid: GitOid }>;
+export function decodePackStream(pack: ReadableStream<Uint8Array>, options: DecodePackOptions)
+    : AsyncGenerator<DecodedPackObject>;
 export async function* decodePackStream(
     pack: ReadableStream<Uint8Array>, options: DecodePackOptions)
-    : AsyncGenerator<PackableObject & { oid: GitOid }> {
-  using reader = new PackReader(pack, options.maxPackSize);
+    : AsyncGenerator<DecodedPackObject> {
+  let maxObjectSize = options.maxObjectSize ?? Number.MAX_SAFE_INTEGER;
+  let sizeError = (size: number) => new Error(options.maxObjectSize === undefined
+      ? "invalid packfile: entry size is too large"
+      : `invalid packfile: entry of ${size} bytes exceeds the ${maxObjectSize}-byte limit`);
+  using reader = new PackReader(pack, options.maxPackSize ?? Infinity);
   let header = await reader.bytes(12);
   if (new TextDecoder().decode(header.subarray(0, 4)) !== "PACK") {
     throw new Error("invalid packfile: bad magic");
@@ -648,18 +770,15 @@ export async function* decodePackStream(
     for (let multiplier = 16; byte & 0x80; multiplier *= 128) {
       // No size within the cap has a digit worth this much. (Left to run, a varint of zeros
       // overflows the multiplier into a NaN size that the check below would let through.)
-      if (multiplier > options.maxObjectSize) {
-        throw new Error(
-            `invalid packfile: entry size exceeds the ${options.maxObjectSize}-byte limit`);
+      if (multiplier > maxObjectSize) {
+        throw new Error(options.maxObjectSize === undefined
+            ? "invalid packfile: entry size is too large"
+            : `invalid packfile: entry size exceeds the ${maxObjectSize}-byte limit`);
       }
       byte = await reader.byte();
       size += (byte & 0x7f) * multiplier;
     }
-    if (size > options.maxObjectSize) {
-      throw new Error(
-          `invalid packfile: entry of ${size} bytes exceeds the ` +
-          `${options.maxObjectSize}-byte limit`);
-    }
+    if (size > maxObjectSize) throw sizeError(size);
 
     let baseOid: GitOid | undefined;
     if (typeCode === OFS_DELTA) {
@@ -680,19 +799,43 @@ export async function* decodePackStream(
       throw new Error(`invalid packfile: unsupported object type code ${typeCode}`);
     }
 
-    let type = PACK_CODE_TYPES[typeCode];
-    let payload = await reader.inflate(size);
-    if (baseOid !== undefined) {
-      let base = options.resolveBase(baseOid);
-      if (base === undefined) {
+    let entry: DecodedPackObject;
+    if (baseOid === undefined) {
+      let type = PACK_CODE_TYPES[typeCode];
+      let sink = type === "blob" ? options.openBlobSink?.(size) : undefined;
+      if (sink !== undefined) {
+        await reader.inflateTo(size, piece => sink.write(piece));
+        entry = { oid: sink.finish(), type: "blob", size, stored: true };
+      } else {
+        let payload = await reader.inflate(size);
+        entry = { oid: await gitObjectOid(type, payload), type, payload };
+      }
+    } else {
+      let held = options.resolveBase(baseOid);
+      let large = held === undefined ? options.resolveLargeBase?.(baseOid) : undefined;
+      if (held === undefined && large === undefined) {
         throw new Error(`invalid packfile: delta base ${baseOid} is unavailable`);
       }
-      type = base.type;
-      payload = applyGitDelta(payload, base.payload, options.maxObjectSize);
+      let type = held?.type ?? "blob";
+      // Where the result goes, chosen once the delta's header gives its size.
+      let target: { sink?: PackBlobSink, payload?: Uint8Array } = {};
+      let applier = new GitDeltaApplier(large ?? bytesDeltaBase(held!.payload), targetSize => {
+        if (targetSize > maxObjectSize) throw sizeError(targetSize);
+        let sink = type === "blob" ? options.openBlobSink?.(targetSize) : undefined;
+        if (sink !== undefined) {
+          target.sink = sink;
+          return piece => sink.write(piece);
+        }
+        return bufferSink(target.payload = new Uint8Array(targetSize));
+      });
+      await reader.inflateTo(size, piece => applier.push(piece));
+      applier.finish();
+      entry = target.sink !== undefined
+          ? { oid: target.sink.finish(), type: "blob", size: applier.targetSize!, stored: true }
+          : { oid: await gitObjectOid(type, target.payload!), type, payload: target.payload! };
     }
-    let oid = await gitObjectOid(type, payload);
-    oidAt.set(entryStart, oid);
-    yield { oid, type, payload };
+    oidAt.set(entryStart, entry.oid);
+    yield entry;
   }
 
   let digest = await reader.endBody();
@@ -706,8 +849,11 @@ export async function* decodePackStream(
 const PACK_READ_SIZE = 64 << 10;
 
 /**
- * The largest pack entry `PackReader.inflate()` inflates in one synchronous call over a window
- * of the pack; larger ones are inflated as a stream, a read at a time.
+ * The largest pack entry `PackReader.inflateTo()` inflates in one synchronous call over a window
+ * of the pack; larger ones are inflated as a stream, a read at a time. It equals CHUNK_MAX_SIZE
+ * (git-chunked-blob.ts, which imports this module, so it cannot be imported here), so that every
+ * blob entry large enough to be stored chunked, and so streamed into a BlobWriter, is inflated
+ * as a stream too, and is never held whole.
  */
 const PACK_SYNC_INFLATE_LIMIT = 1 << 20;
 
@@ -849,6 +995,17 @@ class PackReader {
   // (one padded with empty stored blocks, say), and then the window ends before the stream does;
   // that entry, and every larger one, is inflated as a stream instead.
   async inflate(size: number): Promise<Uint8Array> {
+    let pieces: Uint8Array[] = [];
+    await this.inflateTo(size, piece => { pieces.push(piece); });
+    return pieces.length === 1 ? pieces[0] : concatBytes(pieces);
+  }
+
+  // inflate(), delivering the payload to `onData` in non-empty pieces as zlib produces them
+  // rather than whole: one piece for an entry inflated synchronously, a read's worth at a time
+  // for one inflated as a stream. A piece may view a buffer that zlib shares with the pieces
+  // after it: zlib never overwrites it, but transferring it would detach theirs. If `onData`
+  // throws, inflation stops and this rejects with what it threw.
+  async inflateTo(size: number, onData: (piece: Uint8Array) => void): Promise<void> {
     if (size <= PACK_SYNC_INFLATE_LIMIT) {
       let bound = zlibBound(size);
       let window = await this.window(bound);
@@ -874,30 +1031,38 @@ class PackReader {
         await this.skip(result.engine.bytesWritten);
         let { buffer } = result;
         // A Buffer, whose slice() aliases rather than copies; hand out a plain Uint8Array.
-        return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-      }
-    }
-    return await this.#inflateStream(size);
-  }
-
-  // inflate() as a stream: feeds the inflater a read at a time until it reports the zlib
-  // stream's end, then positions the reader after the bytes it consumed.
-  async #inflateStream(size: number): Promise<Uint8Array> {
-    let inflater = createInflate();
-    let pieces: Uint8Array[] = [];
-    let total = 0;
-    let failure: Error | undefined;
-    let ended = false;
-    let wake = () => {};
-    inflater.on("data", (piece: Uint8Array) => {
-      total += piece.byteLength;
-      if (total > size) {
-        failure ??= new Error("invalid packfile: object larger than its declared size");
-        inflater.destroy();
-        wake();
+        if (size > 0) onData(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
         return;
       }
-      pieces.push(new Uint8Array(piece.buffer, piece.byteOffset, piece.byteLength));
+    }
+    await this.#inflateStream(size, onData);
+  }
+
+  // inflateTo() as a stream: feeds the inflater a read at a time until it reports the zlib
+  // stream's end, then positions the reader after the bytes it consumed.
+  async #inflateStream(size: number, onData: (piece: Uint8Array) => void): Promise<void> {
+    let inflater = createInflate();
+    let total = 0;
+    let failure: unknown;
+    let ended = false;
+    let wake = () => {};
+    let fail = (err: unknown) => {
+      failure ??= err;
+      inflater.destroy();
+      wake();
+    };
+    inflater.on("data", (piece: Uint8Array) => {
+      if (failure !== undefined) return;
+      total += piece.byteLength;
+      if (total > size) {
+        fail(new Error("invalid packfile: object larger than its declared size"));
+        return;
+      }
+      try {
+        onData(new Uint8Array(piece.buffer, piece.byteOffset, piece.byteLength));
+      } catch (err) {
+        fail(err);
+      }
     });
     inflater.on("end", () => {
       ended = true;
@@ -921,12 +1086,12 @@ class PackReader {
           wake = resolve;
           inflater.write(piece, () => resolve());
         });
-        if (failure) throw failure;
+        if (failure !== undefined) throw failure;
         if (ended || inflater.bytesWritten < fed) {
           // The stream has ended, though its "end", which follows the last of its output, may
           // not have been emitted yet.
           if (!ended) await new Promise<void>(resolve => { wake = resolve; });
-          if (failure) throw failure;
+          if (failure !== undefined) throw failure;
           this.#pos += inflater.bytesWritten - fedBefore;
           break;
         }
@@ -939,7 +1104,6 @@ class PackReader {
     if (total !== size) {
       throw new Error("invalid packfile: object smaller than its declared size");
     }
-    return concatBytes(pieces);
   }
 
   /** Ends the hashed body at the read position, returning its SHA-1 (hex). */
@@ -984,71 +1148,196 @@ class PackReader {
 
 }
 
-/**
- * Applies a git delta (the inflated payload of an ofs-/ref-delta pack entry) to its base,
- * producing the target object payload. Sizes and every copy range are validated; the result is
- * capped at `maxSize` before it is allocated.
- */
-export function applyGitDelta(delta: Uint8Array, base: Uint8Array, maxSize: number): Uint8Array {
-  let pos = 0;
-  let readVarint = (): number => {
-    let value = 0;
-    let factor = 1;
-    let byte: number;
-    do {
-      if (pos >= delta.byteLength) throw new Error("invalid delta: truncated size");
-      byte = delta[pos++];
-      value += (byte & 0x7f) * factor;
-      factor *= 128;
-    } while (byte & 0x80);
-    return value;
-  };
+// =======================================================================================
+// Deltas
+//
+// A delta (the inflated payload of an ofs-/ref-delta pack entry) is two size varints -- the
+// base's and the target's -- then instructions: a copy of a byte range of the base, or an
+// insert of up to 127 literal bytes carried in the delta itself.
 
-  let baseSize = readVarint();
-  if (baseSize !== base.byteLength) throw new Error("invalid delta: base size mismatch");
-  let targetSize = readVarint();
-  if (targetSize > maxSize) {
-    throw new Error(`invalid delta: result of ${targetSize} bytes exceeds the ${maxSize}-byte limit`);
+/**
+ * A delta's base, read by byte range: a whole payload (`bytesDeltaBase()`), or a stored blob read
+ * a chunk at a time (a `BlobReader` is one).
+ */
+export interface DeltaBase {
+  /** The base payload's byte length. */
+  readonly size: number;
+
+  /**
+   * The `length` bytes at `offset`, a range within `size`. May be borrowed: the applier reads
+   * them before its next call and never retains them.
+   */
+  read(offset: number, length: number): Uint8Array;
+}
+
+/** A whole payload as a delta base. */
+export function bytesDeltaBase(payload: Uint8Array): DeltaBase {
+  return {
+    size: payload.byteLength,
+    read: (offset, length) => payload.subarray(offset, offset + length),
+  };
+}
+
+/**
+ * Receives a delta's result in order, in pieces that are borrowed: valid only during the call.
+ * A copy of the base arrives in pieces of at most DELTA_COPY_PIECE bytes.
+ */
+export type DeltaSink = (piece: Uint8Array) => void;
+
+// The most of a copy instruction's range read from the base at once (a copy can span 16 MiB),
+// so a large copy from a chunked base never sits in memory whole.
+const DELTA_COPY_PIECE = 1 << 20;
+
+/**
+ * Applies a git delta to its base as the delta arrives, in pieces split anywhere -- mid-varint,
+ * mid-instruction -- streaming the result to a sink, so that neither the delta nor the result
+ * need be held whole, and the base is read only where the delta copies from it. The sink is
+ * chosen once the target size is known (by `openSink`), before any output, so a caller can
+ * buffer a small result and stream a large one.
+ *
+ * Every size and range is validated: the base size must match, each copy must lie within the
+ * base, nothing may be written past the target size, op 0 is reserved, and `finish()` checks
+ * that the delta ended between instructions with exactly the target size written.
+ */
+export class GitDeltaApplier {
+  readonly #base: DeltaBase;
+  readonly #openSink: (targetSize: number) => DeltaSink;
+  #sink: DeltaSink | undefined;
+  #targetSize: number | undefined;
+  #written = 0;
+
+  // The header: which size varint is being read (0 = the base's, 1 = the target's, 2 = done),
+  // and its value so far.
+  #header = 0;
+  #varint = 0;
+  #factor = 1;
+
+  // The instruction in progress, if any: a copy whose argument bytes are still arriving (bits 0-3
+  // of the op select offset bytes, bits 4-6 size bytes, read in bit order), or an insert with
+  // literal bytes still to come.
+  #copying = false;
+  #copyBits = 0;
+  #copyOffset = 0;
+  #copySize = 0;
+  #insertLeft = 0;
+
+  constructor(base: DeltaBase, openSink: (targetSize: number) => DeltaSink) {
+    this.#base = base;
+    this.#openSink = openSink;
   }
 
-  let target = new Uint8Array(targetSize);
-  let written = 0;
-  while (pos < delta.byteLength) {
-    let op = delta[pos++];
-    if (op & 0x80) {
-      // Copy from base: bits 0-3 select offset bytes, bits 4-6 select size bytes.
-      let offset = 0;
-      let size = 0;
-      for (let i = 0; i < 4; i++) {
-        if (op & (1 << i)) {
-          if (pos >= delta.byteLength) throw new Error("invalid delta: truncated copy op");
-          offset += delta[pos++] * 2 ** (8 * i);
+  /** The result's size, once the delta's header has been read. */
+  get targetSize(): number | undefined {
+    return this.#targetSize;
+  }
+
+  /** Consumes the next bytes of the delta. They are read during the call and not retained. */
+  push(bytes: Uint8Array): void {
+    let pos = 0;
+    while (pos < bytes.length) {
+      if (this.#header < 2) {
+        let byte = bytes[pos++];
+        this.#varint += (byte & 0x7f) * this.#factor;
+        this.#factor *= 128;
+        if (byte & 0x80) {
+          if (this.#factor > Number.MAX_SAFE_INTEGER) {
+            throw new Error("invalid delta: size overflow");
+          }
+          continue;
+        }
+        let value = this.#varint;
+        this.#varint = 0;
+        this.#factor = 1;
+        if (this.#header++ === 0) {
+          if (value !== this.#base.size) throw new Error("invalid delta: base size mismatch");
+        } else {
+          this.#targetSize = value;
+          this.#sink = this.#openSink(value);
+        }
+      } else if (this.#insertLeft > 0) {
+        let take = Math.min(this.#insertLeft, bytes.length - pos);
+        this.#emit(bytes.subarray(pos, pos + take));
+        pos += take;
+        this.#insertLeft -= take;
+      } else if (this.#copying) {
+        let bit = 31 - Math.clz32(this.#copyBits & -this.#copyBits);  // the lowest one pending
+        this.#copyBits &= ~(1 << bit);
+        let byte = bytes[pos++];
+        if (bit < 4) this.#copyOffset += byte * 2 ** (8 * bit);
+        else this.#copySize += byte * 2 ** (8 * (bit - 4));
+        if (this.#copyBits === 0) this.#copy();
+      } else {
+        let op = bytes[pos++];
+        if (op & 0x80) {
+          this.#copying = true;
+          this.#copyBits = op & 0x7f;
+          this.#copyOffset = 0;
+          this.#copySize = 0;
+          if (this.#copyBits === 0) this.#copy();
+        } else if (op > 0) {
+          if (this.#written + op > this.#targetSize!) {
+            throw new Error("invalid delta: insert out of range");
+          }
+          this.#insertLeft = op;
+        } else {
+          throw new Error("invalid delta: reserved zero op");
         }
       }
-      for (let i = 0; i < 3; i++) {
-        if (op & (0x10 << i)) {
-          if (pos >= delta.byteLength) throw new Error("invalid delta: truncated copy op");
-          size += delta[pos++] * 2 ** (8 * i);
-        }
-      }
-      if (size === 0) size = 0x10000;
-      if (offset + size > base.byteLength || written + size > targetSize) {
-        throw new Error("invalid delta: copy out of range");
-      }
-      target.set(base.subarray(offset, offset + size), written);
-      written += size;
-    } else if (op > 0) {
-      // Insert literal bytes.
-      if (pos + op > delta.byteLength || written + op > targetSize) {
-        throw new Error("invalid delta: insert out of range");
-      }
-      target.set(delta.subarray(pos, pos + op), written);
-      pos += op;
-      written += op;
-    } else {
-      throw new Error("invalid delta: reserved zero op");
     }
   }
-  if (written !== targetSize) throw new Error("invalid delta: result size mismatch");
+
+  /** Ends the delta, checking that it was complete. */
+  finish(): void {
+    if (this.#header < 2) throw new Error("invalid delta: truncated size");
+    if (this.#copying) throw new Error("invalid delta: truncated copy op");
+    if (this.#insertLeft > 0) throw new Error("invalid delta: insert out of range");
+    if (this.#written !== this.#targetSize) throw new Error("invalid delta: result size mismatch");
+  }
+
+  #copy(): void {
+    this.#copying = false;
+    let offset = this.#copyOffset;
+    let size = this.#copySize === 0 ? 0x10000 : this.#copySize;
+    if (offset + size > this.#base.size || this.#written + size > this.#targetSize!) {
+      throw new Error("invalid delta: copy out of range");
+    }
+    for (let done = 0; done < size;) {
+      let length = Math.min(DELTA_COPY_PIECE, size - done);
+      this.#emit(this.#base.read(offset + done, length));
+      done += length;
+    }
+  }
+
+  #emit(piece: Uint8Array): void {
+    this.#written += piece.length;
+    this.#sink!(piece);
+  }
+}
+
+/**
+ * Applies a whole git delta to a whole base, producing the target payload whole (see
+ * GitDeltaApplier, which this wraps). With `maxSize`, a result larger than that is refused
+ * before it is allocated.
+ */
+export function applyGitDelta(delta: Uint8Array, base: Uint8Array, maxSize?: number)
+    : Uint8Array {
+  let target = new Uint8Array(0);
+  let applier = new GitDeltaApplier(bytesDeltaBase(base), size => {
+    if (maxSize !== undefined && size > maxSize) {
+      throw new Error(`invalid delta: result of ${size} bytes exceeds the ${maxSize}-byte limit`);
+    }
+    return bufferSink(target = new Uint8Array(size));
+  });
+  applier.push(delta);
+  applier.finish();
   return target;
+}
+
+// A sink filling `target` from its start. The applier never writes past its target size.
+function bufferSink(target: Uint8Array): DeltaSink {
+  let filled = 0;
+  return piece => {
+    target.set(piece, filled);
+    filled += piece.length;
+  };
 }
