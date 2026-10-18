@@ -18,11 +18,11 @@ import {
   type GraphSite, type GraphSitePage,
 } from "./graph-parse";
 import { accountSource, type StoredIdentity } from "./microsoft-credentials";
-import { SHAREPOINT_RESOURCE, grantedResourcePatterns, type SharePointAccess } from "./microsoft-env";
+import { SHAREPOINT_RESOURCE, grantedResourcePatterns, grantedSharePoint, type SharePointAccess, type SharePointGrant } from "./microsoft-env";
 import { extensionOf } from "./sharepoint-content";
 import { itemSiteId } from "./sharepoint-overlay";
 import * as reads from "./sharepoint-reads";
-import { UnresolvableUrlError, resolveSharePointUrl } from "./sharepoint-resolve";
+import { SiteNotGrantedError, UnresolvableUrlError, resolveSharePointUrl } from "./sharepoint-resolve";
 import { allUrl, parseSharePointUrl } from "./sharepoint-urls";
 
 /** Rows per page: what the picker shows before "Show more". */
@@ -236,6 +236,13 @@ function crumbOf(row: SharePointBrowserItem): SharePointBrowserCrumb {
     ...(row.selectable === false ? { selectable: false, ...(row.unselectableReason ? { unselectableReason: row.unselectableReason } : {}) } : {}) };
 }
 
+/** What the Sites tab says when, under `Sites.Selected`, none of the sites the user can find was granted to the app. */
+const NOT_ADDED_YET = "Your organization hasn't added any sites you can open to this app yet. Ask your SharePoint admin " +
+  "to add the site you want, then paste its link here.";
+
+/** What a link refused under `Sites.Selected` may mean, beyond the user not being able to open it. */
+const MAYBE_NOT_ADDED = " If it's in SharePoint, your organization may not have added its site to this app yet: ask your SharePoint admin.";
+
 /** The picker's message when SharePoint search fails on its side, as it can for a day on a new tenant. */
 function searchUnavailable(error: unknown): string | undefined {
   if (error instanceof GraphApiError && error.status >= 500) {
@@ -319,7 +326,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
   readonly #userObjectId: string;
   readonly #access: SharePointAccess;
   readonly #creds;
-  #status?: { at: number; value: Promise<{ identity: StoredIdentity; granted: boolean }> };
+  #status?: { at: number; value: Promise<{ identity: StoredIdentity; granted: boolean; grant: SharePointGrant | null }> };
   #oneDrive?: Promise<GraphDrive | null>;
 
   constructor(exports: Cloudflare.Exports, userObjectId: string, access: SharePointAccess) {
@@ -406,10 +413,12 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
   async #sitesRoot(api: GraphApi, query: string | undefined, token: string | undefined): Promise<SharePointBrowserPage> {
     const from = token === undefined ? 0 : Number(token.replace(/^from:/, ""));
     if (!Number.isInteger(from) || from < 0) throw new Error("That page of sites has expired. Search again.");
-    const page = await reads.browseSites(api, query, from, PAGE_SIZE);
+    const selected = await this.#selected();
+    const page = await reads.browseSites(api, query, from, PAGE_SIZE, selected);
     if (page.searchError !== undefined && searchUnavailable(page.searchError) === undefined) throw page.searchError;
     const items = page.sites.map(site => siteRow(site));
-    const notice = page.searchError !== undefined
+    const notice = selected && items.length === 0 && from === 0 ? (query === undefined ? NOT_ADDED_YET : undefined)
+      : page.searchError !== undefined
       ? "Showing your home site and the sites you follow, because SharePoint search isn't available right now. Paste a link to choose any other site."
       : items.length === 0 && from === 0 ? (query === undefined ? "You can't open any SharePoint sites yet." : undefined) : undefined;
     return { items, ...(page.nextFrom !== undefined ? { nextPageToken: `from:${page.nextFrom}` } : {}), ...(notice ? { notice } : {}) };
@@ -417,9 +426,15 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
 
   /** The OneDrive tab: the user's own OneDrive, to open or choose, and what others have shared. */
   async #oneDriveRoot(api: GraphApi, query: string | undefined): Promise<SharePointBrowserPage> {
+    // Under Sites.Selected nobody else's OneDrive is granted, so nothing shared from one can be opened.
+    const { grant } = await this.#state();
+    if (grant?.sites === "selected" && !grant.oneDrive) {
+      return { items: [], notice: "Your organization hasn't included OneDrive in this app, so choose from Sites instead." };
+    }
+    const shared = grant?.sites === "selected" ? [] : [SHARED_ROW];
     const drive = await this.#myOneDrive(api);
-    if (drive === null) return { items: [SHARED_ROW], notice: "You don't have a OneDrive of your own." };
-    if (query === undefined) return { items: [driveRow(drive, await this.#viewer()), SHARED_ROW] };
+    if (drive === null) return { items: shared, notice: "You don't have a OneDrive of your own." };
+    if (query === undefined) return { items: [driveRow(drive, await this.#viewer()), ...shared] };
     return await this.#folder(api, drive.id, "root", query, undefined);
   }
 
@@ -431,6 +446,7 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
   async #shared(api: GraphApi, query: string | undefined, token: string | undefined): Promise<SharePointBrowserPage> {
     const from = token === undefined ? 0 : Number(token.replace(/^from:/, ""));
     if (!Number.isInteger(from) || from < 0) throw new Error("That page has expired. Open Shared with you again.");
+    if (await this.#selected()) return { items: [], notice: "Files shared from other people's OneDrives can't be opened through this app." };
     const [mine, viewer, { identity }] = await Promise.all([this.#myOneDrive(api), this.#viewer(), this.#state()]);
     // Every OneDrive lives beside the user's own; without one, where the tenant's usually do.
     const oneDrives = mine === null ? undefined : /^(https:\/\/[^/]+\/personal\/)[^/]+/.exec(mine.webUrl);
@@ -562,7 +578,8 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
     try {
       found = await this.#locate(url);
     } catch (error) {
-      if (error instanceof UnresolvableUrlError) return { items: [], notice: error.message };
+      if (error instanceof SiteNotGrantedError) return { items: [], notice: error.message };
+      if (error instanceof UnresolvableUrlError) return { items: [], notice: error.message + (await this.#selected() ? MAYBE_NOT_ADDED : "") };
       throw error;
     }
     if (found === null) {
@@ -573,11 +590,11 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
 
   /** Where a URL sits in the picker: its row, its tab, and the places above it. Null for "all". */
   async #locate(url: string): Promise<{ row: SharePointBrowserItem; tab: string; path: SharePointBrowserCrumb[] } | null> {
-    const { identity } = await this.#state();
+    const { identity, grant } = await this.#state();
     const tenant = identity.sharePointTenant;
     if (tenant === undefined) throw new UnresolvableUrlError("This Microsoft 365 account has no SharePoint.");
     return await this.#read(async api => {
-      const resolved = await resolveSharePointUrl(api, url, tenant);
+      const resolved = await resolveSharePointUrl(api, url, tenant, { selected: grant?.sites === "selected" });
       const scope = resolved.scope;
       const siteCrumb = async (siteId: string) => {
         const site = await reads.getSite(api, siteId);
@@ -624,13 +641,15 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
     return this.#exports.UserAccount.get(this.#exports.UserAccount.idFromString(this.#userObjectId));
   }
 
-  /** The connected identity and whether the grant covers SharePoint, reused briefly. */
-  #state(): Promise<{ identity: StoredIdentity; granted: boolean }> {
+  /** The connected identity, whether the grant covers SharePoint, and what of it, reused briefly. */
+  #state(): Promise<{ identity: StoredIdentity; granted: boolean; grant: SharePointGrant | null }> {
     const now = Date.now();
     if (this.#status === undefined || now - this.#status.at >= STATUS_TTL_MS) {
       const account = this.#account();
       const value = Promise.all([account.getIdentity(), account.getGrantedScopes()])
-        .then(([identity, scopes]) => ({ identity, granted: grantedResourcePatterns(scopes).includes(SHAREPOINT_RESOURCE.urlPattern) }));
+        .then(([identity, scopes]) => ({
+          identity, granted: grantedResourcePatterns(scopes).includes(SHAREPOINT_RESOURCE.urlPattern), grant: grantedSharePoint(scopes),
+        }));
       const entry = { at: now, value };
       // A failure isn't kept, so the next request asks again.
       value.catch(() => {
@@ -652,6 +671,11 @@ export class SharePointConfiguratorUI extends RpcTarget implements SharePointCon
       this.#oneDrive = drive;
     }
     return this.#oneDrive;
+  }
+
+  /** Whether the grant reaches only the sites a SharePoint admin granted the app. */
+  async #selected(): Promise<boolean> {
+    return (await this.#state()).grant?.sites === "selected";
   }
 
   /** The connected user's display name, for "Modified by you". */

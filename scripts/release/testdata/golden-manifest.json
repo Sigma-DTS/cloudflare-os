@@ -749,7 +749,7 @@
           "setupSteps": [
             "In the Microsoft Entra admin center, open App registrations and select New registration.",
             "Choose Accounts in this organizational directory only, add a Web redirect URI with the value below, and register.",
-            "Under API permissions, add Microsoft Graph delegated permissions: openid, profile, email, offline_access and User.Read; for SharePoint, Sites.ReadWrite.All and Files.ReadWrite.All (or Sites.Read.All and Files.Read.All for read-only access); for Outlook, Mail.ReadWrite, Mail.ReadWrite.Shared, Mail.Send, Mail.Send.Shared, MailboxSettings.ReadWrite, People.Read and User.ReadBasic.All; for Calendar, Calendars.ReadWrite and Calendars.ReadWrite.Shared.",
+            "Under API permissions, add Microsoft Graph delegated permissions: openid, profile, email, offline_access and User.Read; for SharePoint, Sites.ReadWrite.All and Files.ReadWrite.All (or Sites.Read.All and Files.Read.All for read-only access, or Sites.Selected and Files.ReadWrite to reach only the sites your SharePoint admin grants the app); for Outlook, Mail.ReadWrite, Mail.ReadWrite.Shared, Mail.Send, Mail.Send.Shared, MailboxSettings.ReadWrite, People.Read and User.ReadBasic.All; for Calendar, Calendars.ReadWrite and Calendars.ReadWrite.Shared.",
             "Select Grant admin consent, so users aren't asked to approve each permission themselves.",
             "Under Certificates & secrets, create a client secret, and note when it expires: connections stop refreshing once it does.",
             "Copy the Application (client) ID and Directory (tenant) ID from the Overview page, and the secret's Value (not its ID), here."

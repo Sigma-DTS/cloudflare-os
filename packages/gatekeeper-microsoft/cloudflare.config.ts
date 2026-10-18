@@ -7,7 +7,9 @@ import {
  * `MICROSOFT_TENANT_ID` (default `organizations`, which then requires `MICROSOFT_ALLOWED_TENANT_IDS`),
  * and caps what agents may do with `MICROSOFT_SHAREPOINT_ACCESS` (`write`, the default, or `read`),
  * `MICROSOFT_OUTLOOK_ACCESS` (`send`, the default, `draft`, `organize` or `read`) and
- * `MICROSOFT_CALENDAR_ACCESS` (`schedule`, the default, `edit` or `read`).
+ * `MICROSOFT_CALENDAR_ACCESS` (`schedule`, the default, `edit` or `read`). `MICROSOFT_SHAREPOINT_SITES`
+ * (`all`, the default, or `selected`) chooses whether SharePoint asks for every site the user can
+ * open or only the sites a SharePoint admin grants the app.
  */
 export default defineGadgetsWorker({
   name: "gatekeeper-microsoft",

@@ -20,7 +20,7 @@ import { convertToText } from "./content/index";
 import { GraphApiError, type GraphApi } from "./graph-api";
 import { parseCanvas, type GraphColumn, type GraphDrive, type GraphDriveItem, type GraphList, type GraphListItem, type GraphSite, type GraphSitePage } from "./graph-parse";
 import type { StoredIdentity } from "./microsoft-credentials";
-import type { SharePointAccess } from "./microsoft-env";
+import type { SharePointAccess, SharePointSites } from "./microsoft-env";
 import { editDocx } from "./content/docx-edit";
 import { editPptx } from "./content/pptx-edit";
 import { MAX_CELL_CHARS, checkFormula } from "./content/xlsx-write";
@@ -78,6 +78,8 @@ const MAX_UPDATED_CELLS = 10_000;
 export type SessionHost = {
   scope: SharePointScope;
   access: SharePointAccess;
+  /** Whether the grant reaches every site the user can open, or only those granted to the app. */
+  sites: SharePointSites;
   owner(): Promise<StoredIdentity>;
   /** Runs a read as the connection, replayed once on a credential refresh. */
   read<T>(op: (api: GraphApi) => Promise<T>): Promise<T>;
@@ -198,7 +200,9 @@ async function readScopeRoot(ctx: ScopeReader): Promise<ScopeRoot> {
       return {
         name: "SharePoint & OneDrive",
         webUrl: owner.sharePointTenant ? allUrl(owner.sharePointTenant) : "",
-        description: "Everything you can open in SharePoint and OneDrive.",
+        description: ctx.host.sites === "selected"
+          ? "Every SharePoint site your organization has added to this app that you can open, and your own OneDrive if it's included."
+          : "Everything you can open in SharePoint and OneDrive.",
         location: "SharePoint & OneDrive",
         ids: {},
       };
@@ -420,7 +424,8 @@ export class SharePointReaderImpl extends RpcTarget implements SharePointReader 
       remotePageSize: 50,
       dispose: () => walk[Symbol.dispose](),
       fetchPage: async (token, perPage) => {
-        const page = await this.ctx.host.read(api => reads.browseSites(api, query, token === undefined ? 0 : Number(token), perPage));
+        const page = await this.ctx.host.read(api =>
+          reads.browseSites(api, query, token === undefined ? 0 : Number(token), perPage, this.ctx.host.sites === "selected"));
         // With search down, the home and followed sites are still worth returning; the agent is told.
         if (page.searchError !== undefined && page.sites.length === 0) throw searchFailure(page.searchError, "Site search");
         return { items: page.sites.map(toSiteInfo), ...(page.nextFrom !== undefined ? { nextToken: String(page.nextFrom) } : {}) };
@@ -467,7 +472,8 @@ export class SharePointReaderImpl extends RpcTarget implements SharePointReader 
     if (owner.sharePointTenant === undefined) throw new Error("This Microsoft 365 account has no SharePoint.");
     let resolved;
     try {
-      resolved = await this.ctx.host.read(api => resolveSharePointUrl(api, url, owner.sharePointTenant!));
+      resolved = await this.ctx.host.read(api =>
+        resolveSharePointUrl(api, url, owner.sharePointTenant!, { selected: this.ctx.host.sites === "selected" }));
     } catch (error) {
       if (error instanceof UnresolvableUrlError) throw new Error(error.message, { cause: error });
       throw error;

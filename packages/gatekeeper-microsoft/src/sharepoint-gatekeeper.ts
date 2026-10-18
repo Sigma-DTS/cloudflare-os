@@ -23,7 +23,7 @@ import TYPES_CODE from "./types.txt";
 import { DESCRIPTION_TTL_MS, housekeep, isProvisional, PinnedUser, provisionalId, revertRefused } from "./binding";
 import { GraphApi, GraphApiError } from "./graph-api";
 import { accountSource } from "./microsoft-credentials";
-import { effectiveAccess, type Env, type SharePointAccess, type SharePointGatekeeperProps } from "./microsoft-env";
+import { effectiveSharePoint, type Env, type SharePointAccess, type SharePointGatekeeperProps, type SharePointSites } from "./microsoft-env";
 import {
   MAX_UPLOAD_BYTES,
   actions,
@@ -110,10 +110,11 @@ export class SharePointGatekeeper extends DurableObject<Env, SharePointGatekeepe
 
   readonly #actions = actions.bind(this.#journal, this.#actionHost);
 
-  #sessionHost(access: SharePointAccess): SessionHost {
+  #sessionHost({ access, sites }: { access: SharePointAccess; sites: SharePointSites }): SessionHost {
     return {
       scope: this.ctx.props.scope,
       access,
+      sites,
       owner: () => this.#user.get(),
       read: op => this.#graph(op, true),
       cached: (key, ttlMs, load) => this.#cache.cached(key, ttlMs, load),
@@ -135,8 +136,8 @@ export class SharePointGatekeeper extends DurableObject<Env, SharePointGatekeepe
 
   async describe(): Promise<ResourceDescription> {
     const scope = this.ctx.props.scope;
-    const access = await this.#access();
-    const tsType = access === "write" ? "SharePointSession" : "SharePointReader";
+    const grant = await this.#grant();
+    const tsType = grant.access === "write" ? "SharePointSession" : "SharePointReader";
     const kv = this.ctx.storage.kv;
     const stored = kv.get<{ value: ResourceDescription; at: number }>(DESCRIPTION_KEY);
     if (stored && Date.now() - stored.at < DESCRIPTION_TTL_MS) return { ...stored.value, tsType };
@@ -144,7 +145,7 @@ export class SharePointGatekeeper extends DurableObject<Env, SharePointGatekeepe
     let description: ResourceDescription;
     try {
       // The description is the session's own account of its scope, from the same reads.
-      const root = await new ScopeReader(this.#sessionHost(access)).root();
+      const root = await new ScopeReader(this.#sessionHost(grant)).root();
       const personal = scope.kind === "library" && root.location === "OneDrive";
       description = {
         url: root.webUrl,
@@ -168,15 +169,15 @@ export class SharePointGatekeeper extends DurableObject<Env, SharePointGatekeepe
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    if (await this.#access() !== "write") return [];
+    if ((await this.#grant()).access !== "write") return [];
     const submits = BINDING_ACTIONS[this.ctx.props.scope.kind];
     return this.#actions.autoApprovableKinds().filter(kind => submits(kind.tag));
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<Session> {
-    const access = await this.#access();
-    const ctx = new SessionContext(this.#sessionHost(access), approvalQueue.dup(), this.#observers);
-    return access === "write" ? new SharePointSessionImpl(ctx) : new SharePointReaderImpl(ctx);
+    const grant = await this.#grant();
+    const ctx = new SessionContext(this.#sessionHost(grant), approvalQueue.dup(), this.#observers);
+    return grant.access === "write" ? new SharePointSessionImpl(ctx) : new SharePointReaderImpl(ctx);
   }
 
   async applyAction(actionId: number, _cache: RpcStub<GitCache>): Promise<void> {
@@ -229,15 +230,16 @@ export class SharePointGatekeeper extends DurableObject<Env, SharePointGatekeepe
   }
 
   /**
-   * What the deployment, the connection's grant and the user's own role on the bound item together
-   * allow: never more than any of them. So a file shared with the user to view binds read-only.
+   * Which sites the connection's grant reaches, and what the deployment, the grant and the user's
+   * own role on the bound item together allow: never more than any of them. So a file shared with
+   * the user to view binds read-only.
    */
-  async #access(): Promise<SharePointAccess> {
-    const access = effectiveAccess(this.env, await this.#account().getGrantedScopes());
-    if (access === null) {
+  async #grant(): Promise<{ access: SharePointAccess; sites: SharePointSites }> {
+    const grant = effectiveSharePoint(this.env, await this.#account().getGrantedScopes());
+    if (grant === null) {
       throw new Error("This Microsoft 365 connection no longer grants SharePoint access. Reconnect the Microsoft 365 account.");
     }
-    return access === "write" && !await this.#mayChange() ? "read" : access;
+    return { access: grant.access === "write" && !await this.#mayChange() ? "read" : grant.access, sites: grant.sites };
   }
 
   /**

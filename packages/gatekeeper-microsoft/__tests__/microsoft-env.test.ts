@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  MicrosoftConfigurationError, SHAREPOINT_RESOURCE, acceptsTenant, effectiveAccess, getBasePath, getRedirectUri, grantedAccess,
-  grantedResourcePatterns, oauthEndpoints, scopesFor, sharePointAccess, tenantPolicy, type Env,
+  MicrosoftConfigurationError, SHAREPOINT_RESOURCE, acceptsTenant, effectiveSharePoint, getBasePath, getRedirectUri,
+  grantedResourcePatterns, grantedSharePoint, oauthEndpoints, scopesFor, sharePointAccess, tenantPolicy, type Env,
   OUTLOOK_RESOURCE, effectiveOutlookAccess, grantedOutlookAccess, grantsSharedMailboxes, outlookAccess,
 } from "../src/microsoft-env";
 
@@ -109,6 +109,16 @@ describe("scopesFor", () => {
     expect(outlookAccess(env())).toBe("send");
   });
 
+  it("asks for Sites.Selected and the user's own files when the deployment wants selected sites", () => {
+    const selected = scopesFor(env({ MICROSOFT_SHAREPOINT_SITES: "Selected" }), sharePoint);
+    expect(selected).toEqual(expect.arrayContaining(["https://graph.microsoft.com/Sites.Selected", "https://graph.microsoft.com/Files.ReadWrite"]));
+    expect(selected.some(scope => scope.endsWith(".All"))).toBe(false);
+    expect(scopesFor(env({ MICROSOFT_SHAREPOINT_SITES: "selected", MICROSOFT_SHAREPOINT_ACCESS: "read" }), sharePoint))
+      .toContain("https://graph.microsoft.com/Files.Read");
+    // Anything else is every site, the default.
+    expect(scopesFor(env({ MICROSOFT_SHAREPOINT_SITES: "some" }), sharePoint)).toContain("https://graph.microsoft.com/Sites.ReadWrite.All");
+  });
+
   it("asks for nothing beyond sign-in for no resource types, and refuses unknown ones", () => {
     expect(scopesFor(env(), [])).toEqual(["openid", "profile", "email", "offline_access", "User.Read"]);
     expect(scopesFor(env(), sharePoint)).toHaveLength(7);
@@ -152,19 +162,19 @@ describe("reading a grant", () => {
   const write = ["User.Read", "Sites.ReadWrite.All", "Files.ReadWrite.All"];
 
   it("reads Entra's scopes whether qualified or bare, in any case", () => {
-    expect(grantedAccess(read)).toBe("read");
-    expect(grantedAccess(write)).toBe("write");
-    expect(grantedAccess(["user.read", "sites.readwrite.all", "FILES.READWRITE.ALL"])).toBe("write");
+    expect(grantedSharePoint(read)?.access).toBe("read");
+    expect(grantedSharePoint(write)?.access).toBe("write");
+    expect(grantedSharePoint(["user.read", "sites.readwrite.all", "FILES.READWRITE.ALL"])?.access).toBe("write");
   });
 
   it("counts a ReadWrite permission as covering read", () => {
-    expect(grantedAccess(["Sites.ReadWrite.All", "Files.Read.All"])).toBe("read");
+    expect(grantedSharePoint(["Sites.ReadWrite.All", "Files.Read.All"])?.access).toBe("read");
   });
 
   it("is write only when both ReadWrite permissions were consented", () => {
-    expect(grantedAccess(["Sites.ReadWrite.All"])).toBeNull();
-    expect(grantedAccess(["Files.ReadWrite.All", "Sites.Read.All"])).toBe("read");
-    expect(grantedAccess(["openid", "User.Read"])).toBeNull();
+    expect(grantedSharePoint(["Sites.ReadWrite.All"])).toBeNull();
+    expect(grantedSharePoint(["Files.ReadWrite.All", "Sites.Read.All"])?.access).toBe("read");
+    expect(grantedSharePoint(["openid", "User.Read"])).toBeNull();
   });
 
   it("covers the SharePoint resource only with User.Read and a SharePoint grant", () => {
@@ -173,10 +183,20 @@ describe("reading a grant", () => {
     expect(grantedResourcePatterns(["User.Read"])).toEqual([]);
   });
 
+  it("reads Sites.Selected as only the granted sites, with OneDrive only alongside Files.Read or ReadWrite", () => {
+    expect(grantedSharePoint(["User.Read", "Sites.Selected", "Files.ReadWrite"])).toEqual({ sites: "selected", access: "write", oneDrive: true });
+    expect(grantedSharePoint(["User.Read", "Sites.Selected", "Files.Read"])).toMatchObject({ oneDrive: true });
+    expect(grantedSharePoint(["User.Read", "Sites.Selected"])).toMatchObject({ sites: "selected", oneDrive: false });
+    expect(grantedResourcePatterns(["User.Read", "Sites.Selected"])).toEqual([SHAREPOINT_RESOURCE.urlPattern]);
+    // Every site wins when the grant holds both, whatever the deployment asked for.
+    expect(grantedSharePoint([...write, "Sites.Selected"])).toMatchObject({ sites: "all", access: "write" });
+    expect(effectiveSharePoint(env({ MICROSOFT_SHAREPOINT_ACCESS: "read" }), ["User.Read", "Sites.Selected"])).toMatchObject({ access: "read" });
+  });
+
   it("narrows a binding to the lower of the deployment's ceiling and the grant", () => {
-    expect(effectiveAccess(env(), write)).toBe("write");
-    expect(effectiveAccess(env(), read)).toBe("read");
-    expect(effectiveAccess(env({ MICROSOFT_SHAREPOINT_ACCESS: "read" }), write)).toBe("read");
-    expect(effectiveAccess(env({ MICROSOFT_SHAREPOINT_ACCESS: "read" }), ["User.Read"])).toBeNull();
+    expect(effectiveSharePoint(env(), write)?.access).toBe("write");
+    expect(effectiveSharePoint(env(), read)?.access).toBe("read");
+    expect(effectiveSharePoint(env({ MICROSOFT_SHAREPOINT_ACCESS: "read" }), write)?.access).toBe("read");
+    expect(effectiveSharePoint(env({ MICROSOFT_SHAREPOINT_ACCESS: "read" }), ["User.Read"])).toBeNull();
   });
 });

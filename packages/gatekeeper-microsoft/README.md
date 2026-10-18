@@ -16,7 +16,8 @@ working. `plans/microsoft-365-gatekeeper.md` is the design record.
 3. Under **API permissions**, add these Microsoft Graph **delegated** permissions:
    - `openid`, `profile`, `email`, `offline_access`, `User.Read`
    - `Sites.ReadWrite.All` and `Files.ReadWrite.All`, or `Sites.Read.All` and `Files.Read.All` for
-     a read-only deployment
+     a read-only deployment. To reach only sites your SharePoint admin chooses, use `Sites.Selected`
+     and `Files.ReadWrite` instead: see [Every site or only selected sites](#every-site-or-only-selected-sites).
    - for Outlook: `Mail.ReadWrite`, `Mail.ReadWrite.Shared`, `Mail.Send`, `Mail.Send.Shared`,
      `MailboxSettings.ReadWrite`, `People.Read` and `User.ReadBasic.All`. A deployment capped below
      `send` needs neither `Mail.Send` permission, and a `read` one only the `.Read` variants.
@@ -40,6 +41,7 @@ working. `plans/microsoft-365-gatekeeper.md` is the design record.
 | `MICROSOFT_TENANT_ID` | secret | The Directory (tenant) ID, or a verified domain. Only accounts in this tenant can connect. It isn't a credential, but the deploy wizard only collects secrets. |
 | `MICROSOFT_ALLOWED_TENANT_IDS` | var, optional | For a multitenant app. Set `MICROSOFT_TENANT_ID=organizations` and list the tenant IDs (GUIDs) that may connect, comma-separated. `organizations` without this list is refused. `common` and `consumers` are always refused, because personal Microsoft accounts have no SharePoint. |
 | `MICROSOFT_SHAREPOINT_ACCESS` | var, optional | `write` (the default) or `read`. This caps what agents may do whatever the app was granted: the effective access is the lowest of this, the connection's own grant and, for a file, folder or library, the user's own role on it, so something shared with them to view binds read-only. |
+| `MICROSOFT_SHAREPOINT_SITES` | var, optional | `all` (the default) or `selected`. Which SharePoint permissions a connection asks for: every site the user can open, or only the sites a SharePoint admin grants the app. See [Every site or only selected sites](#every-site-or-only-selected-sites). |
 | `MICROSOFT_OUTLOOK_ACCESS` | var, optional | `send` (the default), `draft`, `organize` or `read`, capping Outlook bindings the same way. Unrecognized values mean `read`. |
 | `MICROSOFT_CALENDAR_ACCESS` | var, optional | `schedule` (the default), `edit` or `read`, capping Calendar bindings the same way. Unrecognized values mean `read`. |
 
@@ -80,6 +82,59 @@ OneDrive to choose one part of it, search, or paste any SharePoint or OneDrive l
 also lists what others have shared with the user from their OneDrives, as **Shared with you**. Graph's
 `sharedWithMe` is deprecated, so that list comes from Microsoft Search, which takes minutes to show a
 new share and doesn't include files shared from a site; a link pasted into the picker always works.
+
+### Every site or only selected sites
+
+`MICROSOFT_SHAREPOINT_SITES` chooses between two ways of granting SharePoint:
+
+| | `all` (recommended, the default) | `selected` |
+|---|---|---|
+| Permissions | `Sites.ReadWrite.All`, `Files.ReadWrite.All` | `Sites.Selected`, `Files.ReadWrite` |
+| Reaches | Every site and file the user can already open | Sites a SharePoint admin grants the app, one by one, and the user's own OneDrive |
+| Setup | Admin consent once | Admin consent, then a Graph call per site, and again for each new site |
+| Shared with you | Yes | No |
+| Read-only sites | Show as read-only where Microsoft reports it | Changes are refused when approved |
+
+Either way an agent can never reach more than the user can open, and each binding narrows that
+further. `all` is the better experience and needs no upkeep. Choose `selected` when policy requires
+Microsoft itself to keep the app out of every site that hasn't been approved.
+
+### Only selected sites
+
+To set up `selected`:
+
+1. On the app registration, add the delegated permissions `Sites.Selected`, and `Files.ReadWrite`
+   (or `Files.Read`) if people should reach their own OneDrive, instead of `Sites.ReadWrite.All` and
+   `Files.ReadWrite.All`. Grant admin consent.
+2. Set `MICROSOFT_SHAREPOINT_SITES=selected`, so connections ask for those permissions.
+3. Grant each site to the app. This needs `Sites.FullControl.All`, so a SharePoint admin runs it
+   in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer) or PowerShell, signed in
+   as themselves, with the app's Application (client) ID:
+
+   ```http
+   GET https://graph.microsoft.com/v1.0/sites/contoso.sharepoint.com:/sites/Engineering?$select=id
+
+   POST https://graph.microsoft.com/v1.0/sites/{id from above}/permissions
+   { "roles": ["write"], "grantedToIdentities": [{ "application": { "id": "<client ID>", "displayName": "Gadgets" } }] }
+   ```
+
+   Use `"read"` for a site agents should only read. `DELETE …/sites/{id}/permissions/{permission id}`
+   takes the site away again, and revoking consent to `Sites.Selected` takes every site away at once.
+
+Microsoft then lets the app into a site only if the user can open it *and* it was granted to the
+app. The gatekeeper works by what a connection was actually granted, not by the setting, so a
+connection holding both kinds of permission reaches every site. Under `Sites.Selected`:
+
+- **All of SharePoint & OneDrive** means every granted site the user can open, and the Sites tab
+  lists only the sites whose document library Microsoft opens. Microsoft answers for any site's name
+  and ID, granted or not, so the library is the test. A site that hasn't been granted can't be found
+  or bound, and a pasted link to one says to ask the SharePoint admin.
+- The user's own OneDrive is offered only with `Files.Read` or `Files.ReadWrite`. **Shared with you**
+  isn't offered, because nobody else's OneDrive is granted.
+- Microsoft Search doesn't honor `Sites.Selected`, but every hit is read again as the user, which
+  Microsoft refuses outside the granted sites, so hits from other sites are dropped.
+- Write access is decided per site by its grant, which the gatekeeper can't read. A change in a
+  site granted `read` is refused by Microsoft when it's applied.
 
 ### SharePoint approvals
 

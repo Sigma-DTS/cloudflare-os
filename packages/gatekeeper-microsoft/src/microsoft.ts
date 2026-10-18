@@ -65,6 +65,7 @@ import {
   getBaseUrl,
   getRedirectUri,
   grantedResourcePatterns,
+  grantedSharePoint,
   grantsSharedCalendars,
   grantsSharedMailboxes,
   oauthEndpoints,
@@ -774,10 +775,11 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         "license that includes SharePoint.");
     }
     const source = accountSource(this.ctx.exports, this.ctx.props.userObjectId);
+    const selected = grantedSharePoint(await this.#account().getGrantedScopes())?.sites === "selected";
     let resolved;
     try {
       resolved = await source.run(creds => resolveSharePointUrl(new GraphApi(creds.accessToken), url,
-        identity.sharePointTenant!), { replayable: true });
+        identity.sharePointTenant!, { selected }), { replayable: true });
     } catch (error) {
       if (error instanceof UnresolvableUrlError) throw new Error(error.message, { cause: error });
       throw error;

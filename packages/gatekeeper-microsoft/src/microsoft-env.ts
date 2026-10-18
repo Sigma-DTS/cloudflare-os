@@ -29,6 +29,12 @@ export type Env = Cloudflare.Env & PreviewOAuthEnv & {
   /** `write` (the default) or `read`: the most this deployment lets agents do in SharePoint. */
   MICROSOFT_SHAREPOINT_ACCESS?: string;
   /**
+   * `all` (the default) or `selected`: whether SharePoint access is asked for across every site the
+   * user can open (`Sites.Read.All`), or for only the sites a SharePoint admin grants the app
+   * (`Sites.Selected`). Either way, a connection works by what its grant turns out to hold.
+   */
+  MICROSOFT_SHAREPOINT_SITES?: string;
+  /**
    * `send` (the default), `draft`, `organize` or `read`: the most this deployment lets agents do in
    * Outlook. Each binding chooses its own level, up to this.
    */
@@ -136,6 +142,17 @@ export function oauthEndpoints(authority: string): { authorize: string; token: s
 /** What agents may do in SharePoint on this deployment. */
 export type SharePointAccess = "read" | "write";
 
+/**
+ * Which sites a connection reaches: every one the user can open, or only those a SharePoint admin
+ * has granted the app, which Microsoft then enforces.
+ */
+export type SharePointSites = "all" | "selected";
+
+/** Which sites this deployment asks for. Anything but `selected` is `all`, the default. */
+export function sharePointSites(env: Env): SharePointSites {
+  return env.MICROSOFT_SHAREPOINT_SITES?.trim().toLowerCase() === "selected" ? "selected" : "all";
+}
+
 /** The SharePoint access ceiling. Anything but `read` is `write`, the default. */
 export function sharePointAccess(env: Env): SharePointAccess {
   return env.MICROSOFT_SHAREPOINT_ACCESS?.trim().toLowerCase() === "read" ? "read" : "write";
@@ -225,16 +242,22 @@ const CALENDAR_SCOPES: Record<CalendarAccessLevel, readonly string[]> = {
 /** Scopes every connection carries: sign-in, the user's profile, and a refresh token. */
 const BASE_SCOPES = ["openid", "profile", "email", "offline_access", "User.Read"] as const;
 
-/** The Graph permissions SharePoint needs at each access level. */
-const SHAREPOINT_SCOPES: Record<SharePointAccess, readonly string[]> = {
-  read: ["Sites.Read.All", "Files.Read.All"],
-  write: ["Sites.ReadWrite.All", "Files.ReadWrite.All"],
+/**
+ * The Graph permissions SharePoint needs at each access level, by which sites it reaches. Under
+ * `Sites.Selected` each site's grant to the app says whether it may write, and the user's own
+ * OneDrive, a site of its own that no admin grants one by one, comes from `Files.Read(Write)`, which
+ * reaches only the signed-in user's files.
+ */
+const SHAREPOINT_SCOPES: Record<SharePointSites, Record<SharePointAccess, readonly string[]>> = {
+  all: { read: ["Sites.Read.All", "Files.Read.All"], write: ["Sites.ReadWrite.All", "Files.ReadWrite.All"] },
+  selected: { read: ["Sites.Selected", "Files.Read"], write: ["Sites.Selected", "Files.ReadWrite"] },
 };
 
 /** A permission that implies another, for reading a grant. */
 const COVERED_BY: Record<string, string> = {
   "sites.read.all": "sites.readwrite.all",
   "files.read.all": "files.readwrite.all",
+  "files.read": "files.readwrite",
   "mail.read": "mail.readwrite",
   "mail.read.shared": "mail.readwrite.shared",
   "mailboxsettings.read": "mailboxsettings.readwrite",
@@ -257,7 +280,7 @@ export function scopesFor(env: Env, resourceUrlPatterns?: readonly string[]): st
   const scopes = new Set<string>(BASE_SCOPES);
   const patterns = resourceUrlPatterns ?? ALL_RESOURCES.map(resource => resource.urlPattern);
   for (const pattern of patterns) {
-    const needed = pattern === SHAREPOINT_RESOURCE.urlPattern ? SHAREPOINT_SCOPES[sharePointAccess(env)]
+    const needed = pattern === SHAREPOINT_RESOURCE.urlPattern ? SHAREPOINT_SCOPES[sharePointSites(env)][sharePointAccess(env)]
       : pattern === OUTLOOK_RESOURCE.urlPattern ? OUTLOOK_SCOPES[outlookAccess(env)]
       : pattern === CALENDAR_RESOURCE.urlPattern ? CALENDAR_SCOPES[calendarAccess(env)]
       : undefined;
@@ -280,14 +303,21 @@ function holds(granted: ReadonlySet<string>, scope: string): boolean {
   return granted.has(wanted) || (COVERED_BY[wanted] !== undefined && granted.has(COVERED_BY[wanted]));
 }
 
+/** What SharePoint a grant reaches: which sites, the most agents may do, and the user's own OneDrive. */
+export type SharePointGrant = { sites: SharePointSites; access: SharePointAccess; oneDrive: boolean };
+
 /**
- * The SharePoint access a grant carries: `write` only when both ReadWrite permissions were granted,
- * since an admin may consent to less than was asked for.
+ * The SharePoint a grant carries, whatever the deployment asked for, since an admin may consent to
+ * less or other than was asked. Every site at `write` takes both ReadWrite permissions. Otherwise
+ * `Sites.Selected` means only the sites granted to the app, at whatever each grant allows, which
+ * Microsoft enforces; the user's own OneDrive then needs `Files.Read` or `Files.ReadWrite`.
  */
-export function grantedAccess(grantedScopes: readonly string[]): SharePointAccess | null {
+export function grantedSharePoint(grantedScopes: readonly string[]): SharePointGrant | null {
   const granted = new Set(grantedScopes.map(normalizeScope));
-  if (SHAREPOINT_SCOPES.write.every(scope => granted.has(scope.toLowerCase()))) return "write";
-  if (SHAREPOINT_SCOPES.read.every(scope => holds(granted, scope))) return "read";
+  const { all } = SHAREPOINT_SCOPES;
+  if (all.write.every(scope => granted.has(scope.toLowerCase()))) return { sites: "all", access: "write", oneDrive: true };
+  if (all.read.every(scope => holds(granted, scope))) return { sites: "all", access: "read", oneDrive: true };
+  if (granted.has("sites.selected")) return { sites: "selected", access: "write", oneDrive: holds(granted, "files.read") };
   return null;
 }
 
@@ -299,7 +329,7 @@ export function grantedResourcePatterns(grantedScopes: readonly string[]): strin
   const granted = new Set(grantedScopes.map(normalizeScope));
   if (!granted.has("user.read")) return [];
   return [
-    ...(grantedAccess(grantedScopes) === null ? [] : [SHAREPOINT_RESOURCE.urlPattern]),
+    ...(grantedSharePoint(grantedScopes) === null ? [] : [SHAREPOINT_RESOURCE.urlPattern]),
     ...(grantedCalendarAccess(grantedScopes) === null ? [] : [CALENDAR_RESOURCE.urlPattern]),
     ...(grantedOutlookAccess(grantedScopes) === null ? [] : [OUTLOOK_RESOURCE.urlPattern]),
   ];
@@ -363,13 +393,13 @@ export function effectiveOutlookAccess(env: Env, grantedScopes: readonly string[
 }
 
 /**
- * The access a binding has: the deployment's ceiling, narrowed to what the connection was granted.
- * A connection made when the ceiling was `write` keeps only `read` once the ceiling is lowered.
+ * What a connection reaches in SharePoint: its grant, at no more than the deployment's ceiling. A
+ * connection made when the ceiling was `write` keeps only `read` once the ceiling is lowered.
  */
-export function effectiveAccess(env: Env, grantedScopes: readonly string[]): SharePointAccess | null {
-  const granted = grantedAccess(grantedScopes);
+export function effectiveSharePoint(env: Env, grantedScopes: readonly string[]): SharePointGrant | null {
+  const granted = grantedSharePoint(grantedScopes);
   if (granted === null) return null;
-  return sharePointAccess(env) === "read" ? "read" : granted;
+  return sharePointAccess(env) === "read" ? { ...granted, access: "read" } : granted;
 }
 
 /** Props baked into the Outlook gatekeeper Durable Object class for one binding. */

@@ -32,6 +32,14 @@ export class UnresolvableUrlError extends Error {
   }
 }
 
+/** A link to a site the user can open, but that hasn't been granted to the app under `Sites.Selected`. */
+export class SiteNotGrantedError extends UnresolvableUrlError {
+  constructor() {
+    super("Your organization hasn't added that site to this app yet. Ask your SharePoint admin to add it.");
+    this.name = "SiteNotGrantedError";
+  }
+}
+
 /** Statuses that mean "not this facet, or not visible": try the next. */
 const MISS = [400, 403, 404];
 
@@ -115,9 +123,21 @@ async function fromSitePath(api: GraphApi, url: URL): Promise<ResolvedUrl | null
  * Resolves a URL to the scope it names.
  * @param tenant The connected tenant's SharePoint name (`contoso` for contoso.sharepoint.com); a
  * URL on any other tenant's host is refused before Graph is asked.
- * @throws UnresolvableUrlError for anything that is not a reachable SharePoint object.
+ * @param options.selected Whether the grant reaches only the sites granted to the app. Graph then
+ * still answers any site's metadata, so a site is checked by opening its library.
+ * @throws UnresolvableUrlError for anything that is not a reachable SharePoint object, and its
+ * SiteNotGrantedError for a site the app wasn't granted.
  */
-export async function resolveSharePointUrl(api: GraphApi, raw: string, tenant: string): Promise<ResolvedUrl> {
+export async function resolveSharePointUrl(api: GraphApi, raw: string, tenant: string, options: { selected?: boolean } = {}): Promise<ResolvedUrl> {
+  const resolved = await resolveUrl(api, raw, tenant);
+  if (options.selected && resolved.scope.kind === "site") {
+    const drive = await api.request<unknown>("GET", `/sites/${resolved.scope.siteId}/drive`, { query: { $select: "id" }, allow: MISS });
+    if (drive === null) throw new SiteNotGrantedError();
+  }
+  return resolved;
+}
+
+async function resolveUrl(api: GraphApi, raw: string, tenant: string): Promise<ResolvedUrl> {
   const url = parseSharePointUrl(raw);
   if (url === null) throw new UnresolvableUrlError("That isn't a SharePoint or OneDrive link.");
   const host = parseSharePointHost(url.hostname)!;

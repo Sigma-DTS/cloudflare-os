@@ -250,10 +250,12 @@ function isSystemSite(site: GraphSite): boolean {
  * One page of the sites a user can open, for browsing: on the first page, the home site and the
  * sites they follow (what they most likely mean), then everything Microsoft Search finds; OneDrives
  * and system sites left out, each site once. With a query, every source is narrowed to it.
+ * @param selected Whether the grant reaches only the sites granted to the app (`Sites.Selected`).
+ * Search names every site the user can open, so only those whose library opens are kept.
  * @returns The sites, the next page's offset, and the search failure when only the first two
  * sources answered.
  */
-export async function browseSites(api: GraphApi, query: string | undefined, from: number, size: number):
+export async function browseSites(api: GraphApi, query: string | undefined, from: number, size: number, selected = false):
     Promise<{ sites: GraphSite[]; nextFrom?: number; searchError?: unknown }> {
   const needle = query?.toLowerCase();
   const matches = (site: GraphSite) => needle === undefined || site.name.toLowerCase().includes(needle)
@@ -272,11 +274,27 @@ export async function browseSites(api: GraphApi, query: string | undefined, from
     return true;
   };
   const first = pinned.filter((site): site is GraphSite => site !== null && matches(site)).filter(keep);
-  if ("searchError" in search) return { sites: first, searchError: search.searchError };
+  const open = (sites: GraphSite[]) => selected ? reachableSites(api, sites) : Promise.resolve(sites);
+  if ("searchError" in search) return { sites: await open(first), searchError: search.searchError };
   return {
-    sites: [...first, ...search.result.sites.filter(keep)],
+    sites: await open([...first, ...search.result.sites.filter(keep)]),
     ...(search.result.nextFrom !== undefined ? { nextFrom: search.result.nextFrom } : {}),
   };
+}
+
+/**
+ * The sites among `sites` this connection can open, asked together. Under `Sites.Selected`, Graph
+ * answers any site's own metadata but refuses its library unless the site was granted to the app,
+ * so the library is what's asked for. A site without one isn't offered.
+ */
+export async function reachableSites(api: GraphApi, sites: readonly GraphSite[]): Promise<GraphSite[]> {
+  const open = new Set<string>();
+  for (let start = 0; start < sites.length; start += MAX_BATCH_REQUESTS) {
+    const answers = await api.batch(sites.slice(start, start + MAX_BATCH_REQUESTS)
+      .map((site, index) => ({ id: String(start + index), method: "GET" as const, url: `sites/${site.id}/drive?$select=id` })));
+    for (const [id, answer] of answers) if (answer.status === 200) open.add(id);
+  }
+  return sites.filter((_, index) => open.has(String(index)));
 }
 
 // -- lists --------------------------------------------------------------------------------------

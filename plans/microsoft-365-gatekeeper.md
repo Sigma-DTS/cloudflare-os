@@ -85,7 +85,19 @@ to less than was asked). A connection made under `write` keeps only `read` once 
 folder or library binding is also lowered to `read` when the user's own role on it is only `read`, as for something
 shared with them to view. Graph reports that role as `shared.effectiveRoles`, which isn't documented, so it is only
 ever used to lower access: where it's absent, the binding keeps `write` and SharePoint refuses what the user can't
-do when the change is applied. A
+do when the change is applied.
+
+**Selected sites.** `MICROSOFT_SHAREPOINT_SITES=selected` asks for `Sites.Selected` and `Files.Read(Write)`
+instead, for organizations that want Microsoft to limit the app to sites a SharePoint admin grants it (README,
+"Only selected sites"). Step-by-step consent stays: we can't learn what an admin will allow before asking, and
+asking for a permission they refused strands the user on Microsoft's "Need admin approval" page, so the setting
+chooses what to ask for. What a connection *does* follows its grant (`grantedSharePoint`): both ReadWrite `.All`
+permissions mean every site, whatever the setting; `Sites.Selected` alone means only granted sites, with the user's
+own OneDrive only under `Files.Read(Write)`, and no Shared with you. Microsoft Search doesn't honor
+`Sites.Selected`, and Graph answers any site's own metadata, so site listings and pasted site links keep only
+sites whose library opens (`GET /sites/{id}/drive`); file hits, already read again as the user, drop out by
+themselves. A site's grant role isn't readable with the user's token, so a
+`read`-granted site still binds at the deployment's level and Microsoft refuses its changes at apply. A
 read-only binding's session is a `SharePointReaderImpl`, a separate class with no write methods at all.
 
 ## The SharePoint resource
