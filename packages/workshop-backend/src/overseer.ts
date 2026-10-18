@@ -7257,7 +7257,15 @@ class OverseerImpl implements AgentHooks {
         // (This runs inside the try so the `finally` below still clears the active-agent state and
         // emits a stream "clear" — otherwise the UI would spin forever on a block.)
         let byokRouting: UserGatewayRouting | undefined;
-        if (this.ownerId) {
+        let chatGptToken: (() => Promise<string>) | undefined;
+        if (aiModel.config.credential === "chatgpt") {
+          // Runs on the owner's own subscription, so neither the free tier nor a gateway applies.
+          // The first token is fetched here so that a refusal ends the turn before it starts.
+          let cached: ChatGptAccessToken | undefined;
+          chatGptToken = async () =>
+              (cached = await this.chatGptAccess(initiatorUserId, cached)).token;
+          await chatGptToken();
+        } else if (this.ownerId) {
           let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
           let usage = await checkUsageAndBalance(this.env, ownerStub);
           if (!usage.allowed) {
@@ -7284,6 +7292,7 @@ class OverseerImpl implements AgentHooks {
             this.env, aiModel.config, initiator, {
               sessionAffinity,
               userGateway: byokRouting,
+              chatGptToken,
               metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId },
             });
         turn.setModel(chosenModel.model);
@@ -10694,6 +10703,14 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.deliverCodeModeText(executionId, delta);
   }
 
+  /**
+   * DO NOT MAKE PUBLIC -- returns a ChatGPT access token. Called by a ChatGPT model's
+   * LanguageModelGatekeeper before each request, for the user who minted it (see chatGptAccess()).
+   */
+  async chatGptAccessToken(userId: string): Promise<string> {
+    return (await this.impl.chatGptAccess(userId)).token;
+  }
+
   /** Called by AgentSelfLoopback when any method is called on the `self` object. */
   deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
@@ -11504,6 +11521,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       displayName: chatMeta.aiModel!.profile.name,
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
+      creatorUserId: this.clientUserId,
       metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
     }
 
