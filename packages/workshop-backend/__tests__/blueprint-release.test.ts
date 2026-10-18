@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deflate } from "pako";
+import { deflateSync } from "node:zlib";
 import { MAX_FILE_PATH_LENGTH } from "@gadgets/workshop-shared/code-change";
 import {
   MAX_RELEASE_COMMITS,
@@ -401,7 +401,7 @@ describe("release pack validation", () => {
     new DataView(header.buffer).setUint32(8, 1);
     let body = concatBytes([
       header, new Uint8Array([(7 << 4) | delta.length]),
-      Uint8Array.fromHex(await gitObjectOid("blob", base)), deflate(delta),
+      Uint8Array.fromHex(await gitObjectOid("blob", base)), deflateSync(delta),
     ]);
     let pack = concatBytes([body, new Uint8Array(await crypto.subtle.digest("SHA-1", body))]);
     await expect(readReleasePack(pack, ABSENT)).rejects.toThrow(/delta base .* is unavailable/);

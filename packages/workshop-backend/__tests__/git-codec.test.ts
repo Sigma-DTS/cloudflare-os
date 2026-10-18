@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { deflate } from "pako";
+import { createDeflate, createInflate, deflateSync, inflateSync } from "node:zlib";
 import {
+  GIT_DEFLATE_LEVEL,
   applyGitDelta,
   buildPackBytes,
   concatBytes,
@@ -88,6 +89,74 @@ async function fileTreeOid(files: ReadonlyMap<string, string>): Promise<string> 
   return await gitObjectOid("tree", encodeGitTree(entries));
 }
 
+/** `size` pseudo-random (so incompressible) bytes, the same for the same seed. */
+function randomBytes(size: number, seed = 1): Uint8Array {
+  let out = new Uint8Array(size);
+  let state = seed >>> 0 || 1;
+  for (let i = 0; i < size; i++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    out[i] = state & 0xff;
+  }
+  return out;
+}
+
+/** `bytes` deflated, as a plain Uint8Array (a Buffer's slice() would alias, not copy). */
+function deflate(bytes: Uint8Array): Uint8Array {
+  return new Uint8Array(deflateSync(bytes));
+}
+
+/** A pack entry, raw: its type code, the size its header declares, and its compressed data. */
+interface RawPackEntry {
+  typeCode: number;
+  size: number;
+  data: Uint8Array;
+}
+
+/** A blob entry of `payload`, deflated as git's own encoder would, declaring its true size. */
+function blobEntry(payload: Uint8Array): RawPackEntry {
+  return { typeCode: 3, size: payload.byteLength, data: deflate(payload) };
+}
+
+/** A pack entry's type-and-size varint. */
+function entryHeader(typeCode: number, size: number): Uint8Array {
+  let bytes = [(typeCode << 4) | (size & 0x0f)];
+  for (size = Math.floor(size / 16); size > 0; size = Math.floor(size / 128)) {
+    bytes[bytes.length - 1] |= 0x80;
+    bytes.push(size & 0x7f);
+  }
+  return Uint8Array.from(bytes);
+}
+
+/** A pack of the given raw entries, with a valid trailer, and where each entry starts. */
+async function rawPack(entries: RawPackEntry[]): Promise<{ pack: Uint8Array, offsets: number[] }> {
+  let header = new Uint8Array(12);
+  header.set(new TextEncoder().encode("PACK"));
+  new DataView(header.buffer).setUint32(4, 2);
+  new DataView(header.buffer).setUint32(8, entries.length);
+  let parts = [header];
+  let offsets: number[] = [];
+  let offset = header.byteLength;
+  for (let { typeCode, size, data } of entries) {
+    offsets.push(offset);
+    let entry = concatBytes([entryHeader(typeCode, size), data]);
+    parts.push(entry);
+    offset += entry.byteLength;
+  }
+  let body = concatBytes(parts);
+  let trailer = new Uint8Array(await crypto.subtle.digest("SHA-1", body));
+  return { pack: concatBytes([body, trailer]), offsets };
+}
+
+// Mirrors git-codec.ts's (private) zlibBound() and PackReader's read size.
+const ZLIB_BOUND_SLACK = 13 + 6;
+const PACK_READ_SIZE = 64 << 10;
+
+// Mirrors git-codec.ts's (private) PACK_SYNC_INFLATE_LIMIT: entries above it are inflated as a
+// stream.
+const SYNC_INFLATE_LIMIT = 1 << 20;
+
 describe("loose object codec", () => {
   it("computes the same oids as real git for every fixture object", async () => {
     for (let object of FIXTURE_OBJECTS) {
@@ -117,7 +186,7 @@ describe("loose object codec", () => {
 
   it("rejects a header whose size disagrees with the payload", () => {
     // Deflate the lying bytes directly (encodeLooseObject would write a correct header).
-    expect(() => decodeLooseObject(deflate(new TextEncoder().encode("blob 5\0abc"))))
+    expect(() => decodeLooseObject(deflateSync(new TextEncoder().encode("blob 5\0abc"))))
         .toThrow(/header size does not match payload/);
   });
 });
@@ -595,7 +664,7 @@ describe("pack decoding", () => {
     header.set(new TextEncoder().encode("PACK"));
     new DataView(header.buffer).setUint32(4, 2);
     new DataView(header.buffer).setUint32(8, 1);
-    let body = concatBytes([header, entryHeader, oidBytes, deflate(delta)]);
+    let body = concatBytes([header, entryHeader, oidBytes, deflateSync(delta)]);
     let trailer = new Uint8Array(await crypto.subtle.digest("SHA-1", body));
     let pack = concatBytes([body, trailer]);
 
@@ -622,6 +691,223 @@ describe("pack encoding", () => {
     let pack = concatBytes(await buildPackBytes([]));
     expect(pack.byteLength).toBe(12 + 20);
     expect(await decodePack(pack)).toStrictEqual([]);
+  });
+});
+
+// What the pack decoder relies on from workerd's own node:zlib.
+describe("node:zlib", () => {
+  const PAYLOAD = new TextEncoder().encode("all work and no play makes jack a dull boy\n".repeat(500));
+  const STREAM = deflate(PAYLOAD);
+  const TRAILING = Uint8Array.of(0x78, 0x9c, 1, 2, 3, 4, 5, 6, 7, 8);
+
+  /** Feeds `inflater` `bytes` in `step`-byte writes; resolves on its end, with what it emitted. */
+  async function feed(bytes: Uint8Array, step: number): Promise<Uint8Array> {
+    let inflater = createInflate();
+    let pieces: Uint8Array[] = [];
+    let ended = new Promise<void>((resolve, reject) => {
+      inflater.on("data", (piece: Uint8Array) => pieces.push(piece));
+      inflater.on("end", resolve);
+      inflater.on("error", reject);
+    });
+    for (let pos = 0; pos < bytes.byteLength; pos += step) {
+      inflater.write(bytes.subarray(pos, pos + step));
+    }
+    await ended;
+    expect(inflater.bytesWritten).toBe(STREAM.byteLength);
+    return concatBytes(pieces);
+  }
+
+  it("inflateSync stops at the end of the zlib stream and reports the input it consumed", () => {
+    let { buffer, engine } = inflateSync(concatBytes([STREAM, TRAILING]), { info: true }) as
+        unknown as { buffer: Uint8Array, engine: { bytesWritten: number } };
+    expect(new Uint8Array(buffer)).toStrictEqual(PAYLOAD);
+    expect(engine.bytesWritten).toBe(STREAM.byteLength);
+  });
+
+  it("inflateSync fails truncated input with Z_BUF_ERROR, and only truncated input", () => {
+    expect(() => inflateSync(STREAM.subarray(0, -1), { info: true }))
+        .toThrow(expect.objectContaining({ code: "Z_BUF_ERROR" }));
+    let corrupt = STREAM.slice();
+    corrupt[corrupt.byteLength - 1] ^= 0xff;  // the Adler-32 check
+    expect(() => inflateSync(corrupt, { info: true }))
+        .toThrow(expect.not.objectContaining({ code: "Z_BUF_ERROR" }));
+  });
+
+  it("inflateSync honors maxOutputLength with a RangeError", () => {
+    expect(inflateSync(STREAM, { maxOutputLength: PAYLOAD.byteLength }).byteLength)
+        .toBe(PAYLOAD.byteLength);
+    expect(() => inflateSync(STREAM, { info: true, maxOutputLength: PAYLOAD.byteLength - 1 }))
+        .toThrow(RangeError);
+  });
+
+  it("createInflate ends at the end of the zlib stream, however its input is split", async () => {
+    for (let step of [1, 7, 100, STREAM.byteLength, STREAM.byteLength + TRAILING.byteLength]) {
+      expect(await feed(concatBytes([STREAM, TRAILING]), step)).toStrictEqual(PAYLOAD);
+    }
+    // Ending exactly at a write's end, it ends on the next write, consuming none of it.
+    let inflater = createInflate();
+    let ended = false;
+    inflater.on("data", () => {});
+    inflater.on("end", () => { ended = true; });
+    await new Promise(resolve => inflater.write(STREAM, resolve));
+    expect(inflater.bytesWritten).toBe(STREAM.byteLength);
+    await new Promise(resolve => inflater.write(TRAILING, resolve));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(ended).toBe(true);
+    expect(inflater.bytesWritten).toBe(STREAM.byteLength);
+  });
+
+  it("createDeflate at GIT_DEFLATE_LEVEL, written in pieces, round-trips", async () => {
+    let deflater = createDeflate({ level: GIT_DEFLATE_LEVEL });
+    let pieces: Uint8Array[] = [];
+    let ended = new Promise<void>((resolve, reject) => {
+      deflater.on("data", (piece: Uint8Array) => pieces.push(piece));
+      deflater.on("end", resolve);
+      deflater.on("error", reject);
+    });
+    for (let pos = 0; pos < PAYLOAD.byteLength; pos += 1000) {
+      deflater.write(PAYLOAD.subarray(pos, pos + 1000));
+    }
+    deflater.end();
+    await ended;
+    expect(new Uint8Array(inflateSync(concatBytes(pieces)))).toStrictEqual(PAYLOAD);
+  });
+});
+
+describe("pack entry inflation", () => {
+  const LARGE = randomBytes(SYNC_INFLATE_LIMIT + (512 << 10), 7);
+
+  /** Decodes `pack` and checks it yields exactly `payloads`, as blobs. */
+  async function expectBlobs(pack: Uint8Array, payloads: Uint8Array[], step?: number) {
+    let objects = await decodePack(pack, { step });
+    expect(objects.length).toBe(payloads.length);
+    for (let [i, object] of objects.entries()) {
+      expect(object.type).toBe("blob");
+      expect(object.oid).toBe(await gitObjectOid("blob", payloads[i]));
+      // Not toStrictEqual: a megabyte-long diff of a mismatch is no help.
+      expect(object.payload.byteLength).toBe(payloads[i].byteLength);
+      expect(compareBytesEqual(object.payload, payloads[i])).toBe(true);
+    }
+  }
+
+  function compareBytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    return a.byteLength === b.byteLength && a.every((byte, i) => byte === b[i]);
+  }
+
+  it("decodes entries spanning reads, including a header split across two", async () => {
+    // Size the first blob so that the second entry's 3-byte header starts one byte before the
+    // first read boundary.
+    let target = PACK_READ_SIZE - 1;
+    let size = target - 64;
+    for (let tries = 0; ; tries++) {
+      expect(tries).toBeLessThan(50);
+      let end = 12 + entryHeader(3, size).byteLength + deflateSync(randomBytes(size, 1)).byteLength;
+      if (end === target) break;
+      size += Math.sign(target - end);
+    }
+    let payloads = [randomBytes(size, 1), randomBytes(200 << 10, 2), randomBytes(100, 3)];
+    let { pack, offsets } = await rawPack(payloads.map(blobEntry));
+    expect(offsets[1]).toBe(target);
+    expect(entryHeader(3, payloads[1].byteLength).byteLength).toBe(3);
+    for (let step of [undefined, 1000, 4097]) await expectBlobs(pack, payloads, step);
+  });
+
+  it("holds only its window of a large entry, however short the source's reads", async () => {
+    // A read's view retains its whole read buffer: were each read of the window kept whole,
+    // these 1-byte reads would hold a 64 KiB buffer apiece, some 64 GiB in all.
+    let payloads = [randomBytes(SYNC_INFLATE_LIMIT, 4), new TextEncoder().encode("after")];
+    let { pack } = await rawPack(payloads.map(blobEntry));
+    await expectBlobs(pack, payloads, 1);
+  }, 60_000);
+
+  it("decodes a zero-length blob", async () => {
+    let payloads = [new Uint8Array(0), new TextEncoder().encode("after"), new Uint8Array(0)];
+    let pack = concatBytes(await buildPackBytes(payloads.map(payload => ({ type: "blob", payload }))));
+    for (let step of [undefined, 1]) await expectBlobs(pack, payloads, step);
+  });
+
+  it("decodes an entry whose stream is longer than any zlib would write", async () => {
+    // Empty stored blocks after the zlib header: valid, but past the window the synchronous
+    // inflate is given, so the entry is decoded again as a stream.
+    let payload = new TextEncoder().encode("padded");
+    let stream = deflate(payload);
+    let padding = new Uint8Array(5 * 20);
+    for (let i = 0; i < padding.byteLength; i += 5) padding.set([0, 0, 0, 0xff, 0xff], i);
+    let padded = concatBytes([stream.subarray(0, 2), padding, stream.subarray(2)]);
+    expect(padded.byteLength).toBeGreaterThan(payload.byteLength + ZLIB_BOUND_SLACK);
+    expect(new Uint8Array(inflateSync(padded))).toStrictEqual(payload);
+
+    let after = new TextEncoder().encode("after");
+    let { pack, offsets } = await rawPack(
+        [{ typeCode: 3, size: payload.byteLength, data: padded }, blobEntry(after)]);
+    for (let step of [undefined, 1]) await expectBlobs(pack, [payload, after], step);
+
+    // Truncated within the padding, it is a truncated pack.
+    await expect(decodePack(pack.subarray(0, offsets[0] + 40)))
+        .rejects.toThrow("invalid packfile: truncated");
+  });
+
+  it("decodes an entry too large to inflate whole, wherever its stream ends", async () => {
+    let after = new TextEncoder().encode("after");
+    let { pack, offsets } = await rawPack([blobEntry(LARGE), blobEntry(after)]);
+    // With `offsets[1]` as the step, the large entry's stream ends exactly at a read's end.
+    for (let step of [undefined, offsets[1], 4097]) {
+      await expectBlobs(pack, [LARGE, after], step);
+    }
+  });
+
+  for (let [path, payload] of [["synchronous", randomBytes(100, 5)], ["streaming", LARGE]] as const) {
+    it(`rejects a lying size header (${path})`, async () => {
+      let { data } = blobEntry(payload);
+      let over = await rawPack([{ typeCode: 3, size: payload.byteLength - 1, data }]);
+      await expect(decodePack(over.pack))
+          .rejects.toThrow("invalid packfile: object larger than its declared size");
+      let under = await rawPack([{ typeCode: 3, size: payload.byteLength + 1, data }]);
+      await expect(decodePack(under.pack))
+          .rejects.toThrow("invalid packfile: object smaller than its declared size");
+    });
+
+    it(`rejects a pack truncated inside an entry (${path})`, async () => {
+      let { pack, offsets } = await rawPack([blobEntry(payload)]);
+      let cut = offsets[0] + Math.floor(payload.byteLength / 2);
+      for (let step of [undefined, 1000]) {
+        await expect(decodePack(pack.subarray(0, cut), { step }))
+            .rejects.toThrow("invalid packfile: truncated");
+      }
+    });
+
+    it(`rejects corrupt entry data (${path})`, async () => {
+      let { data } = blobEntry(payload);
+      for (let at of [0, data.byteLength - 1]) {  // the zlib header, and the Adler-32 check
+        let corrupt = data.slice();
+        corrupt[at] ^= 0xff;
+        let { pack } = await rawPack([{ typeCode: 3, size: payload.byteLength, data: corrupt }]);
+        await expect(decodePack(pack)).rejects.toThrow(/invalid packfile: corrupt object data/);
+      }
+    });
+  }
+
+  it("rejects a 0-byte entry that inflates to more", async () => {
+    let { pack } = await rawPack([{ typeCode: 3, size: 0, data: deflate(Uint8Array.of(1)) }]);
+    await expect(decodePack(pack))
+        .rejects.toThrow("invalid packfile: object larger than its declared size");
+  });
+
+  it("decodes a repository-sized pack of many small objects to the same oids", async () => {
+    let encoder = new TextEncoder();
+    let objects: PackableObject[] = [];
+    let entries: GitTreeEntry[] = [];
+    for (let i = 0; i < 3000; i++) {
+      let payload = encoder.encode(`file ${i}\n`.repeat(i % 40));
+      objects.push({ type: "blob", payload });
+      entries.push({ mode: "100644", name: `f${i}`, oid: await gitObjectOid("blob", payload) });
+    }
+    objects.push({ type: "tree", payload: encodeGitTree(entries) });
+    let expected = await Promise.all(objects.map(o => gitObjectOid(o.type, o.payload)));
+    let pack = concatBytes(await buildPackBytes(objects));
+    for (let step of [undefined, 1000]) {
+      expect((await decodePack(pack, { step })).map(o => o.oid)).toStrictEqual(expected);
+    }
   });
 });
 

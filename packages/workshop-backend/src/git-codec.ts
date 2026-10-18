@@ -9,15 +9,17 @@
 // so it bounds allocations and fails loudly.
 //
 // Everything here is pure computation over bytes (the pack decoder reads a stream): no storage,
-// no RPC. Loose objects use workerd's native node:zlib: storing a mount pack deflates every object
-// it carries, and pako's deflate takes about twice the CPU of the native one. The pack decoder
-// uses pako because pack entries are concatenated zlib streams with no recorded lengths --
-// finding where one ends requires a streaming inflater that reports unconsumed input, which
-// DecompressionStream cannot do.
+// no RPC.
+//
+// All compression is workerd's native node:zlib, at GIT_DEFLATE_LEVEL. DecompressionStream
+// cannot decode packs: pack entries are zlib streams concatenated with no recorded lengths, and
+// it both rejects the bytes that follow a stream ("trailing junk") and never says where the
+// stream ended. node:zlib's inflaters stop at the end of the zlib stream, ignore what follows,
+// and report the input they consumed as `bytesWritten`, which is how the pack decoder finds each
+// entry's end (see PackReader.inflate()).
 
-import { constants, deflateSync, inflateSync } from "node:zlib";
+import { constants, createInflate, deflateSync, inflateSync, type Inflate } from "node:zlib";
 import { createHash } from "node:crypto";
-import { Inflate, deflate } from "pako";
 import type { GitObjectType, GitOid } from "@gadgets/workshop-shared/gatekeeper";
 import type { CommitSignature } from "./worktree-binding";
 
@@ -91,13 +93,18 @@ export async function blobOid(text: string): Promise<GitOid> {
 }
 
 /**
- * Encodes a loose object record's `data` bytes from a type and headerless payload, at zlib's
- * fastest level: deflating is the largest single cost of storing a pack, and the level trades
- * about a third of that CPU for some 10% more stored bytes.
+ * The zlib level of every deflate of git data: stored objects and pack output alike. It is
+ * zlib's fastest level (`Z_BEST_SPEED`), since deflating is the largest single cost of storing a
+ * pack, and CPU is what limits large mounts: level 1 deflates about 1.5x faster than the default
+ * level 6 for some 10% more stored bytes. The level never affects an oid, which is computed over
+ * the inflated bytes.
  */
+export const GIT_DEFLATE_LEVEL = constants.Z_BEST_SPEED;
+
+/** Encodes a loose object record's `data` bytes from a type and headerless payload. */
 export function encodeLooseObject(type: GitObjectType, payload: Uint8Array): Uint8Array {
   let header = ENCODER.encode(`${type} ${payload.byteLength}\0`);
-  return deflateSync(concatBytes([header, payload]), { level: constants.Z_BEST_SPEED });
+  return deflateSync(concatBytes([header, payload]), { level: GIT_DEFLATE_LEVEL });
 }
 
 /** Decodes a loose object record's `data` bytes into its type and headerless payload. */
@@ -524,7 +531,7 @@ export async function buildPackBytes(objects: readonly PackableObject[]): Promis
     let typeCode = PACK_TYPE_CODES[object.type];
     if (typeCode === undefined) throw new Error(`cannot pack object of type ${object.type}`);
     chunks.push(packEntryHeader(typeCode, object.payload.byteLength));
-    chunks.push(deflate(object.payload));
+    chunks.push(deflateSync(object.payload, { level: GIT_DEFLATE_LEVEL }));
   }
 
   chunks.push(new Uint8Array(await crypto.subtle.digest("SHA-1", concatBytes(chunks))));
@@ -544,7 +551,7 @@ export function buildPackStream(count: number, objects: AsyncIterable<PackableOb
     let emitted = 0;
     for await (const object of objects) {
       const entry = packEntryHeader(PACK_TYPE_CODES[object.type]!, object.payload.byteLength);
-      const bytes = deflateSync(object.payload, {level: constants.Z_BEST_SPEED});
+      const bytes = deflateSync(object.payload, {level: GIT_DEFLATE_LEVEL});
       hash.update(entry); hash.update(bytes);
       yield entry; yield bytes;
       ++emitted;
@@ -689,20 +696,43 @@ export async function* decodePackStream(
   if (trailer !== digest) throw new Error("invalid packfile: trailer SHA-1 mismatch");
 }
 
-// The Inflate internals this codec relies on beyond @types/pako's declarations, all stable pako
-// API in practice (isomorphic-git's pack parser relies on `strm.avail_in` the same way):
-// `ended` flips when the zlib stream completes mid-input, and `strm.avail_in` is how many bytes
-// of the last push() the stream did not consume -- together they locate the entry boundary.
-interface InflateWithInternals {
-  ended: boolean;
-  err: number;
-  msg: string;
-  strm: { avail_in: number };
-  onData: (chunk: Uint8Array) => void;
-  push(data: Uint8Array, flush: boolean): void;
+const PACK_READ_SIZE = 64 << 10;
+
+/**
+ * The largest pack entry `PackReader.inflate()` inflates in one synchronous call over a window
+ * of the pack; larger ones are inflated as a stream, a read at a time.
+ */
+const PACK_SYNC_INFLATE_LIMIT = 1 << 20;
+
+// The most bytes zlib's own encoder emits for `size` bytes of input, at any level: zlib's
+// compressBound() plus its 6-byte header and trailer. Another encoder can exceed it, which
+// PackReader.inflate() tolerates, only more slowly.
+function zlibBound(size: number): number {
+  return size + (size >> 12) + (size >> 14) + (size >> 25) + 13 + 6;
 }
 
-const PACK_READ_SIZE = 64 << 10;
+// What inflateSync() returns given `info: true`, which @types/node does not model: the output,
+// and the inflater whose `bytesWritten` is the input it consumed.
+interface InflateSyncInfo {
+  buffer: Uint8Array;
+  engine: Inflate;
+}
+
+// Whether a zlib error means its input ended before the zlib stream did.
+function isTruncatedInput(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === "Z_BUF_ERROR";
+}
+
+// The pack error for a zlib failure other than truncated input. maxOutputLength, set at an
+// entry's declared size, fails with a RangeError (ERR_BUFFER_TOO_LARGE); anything else is
+// malformed data.
+function packInflateError(err: unknown): Error {
+  if (err instanceof RangeError) {
+    return new Error("invalid packfile: object larger than its declared size", { cause: err });
+  }
+  let message = err instanceof Error ? err.message : String(err);
+  return new Error(`invalid packfile: corrupt object data (${message})`, { cause: err });
+}
 
 // decodePackStream's reads, in order, hashing every byte before `endBody()` (the trailer's SHA-1
 // input) a chunk at a time. Reads are BYOB, which a gatekeeper facet's pack stream supports once
@@ -710,15 +740,20 @@ const PACK_READ_SIZE = 64 << 10;
 // shape): a default reader gets 4 KiB chunks there, and each read after one of the caller's
 // storage writes costs an implicit commit (a TypeScript-size pack took 7.0 s of reads instead of
 // 2.8 s, in workerd).
+//
+// The read position is in `#chunk`, the bytes of the last read, and every read is hashed as the
+// position leaves it. `window()` may replace `#chunk` with a larger buffer holding its unread
+// bytes followed by further reads, hashing the read bytes it leaves behind.
 class PackReader {
   #reader: ReadableStreamBYOBReader;
   #maxSize: number;
   #digest = new crypto.DigestStream("SHA-1");
   #hash: WritableStreamDefaultWriter<ArrayBuffer | ArrayBufferView> | undefined =
       this.#digest.getWriter();
-  #chunk = new Uint8Array(0);
+  #chunk: Uint8Array = new Uint8Array(0);
   #pos = 0;
   #received = 0;
+  #ended = false;
 
   constructor(stream: ReadableStream<Uint8Array>, maxSize: number) {
     this.#reader = stream.getReader({ mode: "byob" });
@@ -733,14 +768,10 @@ class PackReader {
   /** Whether any bytes remain, buffering at least one if so. */
   async more(): Promise<boolean> {
     while (this.#pos === this.#chunk.byteLength) {
-      let next = await this.#reader.read(new Uint8Array(PACK_READ_SIZE));
-      if (next.done) return false;
-      this.#received += next.value.byteLength;
-      if (this.#received > this.#maxSize) {
-        throw new Error(`packfile exceeds the ${this.#maxSize}-byte limit`);
-      }
+      let { bytes, done } = await this.#read(new Uint8Array(PACK_READ_SIZE));
+      if (done) return false;
       await this.#hash?.write(this.#chunk);
-      this.#chunk = next.value;
+      this.#chunk = bytes;
       this.#pos = 0;
     }
     return true;
@@ -763,44 +794,145 @@ class PackReader {
     return out;
   }
 
+  /**
+   * A contiguous view of the next `n` bytes without consuming them, or of all that remain if
+   * fewer do. A view into the current read where it holds them all.
+   *
+   * Otherwise the unread bytes move to one new buffer, and further reads fill it in place, so
+   * the memory held is the window's, however short the source's reads: a read's view retains its
+   * whole buffer, so keeping each read whole would hold a full read buffer per read, short or not.
+   */
+  async window(n: number): Promise<Uint8Array> {
+    if (!await this.more()) return new Uint8Array(0);
+    let unread = this.#chunk.subarray(this.#pos);
+    if (unread.byteLength >= n) return unread.subarray(0, n);
+
+    let buffer: Uint8Array = new Uint8Array(Math.max(n, PACK_READ_SIZE));
+    buffer.set(unread);
+    let filled = unread.byteLength;
+    await this.#hash?.write(this.#chunk.subarray(0, this.#pos));
+    this.#chunk = buffer.subarray(0, filled);
+    this.#pos = 0;
+    while (filled < n) {
+      let { bytes, done } = await this.#read(buffer.subarray(filled));
+      buffer = new Uint8Array(bytes.buffer);
+      filled += bytes.byteLength;
+      this.#chunk = buffer.subarray(0, filled);
+      if (done) break;
+    }
+    return this.#chunk.subarray(0, n);
+  }
+
+  /** Consumes `n` bytes. */
+  async skip(n: number): Promise<void> {
+    while (n > 0) {
+      await this.#fill();
+      let step = Math.min(n, this.#chunk.byteLength - this.#pos);
+      this.#pos += step;
+      n -= step;
+    }
+  }
+
   // Inflates the zlib stream at the read position. `size` comes from the (untrusted) entry
   // header; it was pre-checked against the object-size cap, and is enforced again here *during*
   // inflation so a lying header cannot cause a larger allocation than it claimed.
+  //
+  // An entry of up to PACK_SYNC_INFLATE_LIMIT is inflated in one inflateSync() over a window of
+  // the pack long enough for any stream zlib would encode it as. A valid stream can be longer
+  // (one padded with empty stored blocks, say), and then the window ends before the stream does;
+  // that entry, and every larger one, is inflated as a stream instead.
   async inflate(size: number): Promise<Uint8Array> {
-    let inflator = new Inflate() as unknown as InflateWithInternals;
-    let chunks: Uint8Array[] = [];
-    let total = 0;
-    let overflow = false;
-    inflator.onData = (chunk: Uint8Array) => {
-      total += chunk.byteLength;
-      if (total > size) {
-        overflow = true;
-        // pako offers no abort; raising here unwinds through push() below.
-        throw new Error("pack entry exceeds declared size");
+    if (size <= PACK_SYNC_INFLATE_LIMIT) {
+      let bound = zlibBound(size);
+      let window = await this.window(bound);
+      let result: InflateSyncInfo | undefined;
+      try {
+        // maxOutputLength must be positive; a 1-byte output for a size-0 entry is caught below.
+        result = inflateSync(window, { info: true, maxOutputLength: Math.max(size, 1) }) as
+            unknown as InflateSyncInfo;
+      } catch (err) {
+        if (!isTruncatedInput(err)) throw packInflateError(err);
+        if (window.byteLength < bound) {
+          throw new Error("invalid packfile: truncated", { cause: err });
+        }
+        // Else the stream is longer than the window: inflate it as a stream, below.
       }
-      chunks.push(chunk);
-    };
+      if (result !== undefined) {
+        if (result.buffer.byteLength > size) {
+          throw new Error("invalid packfile: object larger than its declared size");
+        }
+        if (result.buffer.byteLength < size) {
+          throw new Error("invalid packfile: object smaller than its declared size");
+        }
+        await this.skip(result.engine.bytesWritten);
+        let { buffer } = result;
+        // A Buffer, whose slice() aliases rather than copies; hand out a plain Uint8Array.
+        return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      }
+    }
+    return await this.#inflateStream(size);
+  }
+
+  // inflate() as a stream: feeds the inflater a read at a time until it reports the zlib
+  // stream's end, then positions the reader after the bytes it consumed.
+  async #inflateStream(size: number): Promise<Uint8Array> {
+    let inflater = createInflate();
+    let pieces: Uint8Array[] = [];
+    let total = 0;
+    let failure: Error | undefined;
+    let ended = false;
+    let wake = () => {};
+    inflater.on("data", (piece: Uint8Array) => {
+      total += piece.byteLength;
+      if (total > size) {
+        failure ??= new Error("invalid packfile: object larger than its declared size");
+        inflater.destroy();
+        wake();
+        return;
+      }
+      pieces.push(new Uint8Array(piece.buffer, piece.byteOffset, piece.byteLength));
+    });
+    inflater.on("end", () => {
+      ended = true;
+      wake();
+    });
+    inflater.on("error", err => {
+      failure ??= packInflateError(err);
+      wake();
+    });
 
     try {
-      while (!inflator.ended) {
+      let fed = 0;  // bytes written to the inflater
+      for (;;) {
         await this.#fill();
-        inflator.push(this.#chunk.subarray(this.#pos), false);
-        if (inflator.err) {
-          throw new Error(`invalid packfile: corrupt object data (${inflator.msg || inflator.err})`);
+        let piece = this.#chunk.subarray(this.#pos);
+        let fedBefore = fed;
+        fed += piece.byteLength;
+        // The callback runs once the inflater has consumed what of `piece` it will; one that
+        // ends the zlib stream leaves the rest, and `bytesWritten` counts only what it consumed.
+        await new Promise<void>(resolve => {
+          wake = resolve;
+          inflater.write(piece, () => resolve());
+        });
+        if (failure) throw failure;
+        if (ended || inflater.bytesWritten < fed) {
+          // The stream has ended, though its "end", which follows the last of its output, may
+          // not have been emitted yet.
+          if (!ended) await new Promise<void>(resolve => { wake = resolve; });
+          if (failure) throw failure;
+          this.#pos += inflater.bytesWritten - fedBefore;
+          break;
         }
-        this.#pos = this.#chunk.byteLength - inflator.strm.avail_in;
+        this.#pos = this.#chunk.byteLength;
       }
-    } catch (err) {
-      if (overflow) {
-        throw new Error("invalid packfile: object larger than its declared size", { cause: err });
-      }
-      throw err;
+    } finally {
+      inflater.destroy();
     }
 
     if (total !== size) {
       throw new Error("invalid packfile: object smaller than its declared size");
     }
-    return concatBytes(chunks);
+    return concatBytes(pieces);
   }
 
   /** Ends the hashed body at the read position, returning its SHA-1 (hex). */
@@ -821,6 +953,28 @@ class PackReader {
   async #fill(): Promise<void> {
     if (!await this.more()) throw new Error("invalid packfile: truncated");
   }
+
+  // Reads the next bytes of the pack from the source into `view`. A read moves `view`'s buffer,
+  // so `bytes` is a view of the buffer it moved to, ending with the bytes read; at the source's
+  // end, when `done`, it is an empty one.
+  async #read(view: Uint8Array): Promise<{ bytes: Uint8Array, done: boolean }> {
+    if (this.#ended) return { bytes: view.subarray(0, 0), done: true };
+    let next = await this.#reader.read(view);
+    if (next.done) {
+      this.#ended = true;
+      // The streams standard gives the moved buffer back even here, as an empty view, but for a
+      // cancelled stream (which only disposal cancels); workerd's types omit it.
+      let { value } = next as { value?: Uint8Array };
+      if (value === undefined) throw new Error("invalid packfile: stream cancelled");
+      return { bytes: value, done: true };
+    }
+    this.#received += next.value.byteLength;
+    if (this.#received > this.#maxSize) {
+      throw new Error(`packfile exceeds the ${this.#maxSize}-byte limit`);
+    }
+    return { bytes: next.value, done: false };
+  }
+
 }
 
 /**

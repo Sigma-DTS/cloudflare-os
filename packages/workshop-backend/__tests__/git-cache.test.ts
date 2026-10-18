@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
-import { deflate } from "pako";
+import { deflateSync } from "node:zlib";
 import type { GitPullHints, GitOid } from "@gadgets/workshop-shared/gatekeeper";
 import { READ_FILES_RESPONSE_BUDGET } from "@gadgets/workshop-shared/api";
 import { makeMockStorage } from "./mock-storage";
@@ -1214,7 +1214,7 @@ describe("consumePack", () => {
     let varint = (n: number): number[] => n < 0x80 ? [n] : [(n & 0x7f) | 0x80, ...varint(n >>> 7)];
     let delta = new Uint8Array([...varint(big.byteLength), 16, 0x90, 16]);
     let body = concatBytes([prefix, new Uint8Array([(7 << 4) | delta.length]),
-      Uint8Array.from(bigOid.match(/../g)!, h => parseInt(h, 16)), deflate(delta)]);
+      Uint8Array.from(bigOid.match(/../g)!, h => parseInt(h, 16)), deflateSync(delta)]);
     let pack = concatBytes([body, new Uint8Array(await crypto.subtle.digest("SHA-1", body))]);
 
     let target = big.subarray(0, 16);
