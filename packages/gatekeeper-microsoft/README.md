@@ -1,0 +1,357 @@
+# Gatekeeper Microsoft 365
+
+Connects Microsoft 365 work and school accounts to Gadgets, for [SharePoint and
+OneDrive](#sharepoint-and-onedrive), [Outlook](#outlook) mail and [Outlook Calendar](#calendar), all
+through one connection. Agents act with the user's **delegated** permissions, so they never see more
+than the user can open themselves, and each binding narrows that further. Every change waits for the
+user's approval, and shows to the agent as though already made while it waits, so the agent keeps
+working. `plans/microsoft-365-gatekeeper.md` is the design record.
+
+## Setting up the app registration
+
+1. In the [Microsoft Entra admin center](https://entra.microsoft.com), open **App registrations →
+   New registration**.
+2. For supported account types, choose **Accounts in this organizational directory only**. Then add
+   a **Web** redirect URI, `{PUBLIC_BASE_URL}/gatekeeper/microsoft/oauth`.
+3. Under **API permissions**, add these Microsoft Graph **delegated** permissions:
+   - `openid`, `profile`, `email`, `offline_access`, `User.Read`
+   - `Sites.ReadWrite.All` and `Files.ReadWrite.All`, or `Sites.Read.All` and `Files.Read.All` for
+     a read-only deployment
+   - for Outlook: `Mail.ReadWrite`, `Mail.ReadWrite.Shared`, `Mail.Send`, `Mail.Send.Shared`,
+     `MailboxSettings.ReadWrite`, `People.Read` and `User.ReadBasic.All`. A deployment capped below
+     `send` needs neither `Mail.Send` permission, and a `read` one only the `.Read` variants.
+     `User.ReadBasic.All` turns a shared mailbox's address into its owner's object ID; without it
+     only the user's own mailbox can be connected.
+   - for Calendar: `Calendars.ReadWrite`, `Calendars.ReadWrite.Shared`, `MailboxSettings.Read`,
+     `People.Read` and `User.ReadBasic.All` (or the `Calendars.Read` variants for a `read`
+     deployment). Without the `.Shared` permission and `User.ReadBasic.All`, only the user's own
+     calendars can be connected.
+4. Select **Grant admin consent for <organization>**. Many organizations stop users from consenting
+   to these permissions themselves. In that case the connect flow shows an admin-consent page with a
+   link an administrator can open.
+5. Under **Certificates & secrets**, create a client secret. Connections stop refreshing once it
+   expires, so set a reminder to rotate it.
+6. Set the deployment's inputs:
+
+| Name | Kind | What it is |
+|---|---|---|
+| `CLIENT_ID` | secret | The app registration's Application (client) ID. |
+| `CLIENT_SECRET` | secret | The client secret's **Value**, not its ID. |
+| `MICROSOFT_TENANT_ID` | secret | The Directory (tenant) ID, or a verified domain. Only accounts in this tenant can connect. It isn't a credential, but the deploy wizard only collects secrets. |
+| `MICROSOFT_ALLOWED_TENANT_IDS` | var, optional | For a multitenant app. Set `MICROSOFT_TENANT_ID=organizations` and list the tenant IDs (GUIDs) that may connect, comma-separated. `organizations` without this list is refused. `common` and `consumers` are always refused, because personal Microsoft accounts have no SharePoint. |
+| `MICROSOFT_SHAREPOINT_ACCESS` | var, optional | `write` (the default) or `read`. This caps what agents may do whatever the app was granted: the effective access is the lower of this and the connection's own grant. |
+| `MICROSOFT_OUTLOOK_ACCESS` | var, optional | `send` (the default), `draft`, `organize` or `read`, capping Outlook bindings the same way. Unrecognized values mean `read`. |
+| `MICROSOFT_CALENDAR_ACCESS` | var, optional | `schedule` (the default), `edit` or `read`, capping Calendar bindings the same way. Unrecognized values mean `read`. |
+
+### Local development
+
+Put `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` and `MICROSOFT_TENANT_ID` in the root
+`.dev.vars`. `pnpm dev-server` maps the first two into the worker's `CLIENT_ID` and `CLIENT_SECRET`.
+It passes the tenant ID, `MICROSOFT_ALLOWED_TENANT_IDS`, `MICROSOFT_SHAREPOINT_ACCESS`,
+`MICROSOFT_OUTLOOK_ACCESS` and `MICROSOFT_CALENDAR_ACCESS` through unchanged. Register
+`http://localhost:8787/gatekeeper/microsoft/oauth` as a Web redirect URI; Entra allows
+`http://localhost` for Web clients.
+
+## SharePoint and OneDrive
+
+Agents browse sites and OneDrive, read files (Word, PowerPoint and PDF as Markdown or text,
+workbooks as cells), query lists and read pages. They can propose new folders and files, uploads,
+in-place edits, renames, moves and deletions, and list item changes. `src/types.d.ts` is the
+agent's API.
+
+A binding covers one of these:
+
+| Choice | Link | What it reaches |
+|---|---|---|
+| All of SharePoint & OneDrive | `https://<tenant>.sharepoint.com/_layouts/15/sharepoint.aspx` | Every site, library, list and file the user can open, now or later. |
+| A site | `https://<tenant>.sharepoint.com/sites/<site>` | The site's libraries, lists and pages, but not its subsites. |
+| A library or a OneDrive | `…/sites/<site>/Shared%20Documents`, `https://<tenant>-my.sharepoint.com/personal/<user>/Documents` | Every folder and file in it. |
+| A folder | `…/Shared%20Documents/<path>` | Every folder and file inside it. |
+| A file | `…/Shared%20Documents/<path>/<file>` | Just that file. |
+| A list | `…/sites/<site>/Lists/<list>` | The list's columns and items. |
+| A page | `…/sites/<site>/SitePages/<page>.aspx` | Just that page. |
+
+Every ID an agent passes is checked against the binding before Graph is called, including a
+folder's whole ancestry. Paths are measured from the top of the binding, so a folder binding never
+reveals the library around it.
+
+The configurator starts at **All of SharePoint & OneDrive**. The user can open a site or their
+OneDrive to choose one part of it, search, or paste any SharePoint or OneDrive link.
+
+### SharePoint approvals
+
+Every change is an action that waits for approval:
+
+| Kind | Actions | Can be auto-approved |
+|---|---|---|
+| `sharepoint.files.create` | Create a folder, upload or copy a file | Yes |
+| `sharepoint.files.edit` | Replace a file's content, edit a Word document or deck in place, set cells in a workbook | Yes |
+| `sharepoint.files.organize` | Rename, move within a library | Yes |
+| `sharepoint.files.delete` | Delete a file or folder | Yes |
+| `sharepoint.lists.edit` | Add or edit a list item | Yes |
+| `sharepoint.lists.delete` | Delete a list item | Yes |
+
+A binding offers only the kinds it can submit, so a list binding offers no file actions. Changes are
+fenced: a replace or delete is refused if the file changed after it was proposed (on its `cTag`),
+and an item update if the item changed (on its `eTag`). The approver sees a replacement as a unified
+diff when the file is text and no larger than 64 KB. Applied actions can be reverted for 30 days:
+
+- A replace, in-place edit or cell change restores the previous version.
+- A create deletes what it made.
+- A rename or move is undone.
+- An item update restores the values it overwrote.
+- A deletion can't be reverted from here. Restore it from the site's recycle bin.
+
+Things agents can never do, at any access level: share or create sharing links, change permissions,
+change sensitivity labels, check files in or out, create or delete sites, libraries or lists, or
+publish pages.
+
+### Word, Excel and PowerPoint
+
+Files are written in the format their name says, so they open, co-author, print and search like any
+other in the tenant:
+
+- **Word (`.docx`)** from Markdown, in Word's built-in styles (Heading 1–6, List Bullet, Table Grid,
+  and so on): headings, nested and numbered lists, task lists, tables, links, quotes and code.
+- **PowerPoint (`.pptx`)** from Markdown, 16:9: each `#` heading starts a slide, and a blockquote
+  starting "Notes:" becomes speaker notes.
+- **Excel (`.xlsx`)** from rows or CSV, with a bold, frozen, filterable header row. A string starting
+  with `=` is a formula. Formulas that reach outside the workbook (WEBSERVICE, HYPERLINK, RTD, DDE,
+  links to other workbooks) are refused. After an approved write, Excel for the web calculates the
+  workbook, so previews, the PDF view and search show formula results, not empty cells.
+
+A Word document or deck can take its styles, theme, page setup and masters from a template the
+binding covers (`template`). Graph can't convert into Office formats, so the gatekeeper writes the
+Office Open XML itself (`src/content/*-write.ts`).
+
+A whole rewrite of an existing Office file loses what Markdown or rows can't express. The approver is
+told what it will lose, such as "3 images" or "comments". To change part of a file, agents edit in
+place, and everything else is kept:
+
+- `editDocument` makes find/replace, insert and delete-paragraph edits to a `.docx`. By default it
+  records them as tracked changes for the owner to accept in Word, authored "<owner> (agent)".
+- `editPresentation` makes find/replace, add-slides and delete-slide edits to a `.pptx`.
+- `updateCells` sets a range through Excel's own workbook API, so every other cell, format, chart
+  and sheet is untouched.
+
+The approver sees each edit as before/after lines and each cell change as `B2: old → new`. Reading
+for an edit counts as reading the file, so the [observation rules](#sharing-a-workspace) apply to it.
+
+To see what the writers produce the way people will, `scripts/office-render.ts` uploads files to a
+scratch folder in the contract user's OneDrive, has Microsoft 365 render them to PDF, draws each page
+to PNG with macOS PDFKit, and deletes the folder:
+
+```sh
+node scripts/office-render.ts out/*.docx out/*.pptx --out /tmp/m365-render
+```
+
+## Outlook
+
+Agents read, search and triage mail, write drafts, and send with approval, in the user's own mailbox
+or a shared one they can open. `plans/microsoft-outlook.md` is the design record and
+`src/outlook-types.d.ts` the agent's API.
+
+A binding is one mailbox, optionally narrowed, at one access level:
+
+| Narrowing | Link | What it reaches |
+|---|---|---|
+| The whole mailbox | `https://outlook.office.com/mail/` | Every folder. |
+| A folder | `…/mail/inbox`, `…/mail/folder/<id>`, `?subfolders=0` | That folder, with its subfolders unless excluded. Resolved once, at binding, to an immutable ID, so renaming or moving it changes nothing. |
+| A conversation | `…/mail/inbox/id/<message id>`, `?conversation=<id>` | Every message in the thread, wherever it is filed. |
+| People | `?senders=ada@contoso.com,@fabrikam.com` | Mail from those addresses or domains. |
+| Categories | `?categories=Vendors,Legal` | Mail carrying any of them. |
+| Recent mail | `?recent=30` | Mail received in the last N days, a sliding window. |
+
+A shared mailbox's links put its address first, `…/mail/team@contoso.com/inbox`. Narrowings
+combine, and `&access=read|organize|draft|send` sets the level. Links copied from Outlook on the
+web, including "Open in Outlook" links (`/owa/?ItemID=…`), are read as they are.
+
+Every message ID an agent passes is read first and checked against the binding, so a narrowed
+binding can't reach a message outside it by guessing or pasting an ID. Drafts a binding wrote stay
+in it whatever its narrowing, so a sender-narrowed binding can reply. Junk Email, Deleted Items,
+Outbox and the hidden folders are left out of narrowed bindings unless named. Mailbox settings
+(automatic replies) need a whole-mailbox binding.
+
+The levels:
+
+| Level | Adds | Kind | Can be auto-approved |
+|---|---|---|---|
+| `read` | Reading, search, attachments (Office files and PDFs as text), categories, people | — | — |
+| `organize` | Move, archive, delete (to Deleted Items), mark read, flag, categorize, create folders | `outlook.organize` | Yes |
+| `draft` | Create, edit and delete drafts, including replies and forwards that keep the quoted thread | `outlook.drafts` | Yes |
+| `send` | Send a draft, a new message, a reply or a forward | `outlook.send` | **Never** |
+| `send`, whole mailbox | Automatic replies, which answer whoever writes | `outlook.settings` | **Never** |
+
+A `read` binding's session is an `OutlookReader`, with no write methods at all. Everything else is
+an action, shown to the agent as though already applied while it waits, and reverted for 30 days
+where Exchange allows: moves go back, flags, categories and read state are restored, folders and
+drafts are deleted, a draft edit is undone, automatic replies return to what they were. A send
+can't be unsent.
+
+The approver of a send sees every recipient, marked when they're outside the organization, when the
+user has never written to them, or when they aren't in the conversation being replied to; the body
+verbatim; and each attachment with its size, SHA-256 and where it came from. A draft edit is fenced
+on the draft's `changeKey`, so it's refused if the user changed the draft meanwhile.
+
+A send is exactly-once. It carries a Message-ID chosen when it was proposed, and applying it first
+looks for that ID across the whole mailbox (Outbox included), so a retry after a crash finds the
+sent message rather than sending again.
+
+Mail is written by its sender, so `readMessage` turns HTML into Markdown and removes what a person
+couldn't see or an agent shouldn't follow (scripts, hidden text, tracking images), lists links
+separately with their real targets, says whether the sender is the user, a colleague or someone
+outside the organization, and says when a message is encrypted rather than showing it empty.
+
+Agents can never, at any level: create inbox rules (a forwarding rule is a standing channel out),
+delete permanently, change mailbox or folder permissions or delegates, or send as someone else.
+
+**New-message hooks.** `subscribeNewMessages(hook)` delivers each new message the binding admits,
+with a session for the same binding, through an `OutlookHookDriver` per connection and mailbox. The
+driver reads what arrived since its cursor, so a lost, late or forged notification costs at most a
+read. Where the deployment has a public `https` `BASE_URL`, it also keeps a Graph change-notification
+subscription (`{BASE_URL}/outlook/notifications/<driver>`, checked by a secret `clientState`, renewed
+halfway through its three days) and reads within seconds of a notification; it polls every two
+minutes without one and hourly with one. A hook delivers nothing until the user enables it, and
+disconnecting the account stops its hooks.
+
+## Calendar
+
+Agents read calendars, check when people are free, and propose events, meetings and responses, in
+the user's own calendars or ones shared with them. `plans/microsoft-calendar.md` is the design
+record and `src/calendar-types.d.ts` the agent's API.
+
+A binding is one of three shapes, each made for a use:
+
+| Shape | Link | What it reaches | Made for |
+|---|---|---|---|
+| Every calendar | `https://outlook.office.com/calendar/` (or any `…/calendar/view/…` link) | All the user's calendars, private events included, and availability of anyone in the organization. | Chat, as the user's own assistant. |
+| One calendar | `…/calendar/default`, `…/calendar/id/<id>`, and `…/calendar/<owner>/…` for one shared with the user | That calendar alone, at a level of detail: `?details=freeBusy\|limited\|full`, and `&private=show` to show private events. | A gadget showing a team calendar, shared with whoever that calendar is shared with. |
+| Availability | `…/calendar/availability` | Busy times and working hours of people in the organization, never what the events are. | Scheduling, without reading anyone's calendar. |
+
+`&access=read|edit|schedule` sets the level. A calendar binding is resolved once, at binding, to the
+calendar's immutable ID and its entry ID, so renaming the calendar changes nothing, and every event
+an agent names is read and checked to be in that calendar before anything is shown. Graph's own
+listings are rechecked the same way, and a stray event from another calendar is dropped and logged.
+
+What a calendar binding shows follows Exchange's own sharing levels, enforced by the gatekeeper, not
+just by what Graph returns: `freeBusy` is times and show-as only, `limited` adds subject and
+location, `full` adds attendees, the description and the rest. A private event shows as a busy block
+unless the binding shows private events. An availability binding answers through `getSchedule`,
+which never returns subjects, and finds free time across people's working hours, each in their own
+time zone.
+
+The levels:
+
+| Level | Adds | Kind | Can be auto-approved |
+|---|---|---|---|
+| `read` | Events, availability, free times, people | — | — |
+| `edit` | Create, change and delete events only the user sees (no attendees), and their own copy's categories, show-as and reminder on others' meetings | `calendar.events` | Yes |
+| `schedule` | Meetings: invitations, updates and cancellations | `calendar.invitations` | **Never** |
+| `schedule` | Accept, tentatively accept or decline, optionally proposing another time | `calendar.responses` | **Never** |
+
+Only a `full` binding can change events, since nothing a binding can't fully see can be changed
+through it. A read binding's session is a `CalendarReader`, with no write methods at all. A change
+is fenced on the event's `changeKey`, so an edit made in Outlook after the proposal stops it; a
+creation carries a `transactionId`, so a retry can't make two. Events only the user sees revert for
+30 days: a creation is deleted, a change restored, a deletion recreated as a new event. Anything
+that sent mail can't be called back, and says so. The approver of a meeting sees every attendee,
+marked when outside the organization.
+
+Agents can never change who a calendar is shared with, delete someone else's meeting (they decline
+it), or change a meeting they don't organize.
+
+## Sharing a workspace
+
+A collaborator can observe a workspace that reads SharePoint only if all of these hold:
+
+- they have their own working Microsoft 365 connection
+- that connection is in the same tenant
+- their own account can open everything the workspace has already read
+
+For Outlook, the same holds for mail: a collaborator observes mail reads only if they can open
+that mailbox themselves, so a workspace reading a shared mailbox can be shared with its members,
+while one reading the user's own mail is kept from everyone else.
+
+For Calendar, a collaborator observes a calendar binding's reads only if that calendar's sharing list
+gives them a role that sees at least as much as the binding shows (`freeBusyRead` for `freeBusy`,
+`limitedRead` for `limited`, `read` for `full`, delegate access to private events for `private=show`).
+So a gadget showing the team calendar at free/busy can be shared with the whole organization if the
+calendar is, and one showing full details only with the people it is shared with at `read`. An
+availability read admits whoever can see those people's free/busy themselves, and an every-calendar
+binding that has read events is the user's alone.
+
+SharePoint can break permission inheritance on any folder, file or list item. So the gatekeeper
+tracks each thing a read reveals (up to 2,000 per binding) rather than one container. Each later
+read is checked against every observer, and an observer who can't open what it revealed is left out
+of that observation. See `docs/observers.md`.
+
+## Troubleshooting
+
+### "An administrator needs to approve this app"
+
+The organization allows only administrators to consent to the SharePoint, mail or calendar
+permissions. An administrator can grant consent from the link on the page, or from the app
+registration's **API permissions** page.
+
+### "That account can't connect here"
+
+The user signed in with an account from another tenant, or with a personal Microsoft account. Sign
+in with a work or school account from the deployment's own tenant.
+
+### "Your organization blocked this sign-in"
+
+A Conditional Access policy refused the sign-in, for example because it requires a managed device.
+The organization's administrators decide this.
+
+### "That's a different Microsoft 365 account"
+
+The reconnect signed in as a different user from the one the connection was made for. A connection
+stays pinned to its tenant and user. Reconnect as that user, or connect the other account
+separately.
+
+### "The Microsoft 365 connection has expired or was revoked."
+
+Entra refused the refresh token. Typical causes:
+
+- the user's sessions were revoked
+- their password was reset
+- the client secret expired or was rotated
+- a Conditional Access policy now requires an interactive sign-in
+
+Reconnect from the Workshop's Connections page.
+
+### Search finds nothing in a new site
+
+SharePoint indexes new content in the background. On a new tenant that can take hours or more.
+Browsing and reading don't depend on the index; search and the configurator's site list do. Until
+the index catches up, the site list falls back to the user's home and followed sites.
+
+## Tests
+
+```sh
+pnpm --filter @gadgets/microsoft-gatekeeper test:run    # Node, then workerd against a fake Graph
+npx vitest run -c vitest.contract.config.ts             # workerd, against a live tenant
+```
+
+The contract suite runs only when `.dev.vars` holds the app credentials and a tokens file exists at
+`MICROSOFT_CONTRACT_TOKENS` (default `~/.config/gadgets-microsoft-contract/tokens.json`). The file holds the
+refresh tokens of three test users:
+
+- `phillip` owns the content
+- `sarah` is a member of the private Engineering site
+- `bob` is a visitor
+
+The suite rotates the tokens in place. Its file writes happen in a scratch folder it creates and
+deletes. `office.test.ts` also has Microsoft 365 render each Office file it writes to PDF, which
+proves Office for the web opens it; the slide count checks a deck's structure.
+
+`outlook.test.ts` has the three users mail one another, and deletes what it sent. Its hooks test
+makes a real Graph subscription when `MICROSOFT_CONTRACT_BASE_URL` is a public `https` URL (a
+`cloudflared` tunnel will do; only the validation handshake needs answering), and polls otherwise.
+`calendar.test.ts` uses Phillip's "Gadgets Spike Team" calendar, shared `read` with Sarah and
+`freeBusyRead` with Bob, and Bob's main calendar shared with nobody, not even as free/busy; it makes
+its events five weeks out and deletes them afterwards. `outlook.test.ts` needs Sarah as a Reviewer of
+Phillip's Inbox and of no other folder.
+
+`MICROSOFT_LIVE=1 npx vitest run __tests__/outlook-configurator.live.test.ts` checks the Outlook
+configurator's listings and URLs against the live mailbox.

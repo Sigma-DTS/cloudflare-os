@@ -241,8 +241,10 @@ function postSelectionState() {
 
 function setValues(patch) {
   const active = getFocusState();
-  values = { ...values, ...patch };
-  render(active, true);
+  // A patch that changes nothing keeps the same values, so a configurator can re-render for what
+  // it has loaded (\`setValues({})\`) without collectResourceUrl taking that for an edit.
+  if (Object.entries(patch).some(([key, value]) => values[key] !== value)) values = { ...values, ...patch };
+  render(active);
 }
 
 function clearFields(...names) {
@@ -527,7 +529,12 @@ const components = {
       ]);
     });
 
-    children.push(el("div", { className: "checkbox-rows", "data-internal-scroller": "" }, rows));
+    // Keyed by the filter too, so a list filtered differently starts at its top.
+    children.push(el("div", {
+      className: "checkbox-rows",
+      "data-internal-scroller": "",
+      "data-preserve-scroll": JSON.stringify(["checkbox", name, filter]),
+    }, rows));
     return el("div", { className: "checkbox-list", "data-name": name }, children);
   },
 
@@ -705,14 +712,14 @@ Autocomplete = components.Autocomplete;
 Button = components.Button;
 Notice = components.Notice;
 
-function render(focusState = undefined, preserveCheckboxScroll = false) {
+function render(focusState = undefined) {
   if (!root || !spec) return;
   if (focusState === undefined) focusState = getFocusState();
-  const checkboxScrollOffsets = preserveCheckboxScroll
-    ? new Map(Array.from(root.querySelectorAll(".checkbox-list[data-name]"), list => [
-        list.getAttribute("data-name"), list.querySelector(".checkbox-rows")?.scrollTop,
-      ]))
-    : null;
+  // Every render rebuilds the tree, so a scroller marked data-preserve-scroll with a name is put back
+  // where the one of that name was.
+  const scrollOffsets = new Map(Array.from(root.querySelectorAll("[data-preserve-scroll]"), node => [
+    node.getAttribute("data-preserve-scroll"), node.scrollTop,
+  ]));
   renderGeneration++;
   renderedCheckboxNames = new Set();
   renderedInfoNotice = "";
@@ -721,12 +728,9 @@ function render(focusState = undefined, preserveCheckboxScroll = false) {
     root.replaceChildren(el("div", { id: "layout-root" }, [
       spec.render({ ui, values, setValues, clearFields, ensureResources, components }),
     ]));
-    if (checkboxScrollOffsets) {
-      for (const list of root.querySelectorAll(".checkbox-list[data-name]")) {
-        const offset = checkboxScrollOffsets.get(list.getAttribute("data-name"));
-        const rows = list.querySelector(".checkbox-rows");
-        if (rows && offset !== undefined) rows.scrollTop = offset;
-      }
+    for (const node of root.querySelectorAll("[data-preserve-scroll]")) {
+      const offset = scrollOffsets.get(node.getAttribute("data-preserve-scroll"));
+      if (offset) node.scrollTop = offset;
     }
     pruneCheckboxEntries(checkboxOptionsByName, renderedCheckboxNames);
     if (noticeAnnouncer.textContent !== renderedInfoNotice) {

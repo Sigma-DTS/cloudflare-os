@@ -15,6 +15,12 @@ export type ConfiguratorUIRenderContext<
   TValues extends ConfiguratorUIValues = ConfiguratorUIValues,
 > = {
   values: TValues;
+  /**
+   * Merges `values` and re-renders. A patch that changes nothing, such as `setValues({})`, only
+   * re-renders, which is how a configurator shows something it loaded; the values stay the same
+   * object, so a resource URL being collected meanwhile is not invalidated. Every render rebuilds
+   * the tree: an element marked `data-preserve-scroll="<name>"` keeps its scroll position across it.
+   */
   setValues(values: Partial<TValues>): void;
   clearFields(...names: (keyof TValues & string)[]): void;
   /**
