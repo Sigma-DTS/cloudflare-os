@@ -26,10 +26,11 @@
 // - No size is bounded, neither of what is written (locally or from a remote) nor of what is
 //   read: whatever is stored is returned, inline or chunked, whatever its size. What bounds a row
 //   is chunking, which keeps every row written now within about CHUNK_MAX_SIZE; what bounds
-//   memory is streaming, which pulls (consumePack), pushes (buildPack) and `GitCache.get()` do
-//   for a large blob. Every caller writes objects before moving any record to name them, and a
-//   chunked blob's chunks are written before its index row, so a failure only leaves earlier
-//   objects dangling.
+//   memory is streaming, which pulls (consumePack), pushes (buildPack), `GitCache.get()`,
+//   `readFilesAtCommit()`, streamed writes (`writeBlobStream`) and ranged reads (`openBlob`,
+//   `openFileAtCommit`) do for a large blob. Every caller writes objects before moving any
+//   record to name them, and a chunked blob's chunks are written before its index row, so a
+//   failure only leaves earlier objects dangling.
 // - No GC. Uploads and discarded raw-byte writes can leave blobs dangling, as can accepted
 //   merges, imports, migration, loading a blueprint's release (whose objects are stored whether
 //   or not anything comes to refer to them), and the merge commits of a chat that is then
@@ -134,6 +135,7 @@ import {
   CHUNK_MAX_SIZE,
   blobByteStream,
   isChunkedBlobRecord,
+  readStreamPieces,
 } from "./git-chunked-blob";
 import { createWorkshopLogger } from "./observability";
 
@@ -397,11 +399,30 @@ export class WorkspaceGitCache {
   }
 
   /**
+   * Store a byte stream, of any size, as an ordinary Git blob, returning its reference once it
+   * is wholly stored. The stream is never held whole: its chunk rows are written as they are
+   * cut, outside any transaction, so a failure partway leaves only unreferenced chunks. With
+   * `byteLength`, the blob is hashed as it arrives, and a stream that ends short of it or runs
+   * past it throws, storing no blob; without, it is hashed in a second pass over its chunks.
+   */
+  async writeBlobStream(stream: ReadableStream<Uint8Array>, byteLength?: number)
+      : Promise<BytesRef> {
+    let writer = new BlobWriter(this.storage.gitObjects, byteLength);
+    for await (let piece of readStreamPieces(stream)) writer.write(piece);
+    let blob = writer.finish();
+    if (!this.hasLocalObject(blob.oid)) {
+      this.storage.transaction(() => this.#putObject(blob.oid, blob.record === undefined
+          ? { type: "blob", payload: blob.payload } : { type: "blob", record: blob.record }));
+    }
+    return { oid: blob.oid, byteLength: blob.size };
+  }
+
+  /**
    * Read a locally held Git blob by its OID capability, optionally checking a whole-file OT's
    * length (checked before the blob is read). Never pulls.
    */
   readBlob(oid: string, byteLength?: number): Uint8Array {
-    const reader = this.#openBlobRef(oid, byteLength);
+    const reader = this.openBlobRef(oid, byteLength);
     return reader.read(0, reader.size);
   }
 
@@ -410,10 +431,14 @@ export class WorkspaceGitCache {
    * `readBlob()` does, but without reading the blob whole. Never pulls.
    */
   assertBlob(oid: string, byteLength: number): void {
-    this.#openBlobRef(oid, byteLength);
+    this.openBlobRef(oid, byteLength);
   }
 
-  #openBlobRef(oid: string, byteLength: number | undefined): BlobReader {
+  /**
+   * Opens a locally held Git blob by its OID capability for reading in pieces, with `readBlob()`'s
+   * checks, but without reading it whole. Never pulls.
+   */
+  openBlobRef(oid: string, byteLength: number | undefined): BlobReader {
     let reader = this.openLocalBlob(oid);
     if (reader === undefined) throw new Error("Unknown Git blob.");
     if (byteLength !== undefined && reader.size !== byteLength) {
@@ -1001,6 +1026,18 @@ export class WorkspaceGitCache {
    */
   async readFileAtCommitWithOid(commitOid: GitOid, path: string)
       : Promise<{ text: string, oid: GitOid } | undefined> {
+    let file = await this.openFileAtCommit(commitOid, path);
+    return file && { text: decodeBlobText(file.reader.read(0, file.reader.size), path),
+                     oid: file.oid };
+  }
+
+  /**
+   * `readFileAtCommitWithOid`, but opening the file's blob for reading in pieces rather than
+   * decoding it: same path rules and errors, but no content rules, and the blob is never read
+   * whole. Faults the blob in if missing.
+   */
+  async openFileAtCommit(commitOid: GitOid, path: string)
+      : Promise<{ oid: GitOid, reader: BlobReader } | undefined> {
     let { tree, entry } = await this.#resolveEntryAt(commitOid, path);
     if (entry === undefined || entry.mode === "40000") return undefined;
     switch (entry.mode) {
@@ -1010,9 +1047,21 @@ export class WorkspaceGitCache {
         // The symlink target *is* the blob's content, so the error tells the agent everything.
         throw new Error(symlinkMessage(path, await this.#ensureFileBlob(entry.oid, tree)));
       default:
-        return { text: decodeBlobText(await this.#ensureFileBlob(entry.oid, tree), path),
-                 oid: entry.oid };
+        return { oid: entry.oid, reader: await this.openBlob(entry.oid, tree) };
     }
+  }
+
+  /**
+   * Opens a blob for reading in pieces, whatever its size, fault-pulling it on a miss
+   * (`referencedBy` shapes the pull hints, as for `readTextBlob`). Never reads it whole. Throws
+   * if it cannot be obtained or is not a blob.
+   */
+  async openBlob(oid: GitOid, referencedBy?: GitOid): Promise<BlobReader> {
+    await this.#faultFileBlob(oid, referencedBy);
+    let reader = this.openLocalBlob(oid);
+    // #faultFileBlob throws on failure; this is a defensive backstop.
+    if (reader === undefined) throw new Error(`git object ${oid} is unavailable`);
+    return reader;
   }
 
   /**
@@ -1156,8 +1205,9 @@ export class WorkspaceGitCache {
    * eager-tree walk, every missing blob is pulled in one batch (`ensureBlobs`), and the results
    * come back in request order -- stopping once the accumulated blob bytes exceed
    * READ_FILES_RESPONSE_BUDGET, so the remaining paths are simply omitted. Per-file conditions
-   * become `absent`/`unreadable` entries; a pull failure throws. A file of any size is decoded
-   * whole.
+   * become `absent`/`unreadable` entries; a pull failure throws. A regular file over
+   * MAX_BUFFERED_BLOB_SIZE comes back as a `stream` of its raw bytes, never read whole here and
+   * not counted toward the budget; a smaller one is decoded as text.
    */
   async readFilesAtCommit(commitOid: GitOid, paths: string[])
       : Promise<[path: string, FileAtCommit][]> {
@@ -1186,8 +1236,15 @@ export class WorkspaceGitCache {
         out.push([path, { kind: "unreadable", message: submoduleMessage(path, entry.oid) }]);
       } else {
         try {
-          // Local by now (ensureBlobs), so this is a decode, not a fault.
-          let payload = await this.#ensureFileBlob(entry.oid, entry.referencedBy);
+          // Local by now (ensureBlobs), so this opens the blob, never faults.
+          let reader = await this.openBlob(entry.oid, entry.referencedBy);
+          if (entry.kind !== "symlink" && reader.size > MAX_BUFFERED_BLOB_SIZE) {
+            // Its bytes travel outside the response message, so they count against no budget.
+            out.push([path, { kind: "stream", byteLength: reader.size,
+                              content: blobByteStream(reader) }]);
+            continue;
+          }
+          let payload = reader.read(0, reader.size);
           if (entry.kind === "symlink") {
             out.push([path, { kind: "unreadable", message: symlinkMessage(path, payload) }]);
           } else {

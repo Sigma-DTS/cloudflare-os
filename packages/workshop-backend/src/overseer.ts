@@ -25,6 +25,7 @@ import {
 import type { UserAiModelRecord, WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import { filesEqual, threeWayMerge, type MergeResult } from "./three-way-merge";
 import { GitCacheImpl, WorkspaceGitCache, commitIdentityForAuthor } from "./git-cache";
+import type { BlobReader } from "./git-chunked-blob";
 import {
   OVERSEER_STORAGE_VERSION, migrateToActionIndexes, migrateToBlueprintUpstreams,
   migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes,
@@ -1957,10 +1958,11 @@ class OverseerImpl implements AgentHooks {
     return this.gitCache.readFileAtCommitIfExists(commit, path);
   }
 
-  // AgentHooks implementation: the same read, plus the blob's oid for the read's stamp.
-  readFileAtCommitWithOid(commit: string, path: string)
-      : Promise<{text: string, oid: string} | undefined> {
-    return this.gitCache.readFileAtCommitWithOid(commit, path);
+  // AgentHooks implementation: one file of a commit's tree, opened for reading in pieces, with
+  // the blob's oid for the read's stamp (see WorkspaceGitCache.openFileAtCommit).
+  openFileAtCommit(commit: string, path: string)
+      : Promise<{oid: string, reader: BlobReader} | undefined> {
+    return this.gitCache.openFileAtCommit(commit, path);
   }
 
   // AgentHooks implementation: a regular file's blob oid by path (see
@@ -1975,6 +1977,12 @@ class OverseerImpl implements AgentHooks {
     return this.gitCache.readTextBlob(oid, undefined, path);
   }
 
+  // AgentHooks implementation: a blob by oid, opened for reading in pieces (see
+  // WorkspaceGitCache.openBlob). Like readBlobText, a local read for a stamped read's blob.
+  openBlob(oid: string): Promise<BlobReader> {
+    return this.gitCache.openBlob(oid);
+  }
+
   // AgentHooks implementation: the write side of the tree-entry modes rules (see
   // WorkspaceGitCache.assertWorktreePathWritable).
   assertWorktreePathWritable(commit: string, path: string): Promise<void> {
@@ -1983,8 +1991,8 @@ class OverseerImpl implements AgentHooks {
 
   // AgentHooks implementation: the grep tool's scan (see scanWorkpieceForGrep).
   grepWorkpiece(turn: WorktreeTurnAccess, workpieceId: WorkpieceId, base: string | undefined,
-                path?: string): Promise<GrepScan> {
-    return scanWorkpieceForGrep(this.gitCache, turn, workpieceId, base, path);
+                pattern: RegExp, path?: string): Promise<GrepScan> {
+    return scanWorkpieceForGrep(this.gitCache, turn, workpieceId, base, path, pattern);
   }
 
   // Rebuild a chat's content -- `gadgetId -> (path -> text)` for every gadget whose files live
@@ -11843,8 +11851,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return this.impl.listSlashCommands();
   }
 
-  async uploadBlob(content: Uint8Array): Promise<string> {
-    const {oid} = await this.impl.gitCache.writeBlob(content);
+  async uploadBlob(content: Uint8Array | {stream: ReadableStream<Uint8Array>, byteLength: number})
+      : Promise<string> {
+    const {oid} = content instanceof Uint8Array
+      ? await this.impl.gitCache.writeBlob(content)
+      : await this.impl.gitCache.writeBlobStream(content.stream, content.byteLength);
     await this.impl.ctx.storage.sync();
     return oid;
   }
@@ -12664,7 +12675,10 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
                         _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[]): Promise<void> {
     this.#deny();
   }
-  async uploadBlob(_content: Uint8Array): Promise<string> { this.#deny(); }
+  async uploadBlob(_content: Uint8Array | {stream: ReadableStream<Uint8Array>, byteLength: number})
+      : Promise<string> {
+    this.#deny();
+  }
   async getChatAttachmentContent(_chatId: number, _id: string): Promise<Uint8Array> { this.#deny(); }
   async setChatTitle(_chatId: number, _title: string): Promise<void> { this.#deny(); }
   async mergeChanges(_chatId: number): Promise<MergeChangesResult> {

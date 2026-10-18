@@ -520,6 +520,43 @@ export function blobByteStream(reader: BlobReader, range?: { offset: number, len
   }, { highWaterMark: 0 });
 }
 
+/**
+ * Reads a byte stream to its end in pieces, for feeding a BlobWriter (which copies what it is
+ * given). A stream that supports BYOB reads is read into one reused buffer of `pieceSize` bytes,
+ * so each piece is valid only until the next is requested; any other stream (a stream that
+ * arrived over Cap'n Web may be one) is read with a default reader, in whatever pieces it
+ * delivers. If the consumer stops early -- it threw, say, on a length mismatch -- the stream is
+ * cancelled.
+ */
+export async function* readStreamPieces(stream: ReadableStream<Uint8Array>,
+                                        pieceSize = 64 * 1024): AsyncGenerator<Uint8Array> {
+  let byob: ReadableStreamBYOBReader | undefined;
+  try {
+    byob = stream.getReader({ mode: "byob" });
+  } catch {
+    // Not a byte stream: fall through to a default reader.
+  }
+  let reader = byob ?? stream.getReader();
+  let done = false;
+  try {
+    let buffer = new ArrayBuffer(pieceSize);
+    for (;;) {
+      let result = byob !== undefined
+          ? await byob.read(new Uint8Array(buffer, 0, pieceSize))
+          : await (reader as ReadableStreamDefaultReader<Uint8Array>).read();
+      if (result.done) {
+        done = true;
+        return;
+      }
+      if (byob !== undefined) buffer = result.value.buffer as ArrayBuffer;
+      if (result.value.byteLength > 0) yield result.value;
+    }
+  } finally {
+    if (!done) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 function countNewlines(bytes: Uint8Array): number {
   let count = 0;
   for (let pos = bytes.indexOf(NEWLINE); pos >= 0; pos = bytes.indexOf(NEWLINE, pos + 1)) count++;

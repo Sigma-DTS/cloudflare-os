@@ -1238,6 +1238,19 @@ describe("updateChatFromMainline", () => {
       expect(merged).toContain(wide);
       expect(await impl.gitCache.readFileAtCommit(head, "big.txt")).toBe(merged);
     }));
+
+    it("merging a 9 MB file, stored chunked, whole", () => withImpl(async impl => {
+      let huge = "0123456789abcdef".repeat(9_000_000 / 16) + "\n";
+      await staleChat(impl, { "big.txt": huge, "a.txt": "one\n" },
+                      { "big.txt": huge, "a.txt": "chat\n" },
+                      { "big.txt": `${huge}main\n`, "a.txt": "one\n" });
+      expect(await impl.updateChatFromMainline(1, USER)).toEqual({ conflictPaths: [] });
+      expect(await impl.mergeChanges(1, USER_META, "user-do-id")).toEqual({ outcome: "merged" });
+      let head = impl.storage.gadgets.get(1)!.commitId!;
+      let files = await filesAt(impl, head);
+      expect(files["big.txt"] === `${huge}main\n`).toBe(true);
+      expect(files["a.txt"]).toBe("chat\n");
+    }), 30_000);
   });
 });
 

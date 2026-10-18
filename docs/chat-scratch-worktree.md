@@ -9,7 +9,9 @@ and resized them to fit: source images, like every other upload, must now fit th
 The scratch worktree is created on the first upload and reused for later uploads, plans,
 and other agent working files.
 
-`Overseer.uploadBlob(bytes)` durably stores a raw Git blob and returns its OID. Uploading
+`Overseer.uploadBlob(bytes)` durably stores a raw Git blob and returns its OID; the composer
+sends `{stream, byteLength}` instead, which the backend stores as it arrives and checks
+against the declared length, so neither end holds the whole file. Uploading
 does not change a message or worktree. A message attaches the OID with filename/MIME metadata;
 the same OID can instead be used in a worktree `setBytes` operation with its byte length.
 Attachment limits and MIME signatures are checked when sending, independently of generic
@@ -37,7 +39,8 @@ embedded or base64-encoded in an OT. Binary changes are whole-file replacements 
 binary deltas are deliberately not supported. Text transforms remain unchanged.
 
 Ordinary worktree bindings expose `readBytes()` and `writeBytes(path, rawBytes)`; writes store
-the blob before appending its whole-file OT. There is no staged/resumable upload protocol.
+the blob before appending its whole-file OT. Both stream: `readBytes()` reads a blob (or a byte
+range of it) a chunk at a time, and `writeBytes()` also accepts a `ReadableStream`. There is no staged/resumable upload protocol.
 Git pack export streams one object at a time, so container materialization can transfer files
 without decoding them as text or buffering the entire repository. Containers consume the same
 canonical worktree rather than needing a separate attachment download path. The container-specific

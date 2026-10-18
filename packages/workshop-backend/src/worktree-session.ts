@@ -27,11 +27,14 @@ import type {
   WorktreeFileEntry,
 } from "./worktree-binding";
 import type { AiChatAuthorInfo, WorkpieceId } from "@gadgets/workshop-shared/api";
-import { diffFiles, validateCodeChangeSchema, type FileChange, type FileContent } from "@gadgets/workshop-shared/code-change";
+import {
+  diffFiles, validateCodeChangeSchema, type BytesRef, type FileChange, type FileContent,
+} from "@gadgets/workshop-shared/code-change";
 
 import { UnreadableContentError, commitIdentityForAuthor, type WorkspaceGitCache } from "./git-cache";
 import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
-import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
+import { formatGrep, scanWorkpieceForGrep } from "./grep";
+import { blobByteStream } from "./git-chunked-blob";
 
 /**
  * What the session needs from the overseer: the git plumbing and the worktree's registry record
@@ -175,20 +178,30 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
   async readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>> {
     this.#pinBase();
     const value = await this.#byteValue(path);
-    const bytes = typeof value === "string" ? new TextEncoder().encode(value)
-      : this.host.gitCache.readBlob(value.oid, value.byteLength);
-    const offset = range?.offset ?? 0, length = range?.length ?? bytes.length;
-    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 ||
-        offset > bytes.length || length > bytes.length - offset) throw new Error("Invalid byte range.");
-    return new ReadableStream({pull: c => {
-      this.#pinBase();
-      c.enqueue(bytes.slice(offset, offset + length)); c.close();
-    }}, {highWaterMark: 0});
+    if (typeof value === "string") {
+      const bytes = new TextEncoder().encode(value);
+      const {offset, length} = checkByteRange(range, bytes.length);
+      return new ReadableStream({pull: c => {
+        this.#pinBase();
+        c.enqueue(bytes.slice(offset, offset + length)); c.close();
+      }}, {highWaterMark: 0});
+    }
+    // A blob streams a piece at a time, never read whole, and each piece checks first that the
+    // session is still live, so revocation stops the stream.
+    const reader = this.host.gitCache.openBlobRef(value.oid, value.byteLength);
+    return blobByteStream(reader, checkByteRange(range, reader.size), () => this.#pinBase());
   }
-  async writeBytes(path: string, content: Uint8Array): Promise<void> {
-    await this.host.gitCache.assertWorktreePathWritable(this.#pinBase(), path);
-    this.#pinBase();
-    const value = await this.host.gitCache.writeBlob(content);
+  async writeBytes(path: string, content: Uint8Array | ReadableStream<Uint8Array>): Promise<void> {
+    try {
+      await this.host.gitCache.assertWorktreePathWritable(this.#pinBase(), path);
+      this.#pinBase();
+    } catch (err) {
+      if (!(content instanceof Uint8Array)) await content.cancel(err).catch(() => {});
+      throw err;
+    }
+    // A stream's length isn't known up front, so its blob is hashed in a second pass.
+    const value: BytesRef = content instanceof Uint8Array ? await this.host.gitCache.writeBlob(content)
+        : await this.host.gitCache.writeBlobStream(content);
     const change = {setBytes: value};
     validateCodeChangeSchema({[this.worktreeId]: [[path, change]]});
     this.#pinBase();
@@ -245,19 +258,15 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
 
   async grep(pattern: RegExp, path?: string | string[]): Promise<string> {
     let scan = await scanWorkpieceForGrep(
-        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path);
-    return formatGrep(scan, pattern, Infinity);
+        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path, pattern);
+    return formatGrep(scan, Infinity);
   }
 
   async structuredGrep(pattern: RegExp, path?: string | string[])
       : Promise<StructuredGrepResult> {
-    let { files, errors } = await scanWorkpieceForGrep(
-        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path);
-    return {
-      matches: files.flatMap(file =>
-          matchLines(file.text, pattern).map(match => ({ file: file.path, ...match }))),
-      errors,
-    };
+    let { matches, errors } = await scanWorkpieceForGrep(
+        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path, pattern);
+    return { matches, errors };
   }
 
 
@@ -402,6 +411,15 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     }
     return files;
   }
+}
+
+/** Validates a readBytes range against a file of `size` bytes; no range means the whole file. */
+function checkByteRange(range: {offset: number; length: number} | undefined, size: number)
+    : {offset: number; length: number} {
+  const offset = range?.offset ?? 0, length = range?.length ?? size;
+  if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 ||
+      offset > size || length > size - offset) throw new Error("Invalid byte range.");
+  return {offset, length};
 }
 
 /** One side of a path being diffed: its text and kind (absent where it doesn't exist), or a note. */
