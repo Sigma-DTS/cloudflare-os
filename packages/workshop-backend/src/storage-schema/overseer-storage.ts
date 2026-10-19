@@ -1247,6 +1247,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // Only established build-role readers receive chat metadata; reverified before delivery.
       unreadReaders: collection<{
         userId: string; profileId: string; timelineVersion?: number;
+        // Unix milliseconds and delay milliseconds; cleared on ACK or interactive catch-up.
+        retryAt?: number; retryDelay?: number;
       }>()({primaryKey: "userId"}),
       // One latest-change watermark per thread, including tombstones. No message text is copied.
       chatTimelineChanges: collection<{chatId: number; version: number}>()({

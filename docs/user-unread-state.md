@@ -113,15 +113,19 @@ they must not enumerate recipients or construct snapshots. A deferred drain read
 arms the shared fallback alarm before RPC, rechecks authority, captures heads and their version
 together, and advances each checkpoint only after ACK. Concurrent writes leave it behind the
 source version for another pass. Failed recipients do not block healthy readers or spin within
-the same drain; the persisted 30-second deadline survives resets. Lost ACKs/checkpoint-write
-failures safely retry because the receiver fences source versions. Callback failures do not
-roll back read cursors.
+the same drain. Their persisted backoff doubles from 30 seconds up to 30 minutes and survives
+eviction; new messages still reach healthy readers immediately. Full role/observer authorization
+remains mandatory on each attempted metadata delivery, including retries. A successful delivery
+clears backoff, and interactive reopening requests immediate catch-up after connection repair.
+Lost ACKs/checkpoint-write failures safely retry because the receiver fences source versions.
+Callback failures do not roll back read cursors.
 
 Workspace deletion persists its intent before removing any user's listing and read state. It
 uses the same reader rows, without requiring observer access for removal: a row is deleted only
 after that User DO acknowledges cleanup. The listing removal fences delayed snapshots; only after
-every row is removed does the Overseer delete its own storage. The input gate protects only
-deletion intent: it never joins cross-DO delivery, which may call back into the workspace. The request
+every row is removed does the Overseer delete its own storage. Deletion intent is synchronous;
+cross-DO delivery never holds the input gate, since it may call back into the workspace. Deletion
+clears earlier account-repair backoff because removing metadata needs no observer access. The request
 waits for the owner's listing cleanup, not unhealthy collaborators; the durable alarm finishes
 their cleanup. Alarms resume interrupted deletion without another user action,
 and a deleting workspace refuses new opens, agent callbacks and turn starts. Queued callbacks
@@ -154,7 +158,8 @@ branch does not prevent OS suspension/termination, deliver after full Quit, or a
 - `unread-state.test.ts`: private horizons, sparse counts, epochs, no arrival writes, reconstruction,
   unavailable workspaces, authorization and dismissed-listing catch-up.
 - `unread-outbox.test.ts`: checkpoint fanout, lost ACKs, failed checkpoint writes, real DO eviction,
-  retry isolation and durable deletion, including in-flight agent/gate races. No alert replay.
+  per-recipient capped backoff across eviction, healthy-reader isolation and durable deletion,
+  including in-flight agent/gate races. No alert replay.
 - `workshop-unread.test.ts`: validated WebSocket API with two owner devices and build/use readers;
   live fanout, private reads, rename and deletion without polling/reopening.
 - Frontend tests cover subscription/retry lifecycle, history navigation, unread actions and inbox

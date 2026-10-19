@@ -965,9 +965,12 @@ class OverseerImpl implements AgentHooks {
 
     let times: number[] = [];
 
-    if (this.storage.deletingWorkspace.get() ||
-        this.#pendingTimelineReaders().length) {
-      times.push(this.storage.chatTimelineRetryAt.get() || Date.now());
+    let timelineReaders = this.#pendingTimelineReaders();
+    if (this.storage.deletingWorkspace.get() || timelineReaders.length) {
+      let nextReader = timelineReaders.reduce(
+          (earliest, reader) => Math.min(earliest, reader.retryAt ?? 0), Infinity);
+      times.push(Math.max(this.storage.chatTimelineRetryAt.get(),
+          Number.isFinite(nextReader) ? nextReader : 0) || Date.now());
     }
 
     // Outstanding agent work: see #agentKeepAliveTime for why it is set once and held.
@@ -1044,11 +1047,12 @@ class OverseerImpl implements AgentHooks {
 
   #timelineDelivery: Promise<void> | undefined;
 
-  #pendingTimelineReaders() {
+  #pendingTimelineReaders(readyOnly = false) {
     let version = this.storage.chatTimelineVersion.get();
     let deleting = this.storage.deletingWorkspace.get();
     return [...this.storage.unreadReaders.list()].filter(reader =>
-      deleting || reader.timelineVersion === undefined || reader.timelineVersion < version);
+      (deleting || reader.timelineVersion === undefined || reader.timelineVersion < version) &&
+      (!readyOnly || (reader.retryAt ?? 0) <= Date.now()));
   }
 
   /** Replay the durable unread projection without replaying transient alerts or push sends. */
@@ -1062,7 +1066,7 @@ class OverseerImpl implements AgentHooks {
       this.#updateAlarm();
       let failures = new Map<string, unknown>();
       // Do not hold a storage cursor across RPC or deletion; concurrent turns can queue more.
-      let pending = this.#pendingTimelineReaders();
+      let pending = this.#pendingTimelineReaders(true);
       while (pending.length) {
         for (let record of pending) {
           try {
@@ -1099,18 +1103,24 @@ class OverseerImpl implements AgentHooks {
             let deleted = ids?.filter(id => !this.storage.chatMeta.get(id));
             await user.syncWorkspaceChats(this.ctx.id.toString(), version, heads, deleted);
             let reader = this.storage.unreadReaders.get(record.userId);
-            if (reader) this.storage.unreadReaders.put({...reader, timelineVersion: version});
+            if (reader) this.storage.unreadReaders.put({...reader, timelineVersion: version,
+              retryAt: undefined, retryDelay: undefined});
           } catch (error) {
-            // A disconnected account may require interactive repair. Keep its intent, but do
-            // not block other users or immediately retry it in this drain's next pass.
+            // Keep intent durable without polling a broken account every 30s forever. Backoff
+            // belongs to this reader, so new messages can still reach healthy recipients.
+            let reader = this.storage.unreadReaders.get(record.userId);
+            if (reader) {
+              let retryDelay = Math.min((reader.retryDelay ?? 15_000) * 2, 30 * 60_000);
+              this.storage.unreadReaders.put({...reader, retryDelay, retryAt: Date.now() + retryDelay});
+            }
             failures.set(record.userId, error);
           }
         }
-        pending = this.#pendingTimelineReaders().filter(record => !failures.has(record.userId));
+        pending = this.#pendingTimelineReaders(true).filter(record => !failures.has(record.userId));
       }
       if (failures.size) throw failures.values().next().value;
       this.storage.chatTimelineRetryAt.put(0);
-      if (this.storage.deletingWorkspace.get()) {
+      if (this.storage.deletingWorkspace.get() && !this.#pendingTimelineReaders().length) {
         // No delivery state is discarded until all recipients have durably removed the workspace.
         // Fence continuations before deleteAll clears the persisted deletion intent.
         this.ownerId = undefined;
@@ -1140,7 +1150,7 @@ class OverseerImpl implements AgentHooks {
     });
     let idle = this.storage.chatTimelineRetryAt.get() === 0;
     if (idle) this.storage.chatTimelineRetryAt.put(Date.now() + 30_000);
-    this.#scheduleTimelineDelivery(idle);
+    this.#scheduleTimelineDelivery(true);
   }
 
   #scheduleTimelineDelivery(immediate = false): void {
@@ -1210,6 +1220,12 @@ class OverseerImpl implements AgentHooks {
   deleteWorkspace(): void {
     this.storage.deletingWorkspace.put(true);
     this.destroyAllLiveChats();
+    // Removing metadata needs no observer access; do not inherit an account-repair backoff.
+    for (let reader of this.storage.unreadReaders.list()) {
+      if (reader.retryAt !== undefined) this.storage.unreadReaders.put({
+        ...reader, retryAt: undefined, retryDelay: undefined,
+      });
+    }
     this.queueUnreadSnapshot();
     // Start cleanup asynchronously, without inheriting an older metadata retry delay.
     this.#scheduleTimelineDelivery(true);

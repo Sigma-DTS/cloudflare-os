@@ -171,6 +171,7 @@ export function makeUserStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
       // Read-only legacy schema, retained to preserve read markers on existing test installs.
+      // Remove with the User DO constructor migration once internal prototype installs have upgraded.
       chatReadStates: collection<ChatReadState>()({
         primaryKey: record => `${record.workspaceId}:${record.chatId}`,
         nonUniqueIndexes: {

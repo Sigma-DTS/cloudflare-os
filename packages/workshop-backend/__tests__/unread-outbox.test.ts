@@ -70,6 +70,13 @@ const expectAcknowledged = (impl: Impl) => {
   }
 };
 
+const makeRetriesDue = (impl: Impl) => {
+  impl.storage.chatTimelineRetryAt.put(0);
+  for (const reader of impl.storage.unreadReaders.list()) {
+    if (reader.retryAt !== undefined) impl.storage.unreadReaders.put({...reader, retryAt: 0});
+  }
+};
+
 const setup = async () => {
   const stub = env.TEST_OVERSEER.getByName(`unread-outbox-${crypto.randomUUID()}`);
   const recipientId = await withImpl(stub, async (impl) => {
@@ -256,9 +263,9 @@ describe("durable unread delivery checkpoints", () => {
     });
   });
 
-  it.each(["authorization", "dispatch"])("isolates a recipient's %s failure and defers its retry", async (failure) => {
+  it.each(["authorization", "dispatch"])("backs off a recipient's %s failure across eviction without delaying healthy readers", async (failure) => {
     const { stub, recipientId } = await setup();
-    await withImpl(stub, async (impl) => {
+    const deferred = await withImpl(stub, async (impl) => {
       const ids = [recipientId, ...Array.from({length: 2}, () =>
         impl.users.idFromName(crypto.randomUUID()).toString())].toSorted();
       // Put the failing reader before both a healthy reader and the owner in delivery order.
@@ -268,12 +275,19 @@ describe("durable unread delivery checkpoints", () => {
         await impl.users.get(impl.users.idFromString(id)).newGadget(impl.ctx.id.toString(), "Workspace");
         impl.storage.unreadReaders.put({userId: id, profileId: id});
       }
+      let failedAttempts = 0;
       using verify = vi.spyOn(impl, "authorizeCollaborator").mockImplementation(async (profileId) => {
-        if (failure === "authorization" && profileId === ids[0]) throw new Error("needs repair");
+        if (failure === "authorization" && profileId === ids[0]) {
+          failedAttempts++;
+          throw new Error("needs repair");
+        }
         return "build";
       });
       const dispatch = interceptDispatch(impl, async (user, args) => {
-        if (failure === "dispatch" && user.id.toString() === ids[0]) throw new Error("needs repair");
+        if (failure === "dispatch" && user.id.toString() === ids[0]) {
+          failedAttempts++;
+          throw new Error("needs repair");
+        }
         await user.syncWorkspaceChats(...args);
       });
       try {
@@ -289,9 +303,39 @@ describe("durable unread delivery checkpoints", () => {
         const attempts = verify.mock.calls.length;
         await impl.deliverChatTimelines();
         expect(verify).toHaveBeenCalledTimes(attempts);
+        expect(impl.storage.unreadReaders.get(ids[0])?.retryDelay).toBe(30_000);
+        impl.storage.chats.put({chatId: 1, sequence: 2, timestamp: new Date(),
+          author: {type: "agent", id: "test", name: "Test"}, type: "message", message: "Next"});
+        await impl.deliverChatTimelines(true);
+        expect(failedAttempts).toBe(1);
+        for (const id of ids.slice(1)) {
+          expect((await impl.users.get(impl.users.idFromString(id)).getUnreadState()).unreadMessageCount).toBe(2);
+        }
+        using clock = vi.spyOn(Date, "now");
+        for (const delay of [60_000, 120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000]) {
+          clock.mockReturnValue(impl.storage.unreadReaders.get(ids[0])!.retryAt!);
+          await expect(impl.deliverChatTimelines(true)).rejects.toThrow("needs repair");
+          const reader = impl.storage.unreadReaders.get(ids[0])!;
+          expect(reader.retryDelay).toBe(delay);
+          expect(reader.retryAt).toBe(Date.now() + delay);
+          expect(await impl.ctx.storage.getAlarm()).toBe(reader.retryAt);
+        }
+        return impl.storage.unreadReaders.get(ids[0])!;
       } finally {
         dispatch.restore();
       }
+    });
+    await evictDurableObject(stub);
+    await withImpl(stub, async impl => {
+      await impl.deliverChatTimelines(true);
+      expect(impl.storage.unreadReaders.get(deferred.userId)).toEqual(deferred);
+      using _verify = vi.spyOn(impl, "authorizeCollaborator").mockResolvedValue("build");
+      // Interactive reopening can retry immediately after the user repairs the connection.
+      impl.trackUnreadReader(deferred.userId, deferred.profileId, {catchUp: true});
+      await impl.deliverChatTimelines(true);
+      expectAcknowledged(impl);
+      expect(impl.storage.unreadReaders.get(deferred.userId)?.retryAt).toBeUndefined();
+      expect(impl.storage.unreadReaders.get(deferred.userId)?.retryDelay).toBeUndefined();
     });
   });
 
@@ -360,25 +404,29 @@ describe("durable unread delivery checkpoints", () => {
         await user.deleteGadget(id);
       });
       try {
-        if (ownerUnavailable) await expect(client.deleteSelf()).rejects.toThrow("Owner unavailable");
-        else await expect(client.deleteSelf()).resolves.toBeUndefined();
+        const deletion = client.deleteSelf();
+        const cleanup = expect(impl.deliverChatTimelines(true)).rejects.toThrow(/unavailable/);
+        if (ownerUnavailable) await expect(deletion).rejects.toThrow("Owner unavailable");
+        else await expect(deletion).resolves.toBeUndefined();
+        await cleanup;
         expect(deletedOwners).toEqual([recipientId]);
         expect(notified).toHaveBeenCalledOnce();
         expect(_restart).toHaveBeenCalledOnce();
-        await expect(impl.deliverChatTimelines(true)).rejects.toThrow(/unavailable/);
         if (!ownerUnavailable) {
           expect(await impl.users.get(impl.users.idFromString(recipientId)).getGadget(impl.ctx.id.toString())).toBeNull();
         }
         expect(impl.storage.deletingWorkspace.get()).toBe(true);
         expect(impl.storage.unreadReaders.get(readerId)).toBeDefined();
-        expect(impl.storage.chatTimelineRetryAt.get()).toBeGreaterThan(Date.now());
+        expect(impl.storage.unreadReaders.get(readerId)!.retryAt).toBeGreaterThan(Date.now());
+        expect(await impl.ctx.storage.getAlarm()).toBeGreaterThanOrEqual(
+          impl.storage.unreadReaders.get(readerId)!.retryAt!);
       } finally {
         restore();
         client[Symbol.dispose]();
       }
     });
     await evictDurableObject(stub);
-    await withImpl(stub, async impl => { impl.storage.chatTimelineRetryAt.put(0); });
+    await withImpl(stub, async impl => { makeRetriesDue(impl); });
     await runDurableObjectAlarm(stub);
     await withImpl(stub, async impl => { expect(impl.ownerId).toBeUndefined(); });
   });
@@ -414,7 +462,7 @@ describe("durable unread delivery checkpoints", () => {
           expect((await reader.getUnreadState()).unreadChatCount).toBe(boundary === "before dispatch" ? 1 : 0);
           // The owner's cleanup proceeds even when a collaborator fails.
           expect((await impl.users.get(impl.users.idFromString(recipientId)).getUnreadState()).chats).toEqual([]);
-          impl.storage.chatTimelineRetryAt.put(0);
+          makeRetriesDue(impl);
         } finally {
           restore();
         }
@@ -464,7 +512,7 @@ describe("durable unread delivery checkpoints", () => {
     await withImpl(stub, async (impl) => {
       restore = interceptRemoval(impl, async () => { throw new Error("cleanup unavailable"); });
       start = vi.spyOn(impl, "startAgent").mockImplementation(() => {});
-      impl.storage.chatTimelineRetryAt.put(0);
+      makeRetriesDue(impl);
     });
     try {
       await expect(runDurableObjectAlarm(stub)).rejects.toThrow("cleanup unavailable");
@@ -482,6 +530,7 @@ describe("durable unread delivery checkpoints", () => {
     }
 
     await withImpl(stub, async (impl) => {
+      makeRetriesDue(impl);
       await impl.deliverChatTimelines(true);
       expect(impl.ownerId).toBeUndefined();
       expect([...impl.storage.pendingAgentCalls.list()]).toEqual([]);
@@ -512,7 +561,7 @@ describe("durable unread delivery checkpoints", () => {
       impl.resumeAgentAfterDecision(1);
       const restore = interceptRemoval(impl, async () => { throw new Error("cleanup unavailable"); });
       try {
-        impl.storage.chatTimelineRetryAt.put(0);
+        makeRetriesDue(impl);
         await expect(impl.runAlarmTasks()).rejects.toThrow("cleanup unavailable");
         expect([...impl.storage.chats.list()]).toEqual(before);
         expect(impl.storage.activeAgents.get(1)).toBeDefined();
@@ -520,6 +569,7 @@ describe("durable unread delivery checkpoints", () => {
       } finally {
         restore();
       }
+      makeRetriesDue(impl);
       await impl.deliverChatTimelines(true);
     });
   });
@@ -551,6 +601,7 @@ describe("durable unread delivery checkpoints", () => {
         release.resolve();
         restore();
       }
+      makeRetriesDue(impl);
       await impl.deliverChatTimelines(true);
     });
   });
@@ -714,7 +765,7 @@ describe("durable unread delivery checkpoints", () => {
           expect(dispatch.calls()).toBe(1);
         } finally { dispatch.restore(); }
         await user.markChatRead({workspaceId: impl.ctx.id.toString(), chatId: 1, throughSequence: 1, readEpoch: 0});
-        impl.storage.chatTimelineRetryAt.put(0);
+        makeRetriesDue(impl);
       });
       await evictDurableObject(stub);
       await runDurableObjectAlarm(stub);
