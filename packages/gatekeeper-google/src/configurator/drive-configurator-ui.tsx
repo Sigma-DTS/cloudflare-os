@@ -106,6 +106,12 @@ type Note = { text: string; tone?: "error" };
  */
 let access: { grant: string; note?: Note } | null = null;
 
+/**
+ * Counts listing requests. The picker drops a reply for a location it has left only after
+ * `loadItems` returns, so only the latest request, the one for the location shown, sets `access`.
+ */
+let listings = 0;
+
 /** Asks from the click, so the browser lets Workshop open Google's consent pop-up. */
 const allow = async ({ ensureResources, setValues }: Context, grant: string) => {
   const note = await ensureResources([grant]).then(
@@ -153,15 +159,14 @@ export default {
             selectable: accepts(accepted, ROOT_ID),
           }}
           loadItems={async ({ parentId, query, cursor }) => {
+            const listing = ++listings;
             const page = await ui.listDriveNodes(parentId, query, cursor);
-            if (page.needsGrant) {
-              access = { grant: page.needsGrant };
+            if (listing === listings && (access || page.needsGrant)) {
+              access = page.needsGrant ? { grant: page.needsGrant } : null;
               setValues({});
-              throw new Error("Listing shared drives needs one more permission from Google. Allow it below, then select Retry.");
             }
-            if (access) {
-              access = null;
-              setValues({});
+            if (page.needsGrant) {
+              throw new Error("Listing shared drives needs one more permission from Google. Allow it below, then select Retry.");
             }
             return { items: page.nodes.map(node => toItem(node, accepted)), nextCursor: page.nextCursor };
           }}
