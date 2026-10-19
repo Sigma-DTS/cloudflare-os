@@ -7,7 +7,8 @@ There is no continuation table, saved phase, wait list, ready flag or second dri
 ## Scope
 
 This layer provides scoped lifecycle notifications and cleanup coordination. Contextual
-application of approved actions is a separate follow-up; it is not part of this API.
+application of approved actions has a [separate contract](contextual-gatekeeper-actions.md);
+it is not part of the lifecycle API.
 Automatic effect replay, nested approval trees, and extending completed model turns are
 also out of scope.
 No shipping gatekeeper is opted in or modified by this change.

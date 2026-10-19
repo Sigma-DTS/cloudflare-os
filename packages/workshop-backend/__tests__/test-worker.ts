@@ -2,7 +2,8 @@
 // the real Durable Objects and callbacks) plus test-only entrypoints that stand in for other Workers.
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
-import type { AgentContext, AgentTurnEvent, AgentTurnInfo, AgentTurnParticipant } from "@gadgets/workshop-shared/agent-integration";
+import type { AgentContext, AgentTurnEvent, AgentTurnInfo, AgentTurnParticipant,
+  GatekeeperActionContext } from "@gadgets/workshop-shared/agent-integration";
 import type {
   AccountDescription,
   AppUiContext,
@@ -136,6 +137,12 @@ export class TestLifecycleParticipant extends WorkerEntrypoint<unknown, {name: s
     return barrier.observed.promise;
   }
   calls(): {event: AgentTurnEvent; turn: AgentTurnInfo}[] { return this.#state().calls; }
+  async actionTurn(context: RpcStub<GatekeeperActionContext>): Promise<AgentTurnInfo | null> {
+    using borrowed = context;
+    using _cache = await borrowed.getGitCache();
+    using agent = await borrowed.getAgentContext();
+    return agent ? await agent.getTurn() : null;
+  }
 }
 
 /** What each FakeGatekeeperAccount has been asked to do, by its `name` prop. */

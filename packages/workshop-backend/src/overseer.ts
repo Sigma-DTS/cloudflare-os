@@ -49,6 +49,7 @@ import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alw
 import { WorktreeSessionImpl } from "./worktree-session";
 import type { AgentContext } from "@gadgets/workshop-shared/agent-integration";
 import { AgentIntegrations, agentIntegrationGrant } from "./agent-integration";
+import { GatekeeperActionContextImpl } from "./gatekeeper-action-context";
 import { GitImpl } from "./git-binding";
 import { GadgetExportsImpl } from "./exports-session";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
@@ -4927,8 +4928,28 @@ class OverseerImpl implements AgentHooks {
       // The apply-time cache stub is scoped to the gatekeeper AND to this action (approval can
       // happen long after the session that queued it, so the queue-time stub is gone) -- the
       // binding that makes buildPack() serve exactly this action's pending-push closure.
-      await gatekeeper.applyAction(record.action,
-          new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id));
+      if (record.contextualApply) {
+        if (!this.integrationGrant(record.gatekeeperId).contextualActions) {
+          throw new Error("Contextual action access revoked; legacy dispatch is not a fallback.");
+        }
+        // Facet lookup opened the input gate. Re-read before claiming dispatch, and persist the
+        // claim before the effect: a lost reply (or reset) must not make it auto-eligible again.
+        let pending = this.storage.actions.get(record.id);
+        if (!pending || pending.type !== "action" || pending.state !== "pending" || pending.action === "create") {
+          throw new Error("This action is no longer pending.");
+        }
+        if (autoApproved && pending.contextualAttempted) {
+          throw new Error("This action was already attempted; retry it explicitly after checking the outcome.");
+        }
+        record = {...pending, contextualAttempted: true};
+        this.storage.actions.put(record);
+        using context = new GatekeeperActionContextImpl(this, record);
+        await (gatekeeper as Fetcher<Gatekeeper<any> &
+          Required<Pick<Gatekeeper<any>, "applyActionInContext">>>).applyActionInContext(pending.action, context);
+      } else {
+        await gatekeeper.applyAction(record.action,
+            new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id));
+      }
     }
     record.state = "approved";
     record.appliedAt = new Date();
@@ -5849,7 +5870,7 @@ class OverseerImpl implements AgentHooks {
                      description: ActionDescription, caller: GatekeeperCaller,
                      integrationOrigin?: AgentIntegrationOrigin)
       : Promise<void> {
-    if (integrationOrigin) this.integrations.turn(integrationOrigin);
+    if (integrationOrigin) this.integrations.turn(integrationOrigin, "running");
     // An in-flight facet RPC can outlive removeGatekeeper, and a pending action on a removed
     // connection could never be approved or rejected (both dereference the facet).
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
@@ -5895,6 +5916,10 @@ class OverseerImpl implements AgentHooks {
       type: "action",
       description
     };
+    if (action !== "create" && this.integrationGrant(gatekeeperId).contextualActions) {
+      record.contextualApply = true;
+      record.integrationOrigin = integrationOrigin;
+    }
 
     // The marking walk stamps the verified push closure "pending push" -- the read grant that
     // lets the gatekeeper simulate the queued push -- in the same transaction that persists the
@@ -5907,20 +5932,10 @@ class OverseerImpl implements AgentHooks {
     });
     this.#associateAction(caller, actionId);
 
-    // Same auto-approval gate the drainer uses, named because awaitDecision uses it too. The drain
+    // Same auto-approval gate the drainer uses. The drain
     // is deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
-    let willAutoApprove = autoApprovalRule(this.storage, gatekeeperId, description) !== undefined;
+    let willAutoApprove = autoApprovalRule(this.storage, record) !== undefined;
     if (!willAutoApprove) this.traceAgentActionApproval(record, "requested");
-
-    // Only agent turns suspend on awaitDecision, and only when a manual decision is pending: on this
-    // action, or on an earlier one the in-order drain stops at. Auto-approved actions keep the
-    // seamless behavior the user opted into.
-    if (caller.from === "agent" && description.awaitDecision && (!willAutoApprove ||
-        [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)].some(queued =>
-            queued.type === "action" &&
-            autoApprovalRule(this.storage, gatekeeperId, queued.description) === undefined))) {
-      this.#getOrCreateCapturedActions(caller.chatId).awaitDecision = true;
-    }
 
     if (willAutoApprove) {
       this.ctx.waitUntil(this.drainAutoApprovals(gatekeeperId));
@@ -6305,7 +6320,7 @@ class OverseerImpl implements AgentHooks {
       integrationOrigin: AgentIntegrationOrigin | null | undefined = this.captureIntegrationOrigin(caller, id))
       : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
-    if (integrationOrigin) this.integrations.checkContext(id, integrationOrigin);
+    if (integrationOrigin) this.integrations.checkContext(id, integrationOrigin, "running");
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
     return facet.startSession(new ApprovalQueueImpl(this, id, caller, undefined, integrationOrigin ?? undefined));
   }
@@ -6321,7 +6336,7 @@ class OverseerImpl implements AgentHooks {
   captureIntegrationOrigin(caller: GatekeeperCaller, gatekeeperId: number): AgentIntegrationOrigin | undefined {
     if (caller.from !== "agent") return;
     const grant = this.integrationGrant(gatekeeperId);
-    if (grant.lifecycle) return this.integrations.capture(caller.chatId);
+    if (grant.lifecycle || grant.contextualActions) return this.integrations.capture(caller.chatId);
   }
 
   // Sessions are authorized and verified only at open(), so widening what a live session's holder
@@ -8990,14 +9005,17 @@ class OverseerImpl implements AgentHooks {
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined {
     let result = this.#capturedActions.get(chatId);
     this.#capturedActions.delete(chatId);
-    // Submission latched this, but the user may decide while the tool still runs, before the step's
-    // action cards exist for an approval to resume from. So stop only for an awaited action that is
-    // still pending, or was rejected (which ends the turn).
+    // Decide after the tool returns: an earlier action's attempt fence or a human decision may
+    // have arrived since submission. Awaited actions pause on the same manual gates as the drain,
+    // including an uncertain predecessor; already-approved actions do not pause.
     if (result) {
-      result.awaitDecision &&= result.actions.some(id => {
+      result.awaitDecision = result.actions.some(id => {
         let record = this.storage.actions.get(id);
-        return record?.type === "action" && record.description.awaitDecision &&
-            record.state !== "approved";
+        if (record?.type !== "action" || !record.description.awaitDecision || record.state === "approved") return false;
+        return record.state === "rejected" ||
+            [...this.storage.actions.pendingByGatekeeper.get(record.gatekeeperId)].some(queued =>
+                queued.type === "action" && queued.id <= record.id &&
+                autoApprovalRule(this.storage, queued) === undefined);
       });
     }
     return result;
@@ -13372,7 +13390,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
 
   #check() {
     if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
-    if (this.integrationOrigin) this.impl.integrations.checkContext(this.gatekeeperId, this.integrationOrigin);
+    if (this.integrationOrigin) this.impl.integrations.checkContext(this.gatekeeperId, this.integrationOrigin, "running");
   }
 
   async getAgentContext(): Promise<AgentContext | null> {

@@ -428,6 +428,12 @@ export type ActionRecord = {
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+  /** Captured at submission; a later prompt must never supply this action's context. */
+  integrationOrigin?: AgentIntegrationOrigin;
+  /** Dispatch choice fixed at queue time; revocation fails closed without legacy fallback. */
+  contextualApply?: true;
+  /** Persisted before contextual dispatch; an uncertain pending attempt requires explicit retry. */
+  contextualAttempted?: true;
 } | {
   type: "observation";
   description: ObservationDescription;

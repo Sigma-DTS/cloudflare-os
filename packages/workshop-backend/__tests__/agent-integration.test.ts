@@ -39,7 +39,7 @@ async function fixture() {
 
 describe("trusted integration grants", () => {
   it("is exact, independent of ambience, and fails closed on malformed/unknown grants", () => {
-    expect(agentIntegrationGrant(grants, "test")).toEqual({lifecycle: true});
+    expect(agentIntegrationGrant(grants, "test")).toEqual({lifecycle: true, contextualActions: false});
     expect(agentIntegrationGrant(grants, "TEST")).toEqual({});
     for (const config of [undefined, "invalid", "null", "[]", '{"test":true}',
       '{"test":{"lifecycle":"true"}}', '{"test":{"recoverableActions":true}}']) {

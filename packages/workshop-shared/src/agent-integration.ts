@@ -1,4 +1,14 @@
 import type { RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+import type { GitCache } from "./gatekeeper";
+
+/** Fresh, ephemeral capabilities supplied when an approved action is applied. */
+export interface GatekeeperActionContext extends RpcTarget {
+  /** Action- and connection-scoped cache, identical to legacy applyAction's cache. */
+  getGitCache(): Promise<GitCache>;
+  /** Original agent turn, or null if it ended or this was not an agent action. */
+  getAgentContext(): Promise<AgentContext | null>;
+}
+
 /** Ephemeral turn capability; only the participant, not this context, may be persisted. */
 export interface AgentContext extends RpcTarget {
   /** Read opaque identity and current authority without exposing the user's identity. */
@@ -20,7 +30,7 @@ export interface AgentTurnInfo {
   /** Changes on resumption/reset; capabilities from earlier segments expire. */
   segmentId: string;
   /** Closing contexts authorize cleanup only, never new commands. */
-  phase: "running" | "suspending" | "finishing";
+  phase: "running" | "applyingAction" | "suspending" | "finishing";
 }
 
 /** Ordered, at-least-once notification; receivers must durably deduplicate eventId. */

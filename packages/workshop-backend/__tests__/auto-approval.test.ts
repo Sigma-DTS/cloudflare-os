@@ -297,48 +297,48 @@ describe("AutoApprovalDrainer.drain", () => {
 });
 
 // A description that passes every gate, for the predicate tests to knock single gates out of.
-function eligibleDescription(overrides: Partial<ActionDescription> = {}): ActionDescription {
-  return {
+function eligibleAction(overrides: Partial<ActionDescription> = {}, gatekeeperId = GK) {
+  return {gatekeeperId, description: {
     title: "Edit the thing",
     description: "Edits the thing.",
     implementsRevert: true,
     actionKind: { tag: "edit", label: "Edits" },
     autoApprovable: true,
     ...overrides,
-  };
+  }};
 }
 
 describe("autoApprovalRule", () => {
   it("returns the enabling rule when every gate passes", () => {
     let storage = makeStorage();
     enableRule(storage);
-    let rule = autoApprovalRule(storage, GK, eligibleDescription());
+    let rule = autoApprovalRule(storage, eligibleAction());
     expect(rule?.enabledBy).toEqual(ENABLER);
   });
 
   it("requires the author's autoApprovable verdict", () => {
     let storage = makeStorage();
     enableRule(storage);
-    expect(autoApprovalRule(storage, GK, eligibleDescription({ autoApprovable: undefined })))
+    expect(autoApprovalRule(storage, eligibleAction({ autoApprovable: undefined })))
         .toBeUndefined();
-    expect(autoApprovalRule(storage, GK, eligibleDescription({ autoApprovable: false })))
+    expect(autoApprovalRule(storage, eligibleAction({ autoApprovable: false })))
         .toBeUndefined();
   });
 
   it("requires an actionKind", () => {
     let storage = makeStorage();
     enableRule(storage);
-    expect(autoApprovalRule(storage, GK, eligibleDescription({ actionKind: undefined })))
+    expect(autoApprovalRule(storage, eligibleAction({ actionKind: undefined })))
         .toBeUndefined();
   });
 
   it("requires a user-enabled rule for the kind on this gatekeeper", () => {
     let storage = makeStorage();
-    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    expect(autoApprovalRule(storage, eligibleAction())).toBeUndefined();
     enableRule(storage, "edit", GK + 1);  // right tag, wrong gatekeeper
-    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    expect(autoApprovalRule(storage, eligibleAction())).toBeUndefined();
     enableRule(storage, "delete", GK);    // right gatekeeper, wrong tag
-    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    expect(autoApprovalRule(storage, eligibleAction())).toBeUndefined();
   });
 
   it("refuses every action while the restricted-data latch is set", () => {
@@ -348,7 +348,13 @@ describe("autoApprovalRule", () => {
     storage.containsRestrictedData.put(true);
     // The latch is workspace-wide: every action submitAction lets pend must be read by a human,
     // on every gatekeeper.
-    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
-    expect(autoApprovalRule(storage, GK + 1, eligibleDescription())).toBeUndefined();
+    expect(autoApprovalRule(storage, eligibleAction())).toBeUndefined();
+    expect(autoApprovalRule(storage, eligibleAction({}, GK + 1))).toBeUndefined();
+  });
+
+  it("requires explicit reconciliation after an uncertain contextual attempt", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    expect(autoApprovalRule(storage, {...eligibleAction(), contextualAttempted: true})).toBeUndefined();
   });
 });

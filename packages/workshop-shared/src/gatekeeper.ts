@@ -17,7 +17,7 @@
 // `Adapter` type is the root interface implemented by the service binding.
 
 import type { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
-import type { AgentContext } from "./agent-integration";
+import type { AgentContext, GatekeeperActionContext } from "./agent-integration";
 
 /**
  * A pagination cursor.
@@ -1104,6 +1104,13 @@ export interface Gatekeeper<Session> extends DurableObject {
    * declaration).
    */
   applyAction(action: number, cache: RpcStub<GitCache>): Promise<void>;
+
+  /**
+   * Opt-in contextual apply, enabled only by trusted deployment configuration. Receives fresh
+   * capabilities after approval. No automatic retry or fallback to legacy applyAction occurs:
+   * a lost response may have followed a successful effect. Receiver idempotency still applies.
+   */
+  applyActionInContext?(action: number, context: RpcStub<GatekeeperActionContext>): Promise<void>;
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any

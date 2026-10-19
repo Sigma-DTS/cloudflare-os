@@ -14,8 +14,9 @@ export function agentIntegrationGrant(config: string | undefined, vendor: string
     const grant: unknown = parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? Object.getOwnPropertyDescriptor(parsed, vendor)?.value : undefined;
     if (!grant || typeof grant !== "object" || Array.isArray(grant) ||
-        Object.entries(grant).some(([k, v]) => k !== "lifecycle" || typeof v !== "boolean")) return {};
-    return {lifecycle: Reflect.get(grant, "lifecycle") === true};
+        Object.entries(grant).some(([k, v]) => !["lifecycle", "contextualActions"].includes(k) || typeof v !== "boolean")) return {};
+    return {lifecycle: Reflect.get(grant, "lifecycle") === true,
+      contextualActions: Reflect.get(grant, "contextualActions") === true};
   } catch { return {}; }
 }
 
@@ -69,33 +70,35 @@ export class AgentIntegrations {
     this.changed();
   }
 
-  context(gatekeeperId: number, origin: AgentIntegrationOrigin | undefined): AgentContext | null {
+  context(gatekeeperId: number, origin: AgentIntegrationOrigin | undefined,
+      phase: "running" | "applyingAction" = "running", valid = () => true): AgentContext | null {
     if (!origin) return null;
     const grant = this.impl.integrationGrant(gatekeeperId);
-    if (!grant.lifecycle) return null;
-    this.turn(origin);
-    return new AgentContextImpl(this, gatekeeperId, origin);
+    if (!grant.lifecycle && !grant.contextualActions) return null;
+    this.turn(origin, phase);
+    return new AgentContextImpl(this, gatekeeperId, origin, phase, undefined, valid);
   }
 
-  checkContext(gatekeeperId: number, origin: AgentIntegrationOrigin): AgentTurnInfo {
+  checkContext(gatekeeperId: number, origin: AgentIntegrationOrigin,
+      phase: "running" | "applyingAction"): AgentTurnInfo {
     const grant = this.impl.integrationGrant(gatekeeperId);
-    if (!grant.lifecycle) throw new Error("Agent integration grant revoked.");
-    return this.turn(origin);
+    if (!grant.lifecycle && !grant.contextualActions) throw new Error("Agent integration grant revoked.");
+    return this.turn(origin, phase);
   }
 
-  turn(origin: AgentIntegrationOrigin): AgentTurnInfo {
+  turn(origin: AgentIntegrationOrigin, phase: "running" | "applyingAction"): AgentTurnInfo {
     const row = this.impl.storage.activeAgents.get(origin.chatId);
     if (row?.integration?.turnId !== origin.turnId || row.integration.segmentId !== origin.segmentId ||
-        !this.impl.storage.chatMeta.get(origin.chatId)?.activeAgent) {
+        (phase === "running" && !this.impl.storage.chatMeta.get(origin.chatId)?.activeAgent)) {
       throw new Error("Agent integration context expired.");
     }
-    return {...origin, chatId: String(origin.chatId), phase: "running"};
+    return {...origin, chatId: String(origin.chatId), phase};
   }
 
   register(gatekeeperId: number, origin: AgentIntegrationOrigin,
-      participant: Fetcher<AgentTurnParticipant>): void {
+      phase: "running" | "applyingAction", participant: Fetcher<AgentTurnParticipant>): void {
     if (!this.impl.integrationGrant(gatekeeperId).lifecycle) throw new Error("Lifecycle access not granted.");
-    this.turn(origin);
+    this.turn(origin, phase);
     const id = `${origin.turnId}:${gatekeeperId}`;
     if (this.impl.storage.agentParticipants.get(id)) return;
     this.impl.storage.agentParticipants.put({id, chatId: origin.chatId, gatekeeperId,
@@ -132,7 +135,7 @@ export class AgentIntegrations {
           const closing = this.deliveryTurn(id, event).phase !== "running";
           if (closing || this.impl.integrationGrant(r.gatekeeperId).lifecycle) {
             const context = new AgentContextImpl(this, r.gatekeeperId,
-              {chatId: r.chatId, turnId: event.turnId, segmentId: event.segmentId}, {id, event}, () => active);
+              {chatId: r.chatId, turnId: event.turnId, segmentId: event.segmentId}, "running", {id, event}, () => active);
             await Promise.race([r.participant.onAgentTurnEvent(event, context), new Promise<never>((_, reject) => {
               timer = setTimeout(() => reject(new Error("Lifecycle callback timed out.")), 60 * 60 * 1_000);
             })]);
@@ -184,12 +187,12 @@ export class AgentIntegrations {
 @validateRpc()
 class AgentContextImpl extends RpcTarget implements AgentContext {
   constructor(private integrations: AgentIntegrations, private gatekeeperId: number,
-      private origin: AgentIntegrationOrigin,
+      private origin: AgentIntegrationOrigin, private phase: "running" | "applyingAction",
       private delivery?: {id: string; event: AgentTurnEvent}, private valid = () => true) { super(); }
   #turn() {
     if (!this.valid()) throw new Error("Agent integration context expired.");
     return this.delivery ? this.integrations.deliveryTurn(this.delivery.id, this.delivery.event)
-      : this.integrations.checkContext(this.gatekeeperId, this.origin);
+      : this.integrations.checkContext(this.gatekeeperId, this.origin, this.phase);
   }
   async getTurn(): Promise<AgentTurnInfo> {
     return this.#turn();
@@ -199,6 +202,6 @@ class AgentContextImpl extends RpcTarget implements AgentContext {
     if (this.delivery) {
       return; // Already registered; never await our own callback or replace its durable target.
     }
-    this.integrations.register(this.gatekeeperId, this.origin, participant);
+    this.integrations.register(this.gatekeeperId, this.origin, this.phase, participant);
   }
 }

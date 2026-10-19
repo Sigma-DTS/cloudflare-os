@@ -5,7 +5,6 @@
 
 import type { Collection, NonUniqueIndex, Singleton } from "@gadgets/typed-storage";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
-import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { createWorkshopLogger } from "./observability";
 import type { ActionRecord, AutoApproveTagRecord } from "./storage-schema/overseer-storage.js";
 
@@ -23,11 +22,15 @@ export interface AutoApprovalStorage {
 /**
  * The single authority on whether an action may be applied without a human: the enabling rule if
  * the author marked the action `autoApprovable`, the user enabled a rule for its `actionKind` on
- * this gatekeeper, and the workspace has not latched restricted mode; else undefined.
+ * this gatekeeper, the workspace has not latched restricted mode, and no uncertain contextual
+ * attempt requires explicit reconciliation; else undefined.
  */
 export function autoApprovalRule(
-    storage: AutoApprovalStorage, gatekeeperId: number, description: ActionDescription)
+    storage: AutoApprovalStorage,
+    action: Pick<ActionRecord & {type: "action"}, "gatekeeperId" | "description" | "contextualAttempted">)
     : AutoApproveTagRecord | undefined {
+  if (action.contextualAttempted) return undefined;
+  const {gatekeeperId, description} = action;
   if (description.autoApprovable !== true) return undefined;
   let tag = description.actionKind?.tag;
   if (tag === undefined) return undefined;
@@ -83,7 +86,7 @@ export class AutoApprovalDrainer {
   // invariant that nothing is silently applied past a human gate.
   //
   // Eligibility is `autoApprovalRule()`: the author's `autoApprovable` verdict, a user-enabled
-  // rule for the action's kind, and no restricted-data latch.
+  // rule for the action's kind, no restricted-data latch, and no uncertain-attempt fence.
   async #drainOnce(gatekeeperId: number): Promise<void> {
     // Materialize before applying: the index yields lazily in ascending id order, and applying
     // mutates it mid-iteration. Actions created after this snapshot trigger their own drain(),
@@ -93,18 +96,16 @@ export class AutoApprovalDrainer {
     for (let record of pending) {
       if (record.type !== "action") continue;
 
-      let rule = autoApprovalRule(this.storage, gatekeeperId, record.description);
-      if (rule === undefined) {
-        // A manual gate. Stop rather than skipping ahead to any later auto-eligible action.
-        return;
-      }
-
       // Re-check immediately before applying, to guard against a concurrent drain having already
       // taken this one.
       let fresh = this.storage.actions.get(record.id);
       if (!fresh || fresh.type !== "action" || fresh.state !== "pending") {
         continue;
       }
+      let rule = autoApprovalRule(this.storage, fresh);
+      // A manual gate, including uncertain attempts after eviction or coalesced drains. Never
+      // skip ahead to later auto-eligible actions.
+      if (rule === undefined) return;
 
       try {
         // Attribute the auto-approval to the user who enabled the rule -- it runs under their
