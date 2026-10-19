@@ -241,9 +241,14 @@ async function searchSites(api: GraphApi, query: string, from: number, size: num
   return { sites, ...(more ? { nextFrom: from + size } : {}) };
 }
 
-/** The tenant's admin, search and app catalog sites, which nobody means to bind. */
+/**
+ * The tenant's admin, search and app catalog sites, which nobody means to bind, and SharePoint
+ * Embedded containers (`/contentstorage/`, e.g. Microsoft Designer's), which search lists as sites
+ * but the sites API refuses (verified live).
+ */
 function isSystemSite(site: GraphSite): boolean {
-  return /\/sites\/(appcatalog|search|contentTypeHub)\/?$/i.test(site.webUrl) || /-admin\.sharepoint\.com/i.test(site.webUrl);
+  return /\/sites\/(appcatalog|search|contentTypeHub)\/?$/i.test(site.webUrl) || /-admin\.sharepoint\.com/i.test(site.webUrl)
+    || /^https:\/\/[^/]+\/contentstorage\//i.test(site.webUrl);
 }
 
 /**

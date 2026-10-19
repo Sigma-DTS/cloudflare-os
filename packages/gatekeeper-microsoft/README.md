@@ -340,8 +340,8 @@ binding that has read events is the user's alone.
 
 SharePoint can break permission inheritance on any folder, file or list item. So the gatekeeper
 tracks each thing a read reveals (up to 2,000 per binding) rather than one container. Each later
-read is checked against every observer, and an observer who can't open what it revealed is left out
-of that observation. See `docs/observers.md`.
+read is checked against every observer, and a read that reveals something an observer can't open is
+blocked for as long as they remain one. See `docs/observers.md`.
 
 ## Troubleshooting
 
