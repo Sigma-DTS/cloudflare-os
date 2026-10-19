@@ -4,8 +4,8 @@ import { useNavigate, useParams, useRouter } from '@tanstack/react-router'
 import { RpcStub } from 'capnweb'
 import { PublicApi, AuthenticatedApi, AdminApi, BlueprintPublicInfo, BlueprintBinding, BlueprintBindingAssignment, BlueprintUserSummary, AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
 import { SupportedResource, VendorDescription, ResourceConfiguratorFrame, matchesResourceUrlPattern } from '@gadgets/workshop-shared/gatekeeper'
-import { Button, Dialog, DropdownMenu, Select, Tooltip, useKumoToastManager } from '@cloudflare/kumo'
-import { ArrowsOutSimple, ArrowLeft, ArrowSquareOut, DotsThree, DownloadSimple, Lightning, Plus, Robot, Sparkle, Star, Trash, X } from '@phosphor-icons/react'
+import { Banner, Button, Dialog, DropdownMenu, Select, Tooltip, useKumoToastManager } from '@cloudflare/kumo'
+import { ArrowsOutSimple, ArrowLeft, ArrowSquareOut, DotsThree, DownloadSimple, Info, Lightning, Plus, Robot, Sparkle, Star, Trash, X } from '@phosphor-icons/react'
 
 import { useAuth } from './useAuth'
 import LoginPage from './LoginPage'
@@ -811,6 +811,10 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   let meta = blueprint.metadata
   let bindingEntries = Object.entries(meta.bindings)
   let activeBinding = activeBindingName ? meta.bindings[activeBindingName] : undefined
+  let activeSharingNotice = activeBinding?.type === 'gatekeeper'
+    ? findBindingVendor(vendors, activeBinding.gatekeeperName)?.supportedResources
+      .find(r => r.urlPattern === activeBinding.typeUrlPattern)?.sharingNotice
+    : undefined
   let readyCount = bindingEntries.filter(([name]) => usableDraftAssignments[name]).length
   let unresolvedBindingName = getFirstUnresolvedBindingName()
   let remainingCount = bindingEntries.length - readyCount
@@ -1108,17 +1112,28 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
                 />
               </div>
 
-              <div className="shrink-0 flex items-center justify-end gap-2 border-t border-kumo-line px-5 py-3">
-                <WorkshopButton onClick={() => setActiveBindingName(null)}>
-                  Cancel
-                </WorkshopButton>
-                <WorkshopButton
-                  tone="primary"
-                  onClick={handleSaveActiveBinding}
-                  disabled={!canSaveActiveBinding()}
-                >
-                  Save connection
-                </WorkshopButton>
+              <div className="shrink-0 border-t border-kumo-line px-5 py-3">
+                {activeSharingNotice && (
+                  <Banner
+                    variant="alert"
+                    size="sm"
+                    icon={<Info weight="fill" />}
+                    description={activeSharingNotice}
+                    className="mb-3"
+                  />
+                )}
+                <div className="flex items-center justify-end gap-2">
+                  <WorkshopButton onClick={() => setActiveBindingName(null)}>
+                    Cancel
+                  </WorkshopButton>
+                  <WorkshopButton
+                    tone="primary"
+                    onClick={handleSaveActiveBinding}
+                    disabled={!canSaveActiveBinding()}
+                  >
+                    Save connection
+                  </WorkshopButton>
+                </div>
               </div>
             </>
           )}
@@ -1566,6 +1581,10 @@ function formatSuggestedResource(resourceUrl: string): string {
   }
 }
 
+// Blueprints name their gatekeeper case-insensitively.
+const findBindingVendor = <V extends { id: string }>(vendors: V[], gatekeeperName: string) =>
+  vendors.find(v => v.id.toLowerCase() === gatekeeperName.toLowerCase()) ?? null
+
 // A started configurator frame and the account it was started on.
 type FrameState = { key: number, frame: ResourceConfiguratorFrame, accountId: number }
 
@@ -1607,7 +1626,7 @@ function BlueprintGatekeeperBindingField({
 }) {
   const toasts = useKumoToastManager()
   const vendor = useMemo(
-    () => vendors.find(v => v.id.toLowerCase() === binding.gatekeeperName.toLowerCase()) ?? null,
+    () => findBindingVendor(vendors, binding.gatekeeperName),
     [vendors, binding.gatekeeperName],
   )
   const resource = useMemo(

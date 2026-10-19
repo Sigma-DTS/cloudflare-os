@@ -1,11 +1,12 @@
 import { logRpcFailure } from './rpcErrors'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Dialog, useKumoToastManager } from '@cloudflare/kumo'
+import { Banner, Dialog, useKumoToastManager } from '@cloudflare/kumo'
 import {
   CaretDown,
   CaretLeft,
   CaretRight,
   Database,
+  Info,
   MagnifyingGlass,
   Robot,
   Sparkle,
@@ -111,6 +112,7 @@ type ConnectionType = {
   resourceUrlPattern?: string
   // Whether this resource type is independently grantable.
   grantable?: boolean
+  sharingNotice?: string
 }
 
 type VendorOption = {
@@ -170,6 +172,7 @@ function connectionForResource(vendor: VendorOption, resource: SupportedResource
     accent: vendor.description.color,
     resourceUrlPattern: resource.urlPattern,
     grantable: Boolean(resource.grantable),
+    sharingNotice: resource.sharingNotice,
   }
 }
 
@@ -961,19 +964,30 @@ export default function GatekeeperModal({
         )}
 
         {selectedConnection && (
-          <div ref={footerRef} className="shrink-0 flex items-center justify-between gap-3 border-t border-kumo-line px-5 py-3">
-            <div />
-            <div className="flex shrink-0 items-center gap-2">
-              <WorkshopButton onClick={() => setSelectedConnectionId(null)} disabled={creating} className="!h-9">
-                Back
-              </WorkshopButton>
-              <WorkshopButton
-                tone="primary"
-                onClick={handleCreate}
-                disabled={!canCreate || creating}
-              >
-                {creating ? 'Creating...' : createLabel}
-              </WorkshopButton>
+          <div ref={footerRef} className="shrink-0 border-t border-kumo-line px-5 py-3">
+            {selectedConnection.sharingNotice && (
+              <Banner
+                variant="alert"
+                size="sm"
+                icon={<Info weight="fill" />}
+                description={selectedConnection.sharingNotice}
+                className="mb-3"
+              />
+            )}
+            <div className="flex items-center justify-between gap-3">
+              <div />
+              <div className="flex shrink-0 items-center gap-2">
+                <WorkshopButton onClick={() => setSelectedConnectionId(null)} disabled={creating} className="!h-9">
+                  Back
+                </WorkshopButton>
+                <WorkshopButton
+                  tone="primary"
+                  onClick={handleCreate}
+                  disabled={!canCreate || creating}
+                >
+                  {creating ? 'Creating...' : createLabel}
+                </WorkshopButton>
+              </div>
             </div>
           </div>
         )}
