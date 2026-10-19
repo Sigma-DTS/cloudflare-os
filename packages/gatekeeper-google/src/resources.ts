@@ -31,6 +31,7 @@ export const GMAIL_RESOURCE: SupportedResource = {
   title: "Gmail Mailbox",
   description: "Read email and, after approval, send or manage messages, drafts, and labels.",
   grantable: true,
+  sharingNotice: "A gadget using Gmail can't be shared with collaborators.",
 };
 
 /** A single Google Doc. */
@@ -96,6 +97,9 @@ export const GOOGLE_CHAT_RESOURCE: SupportedResource = {
       "or group chats with them. Covers direct messages as well as spaces, so it cannot be " +
       "shared with collaborators — connect a single conversation for that.",
   grantable: true,
+  sharingNotice:
+      "A gadget using all of Google Chat can't be shared with collaborators. A single " +
+      "conversation or thread can be.",
 };
 
 /**
@@ -148,6 +152,9 @@ export const GOOGLE_DRIVE_RESOURCE: SupportedResource = {
       "results contain metadata only, while native Google Docs, Sheets and Slides can be opened " +
       "read-only.",
   grantable: true,
+  sharingNotice:
+      "A gadget using all of Drive can stop being shareable after some reads, such as a search " +
+      "that finds nothing. Connecting a single file avoids this.",
 };
 
 /** A selected Drive folder or shared-drive root, exposed through direct-child navigation. */
@@ -158,6 +165,9 @@ export const GOOGLE_DRIVE_FOLDER_RESOURCE: SupportedResource = {
       "Browse a selected folder or shared drive, search its direct children, and read native " +
       "Google Docs, Sheets and Slides.",
   grantable: true,
+  sharingNotice:
+      "A gadget using a Drive folder can stop being shareable after some reads, such as a search " +
+      "that finds nothing. Connecting a single file avoids this.",
 };
 
 /** Metadata and, when native, read-only content for one immutable Drive file ID. */

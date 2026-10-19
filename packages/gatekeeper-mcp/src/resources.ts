@@ -7,6 +7,7 @@ const HTTPS_RESOURCE: SupportedResource = {
   urlPattern: "https://*",
   title: "Any MCP server",
   description: DESCRIPTION,
+  sharingNotice: "A gadget using an MCP server can't be shared with collaborators.",
 };
 
 const HTTP_RESOURCE: SupportedResource = { ...HTTPS_RESOURCE, urlPattern: "http://*" };

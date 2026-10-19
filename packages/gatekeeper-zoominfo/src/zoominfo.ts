@@ -165,6 +165,7 @@ const ACCOUNT_RESOURCE: SupportedResource = {
     "Whole-account access: lookup, company/contact/intent/scoop/news search, record enrichment " +
     "(consumes credits), recommendations, and account intelligence — subject to entitlements.",
   icon: { url: ZOOMINFO_LOGO_URL },
+  sharingNotice: "A gadget using ZoomInfo can't be shared with collaborators.",
 };
 
 const SUPPORTED_RESOURCES: SupportedResource[] = [ACCOUNT_RESOURCE];

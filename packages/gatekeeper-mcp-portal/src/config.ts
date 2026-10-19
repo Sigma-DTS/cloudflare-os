@@ -181,6 +181,7 @@ export function portalResource(config: PortalConfig): SupportedResource {
     title: config.name,
     description:
       "Tools from the servers behind this portal. Writes need approval.",
+    sharingNotice: "A gadget using this portal can't be shared with collaborators.",
   };
 }
 

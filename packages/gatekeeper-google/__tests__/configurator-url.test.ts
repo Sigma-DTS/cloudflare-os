@@ -259,9 +259,7 @@ describe("Google Chat configurator URLs", () => {
     expect(chatValues("spaces/%E0%A4")).toEqual({});
   });
 
-  it("explains that a conversation connection is shareable but an account one is not", () => {
-    expect(renderedCopy(chatAccountConfigurator))
-      .toContain("cannot be shared with collaborators");
+  it("explains who can open a conversation connection", () => {
     expect(renderedCopy(chatSpaceConfigurator))
       .toContain("only if their own Google account can open it too");
   });

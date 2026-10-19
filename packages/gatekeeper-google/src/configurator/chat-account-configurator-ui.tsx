@@ -21,7 +21,7 @@ export default {
           options={[{
             value: "account",
             title: "All my Google Chat conversations",
-            description: "Find and search conversations, read messages, and post, react, or edit as you. Because this includes direct messages, a Gadget using it cannot be shared with collaborators — connect a single conversation for that.",
+            description: "Find and search conversations, read messages, and post, react, or edit as you.",
           }]}
           onChange={() => setValues({ scope: "account" })}
         />

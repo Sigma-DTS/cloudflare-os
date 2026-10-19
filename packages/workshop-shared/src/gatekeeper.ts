@@ -366,6 +366,14 @@ export type SupportedResource = {
    * on this flag rather than probing, since RPC stubs cannot report optional-method presence.
    */
   creationConfigurator?: boolean;
+
+  /**
+   * Plain-text warning the Workshop shows while a user configures a connection to this type, for
+   * a type that limits who can open the gadget using it: e.g. its `addObserver()` refuses every
+   * collaborator, or some of its reads close observer admission for good. Say what the limit is
+   * and, where one exists, which narrower resource type avoids it.
+   */
+  sharingNotice?: string;
 }
 
 /** Removes every trailing slash from a string in linear time. */
