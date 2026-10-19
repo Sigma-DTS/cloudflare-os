@@ -76,10 +76,12 @@ const modified = (value: string | undefined): string | undefined => {
 // A folder or shared drive grant reaches everything in it, checked again on every read.
 const CONTAINER_CHOICE = { subtitle: "All of its contents, including anything added later" };
 
+/** As for {@link toItem}: a folder on the path whose children this account cannot list is only seen. */
 const toAncestor = (
-  { id, title }: DriveNodeAncestor,
+  { id, title, listable }: DriveNodeAncestor,
   accepted: readonly string[] | undefined,
-): ConfiguratorUIHierarchyAncestor => ({ id, title, selectable: accepts(accepted, id), choice: CONTAINER_CHOICE });
+): ConfiguratorUIHierarchyAncestor =>
+  ({ id, title, selectable: listable === true && accepts(accepted, id), choice: CONTAINER_CHOICE });
 
 /** A folder whose children this account cannot list cannot be opened or bound, only seen. */
 const toItem = (node: DriveNode, accepted: readonly string[] | undefined): ConfiguratorUIHierarchyItem => {

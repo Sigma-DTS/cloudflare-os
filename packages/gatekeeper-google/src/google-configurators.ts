@@ -9,7 +9,7 @@ import { GoogleAccessToken } from "./google-api";
 import { AccessTokenProvider, AccessTokenRequest } from "./auth-retry";
 import {
   DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, isFileInvisible,
-  type DriveFile, type DriveFileList,
+  isListableFolderFile, type DriveFile, type DriveFileList,
 } from "./drive-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
 import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurator-types";
@@ -522,7 +522,9 @@ async function drivePath(
     }
     ancestors.unshift(top);
   }
-  let folders = ancestors.map(folder => ({ id: `folder:${folder.id}`, title: folder.name }));
+  // Judged as `readFolderRoot` judges a folder binding, so the picker offers only folders that connect.
+  let folders = ancestors.map(folder =>
+    ({ id: `folder:${folder.id}`, title: folder.name, listable: isListableFolderFile(folder) }));
   if (top.driveId === top.id) return [SHARED_DRIVES, ...folders];
   if (top.driveId === undefined && top.id === await myDriveId) {
     return folders.map((folder, index) => index === 0 ? { ...folder, title: "My Drive" } : folder);

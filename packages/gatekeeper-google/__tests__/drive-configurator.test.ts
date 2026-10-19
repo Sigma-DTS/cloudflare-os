@@ -44,6 +44,7 @@ async function open() {
     ui, ensureResources,
     list: (parentId: string, query = "") =>
       find("HierarchyPicker")[0].props.loadItems({ parentId, query, cursor: null }),
+    load: (id: string) => find("HierarchyPicker")[0].props.loadItem(id),
     notices: () => find("Notice").map(node => ({ tone: node.props.tone, text: text(node) })),
     allow: () => find("Button").find(node => text(node) === "Allow access")?.props.onClick(),
   };
@@ -91,4 +92,20 @@ it("says why the grant was not given", async () => {
 
   await vi.waitFor(() => expect(frame.notices()).toContainEqual(
     { tone: "error", text: "The pop-up was closed." }));
+});
+
+it("offers only the folders on a pre-filled file's path that this account can list", async () => {
+  const frame = await open();
+  frame.ui.getDriveNode.mockResolvedValueOnce({
+    id: "file:F9", title: "Q3.pdf", kind: "file",
+    path: [
+      { id: "folder:0AMyRoot", title: "My Drive", listable: true },
+      { id: "folder:A", title: "Archive", listable: false },
+    ],
+  });
+
+  const item = await frame.load("file:F9");
+
+  expect(item.path.map(({ id, selectable }: { id: string; selectable: boolean }) => [id, selectable]))
+    .toEqual([["folder:0AMyRoot", true], ["folder:A", false]]);
 });

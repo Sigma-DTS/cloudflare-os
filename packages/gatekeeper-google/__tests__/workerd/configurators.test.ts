@@ -212,17 +212,26 @@ describe("Google resource configurators", () => {
       expect(calls.map(url => url.pathname)).not.toContain("/drive/v3/files");
     });
 
-    it("finds a pre-filled file with the folders it lives in", async () => {
+    // A folder with limited access shows its name to a reader of a file inside it, but not its
+    // children, so it can be shown on the path but not bound.
+    it("finds a pre-filled file with the folders it lives in, and which of them it can list", async () => {
+      const listable = { trashed: false, capabilities: { canListChildren: true } };
       stubDrive({
         "/files/F9": { id: "F9", name: "Q3.pdf", mimeType: "application/pdf", parents: ["A"] },
-        "/files/A": { id: "A", name: "Reports", mimeType: FOLDER, parents: ["0AMyRoot"] },
-        "/files/0AMyRoot": { id: "0AMyRoot", name: "My Drive", mimeType: FOLDER },
-        "/files/root": { id: "0AMyRoot", name: "My Drive", mimeType: FOLDER },
+        "/files/A": {
+          id: "A", name: "Archive", mimeType: FOLDER, parents: ["0AMyRoot"],
+          trashed: false, capabilities: { canListChildren: false },
+        },
+        "/files/0AMyRoot": { id: "0AMyRoot", name: "My Drive", mimeType: FOLDER, ...listable },
+        "/files/root": { id: "0AMyRoot", name: "My Drive", mimeType: FOLDER, ...listable },
       });
 
       await expect(picker().getDriveNode("file:F9")).resolves.toEqual({
         id: "file:F9", title: "Q3.pdf", kind: "file", mimeType: "application/pdf",
-        path: [{ id: "folder:0AMyRoot", title: "My Drive" }, { id: "folder:A", title: "Reports" }],
+        path: [
+          { id: "folder:0AMyRoot", title: "My Drive", listable: true },
+          { id: "folder:A", title: "Archive", listable: false },
+        ],
       });
     });
 

@@ -2,7 +2,7 @@
 export type DriveConfiguratorValues = { target?: string | null };
 
 /** An ancestor of a {@link DriveNode}, outermost first below the whole account. */
-export type DriveNodeAncestor = { id: string; title: string };
+export type DriveNodeAncestor = Pick<DriveNode, "id" | "title" | "listable">;
 
 /** A grouping, shared drive, folder or file the Drive picker shows. */
 export type DriveNode = {
