@@ -34,6 +34,7 @@ import type {
   HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
+import type { AgentTurnEvent, AgentTurnParticipant } from "@gadgets/workshop-shared/agent-integration";
 
 // =======================================================================================
 // Workpieces
@@ -775,6 +776,23 @@ export type ActiveAgentRecord = {
   callbackInitiated: boolean;
   /** Model-lookup attempts since the last successful preparation, bounded across DO resets. */
   resumeAttempts?: number;
+  /** Optional identity for integrations; readiness and progress still come from the chat log. */
+  integration?: {turnId: string; segmentId: string};
+};
+
+/** A capability's original scope, never inferred from whichever prompt happens to run later. */
+export type AgentIntegrationOrigin = {chatId: number; turnId: string; segmentId: string};
+
+/** Delivery receipts only: no copy of turn progress, waits, model, caller, or execution status. */
+export type AgentParticipantRecord = {
+  id: string;
+  chatId: number;
+  gatekeeperId: number;
+  turnId: string;
+  participant: Fetcher<AgentTurnParticipant>;
+  pending: AgentTurnEvent[];
+  lastEvent?: string;
+  retryAt?: number;
 };
 
 /**
@@ -1169,6 +1187,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     singletons: {
       // Initialized on first startup.
       ownerId: <string | undefined>undefined,
+      // A failed lifecycle cleanup leaves deletion retryable, but must not restart agent work.
+      deleting: false,
 
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
       // at construction time.
@@ -1412,6 +1432,14 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // `ActiveAgentRecord`.
       activeAgents: collection<ActiveAgentRecord>()({
         primaryKey: "chatId"
+      }),
+
+      agentParticipants: collection<AgentParticipantRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {
+          byChat: (r: AgentParticipantRecord) => r.chatId,
+          retryAt: (r: AgentParticipantRecord) => r.retryAt ?? null,
+        },
       }),
 
       gadgetResponseDeliveries: collection<ExternalMessageRecord>()({

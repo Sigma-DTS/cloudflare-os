@@ -23,6 +23,8 @@ export default defineConfig({
   ],
   test: {
     include: ["__integration__/*.test.ts"],
+    // As in the unit config, cached transforms are incompatible with the Workers pool on reruns.
+    fsModuleCache: false,
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ["@gadgets/scripts/assert-workerd"],
     // Whichever test runs first pays for workerd booting and instantiating the whole backend
