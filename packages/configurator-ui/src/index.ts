@@ -250,6 +250,11 @@ export type ConfiguratorUIHierarchyPage = {
   items: ConfiguratorUIHierarchyItem[];
   /** Present when more nodes follow; passed back as the next request's `cursor`. */
   nextCursor?: string | null;
+  /**
+   * Why this location cannot be listed yet, such as a grant the user has still to give. Shown with
+   * Retry in place of its nodes, as a rejected load is, but expected, so not reported as an error.
+   */
+  unavailable?: string;
 };
 
 /** Props of {@link HierarchyPicker}. */

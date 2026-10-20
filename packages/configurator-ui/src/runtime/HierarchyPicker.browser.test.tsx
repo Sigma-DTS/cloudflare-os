@@ -15,8 +15,11 @@ import type {
   HierarchyPickerProps,
 } from "../index.ts";
 import { HierarchyPicker } from "./HierarchyPicker.tsx";
+import { reportFrontendIssue } from "./reporting.ts";
 import { createConfiguratorStore } from "./store.ts";
 import { StoreContext } from "./storeContext.ts";
+
+vi.mock("./reporting.ts", () => ({ reportFrontendIssue: vi.fn() }));
 
 type Item = ConfiguratorUIHierarchyItem;
 type LoadItems = (request: ConfiguratorUIHierarchyRequest) => Promise<ConfiguratorUIHierarchyPage>;
@@ -556,6 +559,24 @@ describe("loading", () => {
 
     loadItems.mockResolvedValueOnce({ items: [budget] });
     await userEvent.click(page.getByRole("button", { name: "Retry" }));
+    await expect.element(option("Budget.xlsx")).toBeVisible();
+  });
+
+  it("says why a location is unavailable, with Retry, without reporting it as a failure", async () => {
+    vi.mocked(reportFrontendIssue).mockClear();
+    const loadItems = vi.fn<LoadItems>(async () => ({ items: [budget] }))
+      .mockRejectedValueOnce(new Error("Drive is down."))
+      .mockResolvedValueOnce({ items: [], unavailable: "Allow access below, then select Retry." });
+    await render({ loadItems });
+    const retry = page.getByRole("button", { name: "Retry" });
+
+    await expect.element(page.getByText("Drive is down.")).toBeVisible();
+    await userEvent.click(retry);
+    await expect.element(page.getByText("Allow access below, then select Retry.")).toBeVisible();
+    expect(reportFrontendIssue).toHaveBeenCalledExactlyOnceWith(
+      "configurator.hierarchy-load", new Error("Drive is down."));
+
+    await userEvent.click(retry);
     await expect.element(option("Budget.xlsx")).toBeVisible();
   });
 

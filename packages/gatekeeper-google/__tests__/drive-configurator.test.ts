@@ -54,7 +54,9 @@ it("asks for the grant a location names, then stops once a listing loads", async
   const frame = await open();
   frame.ui.listDriveNodes.mockResolvedValueOnce({ nodes: [], needsGrant: GRANT });
 
-  await expect(frame.list("shared-drives")).rejects.toThrow("Allow it below, then select Retry.");
+  // Expected, so said as an unavailable location rather than a failure the picker would report.
+  await expect(frame.list("shared-drives")).resolves.toEqual(
+    { items: [], unavailable: expect.stringContaining("Allow it below, then select Retry.") });
   expect(frame.notices()).toEqual([GRANT_NOTICE]);
   frame.allow();
   expect(frame.ensureResources).toHaveBeenCalledExactlyOnceWith([GRANT]);
@@ -74,8 +76,8 @@ it.each([
   const reply = Promise.withResolvers<DriveNodePage>();
   frame.ui.listDriveNodes.mockReturnValueOnce(reply.promise).mockResolvedValueOnce(newer);
 
-  const stale = frame.list("shared-drives", query).catch(() => {});
-  await frame.list("drive").catch(() => {});
+  const stale = frame.list("shared-drives", query);
+  await frame.list("drive");
   reply.resolve(older);
   await stale;
 
@@ -87,7 +89,7 @@ it("says why the grant was not given", async () => {
   frame.ui.listDriveNodes.mockResolvedValueOnce({ nodes: [], needsGrant: GRANT });
   frame.ensureResources.mockRejectedValueOnce(new Error("The pop-up was closed."));
 
-  await expect(frame.list("shared-drives")).rejects.toThrow();
+  await frame.list("shared-drives");
   frame.allow();
 
   await vi.waitFor(() => expect(frame.notices()).toContainEqual(

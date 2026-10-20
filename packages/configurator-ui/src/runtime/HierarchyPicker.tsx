@@ -84,9 +84,15 @@ const sanitizeItem = (value: unknown): Item | undefined => {
   };
 };
 
+/** A page saying its location cannot be listed yet: shown as a failed load is, but expected. */
+class Unavailable extends Error {}
+
 /** One page, refused whole rather than truncated when it is too long to show. */
 const sanitizePage = (page: unknown): Page => {
-  const { items, nextCursor } = (page && typeof page === "object" ? page : {}) as Record<string, unknown>;
+  const { items, nextCursor, unavailable } =
+    (page && typeof page === "object" ? page : {}) as Record<string, unknown>;
+  const reason = displayText(unavailable);
+  if (reason) throw new Unavailable(reason);
   const listed: unknown[] = Array.isArray(items) ? items : [];
   if (listed.length > MAX_OPTIONS) {
     throw new Error(`The list returned more than ${MAX_OPTIONS} items in one page.`);
@@ -98,6 +104,10 @@ const requestPage = (
   loadItems: HierarchyPickerProps["loadItems"],
   request: ConfiguratorUIHierarchyRequest,
 ): Promise<Page> => Promise.resolve().then(() => loadItems(request)).then(sanitizePage);
+
+const reportLoadFailure = (error: unknown) => {
+  if (!(error instanceof Unavailable)) reportFrontendIssue("configurator.hierarchy-load", error);
+};
 
 /** `incoming` after `existing`, skipping ids already listed, which would collide as row keys. */
 const appendUnique = (existing: readonly Item[], incoming: readonly Item[]): Item[] => {
@@ -293,7 +303,7 @@ const Navigator = (props: HierarchyPickerProps) => {
         nextCursor: page.nextCursor, status: "ready", loadingMore: false });
     }, error => {
       if (generation.current !== token) return;
-      reportFrontendIssue("configurator.hierarchy-load", error);
+      reportLoadFailure(error);
       setListing({ parentId: locationId, query, items: [], nextCursor: null, status: "failed",
         message: failureMessage(error, "Could not load items."), loadingMore: false });
     });
@@ -438,7 +448,7 @@ const Navigator = (props: HierarchyPickerProps) => {
         nextCursor: page.nextCursor, loadingMore: false });
     }, error => {
       if (generation.current !== token) return;
-      reportFrontendIssue("configurator.hierarchy-load", error);
+      reportLoadFailure(error);
       setListing(shown => shown && { ...shown, loadingMore: false,
         moreMessage: failureMessage(error, "Could not load more items.") });
     });

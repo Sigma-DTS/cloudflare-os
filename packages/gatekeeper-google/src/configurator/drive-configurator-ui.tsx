@@ -167,10 +167,9 @@ export default {
               access = page.needsGrant ? { grant: page.needsGrant } : null;
               setValues({});
             }
-            if (page.needsGrant) {
-              throw new Error("Listing shared drives needs one more permission from Google. Allow it below, then select Retry.");
-            }
-            return { items: page.nodes.map(node => toItem(node, accepted)), nextCursor: page.nextCursor };
+            return page.needsGrant
+              ? { items: [], unavailable: "Listing shared drives needs one more permission from Google. Allow it below, then select Retry." }
+              : { items: page.nodes.map(node => toItem(node, accepted)), nextCursor: page.nextCursor };
           }}
           loadItem={async id => {
             const node = await ui.getDriveNode(id);
