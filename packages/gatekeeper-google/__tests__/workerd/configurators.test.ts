@@ -74,6 +74,18 @@ describe("Google resource configurators", () => {
       });
     });
 
+    // A reconnect from the picker's Allow access can sign the account in as someone else.
+    it("reads My Drive's root afresh for every listing", async () => {
+      const browser = picker();
+      stubDrive({ "/files/root": { id: "alice-root", name: "My Drive" } });
+      await browser.listDriveNodes("drive", "", null);
+      stubDrive({ "/files/root": { id: "bob-root", name: "My Drive" } });
+
+      await expect(browser.listDriveNodes("drive", "", null)).resolves.toMatchObject({
+        nodes: expect.arrayContaining([expect.objectContaining({ id: "folder:bob-root" })]),
+      });
+    });
+
     it("lists a folder's children folders first, a shortcut standing for its target", async () => {
       const calls = stubDrive({
         "/files": {
@@ -235,8 +247,8 @@ describe("Google resource configurators", () => {
       });
     });
 
-    it("places a pre-filled folder in its shared drive", async () => {
-      stubDrive({
+    it("places a pre-filled folder in its shared drive, without asking for My Drive", async () => {
+      const calls = stubDrive({
         "/files/D2": {
           id: "D2", name: "Specs", mimeType: FOLDER, driveId: "0ADrive", parents: ["0ADrive"],
           capabilities: { canListChildren: true },
@@ -248,6 +260,7 @@ describe("Google resource configurators", () => {
         id: "folder:D2",
         path: [{ id: "shared-drives", title: "Shared drives" }, { id: "folder:0ADrive", title: "Engineering" }],
       });
+      expect(calls.map(url => url.pathname)).not.toContain("/drive/v3/files/root");
     });
 
     // The walk costs a request per level, so it stops 20 folders up.

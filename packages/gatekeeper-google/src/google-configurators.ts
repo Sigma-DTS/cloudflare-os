@@ -41,7 +41,6 @@ type ConfiguratorTokenGetter = (opts?: AccessTokenRequest) => Promise<GoogleAcce
 const googleTokenGetters = new WeakMap<object, ConfiguratorTokenGetter>();
 const officeConversions = new WeakMap<object, OfficeConversion>();
 const sharedDrivesGrantChecks = new WeakMap<object, () => Promise<boolean>>();
-const myDriveIds = new WeakMap<object, Promise<string>>();
 const calendarConfiguratorCaches = new WeakMap<object, Promise<ConfiguratorOption[]>>();
 const bigQueryConfiguratorCaches = new WeakMap<object, Map<string, ConfiguratorOption[]>>();
 const BIGQUERY_CONFIGURATOR_CACHE_MAX_ENTRIES = 200;
@@ -455,16 +454,9 @@ function parseDriveNodeId(id: string): { kind: "folder" | "file"; fileId: string
   return match ? { kind: match[1] as "folder" | "file", fileId: match[2] } : undefined;
 }
 
-/** My Drive's root folder id, which never changes for an account, so a picker reads it once. */
-function myDriveId(target: object, drive: DriveApi): Promise<string> {
-  let id = myDriveIds.get(target);
-  if (!id) {
-    id = drive.getFile("root").then(root => root.id);
-    // Don't let a transient API error poison the cache permanently.
-    id.catch(() => myDriveIds.delete(target));
-    myDriveIds.set(target, id);
-  }
-  return id;
+/** My Drive's root folder id, read afresh: Allow access may reconnect the account as someone else. */
+async function myDriveId(drive: DriveApi): Promise<string> {
+  return (await drive.getFile("root")).id;
 }
 
 /** The picker's node for a listed file. A shortcut stands for its target, which is what binds. */
@@ -503,13 +495,9 @@ function driveFilePage(
 /**
  * A file's ancestors up to the whole account, outermost first. Undefined when one is out of reach
  * (shared from a folder this account cannot see) or the walk is too deep, since a partial path
- * would misstate where the file lives.
+ * would misstate where the file lives. My Drive's root is read only for a path that could end there.
  */
-async function drivePath(
-  drive: DriveApi,
-  file: DriveFile,
-  myDriveId: Promise<string>,
-): Promise<DriveNodeAncestor[] | undefined> {
+async function drivePath(drive: DriveApi, file: DriveFile): Promise<DriveNodeAncestor[] | undefined> {
   let ancestors: DriveFile[] = [];
   let top = file;
   for (let parentId = top.parents?.[0]; parentId; parentId = top.parents?.[0]) {
@@ -526,7 +514,7 @@ async function drivePath(
   let folders = ancestors.map(folder =>
     ({ id: `folder:${folder.id}`, title: folder.name, listable: isListableFolderFile(folder) }));
   if (top.driveId === top.id) return [SHARED_DRIVES, ...folders];
-  if (top.driveId === undefined && top.id === await myDriveId) {
+  if (top.driveId === undefined && top.id === await myDriveId(drive)) {
     return folders.map((folder, index) => index === 0 ? { ...folder, title: "My Drive" } : folder);
   }
   return undefined;
@@ -587,7 +575,7 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
             : file.owners?.[0]?.displayName ?? file.owners?.[0]?.emailAddress ?? "My Drive");
       }
       if (parentId === DRIVE_ROOT_ID) {
-        let myDrive = await myDriveId(this, drive);
+        let myDrive = await myDriveId(drive);
         return {
           nodes: [
             { id: `folder:${myDrive}`, title: "My Drive", kind: "folder", listable: true },
@@ -633,7 +621,7 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
       // A folder named as a file, or a shortcut, is not the node the id claims.
       let node = file.trashed ? undefined : driveFileNode(file);
       if (node?.id !== id) return null;
-      let path = await drivePath(drive, file, myDriveId(this, drive));
+      let path = await drivePath(drive, file);
       return path ? { ...node, path } : node;
     });
   }
