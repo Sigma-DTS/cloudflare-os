@@ -102,6 +102,8 @@ const CLEF_QUESTIONS = {
 /** A changed file, as `pulls.listFiles` returns it. */
 export interface ChangedFile {
   filename: string;
+  /** The path before a rename or copy, which matters as much as the new one. */
+  previous_filename?: string;
   status: string;
   additions: number;
   deletions: number;
@@ -223,6 +225,15 @@ export function isHighRiskPath(filename: string): boolean {
   return HIGH_RISK_PATHS.some((glob) => matchesGlob(filename, glob));
 }
 
+/** Whether a changed file leaves or lands on a high-risk path. A rename can disable a workflow. */
+function touchesHighRiskPath({ filename, previous_filename }: ChangedFile): boolean {
+  return isHighRiskPath(filename) || (previous_filename !== undefined && isHighRiskPath(previous_filename));
+}
+
+function describePath({ filename, previous_filename }: ChangedFile): string {
+  return previous_filename === undefined ? filename : `${previous_filename} → ${filename}`;
+}
+
 /**
  * Renders the diff Clef reads, high-risk paths first so a truncated diff loses the least sensitive
  * part.
@@ -231,16 +242,14 @@ export function isHighRiskPath(filename: string): boolean {
  * @returns The state text, and whether any of the change was left out of it.
  */
 export function buildClefState(files: ChangedFile[]): { state: string; complete: boolean } {
-  const ordered = files.toSorted(
-    (a, b) => Number(isHighRiskPath(b.filename)) - Number(isHighRiskPath(a.filename)),
-  );
+  const ordered = files.toSorted((a, b) => Number(touchesHighRiskPath(b)) - Number(touchesHighRiskPath(a)));
   let complete = true;
   let state = "";
   for (const file of ordered) {
     // A text diff with no patch was too large for the API to inline; binary files change 0 lines.
     if (file.patch === undefined && file.changes > 0) complete = false;
     const section =
-      `--- ${file.filename} (${file.status}, +${file.additions} -${file.deletions})\n` +
+      `--- ${describePath(file)} (${file.status}, +${file.additions} -${file.deletions})\n` +
       `${file.patch ?? "(diff not shown)"}\n`;
     if (state.length + section.length > MAX_STATE_CHARS) return { state, complete: false };
     state += section;
@@ -261,7 +270,7 @@ export function classifyChangeset({ files, complete, clef }: {
 }): Classification {
   const reasons: string[] = [];
 
-  const sensitive = files.filter((file) => isHighRiskPath(file.filename)).map((f) => f.filename);
+  const sensitive = files.filter(touchesHighRiskPath).map(describePath);
   if (sensitive.length > 0) {
     reasons.push(`touches a high-risk path (${sensitive.slice(0, 3).join(", ")}` +
       `${sensitive.length > 3 ? `, and ${sensitive.length - 3} more` : ""})`);

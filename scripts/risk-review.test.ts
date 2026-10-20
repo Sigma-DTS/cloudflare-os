@@ -77,6 +77,13 @@ describe("isHighRiskPath", () => {
 });
 
 describe("buildClefState", () => {
+  it("shows where a renamed file came from", () => {
+    const { state } = buildClefState([
+      file("docs/preview.yml", { status: "renamed", previous_filename: ".github/workflows/preview.yml" }),
+    ]);
+    assert.match(state, /^--- \.github\/workflows\/preview\.yml → docs\/preview\.yml \(renamed/);
+  });
+
   it("puts high-risk files first", () => {
     const { state, complete } = buildClefState([file("docs/a.md"), file("packages/workshop-shared/src/api.ts")]);
     assert.ok(state.indexOf("api.ts") < state.indexOf("docs/a.md"));
@@ -122,6 +129,20 @@ describe("classifyChangeset", () => {
 
   it("rates a diff that addresses the classifier high", () => {
     assert.equal(classify({ clef: { high: 0, steering: 0.8 } }).tier, "high");
+  });
+
+  it("rates a rename out of a high-risk path high", () => {
+    const rename = file("docs/preview.yml", {
+      status: "renamed",
+      previous_filename: ".github/workflows/preview.yml",
+      additions: 0,
+      deletions: 0,
+      changes: 0,
+      patch: undefined,
+    });
+    const { tier, reasons } = classify({ files: [rename], complete: buildClefState([rename]).complete });
+    assert.equal(tier, "high");
+    assert.match(reasons[0], /\.github\/workflows\/preview\.yml → docs\/preview\.yml/);
   });
 
   it("names the files behind a high-risk path", () => {
