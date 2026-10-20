@@ -55,6 +55,19 @@ function inference(gate?: Promise<void>) {
   return () => count;
 }
 
+function failingInference() {
+  let count = 0;
+  const fetch = globalThis.fetch;
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.origin !== MODEL.config.apiUrl) return fetch(input, init);
+    count++;
+    return Promise.resolve(Response.json(
+        {error: {type: "invalid_request_error", message: "Model failure"}}, {status: 400}));
+  });
+  return () => count;
+}
+
 function request(impl: Impl, kind: Kind, requestId = "1:connection") {
   if (kind === "connection") {
     impl.addChatMessages(CHAT, MODEL.profile, [{type: "connectionRequest", requestId,
@@ -147,6 +160,60 @@ async function participate(impl: Impl, id: number, name = crypto.randomUUID()) {
 }
 
 describe("decision handoff using the existing execution row", () => {
+  it.each([false, true])("preserves a model error across a teardown reset (participant: %s)", async subscribed => {
+    const s = await scenario(), requests = failingInference();
+    const teardown = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    await expect(s.visit(async impl => {
+      if (subscribed) await participate(impl, 31);
+      vi.spyOn(impl, "reconcilePendingGadgets")
+        .mockImplementationOnce(async () => {})
+        .mockImplementationOnce(async () => { teardown.resolve(); await release.promise; });
+      decide(impl, "connection");
+      impl.resumeAgentAfterDecision(CHAT);
+      await teardown.promise;
+      expect(impl.storage.activeAgents.get(CHAT)?.finishing).toBe(true);
+      await impl.ctx.storage.sync();
+      impl.ctx.abort("Injected reset during final teardown");
+    })).rejects.toThrow(/Injected reset/);
+    release.resolve();
+    await s.visit(async impl => {
+      await impl.waitForAllAgentsToComplete();
+      expect([...impl.storage.chats.list()].filter(m => m.type === "error"))
+        .toEqual([expect.objectContaining({message: expect.stringContaining("Model failure")})]);
+      expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
+      expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
+      expect([...impl.storage.agentParticipants.list()]).toHaveLength(0);
+    });
+    expect(requests()).toBe(1);
+  });
+
+  it("logs unread steers before failure and refuses later steers during cleanup", async () => {
+    const s = await scenario(), requests = failingInference();
+    const teardown = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    await s.visit(async impl => {
+      vi.spyOn(impl, "reconcilePendingGadgets")
+        .mockImplementationOnce(async () => {})
+        .mockImplementationOnce(async () => { teardown.resolve(); await release.promise; });
+      decide(impl, "connection");
+      impl.resumeAgentAfterDecision(CHAT);
+      expect(impl.steerRunningTurn(CHAT, s.user.id.toString(), USER, "Keep this for Retry")).toBe(true);
+      await teardown.promise;
+      try {
+        expect(impl.steerRunningTurn(CHAT, s.user.id.toString(), USER, "Too late")).toBe(false);
+        expect(() => impl.assertChatNotActive(CHAT)).toThrow();
+      } finally { release.resolve(); }
+      await impl.waitForAllAgentsToComplete();
+      expect([...impl.storage.chats.list()].slice(-2)).toEqual([
+        expect.objectContaining({type: "message", message: "Keep this for Retry", steered: true}),
+        expect.objectContaining({type: "error", message: expect.stringContaining("Model failure")}),
+      ]);
+      expect(impl.storage.chatMeta.get(CHAT)?.queuedSteers).toBeUndefined();
+      expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
+      expect(() => impl.assertChatNotActive(CHAT)).not.toThrow();
+    });
+    expect(requests()).toBe(1);
+  });
+
   it("replacing a paused turn cannot overtake its final cleanup", async () => {
     const s = await scenario(), requests = inference();
     await s.visit(async impl => {

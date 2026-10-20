@@ -6797,6 +6797,10 @@ class OverseerImpl implements AgentHooks {
     const turnTakesSteers = this.#runningAgents.has(chatId) &&
         !this.#liveChats.get(chatId)?.cancelController.signal.aborted;
     if (!isPlainTextMessage || !turnTakesSteers) return false;
+    // A logged error is terminal even while cleanup keeps the chat busy. It must stay last
+    // for Retry; only steers accepted before the failure belong to this turn.
+    const [last] = this.storage.chats.list({prefix: chatKeyPrefix(chatId), reverse: true, limit: 1});
+    if (last?.type === "error") return false;
     let meta = this.getChatMetaOrThrow(chatId);
     meta.queuedSteers = [...meta.queuedSteers ?? [], {text: message, author}];
     meta.lastActive = this.getChatTimestamp();
@@ -7383,7 +7387,7 @@ class OverseerImpl implements AgentHooks {
     // reflects the spend this turn just incurred, rather than waiting for the cache TTL to lapse.
     let byokOwnerStub: DurableObjectStub<UserDurableObject> | undefined;
     let finished = false;
-    // Why the turn ended early, posted in the `finally`.
+    // Why the turn ended early, persisted before teardown I/O in the `finally`.
     let failure: {message: string, code?: string} | undefined;
     // The turn's last model request, kept warm while the chat is viewed (see ChatCacheWarmer).
     let lastRequest: CachedRequest | undefined;
@@ -7503,6 +7507,11 @@ class OverseerImpl implements AgentHooks {
       failure = {message: errorMessage};
     } finally {
       if (owns()) {
+        // Persist the error and terminal intent in the same synchronous span. A reset during
+        // cleanup must not retire the turn without its error (and Retry affordance).
+        if (failure) {
+          this.postAgentErrorMessage(chatId, aiModel.profile, failure.message, failure.code);
+        }
         const wait = this.#decisionWait(chatId);
         const record = this.storage.activeAgents.get(chatId);
         if (record && !(finished && !liveChat.cancelController.signal.aborted && wait && !wait.denied)) {
@@ -7523,12 +7532,6 @@ class OverseerImpl implements AgentHooks {
         // so it can't mask an error propagating out of the turn.
         await this.reconcilePendingGadgets(chatId);
         if (owns()) {
-          // Posted past the turn's last await, so a steer sent as the turn winds down still lands
-          // before the error, which must stay last for Retry to show.
-          if (failure) {
-            this.postAgentErrorMessage(chatId, aiModel.profile, failure.message, failure.code);
-          }
-
           // Note: We no longer emit a stream "clear" event here. The client performs a full clear of
           // provisional streaming state when it observes that the agent is no longer running (i.e. when
           // chat metadata's activeAgent becomes unset, which happens just below).
