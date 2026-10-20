@@ -9,7 +9,7 @@ import { GoogleAccessToken } from "./google-api";
 import { AccessTokenProvider, AccessTokenRequest } from "./auth-retry";
 import {
   DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, isFileInvisible,
-  isListableFolderFile, isListableFolderNode, type DriveFile, type DriveFileList,
+  isListableFolderFile, isListableFolderNode, type DriveFile, type DriveFileList, type DriveScopeNode,
 } from "./drive-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
 import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurator-types";
@@ -460,19 +460,22 @@ async function myDriveId(drive: DriveApi): Promise<string> {
 }
 
 /**
- * The picker's node for a listed file. A shortcut stands for its target, which is what binds, so it
- * is listable only when `listableTargets` holds its target.
+ * The picker's node for a listed file. A shortcut stands for its target, as read into `targets`, and
+ * outlives it: one whose target is gone, trashed or out of reach is left out.
  */
 function driveFileNode(
-  file: DriveFile, detail?: string, listableTargets?: ReadonlySet<string>,
+  file: DriveFile, detail?: string, targets?: ReadonlyMap<string, DriveScopeNode | undefined>,
 ): DriveNode | undefined {
   let { id, mimeType } = file;
   let listable = file.capabilities?.canListChildren === true;
   if (mimeType === SHORTCUT_MIME_TYPE) {
-    if (!file.shortcutDetails?.targetId) return undefined;
-    id = file.shortcutDetails.targetId;
-    mimeType = file.shortcutDetails.targetMimeType;
-    listable = listableTargets?.has(id) ?? false;
+    let targetId = file.shortcutDetails?.targetId;
+    let target = targetId ? targets?.get(targetId) : undefined;
+    if (target?.trashed !== false) return undefined;
+    id = target.id;
+    mimeType = target.mimeType;
+    // Judged as a folder binding is, so a folder shortcut is offered only when it would connect.
+    listable = isListableFolderNode(target);
   }
   let shown = {
     title: file.name,
@@ -488,23 +491,16 @@ function drivePage(nodes: DriveNode[], nextPageToken: string | undefined): Drive
   return { nodes: tellApartSameNamed(nodes), ...(nextPageToken ? { nextCursor: nextPageToken } : {}) };
 }
 
-/**
- * A page of listed files. A listing carries no shortcut target's capabilities, so a folder
- * shortcut's target is read in one batch and judged as a folder binding would be: a shortcut
- * outlives its target being unshared.
- */
+/** A page of listed files. A listing carries nothing of a shortcut's target, so they are read in one batch. */
 async function driveFilePage(
   drive: DriveApi,
   { files, nextPageToken }: DriveFileList,
   detail?: (file: DriveFile) => string,
 ): Promise<DriveNodePage> {
-  let targetIds = files.flatMap(({ shortcutDetails: shortcut }) =>
-    shortcut?.targetId && shortcut.targetMimeType === FOLDER_MIME_TYPE ? [shortcut.targetId] : []);
-  let targets = targetIds.length > 0 ? await drive.getScopeNodes(targetIds) : [];
-  let listableTargets = new Set(targets.flatMap((target, index) =>
-    target && isListableFolderNode(target) ? [targetIds[index]] : []));
-  return drivePage(
-    files.flatMap(file => driveFileNode(file, detail?.(file), listableTargets) ?? []), nextPageToken);
+  let targetIds = files.flatMap(file => file.shortcutDetails?.targetId || []);
+  let read = await drive.getScopeNodes(targetIds);
+  let targets = new Map(targetIds.map((id, index) => [id, read[index]] as const));
+  return drivePage(files.flatMap(file => driveFileNode(file, detail?.(file), targets) ?? []), nextPageToken);
 }
 
 /**

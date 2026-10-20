@@ -118,11 +118,6 @@ describe("Google resource configurators", () => {
               id: "link", name: "Team folder", mimeType: SHORTCUT,
               shortcutDetails: { targetId: "team", targetMimeType: FOLDER },
             },
-            // Its target was unshared, which leaves the shortcut behind.
-            {
-              id: "stale", name: "Old project", mimeType: SHORTCUT,
-              shortcutDetails: { targetId: "unshared", targetMimeType: FOLDER },
-            },
             { id: "dangling", name: "Gone", mimeType: SHORTCUT, shortcutDetails: {} },
           ],
         },
@@ -138,7 +133,6 @@ describe("Google resource configurators", () => {
             modifiedTime: "2026-10-01T10:00:00Z",
           },
           { id: "folder:team", title: "Team folder", kind: "folder", listable: true },
-          { id: "folder:unshared", title: "Old project", kind: "folder", listable: false },
         ],
         nextCursor: "page-3",
       });
@@ -146,6 +140,34 @@ describe("Google resource configurators", () => {
       expect(calls[0].searchParams.get("corpora")).toBe("allDrives");
       expect(calls[0].searchParams.get("orderBy")).toBe("folder,name");
       expect(calls[0].searchParams.get("pageToken")).toBe("page-2");
+    });
+
+    // A shortcut outlives its target being deleted, unshared or trashed, and a listing says nothing
+    // of the target, so what the shortcut offers is decided by the target as read.
+    it("offers a shortcut only for a target that could be connected", async () => {
+      const shortcut = (id: string, targetId: string, targetMimeType: string) =>
+        ({ id, name: id, mimeType: SHORTCUT, shortcutDetails: { targetId, targetMimeType } });
+      stubDrive({
+        "/files": {
+          files: [
+            shortcut("Report", "q3", "application/pdf"),
+            shortcut("Restricted", "limited", FOLDER),
+            shortcut("Deleted", "gone", "application/pdf"),
+            shortcut("Unshared", "unshared", FOLDER),
+            shortcut("Binned", "trashed", "application/pdf"),
+          ],
+        },
+        "/files/q3": { id: "q3", mimeType: "application/pdf", trashed: false },
+        "/files/limited": { id: "limited", mimeType: FOLDER, trashed: false, capabilities: { canListChildren: false } },
+        "/files/trashed": { id: "trashed", mimeType: "application/pdf", trashed: true },
+      });
+
+      await expect(picker().listDriveNodes("folder:F1", "", null)).resolves.toEqual({
+        nodes: [
+          { id: "file:q3", title: "Report", kind: "file", mimeType: "application/pdf" },
+          { id: "folder:limited", title: "Restricted", kind: "folder", listable: false },
+        ],
+      });
     });
 
     it("lists the shared drives and what is shared with this account", async () => {
