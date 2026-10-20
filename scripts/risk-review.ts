@@ -3,7 +3,9 @@
 // are written structurally because this repository does not depend on the Octokit types.
 //
 // Each pull request is low, medium or high risk, and the `risk-review` commit status on its head
-// passes once that tier's human approvals are in. The rules:
+// passes once that tier's human approvals are in. The branch ruleset still requires one approving
+// review, and for a low-risk change the risk-review app gives it, so low needs no human; a broken or
+// skipped run therefore fails toward needing one. The rules:
 //
 // - The classifier sets the tier, never the author. Some paths set a minimum tier; Clef, a Workers
 //   AI decision model, may only raise the tier above that. The author's title and description are
@@ -143,6 +145,7 @@ export interface ChangedFile {
 
 /** A pull request review, reduced to what the approval count reads. */
 export interface Review {
+  id: number;
   user?: GitHubUser | null;
   /** `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED` or `PENDING`. */
   state: string;
@@ -207,6 +210,14 @@ export interface GitHubClient {
       list: unknown;
       listFiles: unknown;
       listReviews: unknown;
+      createReview(args: RepoRef & {
+        pull_number: number;
+        commit_id: string;
+        event: "APPROVE";
+        body: string;
+      }): Promise<unknown>;
+      dismissReview(args: RepoRef & { pull_number: number; review_id: number; message: string }):
+          Promise<unknown>;
     };
     repos: {
       getCollaboratorPermissionLevel(args: RepoRef & { username: string }):
@@ -427,7 +438,7 @@ export function evaluateGate({ tier, approvers, blockers, directors, headSha }: 
   return {
     state: "success",
     description: required === 0
-      ? "low risk: automated review only"
+      ? "low risk: approved on automated review"
       : `${tier} risk: approved by ${approvers.map((login) => `@${login}`).join(", ")}`,
   };
 }
@@ -569,15 +580,44 @@ export async function authorizeRiskReview({ github, context, core }: {
 }
 
 /**
- * Classifies the pull request the event is about and posts its `risk-review` status.
- *
- * @param options GitHub Actions runtime dependencies, plus Clef's credentials and, in tests, `fetch`.
+ * Keeps the app's own approval in step with the verdict: a low-risk change that passes the gate gets
+ * the approving review the ruleset requires, and anything else loses it. A push dismisses it anyway,
+ * but a change can also stop being low without one, through a new base or a change request.
  */
-export async function runRiskReview({ github, context, core, clef, fetchImpl }: {
+async function syncApproval(
+  github: GitHubClient,
+  pull: RepoRef & { pull_number: number },
+  { approver, reviews, headSha, approve, description }: {
+    approver: string;
+    reviews: Review[];
+    headSha: string;
+    approve: boolean;
+    description: string;
+  },
+): Promise<void> {
+  const standing = reviews.filter((review) => review.user?.login === approver && review.state === "APPROVED");
+  if (!approve) {
+    for (const review of standing) {
+      await github.rest.pulls.dismissReview({ ...pull, review_id: review.id, message: description });
+    }
+  } else if (!standing.some((review) => review.commit_id === headSha)) {
+    await github.rest.pulls.createReview({ ...pull, commit_id: headSha, event: "APPROVE", body: description });
+  }
+}
+
+/**
+ * Classifies the pull request the event is about, posts its `risk-review` status, and approves it
+ * when it is low risk.
+ *
+ * @param options GitHub Actions runtime dependencies; Clef's credentials; the risk-review app's bot
+ *     login, without which nothing is approved; and, in tests, `fetch`.
+ */
+export async function runRiskReview({ github, context, core, clef, approver, fetchImpl }: {
   github: GitHubClient;
   context: ActionsContext;
   core: ActionsCore;
   clef: ClefConfig;
+  approver?: string;
   fetchImpl?: typeof fetch;
 }): Promise<void> {
   const { owner, repo } = context.repo;
@@ -627,6 +667,15 @@ export async function runRiskReview({ github, context, core, clef, fetchImpl }: 
     return;
   }
   await postStatus(github, context, headSha, result);
+  if (approver) {
+    await syncApproval(github, { owner, repo, pull_number: pullRequest.number }, {
+      approver,
+      reviews,
+      headSha,
+      approve: classification.tier === "low" && result.state === "success",
+      description: result.description,
+    });
+  }
   await core.summary
     .addHeading(`#${pullRequest.number} at ${headSha.slice(0, 7)}: ${classification.tier} risk`)
     .addList(classification.reasons.length > 0 ? classification.reasons : ["nothing raised it"])

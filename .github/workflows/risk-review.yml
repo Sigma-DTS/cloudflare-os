@@ -2,7 +2,9 @@ name: Risk review
 
 # Classifies each pull request as low, medium or high risk and posts the `risk-review` commit status
 # on its head, which passes once that tier's human approvals of the head commit are in (0, 1, 1).
-# The rules and the reasons behind them are in scripts/risk-review.ts.
+# The ruleset keeps requiring one approving review; the risk-review app gives it to a low-risk head
+# and dismisses it once the change is no longer low. The rules and the reasons behind them are in
+# scripts/risk-review.ts.
 #
 # Both triggers run this file and the script from the base branch, never the pull request's copy,
 # so a change cannot rewrite its own classifier. Nothing checks out the pull request's code: the
@@ -10,10 +12,10 @@ name: Risk review
 # risk-review-trigger.yml, because `pull_request_review` runs the pull request's own copy of the
 # workflow, with a read-only token when the head is in a fork.
 #
-# Statuses are posted as the risk-review GitHub App, and the ruleset accepts `risk-review` only from
-# it. Its key is a secret of the `risk-review` and `risk-review-external` environments, which allow
+# Statuses and approvals come from the risk-review GitHub App, and the ruleset accepts `risk-review`
+# only from it. Its key is a secret of the `risk-review` and `risk-review-external` environments, which allow
 # deployments from `main` alone: runs of this file are on `main`, while a workflow a pull request adds
-# runs on its own ref and can neither read the key nor post a status the ruleset accepts. The key must
+# runs on its own ref and can neither read the key nor post a status or approval as the app. The key must
 # never be a repository secret, which those workflows can read.
 #
 # A maintainer's pull request (write access or above, the same check as Bonk's break-glass) is
@@ -63,7 +65,8 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
-      # Until the app is set up, the job token posts the statuses, which the ruleset must not accept.
+      # Until the app is set up, the job token posts the statuses, which the ruleset must not accept,
+      # and nothing is approved.
       - &app-token
         name: Mint the risk-review app's token
         id: app
@@ -72,7 +75,7 @@ jobs:
         with:
           app-id: ${{ vars.RISK_REVIEW_APP_ID }}
           private-key: ${{ secrets.RISK_REVIEW_APP_PRIVATE_KEY }}
-          permission-pull-requests: read
+          permission-pull-requests: write
           permission-statuses: write
 
       - name: Check the author's permission
@@ -115,6 +118,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_AI_GATEWAY_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
           CLOUDFLARE_GATEWAY_ID: ${{ secrets.CF_AI_GATEWAY_NAME }}
+          RISK_REVIEW_APPROVER: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || '' }}
         with:
           github-token: ${{ steps.app.outputs.token || github.token }}
           script: |
@@ -130,6 +134,7 @@ jobs:
                 apiToken: process.env.CLOUDFLARE_API_TOKEN,
                 gatewayId: process.env.CLOUDFLARE_GATEWAY_ID,
               },
+              approver: process.env.RISK_REVIEW_APPROVER || undefined,
             });
 
   external:

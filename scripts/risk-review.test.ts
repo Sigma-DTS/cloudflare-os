@@ -46,9 +46,13 @@ function file(filename: string, overrides: Partial<ChangedFile> = {}): ChangedFi
   };
 }
 
+let reviewIds = 0;
+
 function review(login: string, state: string, commit = HEAD, type = "User"): Review {
-  return { user: { login, type }, state, commit_id: commit };
+  return { id: ++reviewIds, user: { login, type }, state, commit_id: commit };
 }
+
+const APP = "risk-review[bot]";
 
 describe("pathFloor", () => {
   it("puts all of workshop-backend, the gate itself and the security chokepoints at high", () => {
@@ -220,7 +224,7 @@ function gate(overrides: Partial<Parameters<typeof evaluateGate>[0]>) {
 
 describe("evaluateGate", () => {
   it("passes low risk with no approvals", () => {
-    assert.deepEqual(gate({}), { state: "success", description: "low risk: automated review only" });
+    assert.deepEqual(gate({}), { state: "success", description: "low risk: approved on automated review" });
   });
 
   it("requires one approval for medium and for high risk", () => {
@@ -323,6 +327,7 @@ function harness({
   payload?: Omit<ActionsContext["payload"], "repository">;
 }) {
   const statuses: RecordedStatus[] = [];
+  const reviewCalls: { call: string; commit_id?: string; review_id?: number; body?: string }[] = [];
   const listed: unknown[] = [];
   const outputs: Record<string, string> = {};
   const routes = { list: Symbol("list"), listFiles: Symbol("listFiles"), listReviews: Symbol("listReviews") };
@@ -338,7 +343,16 @@ function harness({
   };
   const github: GitHubClient = {
     rest: {
-      pulls: { get: async () => ({ data: pull }), ...routes },
+      pulls: {
+        get: async () => ({ data: pull }),
+        createReview: async ({ commit_id, event, body }) => {
+          reviewCalls.push({ call: event, commit_id, body });
+        },
+        dismissReview: async ({ review_id }) => {
+          reviewCalls.push({ call: "DISMISS", review_id });
+        },
+        ...routes,
+      },
       repos: {
         getCollaboratorPermissionLevel: async ({ username }) => ({
           data: { permission: permissions[username] ?? "read" },
@@ -383,10 +397,12 @@ function harness({
       context: contextFor(runId),
       core,
       clef: { accountId: "a", apiToken: "t" },
+      approver: APP,
       fetchImpl: clefAnswers,
     });
   return {
     statuses,
+    reviewCalls,
     listed,
     outputs,
     authorize,
@@ -487,11 +503,55 @@ describe("runRiskReview", () => {
     assert.match(statuses.at(-1)?.description ?? "", /@dave/);
   });
 
+  it("approves a low-risk head as the app, once", async () => {
+    const first = harness({});
+    await first.run();
+    assert.deepEqual(first.reviewCalls, [
+      { call: "APPROVE", commit_id: HEAD, body: "low risk: approved on automated review" },
+    ]);
+
+    const again = harness({ reviews: [review(APP, "APPROVED", HEAD, "Bot")] });
+    await again.run();
+    assert.deepEqual(again.reviewCalls, []);
+
+    const pushed = harness({ reviews: [review(APP, "APPROVED", OLD, "Bot")] });
+    await pushed.run();
+    assert.deepEqual(pushed.reviewCalls.map(({ call, commit_id }) => ({ call, commit_id })), [
+      { call: "APPROVE", commit_id: HEAD },
+    ]);
+  });
+
+  it("withdraws the app's approval once a change is no longer low risk or fails the gate", async () => {
+    const appApproval = review(APP, "APPROVED", HEAD, "Bot");
+    const rated = harness({ files: [file("packages/router/src/index.ts")], reviews: [appApproval] });
+    await rated.run();
+    assert.deepEqual(rated.reviewCalls, [{ call: "DISMISS", review_id: appApproval.id }]);
+
+    const blocked = harness({
+      reviews: [appApproval, review("bob", "CHANGES_REQUESTED")],
+      permissions: { bob: "write" },
+    });
+    await blocked.run();
+    assert.deepEqual(blocked.reviewCalls, [{ call: "DISMISS", review_id: appApproval.id }]);
+  });
+
+  it("does not count the app's own approval as a maintainer's", async () => {
+    const { statuses, reviewCalls, run } = harness({
+      files: [file("packages/router/src/index.ts")],
+      reviews: [review(APP, "APPROVED", HEAD, "Bot")],
+      permissions: { [APP]: "write" },
+    });
+    await run();
+    assert.equal(statuses.at(-1)?.state, "failure");
+    assert.equal(reviewCalls[0].call, "DISMISS");
+  });
+
   it("does not restore a verdict a later run withdrew while this one read the reviews", async () => {
-    const { statuses, authorize, evaluate } = harness({ reviews: [review("alice", "APPROVED")] });
+    const { statuses, reviewCalls, authorize, evaluate } = harness({ reviews: [review("alice", "APPROVED")] });
     await authorize(1);
     await authorize(2);
     await evaluate(1);
+    assert.deepEqual(reviewCalls, []);
     assert.deepEqual(statuses.map(({ state, target_url }) => ({ state, run: target_url.split("/").at(-1) })), [
       { state: "pending", run: "1" },
       { state: "pending", run: "2" },
@@ -546,6 +606,7 @@ describe("risk-review workflows", () => {
     ]);
     assert.equal(workflow.match(/github-token: \$\{\{ steps\.app\.outputs\.token \|\| github\.token \}\}/g)?.length, 2);
     assert.match(workflow, /- \*app-token\n/);
+    assert.match(workflow, /approver: process\.env\.RISK_REVIEW_APPROVER/);
   });
 
   it("relays reviews from a workflow with no permissions", () => {
