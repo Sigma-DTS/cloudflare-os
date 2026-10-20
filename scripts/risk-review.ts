@@ -163,6 +163,8 @@ export interface RiskPullRequest {
   user?: GitHubUser | null;
   assignees?: GitHubUser[] | null;
   head: { sha: string };
+  /** Only a pull request into the default branch, which requires the status, is classified. */
+  base: { ref: string };
   /** Files changed, which can exceed what `pulls.listFiles` will list. */
   changed_files: number;
 }
@@ -216,6 +218,8 @@ export interface GitHubClient {
         description: string;
         target_url: string;
       }): Promise<unknown>;
+      getCombinedStatusForRef(args: RepoRef & { ref: string }):
+          Promise<{ data: { statuses: { context: string; target_url: string | null }[] } }>;
     };
   };
   paginate<T>(route: unknown, args: unknown): Promise<T[]>;
@@ -227,11 +231,11 @@ export interface ActionsContext {
   serverUrl: string;
   runId: number;
   payload: {
+    repository: { default_branch: string };
     pull_request?: { number: number };
     workflow_run?: {
       head_branch: string;
       head_repository: { owner: { login: string } };
-      pull_requests?: { number: number }[];
     };
   };
 }
@@ -473,27 +477,36 @@ export async function askClef(
   return { probabilities, steering };
 }
 
+/**
+ * Finds the open pull request into the default branch that the event is about. Statuses belong to
+ * a commit, not a pull request, so a pull request from the same head into another branch must not
+ * be classified: its smaller diff would publish the verdict the default branch's ruleset reads.
+ */
 async function findPullRequest(
   github: GitHubClient,
   context: ActionsContext,
 ): Promise<RiskPullRequest | undefined> {
   const { owner, repo } = context.repo;
-  const { pull_request: pullRequest, workflow_run: run } = context.payload;
-  let number = pullRequest?.number ?? run?.pull_requests?.[0]?.number;
-  // `workflow_run` lists no pull requests when the head is in a fork, so look it up by branch.
+  const { repository, pull_request: pullRequest, workflow_run: run } = context.payload;
+  const base = repository.default_branch;
+  let number = pullRequest?.number;
+  // `workflow_run.pull_requests` is empty when the head is in a fork, and lists pull requests into
+  // every base, so look the pull request up by head and base. GitHub allows one open pull request
+  // per pair.
   if (number === undefined && run) {
     const open = await github.paginate<RiskPullRequest>(github.rest.pulls.list, {
       owner,
       repo,
       state: "open",
       head: `${run.head_repository.owner.login}:${run.head_branch}`,
+      base,
       per_page: 100,
     });
     number = open[0]?.number;
   }
   if (number === undefined) return undefined;
   const { data } = await github.rest.pulls.get({ owner, repo, pull_number: number });
-  return data.state === "open" ? data : undefined;
+  return data.state === "open" && data.base.ref === base ? data : undefined;
 }
 
 async function isMaintainer(github: GitHubClient, { owner, repo }: RepoRef, user: GitHubUser) {
@@ -506,20 +519,23 @@ async function isMaintainer(github: GitHubClient, { owner, repo }: RepoRef, user
   return MAINTAINER_PERMISSIONS.has(data.permission);
 }
 
+function runUrl({ repo: { owner, repo }, serverUrl, runId }: ActionsContext): string {
+  return `${serverUrl}/${owner}/${repo}/actions/runs/${runId}`;
+}
+
 async function postStatus(
   github: GitHubClient,
-  { repo: { owner, repo }, serverUrl, runId }: ActionsContext,
+  context: ActionsContext,
   sha: string,
   { state, description }: { state: "pending" | GateResult["state"]; description: string },
 ): Promise<void> {
   await github.rest.repos.createCommitStatus({
-    owner,
-    repo,
+    ...context.repo,
     sha,
     state,
     context: STATUS_CONTEXT,
     description: description.slice(0, 140),
-    target_url: `${serverUrl}/${owner}/${repo}/actions/runs/${runId}`,
+    target_url: runUrl(context),
   });
 }
 
@@ -601,6 +617,15 @@ export async function runRiskReview({ github, context, core, clef, fetchImpl }: 
     headSha,
   });
 
+  // This run's `authorize` set the status pending. If it is no longer this run's, a later event has
+  // withdrawn it while the reviews above were read, and that run decides; posting would restore a
+  // verdict the event revoked. The workflow serializes runs per head, so this only backs that up.
+  const { data: combined } = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: headSha });
+  const current = combined.statuses.find((status) => status.context === STATUS_CONTEXT);
+  if (current?.target_url !== runUrl(context)) {
+    core.notice("A later run has taken over this commit's status; leaving it to that run.");
+    return;
+  }
   await postStatus(github, context, headSha, result);
   await core.summary
     .addHeading(`#${pullRequest.number} at ${headSha.slice(0, 7)}: ${classification.tier} risk`)

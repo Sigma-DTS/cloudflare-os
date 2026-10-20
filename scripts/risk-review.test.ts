@@ -301,31 +301,44 @@ async function clefAnswers() {
   });
 }
 
-function harness({ pullRequest = {}, files = [file("docs/a.md")], reviews = [], permissions = {} }: {
+interface RecordedStatus {
+  sha: string;
+  state: string;
+  description: string;
+  context: string;
+  target_url: string;
+}
+
+function harness({
+  pullRequest = {},
+  files = [file("docs/a.md")],
+  reviews = [],
+  permissions = {},
+  payload = { pull_request: { number: 7 } },
+}: {
   pullRequest?: Partial<RiskPullRequest> | null;
   files?: ChangedFile[];
   reviews?: Review[];
   permissions?: Record<string, string>;
+  payload?: Omit<ActionsContext["payload"], "repository">;
 }) {
-  const statuses: { sha: string; state: string; description: string }[] = [];
+  const statuses: RecordedStatus[] = [];
+  const listed: unknown[] = [];
   const outputs: Record<string, string> = {};
   const routes = { list: Symbol("list"), listFiles: Symbol("listFiles"), listReviews: Symbol("listReviews") };
+  const pull: RiskPullRequest = {
+    number: 7,
+    state: pullRequest === null ? "closed" : "open",
+    user: { login: "author", type: "User" },
+    assignees: [],
+    head: { sha: HEAD },
+    base: { ref: "main" },
+    changed_files: files.length,
+    ...pullRequest,
+  };
   const github: GitHubClient = {
     rest: {
-      pulls: {
-        get: async () => ({
-          data: {
-            number: 7,
-            state: pullRequest === null ? "closed" : "open",
-            user: { login: "author", type: "User" },
-            assignees: [],
-            head: { sha: HEAD },
-            changed_files: files.length,
-            ...pullRequest,
-          },
-        }),
-        ...routes,
-      },
+      pulls: { get: async () => ({ data: pull }), ...routes },
       repos: {
         getCollaboratorPermissionLevel: async ({ username }) => ({
           data: { permission: permissions[username] ?? "read" },
@@ -333,10 +346,17 @@ function harness({ pullRequest = {}, files = [file("docs/a.md")], reviews = [], 
         createCommitStatus: async (status) => {
           statuses.push(status);
         },
+        // The latest status per context, as GitHub combines them.
+        getCombinedStatusForRef: async ({ ref }) => ({
+          data: { statuses: statuses.filter(({ sha }) => sha === ref).slice(-1) },
+        }),
       },
     },
-    paginate: async <T>(route: unknown) =>
-      (route === routes.listFiles ? files : route === routes.listReviews ? reviews : []) as T[],
+    paginate: async <T>(route: unknown, args: unknown) => {
+      if (route === routes.list) listed.push(args);
+      const results = { [routes.list]: [pull], [routes.listFiles]: files, [routes.listReviews]: reviews };
+      return (results[route as symbol] ?? []) as T[];
+    },
   };
   const summary: ActionsCore["summary"] = {
     addHeading: () => summary,
@@ -350,18 +370,32 @@ function harness({ pullRequest = {}, files = [file("docs/a.md")], reviews = [], 
     },
     summary,
   };
-  const context: ActionsContext = {
+  const contextFor = (runId: number): ActionsContext => ({
     repo: { owner: "cloudflare", repo: "cloudflare-os" },
     serverUrl: "https://github.com",
-    runId: 1,
-    payload: { pull_request: { number: 7 } },
-  };
+    runId,
+    payload: { repository: { default_branch: "main" }, ...payload },
+  });
+  const authorize = (runId = 1) => authorizeRiskReview({ github, context: contextFor(runId), core });
+  const evaluate = (runId = 1) =>
+    runRiskReview({
+      github,
+      context: contextFor(runId),
+      core,
+      clef: { accountId: "a", apiToken: "t" },
+      fetchImpl: clefAnswers,
+    });
   return {
     statuses,
+    listed,
     outputs,
-    authorize: () => authorizeRiskReview({ github, context, core }),
-    run: () =>
-      runRiskReview({ github, context, core, clef: { accountId: "a", apiToken: "t" }, fetchImpl: clefAnswers }),
+    authorize,
+    evaluate,
+    /** One workflow run: `authorize`, then the classifier. */
+    run: async (runId = 1) => {
+      await authorize(runId);
+      await evaluate(runId);
+    },
   };
 }
 
@@ -393,13 +427,40 @@ describe("authorizeRiskReview", () => {
     assert.deepEqual(outputs, { author: "" });
     assert.deepEqual(statuses, []);
   });
+
+  it("leaves a pull request into another branch alone, since the status is the head's", async () => {
+    const { outputs, statuses, authorize } = harness({ pullRequest: { base: { ref: "feature" } } });
+    await authorize();
+    assert.deepEqual(outputs, { author: "" });
+    assert.deepEqual(statuses, []);
+  });
+
+  it("looks a reviewed pull request up by head and default branch", async () => {
+    const { outputs, listed, authorize } = harness({
+      payload: { workflow_run: { head_branch: "topic", head_repository: { owner: { login: "someone" } } } },
+      permissions: { author: "write" },
+    });
+    await authorize();
+    assert.deepEqual(outputs, { author: "maintainer" });
+    assert.deepEqual(listed, [{
+      owner: "cloudflare",
+      repo: "cloudflare-os",
+      state: "open",
+      head: "someone:topic",
+      base: "main",
+      per_page: 100,
+    }]);
+  });
 });
 
 describe("runRiskReview", () => {
   it("passes a low-risk change with no human review", async () => {
     const { statuses, run } = harness({});
     await run();
-    assert.deepEqual(statuses.map(({ sha, state }) => ({ sha, state })), [{ sha: HEAD, state: "success" }]);
+    assert.deepEqual(statuses.map(({ sha, state }) => ({ sha, state })), [
+      { sha: HEAD, state: "pending" },
+      { sha: HEAD, state: "success" },
+    ]);
   });
 
   it("holds a workshop-backend change for a maintainer's approval of the head commit", async () => {
@@ -409,7 +470,7 @@ describe("runRiskReview", () => {
       permissions: { alice: "maintain" },
     });
     await run();
-    assert.equal(statuses[0].description, "high risk: needs a maintainer's approval of aaaaaaa");
+    assert.equal(statuses.at(-1)?.description, "high risk: needs a maintainer's approval of aaaaaaa");
   });
 
   it("asks an agent's pull request for its director's approval", async () => {
@@ -422,8 +483,19 @@ describe("runRiskReview", () => {
       permissions: { alice: "write", dave: "write" },
     });
     await run();
-    assert.equal(statuses[0].state, "failure");
-    assert.match(statuses[0].description, /@dave/);
+    assert.equal(statuses.at(-1)?.state, "failure");
+    assert.match(statuses.at(-1)?.description ?? "", /@dave/);
+  });
+
+  it("does not restore a verdict a later run withdrew while this one read the reviews", async () => {
+    const { statuses, authorize, evaluate } = harness({ reviews: [review("alice", "APPROVED")] });
+    await authorize(1);
+    await authorize(2);
+    await evaluate(1);
+    assert.deepEqual(statuses.map(({ state, target_url }) => ({ state, run: target_url.split("/").at(-1) })), [
+      { state: "pending", run: "1" },
+      { state: "pending", run: "2" },
+    ]);
   });
 });
 
@@ -433,6 +505,15 @@ describe("risk-review workflows", () => {
     assert.doesNotMatch(workflow, /^\s+pull_request_review:/m);
     assert.match(workflow, /ref: \$\{\{ github\.workflow_sha \}\}/);
     assert.doesNotMatch(workflow, /github\.event\.pull_request\.head\.(ref|repo)/);
+  });
+
+  it("classifies only pull requests into main", () => {
+    assert.match(workflow, /pull_request_target:\n(?:\s+#.*\n)*\s+branches: \[main\]/);
+  });
+
+  it("serializes authorize and the classifiers per head commit", () => {
+    assert.match(workflow, /\n {2}authorize:\n[\s\S]*?concurrency: &serialize\n/);
+    assert.equal(workflow.match(/concurrency: \*serialize/g)?.length, 2);
   });
 
   it("reclassifies when the base changes, but not on other edits", () => {

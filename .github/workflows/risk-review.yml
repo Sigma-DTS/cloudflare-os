@@ -15,6 +15,9 @@ name: Risk review
 # maintainer approves the run, and until then its status is pending, so it cannot merge.
 on:
   pull_request_target:
+    # Only `main` requires the status. A status belongs to a commit, so classifying a pull request from
+    # the same head into another branch would let its smaller diff publish `main`'s verdict.
+    branches: [main]
     # `edited` only for a new base (see `authorize`): retargeting keeps the head commit, and with it
     # a status earned against the old base's smaller diff.
     types: [opened, synchronize, reopened, ready_for_review, edited, assigned, unassigned]
@@ -34,6 +37,11 @@ jobs:
       (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request_review')
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # One run per head commit at a time, from `authorize` through the classifier, so a pending status
+    # lands after any verdict already being worked out rather than under it. Each reads live reviews.
+    concurrency: &serialize
+      group: risk-review-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: read
@@ -63,11 +71,7 @@ jobs:
     if: needs.authorize.outputs.author == 'maintainer'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # One evaluation per head commit at a time: each reads live reviews, so the last to finish
-    # must also be the last to start.
-    concurrency:
-      group: risk-review-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
-      cancel-in-progress: false
+    concurrency: *serialize
     permissions:
       contents: read
       pull-requests: read
@@ -110,9 +114,7 @@ jobs:
     timeout-minutes: 5
     # Required reviewers on this environment are what hold the run for a maintainer.
     environment: risk-review-external
-    concurrency:
-      group: risk-review-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
-      cancel-in-progress: false
+    concurrency: *serialize
     permissions:
       contents: read
       pull-requests: read
