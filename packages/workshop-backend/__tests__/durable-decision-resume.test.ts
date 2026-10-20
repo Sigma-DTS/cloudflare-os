@@ -307,6 +307,65 @@ describe("decision handoff using the existing execution row", () => {
     });
   });
 
+  it.each(["stop", "denial"] as const)("refuses a new prompt during idle %s finalization", async terminal => {
+    const s = await scenario(), requests = inference();
+    await s.visit(async impl => {
+      const {receiver} = await participate(impl, 31);
+      await receiver.hold("finished");
+      if (terminal === "stop") impl.cancelAgent(CHAT);
+      else {
+        const message = [...impl.storage.chats.list()].findLast(m => m.type === "connectionRequest")!;
+        if (message.type !== "connectionRequest") throw new Error("Missing request");
+        impl.storage.chats.put({...message, state: "denied"});
+        impl.resumeAgentAfterDecision(CHAT);
+      }
+      await receiver.waitUntilHeld();
+      try {
+        expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
+        using client = await decisionClient(impl, USER, {
+          steerRunningTurn: impl.steerRunningTurn.bind(impl),
+          sendChatMessage: impl.sendChatMessage.bind(impl),
+        });
+        await expect(client.sendChatMessage(CHAT, "Start a fresh task", MODEL.profile.id))
+          .rejects.toThrow("Agent is running");
+        expect(impl.storage.chatMeta.get(CHAT)?.queuedSteers).toBeUndefined();
+      } finally { await receiver.release(); await impl.waitForAllAgentsToComplete(); }
+      expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
+      expect(() => impl.assertChatNotActive(CHAT)).not.toThrow();
+    });
+    expect(requests()).toBe(0);
+  });
+
+  it("keeps idle finalization scheduled after its last receipt is ACKed in the background", async () => {
+    const s = await scenario();
+    await s.visit(async impl => {
+      const {receiver} = await participate(impl, 31);
+      await receiver.setFailure(true);
+      // Hold an unrelated alarm task while cleanup fails and background delivery recovers.
+      const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+      vi.spyOn(impl, "deliverReadyExternalMessageResponses").mockImplementationOnce(async () => {
+        entered.resolve(); await release.promise;
+      });
+      const alarm = impl.runAlarmTasks();
+      await entered.promise;
+      try {
+        impl.cancelAgent(CHAT);
+        await impl.waitForAllAgentsToComplete();
+        expect(impl.storage.activeAgents.get(CHAT)?.finishing).toBe(true);
+        expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
+        await receiver.setFailure(false);
+        const [receipt] = impl.storage.agentParticipants.list();
+        impl.storage.agentParticipants.put({...receipt, retryAt: Date.now() - 1});
+        await impl.integrations.deliverDue();
+        expect([...impl.storage.agentParticipants.list()]).toHaveLength(0);
+      } finally { release.resolve(); await alarm; }
+      expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
+      await impl.runAlarmTasks();
+      expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
+      expect(() => impl.assertChatNotActive(CHAT)).not.toThrow();
+    });
+  });
+
   it("resumes inference without waiting for a notification, but holds the end boundary", async () => {
     const requests = inference(), s = await scenario();
     await s.visit(async impl => {

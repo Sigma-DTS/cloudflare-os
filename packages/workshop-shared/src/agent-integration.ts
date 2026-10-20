@@ -41,7 +41,9 @@ export interface AgentTurnParticipant extends WorkerEntrypoint {
    * For resumed/suspended, acknowledge durable receipt promptly; work proceeds independently
    * of inference. For finished, return only after required cleanup is complete: this is the
    * sole blocking lifecycle boundary, including on Stop. Delivery is retried after failure or
-   * a lost reply, so durably deduplicate eventId. Read the fresh context's phase before acting:
+   * a lost reply. A delivery wait timeout does not cancel the receiver, so retries may overlap:
+   * durably deduplicate and serialize/coalesce attempts for the same eventId.
+   * Read the fresh context's phase before acting:
    * delayed notifications may already have cleanup-only authority.
    */
   onAgentTurnEvent(event: AgentTurnEvent, context: RpcStub<AgentContext>): Promise<void>;

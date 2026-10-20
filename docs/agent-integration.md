@@ -61,7 +61,10 @@ second polling interval. End-of-turn finalization also drains outstanding notifi
 in order, so receivers must ACK advisory events promptly rather than doing long work in
 those callbacks.
 
-An individual callback has a one-hour invocation bound, not an abandonment deadline.
+Each delivery attempt has a one-hour wait timeout, not an abandonment deadline. This
+does not cancel the receiver's invocation: a retry can overlap an earlier attempt that
+is still running. Receivers must serialize or coalesce concurrent attempts for the same
+event ID, and return successfully only once the required receipt/cleanup is durable.
 Unacknowledged cleanup has no age/attempt cutoff. A failed receiver can keep a turn
 finishing until repaired; correctness takes precedence over admitting more work.
 
@@ -79,9 +82,10 @@ cleanup receipts and their cleanup-only delivery capability, not permission to r
 commands. Removing a connector is not an escape hatch for abandoning cleanup.
 
 Workspace deletion durably fences new work, stops turns and drains finalization before
-erasing storage. Failed finalization retains the fence across resets. Once finalization
-has succeeded, an unrelated hook/owner deletion failure releases that fence so the owner
-can work or retry deletion.
+erasing storage. Failed finalization intentionally retains the fence across resets; repair
+the receiver and retry deletion. Removing the connector does not bypass this requirement.
+Once finalization has succeeded, an unrelated hook/owner deletion failure releases the fence
+so the owner can work or retry deletion.
 
 Workerd tests exercise real capability routing, nonblocking notifications, all-participant
 finalization, queued-turn ordering, Stop, removal, lost ACKs and real DO eviction.

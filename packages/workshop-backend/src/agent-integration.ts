@@ -59,9 +59,7 @@ export class AgentIntegrations {
 
   context(gatekeeperId: number, origin: AgentIntegrationOrigin | undefined): AgentContext | null {
     if (!origin) return null;
-    const grant = this.impl.integrationGrant(gatekeeperId);
-    if (!grant.lifecycle) return null;
-    this.turn(origin);
+    this.checkContext(gatekeeperId, origin);
     return new AgentContextImpl(this, gatekeeperId, origin);
   }
 
@@ -98,9 +96,13 @@ export class AgentIntegrations {
     const closing = receipt.pending.findLast(e => e.kind === "suspended" || e.kind === "finished");
     const allowed = this.impl.gatekeeperUsable(receipt.gatekeeperId) &&
       this.impl.integrationGrant(receipt.gatekeeperId).lifecycle;
-    const phase = !allowed || row?.finishing || closing?.kind === "finished" || row?.integration?.turnId !== event.turnId ? "finishing"
-      : closing || row.integration.segmentId !== event.segmentId ||
-          !this.impl.storage.chatMeta.get(receipt.chatId)?.activeAgent ? "suspending" : "running";
+    let phase: AgentTurnInfo["phase"] = "running";
+    if (!allowed || row?.finishing || closing?.kind === "finished" || row?.integration?.turnId !== event.turnId) {
+      phase = "finishing";
+    } else if (closing || row.integration.segmentId !== event.segmentId ||
+        !this.impl.storage.chatMeta.get(receipt.chatId)?.activeAgent) {
+      phase = "suspending";
+    }
     return {turnId: event.turnId, segmentId: event.segmentId, chatId: String(receipt.chatId), phase};
   }
 
@@ -177,8 +179,8 @@ class AgentContextImpl extends RpcTarget implements AgentContext {
     return this.#turn();
   }
   async participate(participant: Fetcher<AgentTurnParticipant>): Promise<void> {
-    this.#turn();
     if (this.delivery) {
+      this.#turn();
       return; // Already registered; never await our own callback or replace its durable target.
     }
     this.integrations.register(this.gatekeeperId, this.origin, participant);

@@ -1007,7 +1007,7 @@ class OverseerImpl implements AgentHooks {
 
     // Outstanding agent work: see #agentKeepAliveTime for why it is set once and held.
     let hasAgentWork = this.#runningAgents.size > 0 ||
-        [...this.storage.activeAgents.list()].some(r => this.storage.chatMeta.get(r.chatId)?.activeAgent) ||
+        [...this.storage.activeAgents.list()].some(r => r.finishing || this.storage.chatMeta.get(r.chatId)?.activeAgent) ||
         Array.from(this.storage.pendingAgentCalls.list({ limit: 1 })).length > 0;
     if (!hasAgentWork) {
       this.#agentKeepAliveTime = undefined;
@@ -5943,10 +5943,8 @@ class OverseerImpl implements AgentHooks {
   }
 
   async submitAction(gatekeeperId: number, action: number | "create",
-                     description: ActionDescription, caller: GatekeeperCaller,
-                     integrationOrigin?: AgentIntegrationOrigin)
+                     description: ActionDescription, caller: GatekeeperCaller)
       : Promise<void> {
-    if (integrationOrigin) this.integrations.turn(integrationOrigin);
     // An in-flight facet RPC can outlive removeGatekeeper, and a pending action on a removed
     // connection could never be approved or rejected (both dereference the facet).
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
@@ -6795,7 +6793,7 @@ class OverseerImpl implements AgentHooks {
     const isPlainTextMessage = typeof message === "string" && message.trim() !== "" &&
         !capsules?.length && !attachments?.length && !formats?.length;
     const turnTakesSteers = this.#runningAgents.has(chatId) &&
-        !this.#liveChats.get(chatId)?.cancelController.signal.aborted;
+        this.#liveChats.get(chatId)?.cancelController.signal.aborted === false;
     if (!isPlainTextMessage || !turnTakesSteers) return false;
     // A logged error is terminal even while cleanup keeps the chat busy. It must stay last
     // for Retry; only steers accepted before the failure belong to this turn.
@@ -13557,7 +13555,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   }
 
   async getAgentContext(): Promise<AgentContext | null> {
-    this.#check();
+    if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
     return this.impl.integrations.context(this.gatekeeperId, this.integrationOrigin);
   }
 
@@ -13572,7 +13570,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
 
   submitAction(action: number, description: ActionDescription): Promise<void> {
     this.#check();
-    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller, this.integrationOrigin);
+    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller);
   }
 
   bindHook<Hook extends RpcTarget>(
