@@ -489,8 +489,13 @@ export class DriveSessionCore extends DriveCoreBase {
     return file;
   }
 
-  /** Native reads need no moving-scope check for immutable account/file capabilities. */
-  nativeRead(_fileId: string, _expectedMimeType: string): NativeRead {
+  /**
+   * Native reads need no moving-scope check for immutable account/file capabilities, so no
+   * metadata is re-read for `_unchanged` to see.
+   */
+  nativeRead(
+    _fileId: string, _expectedMimeType: string, _unchanged?: (file: DriveFile) => void,
+  ): NativeRead {
     return unguardedNativeRead(this.authorize);
   }
 
@@ -660,14 +665,23 @@ export class DriveFolderSessionCore extends DriveCoreBase {
     return {folderIds: [...this.#location.folderIds, folder.id]};
   }
 
-  /** Revalidate the saved path and direct child on every Docs, Sheets, Slides, PDF or file read. */
-  nativeRead(fileId: string, expectedMimeType: string): NativeRead {
+  /**
+   * Revalidate the saved path and direct child on every Docs, Sheets, Slides, PDF or file read.
+   * `unchanged` sees the file's metadata from each check, before and after the fetch, and throws
+   * to refuse a read of a file that has changed since it was opened.
+   */
+  nativeRead(
+    fileId: string, expectedMimeType: string, unchanged?: (file: DriveFile) => void,
+  ): NativeRead {
+    let requireCurrent = async () => {
+      let file = await this.#requireDirectFile(fileId);
+      if (file.mimeType !== expectedMimeType) outsideScope();
+      unchanged?.(file);
+    };
     return async <T>(fetch: () => Promise<T>, observe: (value: T) => NativeObservation) => {
-      let before = await this.#requireDirectFile(fileId);
-      if (before.mimeType !== expectedMimeType) outsideScope();
+      await requireCurrent();
       let value = await fetch();
-      let after = await this.#requireDirectFile(fileId);
-      if (after.mimeType !== expectedMimeType) outsideScope();
+      await requireCurrent();
       let check = await this.prepareObservation(
         [this.#folderObservation(), {kind: "file", fileId}]);
       await this.authorize({...observe(value), excludeObservers: check.excludeObservers});
