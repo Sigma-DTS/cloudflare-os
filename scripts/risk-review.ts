@@ -67,8 +67,13 @@ const ESCALATE_AT = 0.3;
 /** Clef's probability that the diff addresses the classifier at which the change is high risk. */
 const STEERING_AT = 0.5;
 
-/** Diff text sent to Clef. Its context is 65,536 tokens; past this the rest goes unseen. */
-const MAX_STATE_CHARS = 150_000;
+/**
+ * Diff sent to Clef, in UTF-8 bytes. Its context is 65,536 tokens, and Clef silently truncates a
+ * state that overflows it. Characters are no bound, since its tokenizer splits digits and non-ASCII
+ * text can take several tokens a character; but no token is shorter than a byte, so bytes are. The
+ * rest of the context is left for the questions and the prompt around them.
+ */
+const MAX_STATE_BYTES = 65_536 - 4_096;
 
 const CLEF_URL = (accountId: string) =>
   `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/cloudflare/clef`;
@@ -245,13 +250,15 @@ export function buildClefState(files: ChangedFile[]): { state: string; complete:
   const ordered = files.toSorted((a, b) => Number(touchesHighRiskPath(b)) - Number(touchesHighRiskPath(a)));
   let complete = true;
   let state = "";
+  let bytes = 0;
   for (const file of ordered) {
     // A text diff with no patch was too large for the API to inline; binary files change 0 lines.
     if (file.patch === undefined && file.changes > 0) complete = false;
     const section =
       `--- ${describePath(file)} (${file.status}, +${file.additions} -${file.deletions})\n` +
       `${file.patch ?? "(diff not shown)"}\n`;
-    if (state.length + section.length > MAX_STATE_CHARS) return { state, complete: false };
+    bytes += Buffer.byteLength(section);
+    if (bytes > MAX_STATE_BYTES) return { state, complete: false };
     state += section;
   }
   return { state, complete };

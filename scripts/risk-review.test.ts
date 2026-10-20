@@ -95,8 +95,16 @@ describe("buildClefState", () => {
     assert.equal(buildClefState([file("big.ts", { patch: undefined, changes: 9000 })]).complete, false);
   });
 
+  it("measures the limit in bytes, which bound tokens where characters do not", () => {
+    // 100,000 digits are 100,000 tokens to a tokenizer that splits digits.
+    assert.equal(buildClefState([file("docs/digits.md", { patch: "1".repeat(100_000) })]).complete, false);
+    // 20,000 characters, but 80,000 UTF-8 bytes.
+    assert.equal(buildClefState([file("docs/emoji.md", { patch: "😀".repeat(20_000) })]).complete, false);
+    assert.equal(buildClefState([file("docs/small.md", { patch: "x".repeat(60_000) })]).complete, true);
+  });
+
   it("stops at the size limit and reports the rest unseen", () => {
-    const huge = file("docs/huge.md", { patch: "x".repeat(200_000) });
+    const huge = file("docs/huge.md", { patch: "x".repeat(70_000) });
     const { state, complete } = buildClefState([file("docs/a.md"), huge]);
     assert.ok(!state.includes("huge.md"));
     assert.equal(complete, false);
