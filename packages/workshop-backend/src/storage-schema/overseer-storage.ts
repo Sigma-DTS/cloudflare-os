@@ -754,9 +754,10 @@ export type CompactionCheckpoint = {
 
 /**
  * Server-only record describing an in-progress agent turn, enabling resumption after a server
- * restart. Keyed by chatId. `chatMeta.activeAgent` identifies runnable records; a paused turn
- * retains its record (and original authority) until its logged decisions are ready. No separate
- * wait state is stored: the chat log already contains the requests and their outcomes.
+ * restart. Keyed by chatId. `chatMeta.activeAgent` keeps the chat busy through inference and
+ * finalization; `finishing` distinguishes cleanup-only recovery. A paused turn retains its
+ * original authority until its logged decisions are ready. No separate approval wait state is
+ * stored: the chat log already contains the requests and their outcomes.
  *
  * Note we deliberately do NOT store the resolved `AiModelConfig` here, because it contains a secret
  * API token. Instead we store enough to re-fetch it from the initiator's user DO on resume.
@@ -776,6 +777,8 @@ export type ActiveAgentRecord = {
   callbackInitiated: boolean;
   /** Model-lookup attempts since the last successful preparation, bounded across DO resets. */
   resumeAttempts?: number;
+  /** Inference has ended. Recovery retries participant finalization, never the model. */
+  finishing?: true;
   /** Optional identity for integrations; readiness and progress still come from the chat log. */
   integration?: {turnId: string; segmentId: string};
 };

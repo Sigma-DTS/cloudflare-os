@@ -5,6 +5,7 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cl
 import type { AgentContext, AgentTurnEvent, AgentTurnInfo, AgentTurnParticipant } from "@gadgets/workshop-shared/agent-integration";
 import type {
   AccountDescription,
+  ApprovalQueue,
   AppUiContext,
   GatekeeperUiFrame,
   GatekeeperUserSelection,
@@ -136,6 +137,25 @@ export class TestLifecycleParticipant extends WorkerEntrypoint<unknown, {name: s
     return barrier.observed.promise;
   }
   calls(): {event: AgentTurnEvent; turn: AgentTurnInfo}[] { return this.#state().calls; }
+}
+
+/** A real facet/session route for lifecycle capability tests, rather than an unserializable class. */
+export class TestLifecycleGatekeeper extends DurableObject {
+  async describe() { return {title: "Lifecycle test", url: "https://lifecycle.test", tsType: "Session"}; }
+  async getTypeScriptTypes() { return "interface Session {}"; }
+  async getAgentCatalog() { return null; }
+  async getAutoApprovableActions() { return []; }
+  async addObserver() {}
+  async removeObserver() {}
+  async applyAction() {}
+  async rejectAction() {}
+  async startSession(queue: RpcStub<ApprovalQueue>) { return new TestLifecycleSession(queue.dup()); }
+}
+
+class TestLifecycleSession extends RpcTarget {
+  constructor(private queue: RpcStub<ApprovalQueue>) { super(); }
+  [Symbol.dispose]() { this.queue[Symbol.dispose](); }
+  getAgentContext() { return this.queue.getAgentContext(); }
 }
 
 /** What each FakeGatekeeperAccount has been asked to do, by its `name` prop. */

@@ -48,7 +48,7 @@ import {
 import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alwaysAvailableResources, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import type { AgentContext } from "@gadgets/workshop-shared/agent-integration";
-import { AgentIntegrations, agentIntegrationGrant, AGENT_LIFECYCLE_RETRY_MS } from "./agent-integration";
+import { AgentIntegrations, agentIntegrationGrant } from "./agent-integration";
 import { GitImpl } from "./git-binding";
 import { GadgetExportsImpl } from "./exports-session";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
@@ -928,7 +928,6 @@ class OverseerImpl implements AgentHooks {
   destroyLiveChat(chatId: number) {
     this.cacheWarmer.end(chatId, "deleted");
     this.#resumeErrors.delete(chatId);
-    this.#unregisterRunningAgent(chatId);
     let meta = this.storage.chatMeta.get(chatId);
     if (meta?.activeAgent) {
       delete meta.activeAgent;
@@ -936,13 +935,14 @@ class OverseerImpl implements AgentHooks {
       this.#updateAlarm();
     }
     let ctx = this.#liveChats.get(chatId);
-    if (!ctx) return;
+    if (!ctx) { this.ctx.waitUntil(this.#finishAgentTurn(chatId)); return; }
 
     // Cancel running agent.
     ctx.cancelController?.abort(new Error("Chat deleted."));
 
     this.#liveChats.delete(chatId);
     this.invalidateChatContent(chatId);
+    this.ctx.waitUntil(this.#finishAgentTurn(chatId));
   }
 
   destroyAllLiveChats() {
@@ -976,17 +976,10 @@ class OverseerImpl implements AgentHooks {
     this.cacheWarmer.end(chatId, "turn");
   }
 
-  // Release a running execution and recompute the alarm. A decision pause or retryable model
-  // lookup retains the existing record; completion deletes it. MUST be called
-  // synchronously together with clearing `chatMeta.activeAgent`. An idle retained row is only
-  // the original authority for the log's current decision; starting new work replaces it.
-  #unregisterRunningAgent(chatId: number, retainRecord = false) {
+  // Release only the in-memory execution. Paused and finishing rows remain durable until their
+  // decision or cleanup completes; #finishAgentTurn is the single terminal handoff.
+  #unregisterRunningAgent(chatId: number) {
     this.#runningAgents.delete(chatId);
-    if (!retainRecord) this.storage.activeAgents.delete(chatId);
-    else if (!this.storage.chatMeta.get(chatId)?.activeAgent) {
-      const row = this.storage.activeAgents.get(chatId);
-      if (row) this.integrations.emit(row, "suspended");
-    }
     this.#updateAlarm();
     if (this.#runningAgents.size === 0) {
       // One -> zero running agents: wake any `alarm()` waiter.
@@ -1058,9 +1051,6 @@ class OverseerImpl implements AgentHooks {
     this.#inAlarmHandler = true;
     this.#scheduledAlarm = undefined; // A success recomputes the next alarm from settled state.
     let failed = false;
-    // The shared alarm may await a long-running turn. Delivery retries must not wait behind it;
-    // the outbox/deadline, not this disposable timer, remains the recovery authority.
-    const deliveryTimer = setInterval(() => this.ctx.waitUntil(this.integrations.deliverDue()), AGENT_LIFECYCLE_RETRY_MS);
     try {
       do {
         this.#resumeInterruptedAgents();
@@ -1079,7 +1069,6 @@ class OverseerImpl implements AgentHooks {
       failed = true;
       throw error;
     } finally {
-      clearInterval(deliveryTimer);
       this.#inAlarmHandler = false;
       this.#agentKeepAliveTime = undefined;
       if (!failed || retryCount >= ALARM_MAX_RETRIES) {
@@ -1121,27 +1110,20 @@ class OverseerImpl implements AgentHooks {
         this.storage.chatMeta.get(record.chatId)?.activeAgent !== undefined;
     let finish = () => {
       if (!owns()) return;
-      let meta = this.storage.chatMeta.get(record.chatId)!;
-      delete meta.activeAgent;
-      this.storage.chatMeta.put(meta);
-      this.#unregisterRunningAgent(record.chatId);
-      this.#finishAgentTurn(record.chatId);
+      this.ctx.waitUntil(this.#finishAgentTurn(record.chatId));
     };
     // A reset can land after a request or final response committed but before teardown. Honor
-    // that logged pause/completion instead of issuing another model request -- unless steers were
-    // queued after the final response: as in #finishAgentTurn, they prompt the next turn.
+    // that logged pause/completion instead of issuing another model request. Unread steers
+    // prompt the next logical turn only after finalization.
     let wait = this.#decisionWait(record.chatId);
     let meta = this.storage.chatMeta.get(record.chatId);
-    if (wait === null && meta?.queuedSteers) {
-      this.#logQueuedSteers(meta, false);
-    } else if (wait !== undefined) {
-      if (meta) {
+    if (wait !== undefined) {
+      if (meta && wait) {
         delete meta.activeAgent;
         this.storage.chatMeta.put(meta);
       }
-      this.#unregisterRunningAgent(record.chatId, !!wait);
-      this.#publishAgentTurnNotification(record.chatId, record.initiator, record.initiatorUserId);
-      this.#finishAgentTurn(record.chatId);
+      if (wait) this.#publishAgentTurnNotification(record.chatId, record.initiator, record.initiatorUserId);
+      this.ctx.waitUntil(this.#finishAgentTurn(record.chatId, !!wait));
       return;
     }
     if ((record.resumeAttempts ?? 0) >= AGENT_RESUME_MAX_ATTEMPTS) {
@@ -1155,11 +1137,12 @@ class OverseerImpl implements AgentHooks {
     let resumeAttempts = (record.resumeAttempts ?? 0) + 1;
     record = {...record, resumeAttempts};
     // Claiming a resume makes the chat busy again. Expire the paused segment before lookup
-    // opens the input gate; enter() will publish the resumed lifecycle event after cleanup.
+    // opens the input gate. Resumption is a notification, never an inference-entry barrier.
     if (record.integration) {
       record.integration = {...record.integration, segmentId: crypto.randomUUID()};
     }
     this.storage.activeAgents.put(record);
+    this.integrations.emit(record, "resumed");
     let aiModel: UserAiModelRecord | undefined;
     let failure: unknown;
     let leaveSession = () => {};
@@ -1194,7 +1177,7 @@ class OverseerImpl implements AgentHooks {
     if (liveChat.cancelController.signal.aborted) { finish(); return; }
     if (failure && shouldRetryAfterReset(failure) && resumeAttempts < AGENT_RESUME_MAX_ATTEMPTS) {
       this.#resumeErrors.set(record.chatId, failure);
-      this.#unregisterRunningAgent(record.chatId, true);
+      this.#unregisterRunningAgent(record.chatId);
       return;
     }
     this.#resumeErrors.delete(record.chatId);
@@ -1217,15 +1200,44 @@ class OverseerImpl implements AgentHooks {
         liveChat);
   }
 
-  // The hand-off once a chat's turn is over and its running-agent state has been torn down: drop
-  // the turn's live context, then deliver whatever was waiting for the chat to go idle -- steers
-  // the turn never read, calls to the agent recorded during the turn (which start another turn),
-  // or failing that the response an external message is waiting on. Every path that ends a turn
-  // goes through here, so nothing sent mid-turn is stranded by the way the turn ended. `turn` is
-  // the turn that ended, absent if none ran.
-  #finishAgentTurn(chatId: number, turn?: {
-    aiModel: UserAiModelRecord, initiator: AiChatAuthorInfo, initiatorUserId: string,
-  }): void {
+  // A segment ending is either an approval pause or finalization of the logical turn. Only
+  // finalization waits for participants before releasing the chat and handing off queued work.
+  async #finishAgentTurn(chatId: number, paused = false): Promise<void> {
+    const record = this.storage.activeAgents.get(chatId);
+    paused &&= !record?.finishing;
+    if (record && !paused) {
+      // Persist before RPC. After a reset this same path retries cleanup, never inference.
+      record.finishing = true;
+      this.storage.activeAgents.put(record);
+      this.#registerRunningAgent(chatId);
+      try {
+        await this.integrations.drain(chatId);
+      } catch (error) {
+        // The durable terminal marker and outbox survive. The alarm retries cleanup only.
+        this.logger.warn("agent finalization deferred", {
+          event: "agent.lifecycle.finalization.deferred", chatId, error,
+        });
+        this.#unregisterRunningAgent(chatId);
+        return;
+      }
+      // Stop/deletion can join this same drain. Only one completion performs the handoff.
+      const current = this.storage.activeAgents.get(chatId);
+      if (!current?.finishing || current.integration?.turnId !== record.integration?.turnId) return;
+      this.storage.activeAgents.delete(chatId);
+      const meta = this.storage.chatMeta.get(chatId);
+      const wait = this.#decisionWait(chatId);
+      const resumingSteers = meta?.queuedSteers && !wait;
+      if (meta?.activeAgent && !resumingSteers) {
+        delete meta.activeAgent;
+        this.storage.chatMeta.put(meta);
+      }
+      if (wait === null || wait?.denied) {
+        this.#publishAgentTurnNotification(chatId, record.initiator, record.initiatorUserId);
+      }
+    } else if (record) {
+      this.integrations.emit(record, "suspended");
+    }
+    this.#unregisterRunningAgent(chatId);
     // A turn started by the drain gets a fresh context, and with it a fresh cancel controller --
     // this one may have been aborted.
     this.#liveChats.delete(chatId);
@@ -1235,13 +1247,16 @@ class OverseerImpl implements AgentHooks {
     // user's decision): they then stay steers, read when the agent next runs.
     let meta = this.storage.chatMeta.get(chatId);
     if (meta?.queuedSteers) {
-      let next = turn && !this.#decisionWait(chatId) ? turn : undefined;
-      if (next) meta.activeAgent = next.aiModel.profile;
-      this.#logQueuedSteers(meta, !next);
-      if (next) {
-        this.startAgent(chatId, next.aiModel, next.initiator, next.initiatorUserId);
+      if (record && !paused && !this.#decisionWait(chatId)) {
+        // Live and recovered handoffs use the same durable original caller/model. The normal
+        // resume path resolves its current config instead of carrying a second in-memory path.
+        this.#logQueuedSteers(meta, false);
+        const {finishing: _, integration: __, resumeAttempts: ___, ...next} = record;
+        this.storage.activeAgents.put(next);
+        this.#resumeInterruptedAgents();
         return;
       }
+      this.#logQueuedSteers(meta, true);
     }
 
     if (this.hasPendingAgentCalls(chatId)) {
@@ -1302,6 +1317,11 @@ class OverseerImpl implements AgentHooks {
       migrateToWorkpieceTypes(this);
       migrateToBlueprintUpstreams(this);
       migrateToSpawnerBindings(this);
+      // Only unacknowledged finalization needs a durable deletion fence. If a later deletion
+      // step reset the DO, there is no live deleter left and the owner can work or retry.
+      if (this.storage.deleting.get() && ![...this.storage.agentParticipants.list({limit: 1})].length) {
+        this.storage.deleting.put(false);
+      }
       // Do not replace an existing alarm during constructor recovery: setAlarm would reset the
       // platform's retry budget. Cache its time before registering any recovered executions.
       this.#scheduledAlarm = await this.ctx.storage.getAlarm();
@@ -1321,6 +1341,12 @@ class OverseerImpl implements AgentHooks {
     if (this.storage.deleting.get()) { this.closeAgentsForDeletion(); return; }
     for (let record of Array.from(this.storage.activeAgents.list())) {
       if (this.#runningAgents.has(record.chatId)) continue;
+      if (record.finishing) {
+        this.#registerRunningAgent(record.chatId);
+        this.ctx.waitUntil(this.reconcilePendingGadgets(record.chatId)
+            .then(() => this.#finishAgentTurn(record.chatId)));
+        continue;
+      }
       if (!this.storage.chatMeta.get(record.chatId)?.activeAgent) {
         this.resumeAgentAfterDecision(record.chatId);
         continue;
@@ -5225,7 +5251,7 @@ class OverseerImpl implements AgentHooks {
 
       case "gatekeeper":
         return this.getGatekeeperFacet(target.id)
-            .then(facet => this.openGatekeeperSession(target.id, facet, caller, integrationOrigin ?? null));
+            .then(facet => this.openGatekeeperSession(target.id, facet, caller, integrationOrigin));
 
       case "worktree": {
         // The programmatic Worktree binding (worktree-session.ts). A worktree's uncommitted
@@ -6373,7 +6399,7 @@ class OverseerImpl implements AgentHooks {
   // blocked pending a scope-widening restart is refused (see #gatekeepersPendingRestart).
   openGatekeeperSession<Session extends RpcCompatible<Session>>(
       id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller,
-      integrationOrigin: AgentIntegrationOrigin | null | undefined = this.captureIntegrationOrigin(caller, id))
+      integrationOrigin?: AgentIntegrationOrigin)
       : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
     if (integrationOrigin) this.integrations.checkContext(id, integrationOrigin);
@@ -6385,7 +6411,6 @@ class OverseerImpl implements AgentHooks {
 
   integrationGrant(gatekeeperId: number) {
     if (this.storage.deleting.get()) return {};
-    this.assertGatekeeperUsable(gatekeeperId);
     const record = this.storage.gatekeepers.get(gatekeeperId);
     const vendorId = record && gatekeeperVendorId(record);
     return vendorId ? agentIntegrationGrant(this.env.AGENT_INTEGRATION_GRANTS, vendorId) : {};
@@ -6503,7 +6528,8 @@ class OverseerImpl implements AgentHooks {
 
   assertChatNotActive(chatId: number, allowMessagePreparation = false): AiChatMetadata {
     let meta = this.getChatMetaOrThrow(chatId);
-    if (meta.activeAgent || !allowMessagePreparation && this.isPreparingChatMessage(chatId)) {
+    if (meta.activeAgent || this.storage.activeAgents.get(chatId)?.finishing ||
+        !allowMessagePreparation && this.isPreparingChatMessage(chatId)) {
       throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
     }
     return meta;
@@ -6927,6 +6953,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   #deliverWaitingExternalMessageResponse(chatId: number): void {
+    if (this.storage.activeAgents.get(chatId)?.finishing) return;
     let response = this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
     if (response?.status !== "waiting") return;
 
@@ -7014,9 +7041,9 @@ class OverseerImpl implements AgentHooks {
       meta.lastActive = this.getChatTimestamp();
       this.storage.chatMeta.put(meta);
     }
-    // Stop prevents resumption even if the DO disappears before the aborted task's finally runs;
-    // restart recovery clears any busy marker left without an execution row.
-    this.storage.activeAgents.delete(chatId);
+    // Persist Stop before aborting: a reset must finish cleanup, never resume inference.
+    const record = this.storage.activeAgents.get(chatId);
+    if (record) { record.finishing = true; this.storage.activeAgents.put(record); }
     this.#resumeErrors.delete(chatId);
     let author = this.storage.chatMeta.get(chatId)?.activeAgent ?? this.#decisionWait(chatId)?.agent;
     if (author) this.addChatMessages(chatId, author,
@@ -7028,14 +7055,7 @@ class OverseerImpl implements AgentHooks {
     // A retryable lookup has already released its task to the alarm, so no finally is left to
     // clear the busy marker. Stop must finish that handoff synchronously too.
     if (!this.#runningAgents.has(chatId)) {
-      let meta = this.storage.chatMeta.get(chatId);
-      if (meta?.activeAgent) {
-        delete meta.activeAgent;
-        meta.lastActive = this.getChatTimestamp();
-        this.storage.chatMeta.put(meta);
-      }
-      this.#updateAlarm();
-      this.#finishAgentTurn(chatId);
+      this.ctx.waitUntil(this.#finishAgentTurn(chatId));
     }
   }
 
@@ -7306,6 +7326,7 @@ class OverseerImpl implements AgentHooks {
              callbackInitiated: boolean = false,
              keepAlive: boolean = false): void {
     if (this.storage.deleting.get()) throw new Error("Workspace deletion is in progress.");
+    if (this.storage.activeAgents.get(chatId)?.finishing) throw new Error("The previous turn is still finishing.");
     // Register before starting the turn so registration always precedes the turn's teardown
     // (`#unregisterRunningAgent`, in `#runAgentTurn`'s finally).
     this.#registerRunningAgent(chatId);
@@ -7324,11 +7345,24 @@ class OverseerImpl implements AgentHooks {
     if (keepAlive) this.ctx.waitUntil(turn);
   }
 
-  #runAgentTurn(chatId: number, aiModel: UserAiModelRecord,
+  async #runAgentTurn(chatId: number, aiModel: UserAiModelRecord,
                 initiator: AiChatAuthorInfo,
                 initiatorUserId: string,
                 callbackInitiated: boolean,
                 liveChat: LiveChatContext): Promise<void> {
+    try {
+      // Replacing a paused logical turn must still respect its end boundary. Ordinary resumed
+      // and suspended notifications are not awaited here or anywhere before inference.
+      await this.integrations.finishPrevious(chatId);
+    } catch (error) {
+      this.logger.warn("previous turn finalization deferred", {
+        event: "agent.lifecycle.finalization.deferred", chatId, error,
+      });
+      if (this.storage.activeAgents.get(chatId)?.finishing) await this.#finishAgentTurn(chatId);
+      else this.#unregisterRunningAgent(chatId);
+      return;
+    }
+    if (this.#liveChats.get(chatId) !== liveChat) return;
     return obsContext.with({
       operation: "agent.run",
       gadgetId: this.ctx.id.toString(),
@@ -7349,8 +7383,6 @@ class OverseerImpl implements AgentHooks {
     // reflects the spend this turn just incurred, rather than waiting for the cache TTL to lapse.
     let byokOwnerStub: DurableObjectStub<UserDurableObject> | undefined;
     let finished = false;
-    let lifecycleReady = false;
-    let lifecycleDeferred = false;
     // Why the turn ended early, posted in the `finally`.
     let failure: {message: string, code?: string} | undefined;
     // The turn's last model request, kept warm while the chat is viewed (see ChatCacheWarmer).
@@ -7366,14 +7398,6 @@ class OverseerImpl implements AgentHooks {
     });
 
     try {
-      await this.integrations.drain(chatId, liveChat.cancelController.signal);
-      if (!owns()) return;
-      liveChat.cancelController.signal.throwIfAborted();
-      this.integrations.enter(chatId);
-      await this.integrations.drain(chatId, liveChat.cancelController.signal);
-      if (!owns()) return;
-      liveChat.cancelController.signal.throwIfAborted();
-      lifecycleReady = true;
       // The trace span covers the turn's setup and run, not the teardown below, which can start the
       // chat's next turn.
       await traceAgentTurn(this.getChatAgentContext(chatId), liveChat.cancelController.signal,
@@ -7444,13 +7468,6 @@ class OverseerImpl implements AgentHooks {
       });
     } catch (err: unknown) {
       if (!owns()) return;
-      if (!lifecycleReady && !liveChat.cancelController.signal.aborted) {
-        lifecycleDeferred = true;
-        turnLogger.warn("agent entry awaiting lifecycle delivery", {
-          event: "agent.lifecycle.entry.deferred", error: err,
-        });
-        return;
-      }
       // A failed model request surfaces as AgentTurnError (pi reports provider failures as data;
       // runAgent converts them back to a throw), carrying the failing request's HTTP status when
       // one was observed.
@@ -7485,11 +7502,13 @@ class OverseerImpl implements AgentHooks {
 
       failure = {message: errorMessage};
     } finally {
-      if (owns() && lifecycleDeferred) {
-        // Keep #797's runnable row/busy marker. The existing alarm retries this entry without
-        // issuing inference or inventing another continuation state.
-        this.#unregisterRunningAgent(chatId, true);
-      } else if (owns()) {
+      if (owns()) {
+        const wait = this.#decisionWait(chatId);
+        const record = this.storage.activeAgents.get(chatId);
+        if (record && !(finished && !liveChat.cancelController.signal.aborted && wait && !wait.denied)) {
+          record.finishing = true;
+          this.storage.activeAgents.put(record);
+        }
         // If this turn billed the user's own Cloudflare account, refresh their cached balance now (in
         // the background) so the next turn's billing decision reflects the spend just incurred. Runs
         // on both the success and error paths — an "insufficient funds" failure is exactly when an
@@ -7515,8 +7534,10 @@ class OverseerImpl implements AgentHooks {
           // chat metadata's activeAgent becomes unset, which happens just below).
 
           let meta = this.storage.chatMeta.get(chatId);
+          const wait = this.#decisionWait(chatId);
+          const paused = finished && !liveChat.cancelController.signal.aborted && !!meta && !!wait && !wait.denied;
           if (meta) {
-            delete meta.activeAgent;
+            if (paused) delete meta.activeAgent;
             meta.lastActive = this.getChatTimestamp();
             this.storage.chatMeta.put(meta);
           }
@@ -7528,21 +7549,17 @@ class OverseerImpl implements AgentHooks {
             this.addChatMessages(chatId, initiator,
                 [{type: "agentNudge", text: "The user stopped this turn. Wait for a new request."}]);
           }
-          let wait = this.#decisionWait(chatId);
-          this.#unregisterRunningAgent(chatId,
-              finished && !liveChat.cancelController.signal.aborted && !!meta && !!wait && !wait.denied);
-
-          // Without `meta`, the chat was deleted while the turn was ending.
+          // A subsequent execution ends this warming as it registers.
           if (lastRequest && meta) this.cacheWarmer.start(chatId, lastRequest, aiModel.profile.id);
 
-          if (finished && meta) {
+          if (finished && meta && paused) {
             // Classified here, past the turn's last await, so a decision made as it ended counts.
             this.#publishAgentTurnNotification(chatId, initiator, initiatorUserId);
           }
 
           // A failed turn logged its unread steers before its error (see postAgentErrorMessage),
           // so it starts no follow-up, which would likely fail the same way.
-          this.#finishAgentTurn(chatId, {aiModel, initiator, initiatorUserId});
+          await this.#finishAgentTurn(chatId, paused);
         }
       }
     }
@@ -7673,7 +7690,7 @@ class OverseerImpl implements AgentHooks {
       }
       let meta = this.storage.chatMeta.get(chatId);
       if (!meta) return;  // deleted meanwhile; deleteChat removed the calls too
-      if (meta.activeAgent) return;
+      if (meta.activeAgent || this.storage.activeAgents.get(chatId)?.finishing) return;
 
       // Move every recorded call into the chat log. No awaits from here to the turn start, so a
       // crash cannot leave a call half-delivered, and a call recorded after this point waits for
@@ -9309,11 +9326,12 @@ class OverseerImpl implements AgentHooks {
     if (meta?.activeAgent) return; // Teardown rechecks after releasing this execution.
     let record = this.storage.activeAgents.get(chatId);
     if (!record) return;
+    if (record.finishing) return;
     let wait = this.#decisionWait(chatId);
     if (wait && decisionId !== undefined && !(typeof decisionId === "number"
         ? wait.actionIds.includes(decisionId) : wait.requestIds.includes(decisionId))) return;
     if (!meta || !wait || wait.denied) {
-      this.storage.activeAgents.delete(chatId);
+      this.ctx.waitUntil(this.#finishAgentTurn(chatId));
       return;
     }
     if (wait.pending || this.isPreparingChatMessage(chatId)) return;
@@ -11477,36 +11495,43 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     this.impl.closeAgentsForDeletion();
     await this.impl.integrations.drain();
-    // TODO: Revoke user sessions.
+    try {
+      // TODO: Revoke user sessions.
 
-    // Disable all enabled hooks so that the gatekeepers stop delivering events to this gadget.
-    // We do this before deleting storage so that we still have access to the hook controllers.
-    // TODO: If any disablement fails, deletion will be blocked. We could ignore failures, but that
-    //   would leave gatekeepers pointing at gadgets that don't exist anymore, which is also bad.
-    //   What do we really want here?
-    for (let record of Array.from(this.impl.storage.boundHooks.list())) {
-      if (record.enabled) {
-        await this.disableHook(record.id);
+      // Disable all enabled hooks so that the gatekeepers stop delivering events to this gadget.
+      // We do this before deleting storage so that we still have access to the hook controllers.
+      // TODO: If any disablement fails, deletion will be blocked. We could ignore failures, but that
+      //   would leave gatekeepers pointing at gadgets that don't exist anymore, which is also bad.
+      //   What do we really want here?
+      for (let record of Array.from(this.impl.storage.boundHooks.list())) {
+        if (record.enabled) {
+          await this.disableHook(record.id);
+        }
       }
-    }
 
-    await this.impl.ctx.blockConcurrencyWhile(async () => {
-      await this.#owner.deleteGadget(this.impl.ctx.id.toString());
-      await this.impl.ctx.storage.deleteAll();
-      this.impl.recordGadgetAnalytics({
-        event_name: "gadget_deleted",
-        user_id: this.#clientUser.id.toString(),
+      await this.impl.ctx.blockConcurrencyWhile(async () => {
+        await this.#owner.deleteGadget(this.impl.ctx.id.toString());
+        await this.impl.ctx.storage.deleteAll();
+        this.impl.recordGadgetAnalytics({
+          event_name: "gadget_deleted",
+          user_id: this.#clientUser.id.toString(),
+        });
+        // The restart severs every session still holding this workspace so its client reopens. The
+        // deleter has nothing to reopen, so close it first. Best-effort: throwing here resets the DO.
+        await this.notifyClosed().catch(() => {});
+        this.impl.scheduleAccessRestart("Gadget restarted because the workspace was deleted.");
+        this.impl.ownerId = undefined;
       });
-      // The restart severs every session still holding this workspace so its client reopens. The
-      // deleter has nothing to reopen, so close it first. Best-effort: throwing here resets the DO.
-      await this.notifyClosed().catch(() => {});
-      this.impl.scheduleAccessRestart("Gadget restarted because the workspace was deleted.");
-      this.impl.ownerId = undefined;
-    });
 
-    this.impl.logger.info("deleted workspace", {
-      event: "workspace.delete.completed", durationMs: Date.now() - startedAt,
-    });
+      this.impl.logger.info("deleted workspace", {
+        event: "workspace.delete.completed", durationMs: Date.now() - startedAt,
+      });
+    } catch (error) {
+      // Required cleanup is complete. An unrelated hook/owner failure must not leave the
+      // workspace permanently fenced; the owner can continue working or retry deletion.
+      this.impl.storage.deleting.put(false);
+      throw error;
+    }
   }
 
   async submitCodeChange(chatId: number, submission: CodeChangeSubmission)
@@ -13539,7 +13564,6 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   }
 
   async getGitCache(): Promise<GitCache> {
-    this.#check();
     return new GitCacheImpl(this.impl.gitCache, this.gatekeeperId);
   }
 

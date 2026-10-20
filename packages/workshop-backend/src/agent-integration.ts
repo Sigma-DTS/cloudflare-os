@@ -6,18 +6,12 @@ import type { ActiveAgentRecord, AgentIntegrationOrigin } from "./storage-schema
 
 type Impl = OverseerDurableObject["impl"];
 
-/** Durable delivery retries and polling during a long-running shared alarm use the same interval. */
-export const AGENT_LIFECYCLE_RETRY_MS = 30_000;
+const RETRY_MS = 30_000;
 
 /** Independent, fail-closed deployment grants; gatekeepers cannot assert their own permissions. */
 export function agentIntegrationGrant(config: string | undefined, vendor: string) {
   try {
-    const parsed: unknown = JSON.parse(config ?? "null");
-    const grant: unknown = parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? Object.getOwnPropertyDescriptor(parsed, vendor)?.value : undefined;
-    if (!grant || typeof grant !== "object" || Array.isArray(grant) ||
-        Object.entries(grant).some(([k, v]) => k !== "lifecycle" || typeof v !== "boolean")) return {};
-    return {lifecycle: Reflect.get(grant, "lifecycle") === true};
+    return JSON.parse(config ?? "null")?.[vendor]?.lifecycle === true ? {lifecycle: true} : {};
   } catch { return {}; }
 }
 
@@ -30,7 +24,8 @@ export class AgentIntegrations {
     impl.storage.activeAgents.subscribe({
       add() {},
       update: (old, next) => {
-        if (old.integration && old.integration.turnId !== next.integration?.turnId) this.emit(old, "finished");
+        if (old.integration && (!old.finishing && next.finishing ||
+            old.integration.turnId !== next.integration?.turnId)) this.emit(old, "finished");
       },
       remove: old => this.emit(old, "finished"),
     });
@@ -38,7 +33,7 @@ export class AgentIntegrations {
 
   capture(chatId: number): AgentIntegrationOrigin | undefined {
     const row = this.impl.storage.activeAgents.get(chatId);
-    if (!row || !this.impl.storage.chatMeta.get(chatId)?.activeAgent) return;
+    if (!row || row.finishing || !this.impl.storage.chatMeta.get(chatId)?.activeAgent) return;
     if (!row.integration) {
       row.integration = {turnId: crypto.randomUUID(), segmentId: crypto.randomUUID()};
       this.impl.storage.activeAgents.put(row);
@@ -46,20 +41,10 @@ export class AgentIntegrations {
     return {chatId, ...row.integration};
   }
 
-  /** Rotate capability identity only; execution phase and readiness remain in #797's row/log. */
-  enter(chatId: number): void {
-    const row = this.impl.storage.activeAgents.get(chatId);
-    if (!row?.integration) return;
-    this.impl.storage.transaction(() => {
-      row.integration!.segmentId = crypto.randomUUID();
-      this.impl.storage.activeAgents.put(row);
-      this.emit(row, "resumed");
-    });
-  }
-
   emit(row: ActiveAgentRecord, kind: AgentTurnEvent["kind"]): void {
     if (!row.integration) return;
     // Buffer before writes: the DO's KV permits only one live iterator, including index reads.
+    let queued = false;
     for (const r of Array.from(this.impl.storage.agentParticipants.byChat.get(row.chatId))) {
       const event = {...row.integration, kind, eventId: `${r.id}:${row.integration.segmentId}:${kind}`};
       if (r.turnId !== event.turnId || r.lastEvent === event.eventId ||
@@ -67,8 +52,9 @@ export class AgentIntegrations {
       r.pending.push(event);
       r.retryAt = Date.now();
       this.impl.storage.agentParticipants.put(r);
+      queued = true;
     }
-    this.changed();
+    if (queued) this.changed();
   }
 
   context(gatekeeperId: number, origin: AgentIntegrationOrigin | undefined): AgentContext | null {
@@ -80,6 +66,7 @@ export class AgentIntegrations {
   }
 
   checkContext(gatekeeperId: number, origin: AgentIntegrationOrigin): AgentTurnInfo {
+    this.impl.assertGatekeeperUsable(gatekeeperId);
     const grant = this.impl.integrationGrant(gatekeeperId);
     if (!grant.lifecycle) throw new Error("Agent integration grant revoked.");
     return this.turn(origin);
@@ -87,7 +74,7 @@ export class AgentIntegrations {
 
   turn(origin: AgentIntegrationOrigin): AgentTurnInfo {
     const row = this.impl.storage.activeAgents.get(origin.chatId);
-    if (row?.integration?.turnId !== origin.turnId || row.integration.segmentId !== origin.segmentId ||
+    if (row?.finishing || row?.integration?.turnId !== origin.turnId || row.integration.segmentId !== origin.segmentId ||
         !this.impl.storage.chatMeta.get(origin.chatId)?.activeAgent) {
       throw new Error("Agent integration context expired.");
     }
@@ -96,15 +83,11 @@ export class AgentIntegrations {
 
   register(gatekeeperId: number, origin: AgentIntegrationOrigin,
       participant: Fetcher<AgentTurnParticipant>): void {
-    if (!this.impl.integrationGrant(gatekeeperId).lifecycle) throw new Error("Lifecycle access not granted.");
-    this.turn(origin);
+    this.checkContext(gatekeeperId, origin);
     const id = `${origin.turnId}:${gatekeeperId}`;
     if (this.impl.storage.agentParticipants.get(id)) return;
     this.impl.storage.agentParticipants.put({id, chatId: origin.chatId, gatekeeperId,
-      turnId: origin.turnId, participant, pending: [{turnId: origin.turnId,
-        segmentId: origin.segmentId, eventId: `${id}:${origin.segmentId}:started`, kind: "started"}],
-      retryAt: Date.now()});
-    this.changed();
+      turnId: origin.turnId, participant, pending: []});
   }
 
   deliveryTurn(id: string, event: AgentTurnEvent): AgentTurnInfo {
@@ -115,7 +98,7 @@ export class AgentIntegrations {
     const closing = receipt.pending.findLast(e => e.kind === "suspended" || e.kind === "finished");
     const allowed = this.impl.gatekeeperUsable(receipt.gatekeeperId) &&
       this.impl.integrationGrant(receipt.gatekeeperId).lifecycle;
-    const phase = !allowed || closing?.kind === "finished" || row?.integration?.turnId !== event.turnId ? "finishing"
+    const phase = !allowed || row?.finishing || closing?.kind === "finished" || row?.integration?.turnId !== event.turnId ? "finishing"
       : closing || row.integration.segmentId !== event.segmentId ||
           !this.impl.storage.chatMeta.get(receipt.chatId)?.activeAgent ? "suspending" : "running";
     return {turnId: event.turnId, segmentId: event.segmentId, chatId: String(receipt.chatId), phase};
@@ -131,17 +114,14 @@ export class AgentIntegrations {
         let timer: ReturnType<typeof setTimeout> | undefined;
         let active = true;
         try {
-          const closing = this.deliveryTurn(id, event).phase !== "running";
-          if (closing || this.impl.integrationGrant(r.gatekeeperId).lifecycle) {
-            const context = new AgentContextImpl(this, r.gatekeeperId,
-              {chatId: r.chatId, turnId: event.turnId, segmentId: event.segmentId}, {id, event}, () => active);
-            await Promise.race([r.participant.onAgentTurnEvent(event, context), new Promise<never>((_, reject) => {
-              timer = setTimeout(() => reject(new Error("Lifecycle callback timed out.")), 60 * 60 * 1_000);
-            })]);
-          }
+          const context = new AgentContextImpl(this, r.gatekeeperId,
+            {chatId: r.chatId, turnId: event.turnId, segmentId: event.segmentId}, {id, event}, () => active);
+          await Promise.race([r.participant.onAgentTurnEvent(event, context), new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Lifecycle callback timed out.")), 60 * 60 * 1_000);
+          })]);
         } catch (error) {
           const latest = this.impl.storage.agentParticipants.get(id);
-          if (latest) { latest.retryAt = Date.now() + AGENT_LIFECYCLE_RETRY_MS; this.impl.storage.agentParticipants.put(latest); }
+          if (latest) { latest.retryAt = Date.now() + RETRY_MS; this.impl.storage.agentParticipants.put(latest); }
           throw error;
         } finally { active = false; if (timer !== undefined) clearTimeout(timer); }
         const latest = this.impl.storage.agentParticipants.get(id);
@@ -158,18 +138,18 @@ export class AgentIntegrations {
     finally { this.#deliveries.delete(id); this.changed(); }
   }
 
-  /** Cancel only the entry wait, not durable delivery or destructive deletion's cleanup. */
-  async drain(chatId?: number, signal?: AbortSignal): Promise<void> {
-    signal?.throwIfAborted();
+  /** Wait for required end-of-turn cleanup, including earlier ordered notifications. */
+  async drain(chatId?: number): Promise<void> {
     const records = chatId === undefined ? [...this.impl.storage.agentParticipants.list()]
       : [...this.impl.storage.agentParticipants.byChat.get(chatId)];
-    const delivery = Promise.all(records.map(r => this.#deliver(r.id)));
-    if (!signal) { await delivery; return; }
-    const cancelled = Promise.withResolvers<never>();
-    const abort = () => cancelled.reject(signal.reason);
-    signal.addEventListener("abort", abort, {once: true});
-    try { await Promise.race([delivery, cancelled.promise]); }
-    finally { signal.removeEventListener("abort", abort); }
+    await Promise.all(records.map(r => this.#deliver(r.id)));
+  }
+
+  /** A new prompt may replace a paused turn, but cannot overtake that turn's finalization. */
+  async finishPrevious(chatId: number): Promise<void> {
+    const records = [...this.impl.storage.agentParticipants.byChat.get(chatId)]
+      .filter(r => r.pending.some(event => event.kind === "finished"));
+    await Promise.all(records.map(r => this.#deliver(r.id)));
   }
 
   /** Alarm and immediate best-effort delivery; failed receipts keep a durable retry deadline. */

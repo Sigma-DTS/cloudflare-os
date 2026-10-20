@@ -6,7 +6,7 @@ export interface AgentContext extends RpcTarget {
   /**
    * Durably register one participant per connection and turn. Repeated registration is a no-op;
    * it does not replace the original participant or await its callback. The receiver must
-   * initialize lazily when first used, not depend on a started notification arriving first.
+   * initialize lazily when first used; registration does not send a started notification.
    */
   participate(participant: Fetcher<AgentTurnParticipant>): Promise<void>;
 }
@@ -31,15 +31,18 @@ export interface AgentTurnEvent {
   turnId: string;
   /** Segment which produced the event. */
   segmentId: string;
-  /** Finished means the execution row was removed, regardless of its outcome. */
-  kind: "started" | "resumed" | "suspended" | "finished";
+  /** Finished requests required cleanup before the logical turn can be released. */
+  kind: "resumed" | "suspended" | "finished";
 }
 
 /** Persistent, account/workspace-bound Worker entrypoint supplied by a trusted integration. */
 export interface AgentTurnParticipant extends WorkerEntrypoint {
   /**
-   * Bounded delivery with a fresh context. Read its phase before acting: delayed entry events
-   * may already have cleanup-only authority. A lost reply does not mean cleanup never ran.
+   * For resumed/suspended, acknowledge durable receipt promptly; work proceeds independently
+   * of inference. For finished, return only after required cleanup is complete: this is the
+   * sole blocking lifecycle boundary, including on Stop. Delivery is retried after failure or
+   * a lost reply, so durably deduplicate eventId. Read the fresh context's phase before acting:
+   * delayed notifications may already have cleanup-only authority.
    */
   onAgentTurnEvent(event: AgentTurnEvent, context: RpcStub<AgentContext>): Promise<void>;
 }
