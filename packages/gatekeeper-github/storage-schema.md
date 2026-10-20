@@ -160,7 +160,7 @@ Implemented TTL cache families:
 ### Cache TTLs
 
 - Viewer cache: 5 minutes
-- Entity caches (`repo-v2`, `issue`, `pull`, `discussion-reviews`, `resolve-ref`, `diff-v2`):
+- Entity caches (`repo-v2`, `issue`, `pull-v2`, `discussion-reviews`, `resolve-ref`, `diff-v2`):
   30 seconds
 - List/search caches: 15 seconds
 - `merge-base` entries never expire (a merge base is a pure function of its two key commits);
