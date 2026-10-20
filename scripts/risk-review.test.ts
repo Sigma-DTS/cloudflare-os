@@ -346,6 +346,9 @@ describe("authorizeRiskReview", () => {
     const outsider = harness({ permissions: { author: "triage" } });
     await outsider.authorize();
     assert.deepEqual(outsider.outputs, { author: "other" });
+    assert.deepEqual(outsider.statuses.map(({ sha, state, description }) => ({ sha, state, description })), [
+      { sha: HEAD, state: "pending", description: "Waiting for a maintainer to approve the run" },
+    ]);
 
     const bot = harness({ pullRequest: { user: { login: "bonk[bot]", type: "Bot" } } });
     await bot.authorize();
@@ -353,9 +356,10 @@ describe("authorizeRiskReview", () => {
   });
 
   it("routes nowhere when the pull request is closed", async () => {
-    const { outputs, authorize } = harness({ pullRequest: null });
+    const { outputs, statuses, authorize } = harness({ pullRequest: null });
     await authorize();
     assert.deepEqual(outputs, { author: "" });
+    assert.deepEqual(statuses, []);
   });
 });
 
@@ -414,6 +418,10 @@ describe("risk-review workflows", () => {
     const authorizeJob = /\n {2}authorize:\n([\s\S]*?)\n {2}\w+:\n/.exec(workflow)?.[1];
     assert.ok(authorizeJob);
     assert.doesNotMatch(authorizeJob, /secrets\./);
+  });
+
+  it("lets authorize withdraw the status without the Clef credentials", () => {
+    assert.match(workflow, /\n {2}authorize:\n[\s\S]*?statuses: write[\s\S]*?\n {2}maintainer:/);
   });
 
   it("relays reviews from a workflow with no permissions", () => {

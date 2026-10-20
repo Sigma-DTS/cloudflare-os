@@ -450,9 +450,27 @@ async function isMaintainer(github: GitHubClient, { owner, repo }: RepoRef, user
   return MAINTAINER_PERMISSIONS.has(data.permission);
 }
 
+async function postStatus(
+  github: GitHubClient,
+  { repo: { owner, repo }, serverUrl, runId }: ActionsContext,
+  sha: string,
+  { state, description }: { state: "pending" | GateResult["state"]; description: string },
+): Promise<void> {
+  await github.rest.repos.createCommitStatus({
+    owner,
+    repo,
+    sha,
+    state,
+    context: STATUS_CONTEXT,
+    description: description.slice(0, 140),
+    target_url: `${serverUrl}/${owner}/${repo}/actions/runs/${runId}`,
+  });
+}
+
 /**
- * Sets the `author` output the workflow routes on: `maintainer` runs the classifier straight away,
- * `other` holds it for a maintainer to approve, and empty means no open pull request to classify.
+ * Marks the head's status pending and sets the `author` output the workflow routes on:
+ * `maintainer` runs the classifier straight away, `other` holds it for a maintainer to approve, and
+ * empty means no open pull request to classify.
  *
  * @param options GitHub Actions runtime dependencies.
  */
@@ -461,13 +479,20 @@ export async function authorizeRiskReview({ github, context, core }: {
   context: ActionsContext;
   core: ActionsCore;
 }): Promise<void> {
-  const author = (await findPullRequest(github, context))?.user;
-  if (author === undefined) {
+  const pullRequest = await findPullRequest(github, context);
+  if (!pullRequest) {
     core.notice("No open pull request matches this event; nothing to classify.");
     core.setOutput("author", "");
     return;
   }
-  const maintainer = author !== null && await isMaintainer(github, context.repo, author);
+  const author = pullRequest.user;
+  const maintainer = !!author && await isMaintainer(github, context.repo, author);
+  // Withdraw the head's earlier verdict first: the event may have revoked an approval or moved the
+  // base, and a run waiting for approval, or rejected, must not leave the old success standing.
+  await postStatus(github, context, pullRequest.head.sha, {
+    state: "pending",
+    description: maintainer ? "Classifying" : "Waiting for a maintainer to approve the run",
+  });
   core.setOutput("author", maintainer ? "maintainer" : "other");
 }
 
@@ -520,15 +545,7 @@ export async function runRiskReview({ github, context, core, clef, fetchImpl }: 
     headSha,
   });
 
-  await github.rest.repos.createCommitStatus({
-    owner,
-    repo,
-    sha: headSha,
-    state: result.state,
-    context: STATUS_CONTEXT,
-    description: result.description.slice(0, 140),
-    target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
-  });
+  await postStatus(github, context, headSha, result);
   await core.summary
     .addHeading(`#${pullRequest.number} at ${headSha.slice(0, 7)}: ${classification.tier} risk`)
     .addList(classification.reasons.length > 0 ? classification.reasons : ["nothing raised it"])

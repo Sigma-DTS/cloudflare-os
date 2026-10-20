@@ -12,7 +12,7 @@ name: Risk review
 #
 # A maintainer's pull request (write access or above, the same check as Bonk's break-glass) is
 # classified straight away. Anyone else's waits in the `risk-review-external` environment until a
-# maintainer approves the run, and until then has no status, so it cannot merge.
+# maintainer approves the run, and until then its status is pending, so it cannot merge.
 on:
   pull_request_target:
     # `edited` only for a new base (see `authorize`): retargeting keeps the head commit, and with it
@@ -25,7 +25,8 @@ on:
 permissions: {}
 
 jobs:
-  # Reads only the GitHub API, with no secrets, so it is safe to run for anyone.
+  # Uses only the GitHub API, with no secrets, so it is safe to run for anyone. It also sets the
+  # status pending, so a revoked approval takes effect even while the classifier waits.
   authorize:
     if: >-
       (github.event_name == 'pull_request_target' &&
@@ -36,6 +37,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      statuses: write
     outputs:
       author: ${{ steps.authorize.outputs.author }}
     steps:
