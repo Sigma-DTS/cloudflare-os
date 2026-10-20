@@ -3,7 +3,7 @@ import type { ObservationDescription } from "@gadgets/workshop-shared/gatekeeper
 import { CursorPager, type Pager } from "./cursor";
 import {
   FOLDER_MIME_TYPE, MAX_QUERY_PARENTS, SHORTCUT_MIME_TYPE,
-  isFileInvisible, isListableFolderFile, isListableFolderNode,
+  getVisibleFile, isFileInvisible, isListableFolderFile, isListableFolderNode,
   type DriveApi, type DriveFile, type DriveListFilesOptions, type DriveScopeNode,
 } from "./drive-api";
 import {
@@ -362,13 +362,8 @@ abstract class DriveCoreBase {
   }
 
   /** Current metadata for one file, or `undefined` when it is invisible to this account. */
-  protected async tryFetchFile(fileId: string): Promise<DriveFile | undefined> {
-    try {
-      return await this.api.getFile(fileId);
-    } catch (error) {
-      if (isFileInvisible(error)) return undefined;
-      throw error;
-    }
+  protected tryFetchFile(fileId: string): Promise<DriveFile | undefined> {
+    return getVisibleFile(this.api, fileId);
   }
 
   /**

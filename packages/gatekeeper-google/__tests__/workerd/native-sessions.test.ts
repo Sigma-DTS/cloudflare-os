@@ -15,6 +15,7 @@ import type { GooglePresentationSession } from "../../src/slides-types";
 import { buildTab } from "../doc-fixture";
 import { formatSheet } from "../sheets-fixture";
 import { presentation, shape, SIMPLE_LIGHT, slide, text } from "../slides-fixture";
+import { driveBatchResponse } from "./drive-batch";
 
 const DOC_MIME = "application/vnd.google-apps.document";
 const SHEET_MIME = "application/vnd.google-apps.spreadsheet";
@@ -451,35 +452,12 @@ describe("folder-scoped native sessions", () => {
     ]);
   }
 
-  /** One multipart `files.get` batch response, echoing each requested ID by Content-ID position. */
-  function batchResponse(body: string, nodes: Map<string, Node>): Response {
-    const boundary = "folder_batch";
-    const ids = [...body.matchAll(/GET \/drive\/v3\/files\/([^?]+)\?/g)]
-      .map(match => decodeURIComponent(match[1]));
-    const parts = ids.map((id, index) => {
-      const node = nodes.get(id);
-      return [
-        `--${boundary}`,
-        "Content-Type: application/http",
-        `Content-ID: <response-item-${index}>`,
-        "",
-        node ? "HTTP/1.1 200 OK" : "HTTP/1.1 404 Not Found",
-        "Content-Type: application/json",
-        "",
-        node ? JSON.stringify(node) : "{}",
-      ].join("\r\n");
-    });
-    return new Response(`${parts.join("\r\n")}\r\n--${boundary}--\r\n`, {
-      headers: { "Content-Type": `multipart/mixed; boundary=${boundary}` },
-    });
-  }
-
   function installFolderProvider(nodes: Map<string, Node>, onNativeRead?: () => void) {
     const nativeCalls: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : input.toString());
       if (url.pathname === "/batch/drive/v3") {
-        return batchResponse(String(init?.body ?? ""), nodes);
+        return driveBatchResponse(String(init?.body ?? ""), id => nodes.get(id));
       }
       if (url.pathname === "/drive/v3/files") {
         const parents = [...(url.searchParams.get("q") ?? "").matchAll(/'([^']+)' in parents/g)]

@@ -186,9 +186,9 @@ export type DriveListFilesOptions = DriveFileQuery & {
 export type DriveFileList = { files: DriveFile[]; nextPageToken?: string };
 
 /** A shared drive this account is a member of. Its id is also its root folder's. */
-export type DriveSharedDrive = { id: string; name: string };
+type DriveSharedDrive = { id: string; name: string };
 
-export type DriveSharedDriveList = { drives: DriveSharedDrive[]; nextPageToken?: string };
+type DriveSharedDriveList = { drives: DriveSharedDrive[]; nextPageToken?: string };
 
 /** Drive refused because the API is not enabled on this OAuth project. */
 export class DriveApiDisabledError extends Error {}
@@ -455,6 +455,18 @@ export function isFileInvisible(error: unknown): boolean {
     (error.status === 403 || error.status === 404);
 }
 
+/** Current metadata for one file, or `undefined` when it is invisible to this account. */
+export async function getVisibleFile(
+  api: Pick<DriveApi, "getFile">, fileId: string,
+): Promise<DriveFile | undefined> {
+  try {
+    return await api.getFile(fileId);
+  } catch (error) {
+    if (isFileInvisible(error)) return undefined;
+    throw error;
+  }
+}
+
 const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"]);
 
 /**
@@ -682,10 +694,9 @@ export class DriveApi {
     });
     if (options.pageToken) params.set("pageToken", options.pageToken);
     let body = await this.#getUnknown("/drives", params);
-    let rawDrives = isRecord(body) ? body.drives ?? [] : undefined;
-    if (!isRecord(body) || !Array.isArray(rawDrives)) {
-      throw new Error("Invalid Google Drive shared-drive list response");
-    }
+    if (!isRecord(body)) throw new Error("Invalid Google Drive shared-drive list response");
+    let rawDrives = body.drives ?? [];
+    if (!Array.isArray(rawDrives)) throw new Error("Invalid Google Drive shared-drive list response");
     let drives = rawDrives.map((drive: unknown) => {
       if (!isRecord(drive) || typeof drive.id !== "string" || typeof drive.name !== "string") {
         throw new Error("Invalid Google Drive shared drive");

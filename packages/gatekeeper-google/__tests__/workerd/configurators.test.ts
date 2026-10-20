@@ -19,6 +19,7 @@ import {
   GOOGLE_DOC_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, OFFICE_IMPORT_GRANT,
   SHARED_DRIVES_GRANT, resourceUrlPatternsToOAuthScopes,
 } from "../../src/resources";
+import { driveBatchResponse } from "./drive-batch";
 
 const token = (value: string): GoogleAccessToken => ({
   token: value,
@@ -56,26 +57,15 @@ describe("Google resource configurators", () => {
       vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = new URL(input instanceof Request ? input.url : input.toString());
         calls.push(url);
-        if (url.pathname === "/batch/drive/v3") return batchResponse(String(init?.body), routes);
+        if (url.pathname === "/batch/drive/v3") {
+          return driveBatchResponse(String(init?.body), id => routes[`/files/${id}`]);
+        }
         const path = url.pathname.replace(/^\/drive\/v3/, "");
         return path in routes
           ? Response.json(routes[path])
           : Response.json({ error: { code: 404, message: "File not found" } }, { status: 404 });
       }));
       return calls;
-    };
-
-    const batchResponse = (body: string, routes: Record<string, unknown>) => {
-      const parts = [...body.matchAll(/GET \/drive\/v3\/files\/([^?]+)\?/g)].map(([, id], index) => {
-        const file = routes[`/files/${decodeURIComponent(id)}`];
-        return [
-          "--batch", "Content-Type: application/http", `Content-ID: <response-item-${index}>`, "",
-          file ? "HTTP/1.1 200 OK" : "HTTP/1.1 404 Not Found", "Content-Type: application/json", "",
-          JSON.stringify(file ?? {}),
-        ].join("\r\n");
-      });
-      return new Response(`${parts.join("\r\n")}\r\n--batch--\r\n`,
-        { headers: { "Content-Type": "multipart/mixed; boundary=batch" } });
     };
 
     // My Drive's root can be bound only by its real ID: the folder scope refuses the `root` alias.
@@ -108,7 +98,7 @@ describe("Google resource configurators", () => {
         "/files": {
           nextPageToken: "page-3",
           files: [
-            { id: "sub", name: "Plans", mimeType: FOLDER, capabilities: { canListChildren: true } },
+            { id: "sub", name: "Plans", mimeType: FOLDER, trashed: false, capabilities: { canListChildren: true } },
             { id: "locked", name: "Archive", mimeType: FOLDER, capabilities: { canListChildren: false } },
             {
               id: "doc", name: "Notes", mimeType: "application/vnd.google-apps.document",

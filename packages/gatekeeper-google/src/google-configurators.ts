@@ -8,7 +8,7 @@ import type { ChatSpaceInfo } from "./chat-types";
 import { GoogleAccessToken } from "./google-api";
 import { AccessTokenProvider, AccessTokenRequest } from "./auth-retry";
 import {
-  DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, isFileInvisible,
+  DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, getVisibleFile,
   isListableFolderFile, isListableFolderNode, type DriveFile, type DriveFileList, type DriveScopeNode,
 } from "./drive-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
@@ -467,7 +467,7 @@ function driveFileNode(
   file: DriveFile, detail?: string, targets?: ReadonlyMap<string, DriveScopeNode | undefined>,
 ): DriveNode | undefined {
   let { id, mimeType } = file;
-  let listable = file.capabilities?.canListChildren === true;
+  let listable = isListableFolderFile(file);
   if (mimeType === SHORTCUT_MIME_TYPE) {
     let targetId = file.shortcutDetails?.targetId;
     let target = targetId ? targets?.get(targetId) : undefined;
@@ -497,7 +497,7 @@ async function driveFilePage(
   { files, nextPageToken }: DriveFileList,
   detail?: (file: DriveFile) => string,
 ): Promise<DriveNodePage> {
-  let targetIds = files.flatMap(file => file.shortcutDetails?.targetId || []);
+  let targetIds = [...new Set(files.flatMap(file => file.shortcutDetails?.targetId || []))];
   let read = await drive.getScopeNodes(targetIds);
   let targets = new Map(targetIds.map((id, index) => [id, read[index]] as const));
   return drivePage(files.flatMap(file => driveFileNode(file, detail?.(file), targets) ?? []), nextPageToken);
@@ -513,13 +513,9 @@ async function drivePath(drive: DriveApi, file: DriveFile): Promise<DriveNodeAnc
   let top = file;
   for (let parentId = top.parents?.[0]; parentId; parentId = top.parents?.[0]) {
     if (ancestors.length === MAX_DRIVE_PATH_DEPTH) return undefined;
-    try {
-      top = await drive.getFile(parentId);
-    } catch (error) {
-      if (isFileInvisible(error)) return undefined;
-      throw error;
-    }
-    ancestors.unshift(top);
+    let parent = await getVisibleFile(drive, parentId);
+    if (!parent) return undefined;
+    ancestors.unshift(top = parent);
   }
   // Judged as `readFolderRoot` judges a folder binding, so the picker offers only folders that connect.
   let folders = ancestors.map(folder =>
@@ -623,15 +619,10 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
     if (!fileId) return null;
     let drive = new DriveApi(googleTokenProvider(this));
     return withDriveApiEnabled<DriveNode | null>(DRIVE_BROWSE_DISABLED, async () => {
-      let file: DriveFile;
-      try {
-        file = await drive.getFile(fileId);
-      } catch (error) {
-        if (isFileInvisible(error)) return null;
-        throw error;
-      }
+      let file = await getVisibleFile(drive, fileId);
+      if (!file || file.trashed) return null;
       // A folder named as a file, or a shortcut, is not the node the id claims.
-      let node = file.trashed ? undefined : driveFileNode(file);
+      let node = driveFileNode(file);
       if (node?.id !== id) return null;
       let path = await drivePath(drive, file);
       return path ? { ...node, path } : node;

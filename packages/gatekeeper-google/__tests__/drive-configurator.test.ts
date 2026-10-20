@@ -3,6 +3,7 @@
 
 import { expect, it, vi } from "vitest";
 import type { DriveNodePage } from "../src/configurator/drive-configurator-types";
+import { SHARED_DRIVES_GRANT as GRANT } from "../src/resources";
 import { nodes, text } from "./configurator-tree";
 
 vi.mock("@gadgets/configurator-ui", () => ({
@@ -17,7 +18,6 @@ vi.mock("@gadgets/configurator-ui", () => ({
   Section: "Section",
 }));
 
-const GRANT = "https://drive.google.com/drive/shared-drives";
 const GRANT_NOTICE = { tone: undefined, text: expect.stringContaining('"View and download all your Drive files"') };
 
 /** A fresh module, since it keeps the pending grant at module level, and its frame. */
