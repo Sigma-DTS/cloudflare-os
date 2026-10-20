@@ -47,18 +47,35 @@ describe("Google resource configurators", () => {
     const picker = (holdsSharedDrivesGrant = true) =>
       new DriveConfiguratorUI(async () => token("access-token"), async () => holdsSharedDrivesGrant);
 
-    /** Answers each Drive request from `routes` by path, recording every URL asked for. */
+    /**
+     * Answers each Drive request from `routes` by path, recording every URL asked for. A batch is
+     * answered part by part from the `/files/<id>` routes.
+     */
     const stubDrive = (routes: Record<string, unknown>) => {
       const calls: URL[] = [];
-      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = new URL(input instanceof Request ? input.url : input.toString());
         calls.push(url);
+        if (url.pathname === "/batch/drive/v3") return batchResponse(String(init?.body), routes);
         const path = url.pathname.replace(/^\/drive\/v3/, "");
         return path in routes
           ? Response.json(routes[path])
           : Response.json({ error: { code: 404, message: "File not found" } }, { status: 404 });
       }));
       return calls;
+    };
+
+    const batchResponse = (body: string, routes: Record<string, unknown>) => {
+      const parts = [...body.matchAll(/GET \/drive\/v3\/files\/([^?]+)\?/g)].map(([, id], index) => {
+        const file = routes[`/files/${decodeURIComponent(id)}`];
+        return [
+          "--batch", "Content-Type: application/http", `Content-ID: <response-item-${index}>`, "",
+          file ? "HTTP/1.1 200 OK" : "HTTP/1.1 404 Not Found", "Content-Type: application/json", "",
+          JSON.stringify(file ?? {}),
+        ].join("\r\n");
+      });
+      return new Response(`${parts.join("\r\n")}\r\n--batch--\r\n`,
+        { headers: { "Content-Type": "multipart/mixed; boundary=batch" } });
     };
 
     // My Drive's root can be bound only by its real ID: the folder scope refuses the `root` alias.
@@ -101,9 +118,15 @@ describe("Google resource configurators", () => {
               id: "link", name: "Team folder", mimeType: SHORTCUT,
               shortcutDetails: { targetId: "team", targetMimeType: FOLDER },
             },
+            // Its target was unshared, which leaves the shortcut behind.
+            {
+              id: "stale", name: "Old project", mimeType: SHORTCUT,
+              shortcutDetails: { targetId: "unshared", targetMimeType: FOLDER },
+            },
             { id: "dangling", name: "Gone", mimeType: SHORTCUT, shortcutDetails: {} },
           ],
         },
+        "/files/team": { id: "team", mimeType: FOLDER, trashed: false, capabilities: { canListChildren: true } },
       });
 
       await expect(picker().listDriveNodes("folder:F1", "", "page-2")).resolves.toEqual({
@@ -115,6 +138,7 @@ describe("Google resource configurators", () => {
             modifiedTime: "2026-10-01T10:00:00Z",
           },
           { id: "folder:team", title: "Team folder", kind: "folder", listable: true },
+          { id: "folder:unshared", title: "Old project", kind: "folder", listable: false },
         ],
         nextCursor: "page-3",
       });

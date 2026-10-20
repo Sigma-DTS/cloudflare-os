@@ -9,7 +9,7 @@ import { GoogleAccessToken } from "./google-api";
 import { AccessTokenProvider, AccessTokenRequest } from "./auth-retry";
 import {
   DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, isFileInvisible,
-  isListableFolderFile, type DriveFile, type DriveFileList,
+  isListableFolderFile, isListableFolderNode, type DriveFile, type DriveFileList,
 } from "./drive-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
 import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurator-types";
@@ -459,17 +459,20 @@ async function myDriveId(drive: DriveApi): Promise<string> {
   return (await drive.getFile("root")).id;
 }
 
-/** The picker's node for a listed file. A shortcut stands for its target, which is what binds. */
-function driveFileNode(file: DriveFile, detail?: string): DriveNode | undefined {
-  let id = file.id;
-  let mimeType = file.mimeType;
+/**
+ * The picker's node for a listed file. A shortcut stands for its target, which is what binds, so it
+ * is listable only when `listableTargets` holds its target.
+ */
+function driveFileNode(
+  file: DriveFile, detail?: string, listableTargets?: ReadonlySet<string>,
+): DriveNode | undefined {
+  let { id, mimeType } = file;
   let listable = file.capabilities?.canListChildren === true;
   if (mimeType === SHORTCUT_MIME_TYPE) {
     if (!file.shortcutDetails?.targetId) return undefined;
     id = file.shortcutDetails.targetId;
     mimeType = file.shortcutDetails.targetMimeType;
-    // A listing does not carry the target's capabilities; connecting to it checks them.
-    listable = true;
+    listable = listableTargets?.has(id) ?? false;
   }
   let shown = {
     title: file.name,
@@ -485,11 +488,23 @@ function drivePage(nodes: DriveNode[], nextPageToken: string | undefined): Drive
   return { nodes: tellApartSameNamed(nodes), ...(nextPageToken ? { nextCursor: nextPageToken } : {}) };
 }
 
-function driveFilePage(
+/**
+ * A page of listed files. A listing carries no shortcut target's capabilities, so a folder
+ * shortcut's target is read in one batch and judged as a folder binding would be: a shortcut
+ * outlives its target being unshared.
+ */
+async function driveFilePage(
+  drive: DriveApi,
   { files, nextPageToken }: DriveFileList,
   detail?: (file: DriveFile) => string,
-): DriveNodePage {
-  return drivePage(files.flatMap(file => driveFileNode(file, detail?.(file)) ?? []), nextPageToken);
+): Promise<DriveNodePage> {
+  let targetIds = files.flatMap(({ shortcutDetails: shortcut }) =>
+    shortcut?.targetId && shortcut.targetMimeType === FOLDER_MIME_TYPE ? [shortcut.targetId] : []);
+  let targets = targetIds.length > 0 ? await drive.getScopeNodes(targetIds) : [];
+  let listableTargets = new Set(targets.flatMap((target, index) =>
+    target && isListableFolderNode(target) ? [targetIds[index]] : []));
+  return drivePage(
+    files.flatMap(file => driveFileNode(file, detail?.(file), listableTargets) ?? []), nextPageToken);
 }
 
 /**
@@ -568,7 +583,7 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
     let page = { pageSize: DRIVE_PAGE_SIZE, ...(cursor ? { pageToken: cursor } : {}) };
     return withDriveApiEnabled<DriveNodePage>(DRIVE_BROWSE_DISABLED, async () => {
       if (query.trim()) {
-        return driveFilePage(
+        return driveFilePage(drive,
           await drive.listFiles({ ...page, namePrefix: query, corpus: { kind: "allDrives" } }),
           file => file.driveId
             ? "In a shared drive"
@@ -596,11 +611,12 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
           nextPageToken);
       }
       if (parentId === SHARED_WITH_ME.id) {
-        return driveFilePage(await drive.listFiles({ ...page, sharedWithMe: true, orderBy: "folder,name" }));
+        return driveFilePage(drive,
+          await drive.listFiles({ ...page, sharedWithMe: true, orderBy: "folder,name" }));
       }
       let folder = parseDriveNodeId(parentId);
       if (folder?.kind !== "folder") throw new Error("Unknown Drive location.");
-      return driveFilePage(await drive.listFiles({
+      return driveFilePage(drive, await drive.listFiles({
         ...page, directParentIds: [folder.fileId], corpus: { kind: "allDrives" }, orderBy: "folder,name",
       }));
     });
