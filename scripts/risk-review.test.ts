@@ -8,7 +8,7 @@ import {
   buildClefState,
   classifyChangeset,
   evaluateGate,
-  isHighRiskPath,
+  pathFloor,
   runRiskReview,
   tallyReviews,
   type ActionsContext,
@@ -28,7 +28,11 @@ const triggerWorkflow = readFileSync(
 
 const HEAD = "a".repeat(40);
 const OLD = "b".repeat(40);
-const lowVerdict: ClefVerdict = { high: 0.05, steering: 0 };
+const lowVerdict: ClefVerdict = { probabilities: { low: 0.9, medium: 0.08, high: 0.02 }, steering: 0 };
+
+function verdict(low: number, medium: number, high: number, steering = 0): ClefVerdict {
+  return { probabilities: { low, medium, high }, steering };
+}
 
 function file(filename: string, overrides: Partial<ChangedFile> = {}): ChangedFile {
   return {
@@ -46,8 +50,8 @@ function review(login: string, state: string, commit = HEAD, type = "User"): Rev
   return { user: { login, type }, state, commit_id: commit };
 }
 
-describe("isHighRiskPath", () => {
-  it("covers all of workshop-backend, the gate itself, and the delivery pipeline", () => {
+describe("pathFloor", () => {
+  it("puts all of workshop-backend, the gate itself and the security chokepoints at high", () => {
     for (const path of [
       "packages/workshop-backend/src/overseer.ts",
       "packages/workshop-backend/__tests__/user.test.ts",
@@ -56,11 +60,22 @@ describe("isHighRiskPath", () => {
       "scripts/risk-review.ts",
       "scripts/release/manifest-lib.ts",
       "packages/workshop-shared/src/api.ts",
+      "packages/mcp-shared/src/tools.ts",
+    ]) {
+      assert.equal(pathFloor(path), "high", path);
+    }
+  });
+
+  it("puts shared code, gatekeepers, dependencies and worker config at medium", () => {
+    for (const path of [
+      "packages/workshop-shared/src/blueprints.ts",
       "packages/gatekeeper-github/src/index.ts",
+      "packages/router/src/index.ts",
       "packages/workshop-frontend/package.json",
       "pnpm-lock.yaml",
+      "packages/router/wrangler.jsonc",
     ]) {
-      assert.equal(isHighRiskPath(path), true, path);
+      assert.equal(pathFloor(path), "medium", path);
     }
   });
 
@@ -71,7 +86,7 @@ describe("isHighRiskPath", () => {
       "packages/gatekeeper-github/__tests__/index.test.ts",
       "packages/workshop-frontend/src/App.tsx",
     ]) {
-      assert.equal(isHighRiskPath(path), false, path);
+      assert.equal(pathFloor(path), "low", path);
     }
   });
 });
@@ -84,9 +99,14 @@ describe("buildClefState", () => {
     assert.match(state, /^--- \.github\/workflows\/preview\.yml → docs\/preview\.yml \(renamed/);
   });
 
-  it("puts high-risk files first", () => {
-    const { state, complete } = buildClefState([file("docs/a.md"), file("packages/workshop-shared/src/api.ts")]);
-    assert.ok(state.indexOf("api.ts") < state.indexOf("docs/a.md"));
+  it("puts higher-floor files first", () => {
+    const { state, complete } = buildClefState([
+      file("docs/a.md"),
+      file("packages/router/src/index.ts"),
+      file("packages/workshop-shared/src/api.ts"),
+    ]);
+    assert.ok(state.indexOf("api.ts") < state.indexOf("router"));
+    assert.ok(state.indexOf("router") < state.indexOf("docs/a.md"));
     assert.equal(complete, true);
   });
 
@@ -120,23 +140,28 @@ describe("classifyChangeset", () => {
     assert.deepEqual(classify({}), { tier: "low", reasons: [] });
   });
 
-  it("lets Clef raise the tier but never lower a high-risk path", () => {
+  it("lets Clef raise the tier but never lower a path floor", () => {
     assert.equal(classify({ files: [file("packages/workshop-backend/src/user.ts")] }).tier, "high");
-    assert.equal(classify({ clef: { high: 0.7, steering: 0 } }).tier, "high");
+    assert.equal(classify({ files: [file("packages/gatekeeper-x/src/index.ts")] }).tier, "medium");
+    assert.equal(
+      classify({ files: [file("packages/gatekeeper-x/src/index.ts")], clef: verdict(0.1, 0.2, 0.7) }).tier,
+      "high",
+    );
   });
 
-  it("rates a change high when Clef is unsure", () => {
-    assert.equal(classify({ clef: { high: 0.3, steering: 0 } }).tier, "high");
-    assert.equal(classify({ clef: { high: 0.29, steering: 0 } }).tier, "low");
+  it("escalates when Clef is unsure", () => {
+    assert.equal(classify({ clef: verdict(0.65, 0.25, 0.1) }).tier, "medium");
+    assert.equal(classify({ clef: verdict(0.5, 0.2, 0.3) }).tier, "high");
+    assert.equal(classify({ clef: verdict(0.71, 0.2, 0.09) }).tier, "low");
   });
 
   it("needs a human when the classifier did not see the whole change", () => {
-    assert.equal(classify({ complete: false }).tier, "high");
-    assert.equal(classify({ clef: { error: "HTTP 500" } }).tier, "high");
+    assert.equal(classify({ complete: false }).tier, "medium");
+    assert.equal(classify({ clef: { error: "HTTP 500" } }).tier, "medium");
   });
 
   it("rates a diff that addresses the classifier high", () => {
-    assert.equal(classify({ clef: { high: 0, steering: 0.8 } }).tier, "high");
+    assert.equal(classify({ clef: verdict(1, 0, 0, 0.8) }).tier, "high");
   });
 
   it("rates a rename out of a high-risk path high", () => {
@@ -150,12 +175,12 @@ describe("classifyChangeset", () => {
     });
     const { tier, reasons } = classify({ files: [rename], complete: buildClefState([rename]).complete });
     assert.equal(tier, "high");
-    assert.match(reasons[0], /\.github\/workflows\/preview\.yml → docs\/preview\.yml/);
+    assert.match(reasons[0], /^high: .*\.github\/workflows\/preview\.yml → docs\/preview\.yml/);
   });
 
-  it("names the files behind a high-risk path", () => {
+  it("names the files behind a floor", () => {
     const { reasons } = classify({ files: [file("packages/workshop-shared/src/api.ts")] });
-    assert.match(reasons[0], /packages\/workshop-shared\/src\/api\.ts/);
+    assert.match(reasons[0], /^high: .*packages\/workshop-shared\/src\/api\.ts/);
   });
 });
 
@@ -198,7 +223,12 @@ describe("evaluateGate", () => {
     assert.deepEqual(gate({}), { state: "success", description: "low risk: automated review only" });
   });
 
-  it("requires one approval for high risk", () => {
+  it("requires one approval for medium and for high risk", () => {
+    assert.deepEqual(gate({ tier: "medium" }), {
+      state: "failure",
+      description: "medium risk: needs a maintainer's approval of aaaaaaa",
+    });
+    assert.equal(gate({ tier: "medium", approvers: ["alice"] }).state, "success");
     assert.deepEqual(gate({ tier: "high" }), {
       state: "failure",
       description: "high risk: needs a maintainer's approval of aaaaaaa",
@@ -226,19 +256,19 @@ describe("askClef", () => {
 
   it("reads the verdict out of the REST API's result wrapper", async () => {
     let request: { url: string; init?: RequestInit } | undefined;
-    const verdict = await askClef("diff", config, async (url, init) => {
+    const answer = await askClef("diff", config, async (url, init) => {
       request = { url: String(url), init };
       return Response.json({
         result: {
           answers: {
-            tier: { type: "choice", choice: "low", probabilities: { low: 0.9, high: 0.1 } },
+            tier: { type: "choice", choice: "low", probabilities: { low: 0.9, medium: 0.1, high: 0 } },
             steering: { type: "noul", noul: 0.01 },
           },
         },
       });
     });
 
-    assert.deepEqual(verdict, { high: 0.1, steering: 0.01 });
+    assert.deepEqual(answer, { probabilities: { low: 0.9, medium: 0.1, high: 0 }, steering: 0.01 });
     assert.ok(request);
     assert.equal(request.url, "https://api.cloudflare.com/client/v4/accounts/acct/ai/run/@cf/cloudflare/clef");
     const headers = request.init?.headers as Record<string, string> | undefined;
@@ -265,7 +295,9 @@ describe("askClef", () => {
 
 async function clefAnswers() {
   return Response.json({
-    result: { answers: { tier: { probabilities: { low: 0.95, high: 0.05 } }, steering: { noul: 0 } } },
+    result: {
+      answers: { tier: { probabilities: { low: 0.95, medium: 0.04, high: 0.01 } }, steering: { noul: 0 } },
+    },
   });
 }
 

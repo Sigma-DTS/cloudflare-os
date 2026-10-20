@@ -1,8 +1,8 @@
 name: Risk review
 
-# Classifies each pull request as low or high risk and posts the `risk-review` commit status on its
-# head, which passes once that tier's human approvals of the head commit are in (0 or 1). The rules
-# and the reasons behind them are in scripts/risk-review.ts.
+# Classifies each pull request as low, medium or high risk and posts the `risk-review` commit status
+# on its head, which passes once that tier's human approvals of the head commit are in (0, 1, 1).
+# The rules and the reasons behind them are in scripts/risk-review.ts.
 #
 # Both triggers run this file and the script from the base branch, never the pull request's copy,
 # so a change cannot rewrite its own classifier. Nothing checks out the pull request's code: the
@@ -82,8 +82,8 @@ jobs:
       - name: Classify and post status
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          # Needs Workers AI Read on the account. Without it every pull request is high risk,
-          # which fails safe but makes the low tier unreachable.
+          # Needs Workers AI Read on the account. Without it every pull request is at least medium
+          # risk, which fails safe but makes the low tier unreachable.
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_AI_GATEWAY_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
           CLOUDFLARE_GATEWAY_ID: ${{ secrets.CF_AI_GATEWAY_NAME }}
