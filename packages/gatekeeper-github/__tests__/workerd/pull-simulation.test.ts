@@ -850,6 +850,22 @@ describe("pushing to a pull request", () => {
       .rejects.toThrow(/pull request #7: .* not a fast-forward .* or merge it in\.$/);
   });
 
+  it("pushes to a provisional pull request's head branch, until its create is discarded", async () => {
+    scenarioGitHub();
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(HEAD2, "commit", commitPayload(TREE_2, [HEAD1], "fix: review feedback"))
+      .withAncestry(HEAD1, HEAD2);
+    await queuePush(gk, cache, "feature", HEAD1);
+    const pr = await queuePullRequest(gk, { title: "Add new.txt", head: "feature", base: "main" });
+
+    expect(await gk.preparePullRequestPush(pr.provisionalId, HEAD2, cache))
+      .toMatchObject({ branch: "feature", expectedOldSha: HEAD1, newSha: HEAD2 });
+    await gk.rejectAction(pr.approvalId);
+    await expect(gk.preparePullRequestPush(pr.provisionalId, HEAD2, cache))
+      .rejects.toThrow(`Provisional pull request ${pr.provisionalId} is no longer available.`);
+  });
+
   it("refuses a fork's pull request, and one whose head branch is gone", async () => {
     const { github, cache } = topicScenario();
     github.pulls.set(9, pullResponse(9, { ref: "topic", sha: HEAD2, repo: FORK }, { ref: "main", sha: BASE }));

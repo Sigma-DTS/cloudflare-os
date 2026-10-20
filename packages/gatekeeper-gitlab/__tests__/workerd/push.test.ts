@@ -304,6 +304,20 @@ describe("pushing to a merge request", () => {
     await expect(push(OTHER, unrelated)).rejects.toThrow(/merge request !133: .* not a fast-forward .* or merge it in\.$/);
   });
 
+  it("pushes to a provisional merge request's source branch, until its create is discarded", async () => {
+    const { props, name } = await setup();
+    const cache = cacheWithChain();
+    await queuePush(name, props, "feature", HEAD1, false, cache);
+    const mr = await unwrap(await hooks().queueAction(name, props, "prepareCreateMergeRequest",
+      [{ title: "x", sourceBranch: "feature", targetBranch: "main" }], DESC));
+    const push = async () =>
+      await unwrap(await hooks().queueAction(name, props, "prepareMergeRequestPush", ["~1", HEAD2, stubOf(cache)], DESC));
+
+    expect(await push()).toMatchObject({ branch: "feature", expectedOldSha: HEAD1, newSha: HEAD2 });
+    await unwrap(await hooks().rejectAction(name, props, mr.approvalId));
+    await expect(push()).rejects.toThrow("Provisional merge request ~1 is no longer available.");
+  });
+
   it("refuses a merge request from a fork, and one whose source branch is gone", async () => {
     await expect((await mergeRequest(2)).push(HEAD1, cacheWithChain())).rejects.toThrow("its source branch is in a fork");
     const { gitlab, push } = await mergeRequest();
