@@ -1,0 +1,18 @@
+name: Risk review trigger
+
+# Relays review events to risk-review.yml, which re-evaluates the pull request from the base branch
+# through `workflow_run`. This file runs as the pull request's copy, so it holds no permissions and
+# does nothing. Deleting it from a branch only stops reviews there from refreshing the status.
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Hand off to Risk review
+        run: echo "risk-review.yml re-evaluates this pull request."
