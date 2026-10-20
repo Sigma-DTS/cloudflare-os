@@ -399,6 +399,11 @@ describe("risk-review workflows", () => {
     assert.doesNotMatch(workflow, /github\.event\.pull_request\.head\.(ref|repo)/);
   });
 
+  it("reclassifies when the base changes, but not on other edits", () => {
+    assert.match(workflow, /types: \[[^\]]*\bedited\b/);
+    assert.match(workflow, /github\.event\.action != 'edited' \|\| github\.event\.changes\.base/);
+  });
+
   it("holds every author but a maintainer behind the approval environment", () => {
     assert.match(workflow, /if: needs\.authorize\.outputs\.author == 'maintainer'/);
     assert.match(

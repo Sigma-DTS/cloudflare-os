@@ -15,7 +15,9 @@ name: Risk review
 # maintainer approves the run, and until then has no status, so it cannot merge.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, assigned, unassigned]
+    # `edited` only for a new base (see `authorize`): retargeting keeps the head commit, and with it
+    # a status earned against the old base's smaller diff.
+    types: [opened, synchronize, reopened, ready_for_review, edited, assigned, unassigned]
   workflow_run:
     workflows: [Risk review trigger]
     types: [completed]
@@ -25,7 +27,10 @@ permissions: {}
 jobs:
   # Reads only the GitHub API, with no secrets, so it is safe to run for anyone.
   authorize:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request_review'
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       (github.event.action != 'edited' || github.event.changes.base)) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request_review')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
