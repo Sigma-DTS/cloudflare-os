@@ -285,9 +285,21 @@ describe("askClef", () => {
     assert.deepEqual(await askClef("diff", config, async () => new Response("", { status: 403 })), {
       error: "HTTP 403",
     });
-    assert.deepEqual(await askClef("diff", config, async () => Response.json({ result: {} })), {
-      error: "unexpected response shape",
-    });
+    for (const answers of [
+      {},
+      { tier: { probabilities: {} }, steering: { noul: 0 } },
+      { tier: { probabilities: [0.9, 0.1, 0] }, steering: { noul: 0 } },
+      { tier: { probabilities: { low: 0.9, medium: 0.1 } }, steering: { noul: 0 } },
+      { tier: { probabilities: { low: 0.9, medium: "0.1", high: 0 } }, steering: { noul: 0 } },
+      { tier: { probabilities: { low: 0.9, medium: 0.1, high: 1.5 } }, steering: { noul: 0 } },
+      { tier: { probabilities: { low: 0.9, medium: 0.1, high: 0 } }, steering: { noul: Number.NaN } },
+    ]) {
+      assert.deepEqual(
+        await askClef("diff", config, async () => Response.json({ result: { answers } })),
+        { error: "unexpected response shape" },
+        JSON.stringify(answers),
+      );
+    }
     assert.deepEqual(
       await askClef("diff", config, async () => {
         throw new TypeError("fetch failed");
@@ -390,7 +402,8 @@ function harness({
     runId,
     payload: { repository: { default_branch: "main" }, ...payload },
   });
-  const authorize = (runId = 1) => authorizeRiskReview({ github, context: contextFor(runId), core });
+  const authorize = (runId = 1) =>
+    authorizeRiskReview({ github, context: contextFor(runId), core, approver: APP });
   const evaluate = (runId = 1) =>
     runRiskReview({
       github,
@@ -451,9 +464,30 @@ describe("authorizeRiskReview", () => {
     assert.deepEqual(statuses, []);
   });
 
+  it("ignores the app's own reviews, which cannot change the verdict", async () => {
+    const { outputs, statuses, authorize } = harness({
+      payload: {
+        workflow_run: {
+          actor: { login: APP },
+          head_branch: "topic",
+          head_repository: { owner: { login: "cloudflare" } },
+        },
+      },
+    });
+    await authorize();
+    assert.deepEqual(outputs, { author: "" });
+    assert.deepEqual(statuses, []);
+  });
+
   it("looks a reviewed pull request up by head and default branch", async () => {
     const { outputs, listed, authorize } = harness({
-      payload: { workflow_run: { head_branch: "topic", head_repository: { owner: { login: "someone" } } } },
+      payload: {
+        workflow_run: {
+          actor: { login: "alice" },
+          head_branch: "topic",
+          head_repository: { owner: { login: "someone" } },
+        },
+      },
       permissions: { author: "write" },
     });
     await authorize();
@@ -606,7 +640,8 @@ describe("risk-review workflows", () => {
     ]);
     assert.equal(workflow.match(/github-token: \$\{\{ steps\.app\.outputs\.token \|\| github\.token \}\}/g)?.length, 2);
     assert.match(workflow, /- \*app-token\n/);
-    assert.match(workflow, /approver: process\.env\.RISK_REVIEW_APPROVER/);
+    // authorize needs the app's login too, to ignore the app's own reviews.
+    assert.equal(workflow.match(/approver: process\.env\.RISK_REVIEW_APPROVER/g)?.length, 2);
   });
 
   it("relays reviews from a workflow with no permissions", () => {

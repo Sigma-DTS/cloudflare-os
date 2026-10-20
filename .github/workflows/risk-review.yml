@@ -81,13 +81,20 @@ jobs:
       - name: Check the author's permission
         id: authorize
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RISK_REVIEW_APPROVER: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || '' }}
         with:
           github-token: ${{ steps.app.outputs.token || github.token }}
           script: |
             const { pathToFileURL } = await import("node:url");
             const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/risk-review.ts`);
             const { authorizeRiskReview } = await import(scriptUrl.href);
-            await authorizeRiskReview({ github, context, core });
+            await authorizeRiskReview({
+              github,
+              context,
+              core,
+              approver: process.env.RISK_REVIEW_APPROVER || undefined,
+            });
 
   # `maintainer` and `external` are the same job; only `external` waits for an approval.
   maintainer:

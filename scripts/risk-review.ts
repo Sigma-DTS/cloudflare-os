@@ -245,6 +245,8 @@ export interface ActionsContext {
     repository: { default_branch: string };
     pull_request?: { number: number };
     workflow_run?: {
+      /** Who submitted or dismissed the review the relay ran for. */
+      actor: { login: string };
       head_branch: string;
       head_repository: { owner: { login: string } };
     };
@@ -482,10 +484,12 @@ export async function askClef(
   const answers = (body?.result ?? body)?.answers;
   const probabilities = answers?.tier?.probabilities;
   const steering = answers?.steering?.noul;
-  if (typeof probabilities !== "object" || probabilities === null || typeof steering !== "number") {
+  // A missing tier would read as probability 0, so an unusable answer must not pass for a low one.
+  if (!TIERS.every((tier) => isProbability(probabilities?.[tier])) || !isProbability(steering)) {
     return { error: "unexpected response shape" };
   }
-  return { probabilities, steering };
+  const { low, medium, high } = probabilities;
+  return { probabilities: { low, medium, high }, steering };
 }
 
 /**
@@ -493,6 +497,10 @@ export async function askClef(
  * a commit, not a pull request, so a pull request from the same head into another branch must not
  * be classified: its smaller diff would publish the verdict the default branch's ruleset reads.
  */
+function isProbability(value: unknown): value is number {
+  return typeof value === "number" && value >= 0 && value <= 1;
+}
+
 async function findPullRequest(
   github: GitHubClient,
   context: ActionsContext,
@@ -553,15 +561,25 @@ async function postStatus(
 /**
  * Marks the head's status pending and sets the `author` output the workflow routes on:
  * `maintainer` runs the classifier straight away, `other` holds it for a maintainer to approve, and
- * empty means no open pull request to classify.
+ * empty means nothing to classify: no open pull request into the default branch, or a review the
+ * risk-review app itself submitted or dismissed.
  *
- * @param options GitHub Actions runtime dependencies.
+ * @param options GitHub Actions runtime dependencies, and the risk-review app's bot login.
  */
-export async function authorizeRiskReview({ github, context, core }: {
+export async function authorizeRiskReview({ github, context, core, approver }: {
   github: GitHubClient;
   context: ActionsContext;
   core: ActionsCore;
+  approver?: string;
 }): Promise<void> {
+  // An app token's actions trigger workflows, so the app's own approval would otherwise withdraw the
+  // verdict it just followed, and hold another author's pull request for a second approval of the run.
+  // Its reviews never count, so they cannot change the verdict.
+  if (approver && context.payload.workflow_run?.actor.login === approver) {
+    core.notice("The risk-review app's own review; nothing to reclassify.");
+    core.setOutput("author", "");
+    return;
+  }
   const pullRequest = await findPullRequest(github, context);
   if (!pullRequest) {
     core.notice("No open pull request matches this event; nothing to classify.");
