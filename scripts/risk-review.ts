@@ -4,8 +4,9 @@
 //
 // Each pull request is low, medium or high risk, and the `risk-review` commit status on its head
 // passes once that tier's human approvals are in. The branch ruleset still requires one approving
-// review, and for a low-risk change the risk-review app gives it, so low needs no human; a broken or
-// skipped run therefore fails toward needing one. The rules:
+// review, and for a low-risk change the risk-review app gives it, so low needs no human (unless an
+// agent opened the pull request, below); a broken or skipped run therefore fails toward needing one.
+// The rules:
 //
 // - The classifier sets the tier, never the author. Some paths set a minimum tier; Clef, a Workers
 //   AI decision model, may only raise the tier above that. The author's title and description are
@@ -58,6 +59,7 @@ const PATH_FLOORS: { tier: RiskTier; reason: string; globs: string[] }[] = [
       ".npmrc",
       "packages/workshop-backend/**",
       "packages/workshop-shared/src/api.ts",
+      "packages/workshop-frontend/src/routes/connect.handoff.tsx",
       "packages/gatekeeper-kit/src/credential-stage.ts",
       "packages/gatekeeper-context/src/collection-access.ts",
       "packages/mcp-shared/src/tools.ts",
@@ -65,16 +67,26 @@ const PATH_FLOORS: { tier: RiskTier; reason: string; globs: string[] }[] = [
   },
   {
     tier: "medium",
-    reason: "changes shared code, a gatekeeper, the router, dependencies or worker config",
+    reason:
+      "changes shared code, a gatekeeper, the router, build or dev tooling, dependencies, worker " +
+      "config, or the instructions the AI reviewer follows",
     globs: [
       "packages/workshop-shared/src/**",
       "packages/gatekeeper-*/src/**",
       "packages/mcp-shared/src/**",
       "packages/router/src/**",
+      "packages/bundled-blueprints/**",
+      "packages/configurator-ui/build/**",
+      "scripts/**",
+      "**/vite.config.ts",
       "**/package.json",
       "pnpm-lock.yaml",
       "**/cloudflare.config.ts",
       "**/wrangler.jsonc",
+      // Bonk is a low-risk change's only review; weakening its instructions weakens every later one.
+      "REVIEW.md",
+      "**/AGENTS.md",
+      ".agents/**",
     ],
   },
 ];
@@ -274,8 +286,28 @@ function maxTier(a: RiskTier, b: RiskTier): RiskTier {
  * @param filename Repository-relative path.
  */
 export function pathFloor(filename: string): RiskTier {
-  const rule = PATH_FLOORS.find(({ globs }) => globs.some((glob) => matchesGlob(filename, glob)));
+  const rule = PATH_FLOORS.find(({ globs }) => globs.some((glob) => matchesPath(filename, glob)));
   return rule?.tier ?? "low";
+}
+
+/**
+ * `matchesGlob`, except that `**` also crosses dot-segments, which `matchesGlob` never matches:
+ * `packages/workshop-backend/**` must cover `packages/workshop-backend/src/.internal/x.ts`. Only a
+ * leading `**\/` or a trailing `/**` is supported, so each reduces to matching the path's last or
+ * first segments.
+ */
+function matchesPath(filename: string, glob: string): boolean {
+  const segments = filename.split("/");
+  if (glob.endsWith("/**")) {
+    const prefix = glob.slice(0, -"/**".length);
+    const depth = prefix.split("/").length;
+    return segments.length > depth && matchesGlob(segments.slice(0, depth).join("/"), prefix);
+  }
+  if (glob.startsWith("**/")) {
+    const suffix = glob.slice("**/".length);
+    return matchesGlob(segments.slice(-suffix.split("/").length).join("/"), suffix);
+  }
+  return matchesGlob(filename, glob);
 }
 
 /**
@@ -299,7 +331,8 @@ function describePath({ filename, previous_filename }: ChangedFile): string {
  * @returns The state text, and whether any of the change was left out of it.
  */
 export function buildClefState(files: ChangedFile[]): { state: string; complete: boolean } {
-  const ordered = files.toSorted((a, b) => TIERS.indexOf(fileFloor(b)) - TIERS.indexOf(fileFloor(a)));
+  const rank = new Map(files.map((file) => [file, TIERS.indexOf(fileFloor(file))]));
+  const ordered = files.toSorted((a, b) => rank.get(b)! - rank.get(a)!);
   let complete = true;
   let state = "";
   let bytes = 0;
@@ -331,11 +364,12 @@ function percent(probability = 0): string {
 /**
  * Combines the path floors and Clef's verdict into one tier. Each can only raise it.
  *
- * @param input The changed files; whether every file made it into the diff Clef read; and Clef's
- *     verdict.
+ * @param input The changed files; whether those are all the pull request changes (`listFiles` stops
+ *     at 3,000); whether every listed file made it into the diff Clef read; and Clef's verdict.
  */
-export function classifyChangeset({ files, complete, clef }: {
+export function classifyChangeset({ files, listed = true, complete, clef }: {
   files: ChangedFile[];
+  listed?: boolean;
   complete: boolean;
   clef: ClefVerdict;
 }): Classification {
@@ -346,13 +380,17 @@ export function classifyChangeset({ files, complete, clef }: {
     reasons.push(`${to}: ${reason}`);
   };
 
+  const floors = files.map((file) => ({ file, floor: fileFloor(file) }));
   for (const { tier: floor, reason } of PATH_FLOORS) {
-    const matched = files.filter((file) => fileFloor(file) === floor).map(describePath);
+    const matched = floors.filter((entry) => entry.floor === floor).map(({ file }) => describePath(file));
     if (matched.length > 0) {
       raise(floor, `${reason} (${matched.slice(0, 3).join(", ")}` +
         `${matched.length > 3 ? `, and ${matched.length - 3} more` : ""})`);
     }
   }
+  // An unlisted file's path is unknown, so it could be any floor's; a listed one Clef could not read
+  // in full still had its path checked.
+  if (!listed) raise("high", "some changed files were not listed, so their paths went unchecked");
   if (!complete) raise("medium", "the diff was too large for the classifier to read in full");
   if ("error" in clef) {
     raise("medium", `the classifier was unavailable: ${clef.error}`);
@@ -492,15 +530,15 @@ export async function askClef(
   return { probabilities: { low, medium, high }, steering };
 }
 
+function isProbability(value: unknown): value is number {
+  return typeof value === "number" && value >= 0 && value <= 1;
+}
+
 /**
  * Finds the open pull request into the default branch that the event is about. Statuses belong to
  * a commit, not a pull request, so a pull request from the same head into another branch must not
  * be classified: its smaller diff would publish the verdict the default branch's ruleset reads.
  */
-function isProbability(value: unknown): value is number {
-  return typeof value === "number" && value >= 0 && value <= 1;
-}
-
 async function findPullRequest(
   github: GitHubClient,
   context: ActionsContext,
@@ -652,7 +690,8 @@ export async function runRiskReview({ github, context, core, clef, approver, fet
   const { state, complete } = buildClefState(files);
   const classification = classifyChangeset({
     files,
-    complete: complete && files.length >= pullRequest.changed_files,
+    listed: files.length >= pullRequest.changed_files,
+    complete,
     clef: await askClef(state, clef, fetchImpl),
   });
 

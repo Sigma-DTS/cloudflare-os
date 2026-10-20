@@ -65,6 +65,7 @@ describe("pathFloor", () => {
       "scripts/release/manifest-lib.ts",
       "packages/workshop-shared/src/api.ts",
       "packages/mcp-shared/src/tools.ts",
+      "packages/workshop-frontend/src/routes/connect.handoff.tsx",
     ]) {
       assert.equal(pathFloor(path), "high", path);
     }
@@ -78,9 +79,35 @@ describe("pathFloor", () => {
       "packages/workshop-frontend/package.json",
       "pnpm-lock.yaml",
       "packages/router/wrangler.jsonc",
+      "scripts/worker-config.ts",
+      "scripts/preview/preview.ts",
+      "vite.config.ts",
+      "packages/workshop-frontend/vite.config.ts",
+      "packages/bundled-blueprints/blueprints/notes/blueprint.json",
+      "packages/configurator-ui/build/frame.ts",
     ]) {
       assert.equal(pathFloor(path), "medium", path);
     }
+  });
+
+  it("puts the instructions the AI reviewer follows at medium", () => {
+    for (const path of [
+      "REVIEW.md",
+      "AGENTS.md",
+      "packages/ui/AGENTS.md",
+      ".agents/skills/write-gatekeeper/SKILL.md",
+    ]) {
+      assert.equal(pathFloor(path), "medium", path);
+    }
+  });
+
+  it("matches across dot-segments, which matchesGlob alone skips", () => {
+    assert.equal(pathFloor("packages/workshop-backend/src/.internal/x.ts"), "high");
+    assert.equal(pathFloor("packages/workshop-backend/.dev.vars"), "high");
+    assert.equal(pathFloor("packages/gatekeeper-x/src/.hidden.ts"), "medium");
+    assert.equal(pathFloor("packages/x/.config/package.json"), "medium");
+    assert.equal(pathFloor("packages/workshop-backend"), "low");
+    assert.equal(pathFloor("packages/workshop-backend-old/src/x.ts"), "low");
   });
 
   it("leaves docs, other tests and the frontend to the classifier", () => {
@@ -89,6 +116,7 @@ describe("pathFloor", () => {
       "README.md",
       "packages/gatekeeper-github/__tests__/index.test.ts",
       "packages/workshop-frontend/src/App.tsx",
+      "packages/workshop-frontend/src/routes/connect.tsx",
     ]) {
       assert.equal(pathFloor(path), "low", path);
     }
@@ -161,6 +189,8 @@ describe("classifyChangeset", () => {
 
   it("needs a human when the classifier did not see the whole change", () => {
     assert.equal(classify({ complete: false }).tier, "medium");
+    // Unlisted files' paths went unchecked, so they could be anything.
+    assert.equal(classify({ listed: false }).tier, "high");
     assert.equal(classify({ clef: { error: "HTTP 500" } }).tier, "medium");
   });
 
@@ -521,6 +551,13 @@ describe("runRiskReview", () => {
     });
     await run();
     assert.equal(statuses.at(-1)?.description, "high risk: needs a maintainer's approval of aaaaaaa");
+  });
+
+  it("rates a pull request high when GitHub did not list all its files", async () => {
+    const { statuses, reviewCalls, run } = harness({ pullRequest: { changed_files: 3001 } });
+    await run();
+    assert.equal(statuses.at(-1)?.description, "high risk: needs a maintainer's approval of aaaaaaa");
+    assert.deepEqual(reviewCalls, []);
   });
 
   it("asks an agent's pull request for its director's approval", async () => {
