@@ -530,11 +530,22 @@ describe("risk-review workflows", () => {
     // Only the two classify jobs may see the Clef credentials.
     const authorizeJob = /\n {2}authorize:\n([\s\S]*?)\n {2}\w+:\n/.exec(workflow)?.[1];
     assert.ok(authorizeJob);
-    assert.doesNotMatch(authorizeJob, /secrets\./);
+    assert.doesNotMatch(authorizeJob, /CF_AI_GATEWAY/);
   });
 
   it("lets authorize withdraw the status without the Clef credentials", () => {
     assert.match(workflow, /\n {2}authorize:\n[\s\S]*?statuses: write[\s\S]*?\n {2}maintainer:/);
+  });
+
+  it("posts every status as the app, from environments that hold its key", () => {
+    const jobs = workflow.slice(workflow.indexOf("\njobs:\n")).split(/\n {2}(?=\w+:\n)/).slice(1);
+    assert.deepEqual(jobs.map((job) => /environment: ([\w-]+)/.exec(job)?.[1]), [
+      "risk-review",
+      "risk-review",
+      "risk-review-external",
+    ]);
+    assert.equal(workflow.match(/github-token: \$\{\{ steps\.app\.outputs\.token \|\| github\.token \}\}/g)?.length, 2);
+    assert.match(workflow, /- \*app-token\n/);
   });
 
   it("relays reviews from a workflow with no permissions", () => {

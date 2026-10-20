@@ -10,6 +10,12 @@ name: Risk review
 # risk-review-trigger.yml, because `pull_request_review` runs the pull request's own copy of the
 # workflow, with a read-only token when the head is in a fork.
 #
+# Statuses are posted as the risk-review GitHub App, and the ruleset accepts `risk-review` only from
+# it. Its key is a secret of the `risk-review` and `risk-review-external` environments, which allow
+# deployments from `main` alone: runs of this file are on `main`, while a workflow a pull request adds
+# runs on its own ref and can neither read the key nor post a status the ruleset accepts. The key must
+# never be a repository secret, which those workflows can read.
+#
 # A maintainer's pull request (write access or above, the same check as Bonk's break-glass) is
 # classified straight away. Anyone else's waits in the `risk-review-external` environment until a
 # maintainer approves the run, and until then its status is pending, so it cannot merge.
@@ -28,8 +34,9 @@ on:
 permissions: {}
 
 jobs:
-  # Uses only the GitHub API, with no secrets, so it is safe to run for anyone. It also sets the
-  # status pending, so a revoked approval takes effect even while the classifier waits.
+  # Uses only the GitHub API and the app's token, never the pull request's code or Clef, so it is
+  # safe to run for anyone. It also sets the status pending, so a revoked approval takes effect even
+  # while the classifier waits.
   authorize:
     if: >-
       (github.event_name == 'pull_request_target' &&
@@ -42,6 +49,7 @@ jobs:
     concurrency: &serialize
       group: risk-review-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
       cancel-in-progress: false
+    environment: risk-review
     permissions:
       contents: read
       pull-requests: read
@@ -55,10 +63,23 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
+      # Until the app is set up, the job token posts the statuses, which the ruleset must not accept.
+      - &app-token
+        name: Mint the risk-review app's token
+        id: app
+        if: vars.RISK_REVIEW_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RISK_REVIEW_APP_ID }}
+          private-key: ${{ secrets.RISK_REVIEW_APP_PRIVATE_KEY }}
+          permission-pull-requests: read
+          permission-statuses: write
+
       - name: Check the author's permission
         id: authorize
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
+          github-token: ${{ steps.app.outputs.token || github.token }}
           script: |
             const { pathToFileURL } = await import("node:url");
             const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/risk-review.ts`);
@@ -72,6 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency: *serialize
+    environment: risk-review
     permissions:
       contents: read
       pull-requests: read
@@ -83,6 +105,8 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
+      - *app-token
+
       - name: Classify and post status
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -92,6 +116,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
           CLOUDFLARE_GATEWAY_ID: ${{ secrets.CF_AI_GATEWAY_NAME }}
         with:
+          github-token: ${{ steps.app.outputs.token || github.token }}
           script: |
             const { pathToFileURL } = await import("node:url");
             const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/risk-review.ts`);
