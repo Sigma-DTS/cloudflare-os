@@ -522,9 +522,10 @@ type AutoApprovalKind = keyof typeof ACTION_KINDS;
 // those its actions can carry. Merges never appear: they are never auto-approvable.
 const ISSUE_ACTIONS: AutoApprovalKind[] =
   ["setTitle", "setBody", "addLabels", "removeLabels", "changeState", "postComment"];
-const PULL_ACTIONS: AutoApprovalKind[] = [...ISSUE_ACTIONS, "postReview", "replyToDiffComment"];
+// A pull request's push only fast-forwards, so force pushes come from the repository alone.
+const PULL_ACTIONS: AutoApprovalKind[] = [...ISSUE_ACTIONS, "postReview", "replyToDiffComment", "push"];
 const BINDING_ACTIONS: Record<ResourceKind, AutoApprovalKind[]> = {
-  repo: ["createIssue", "createPullRequest", ...PULL_ACTIONS, "push", "forcePush"],
+  repo: ["createIssue", "createPullRequest", ...PULL_ACTIONS, "forcePush"],
   issue: ISSUE_ACTIONS,
   pull: PULL_ACTIONS,
 };
