@@ -64,7 +64,8 @@ type FolderPageScope = {driveId: string | undefined; parents: DriveScopeNode[]};
 export type NativeObservation = Omit<ObservationDescription, "excludeObservers">;
 
 /**
- * Performs one Docs, Sheets, Slides or PDF read and authorizes it before the value is disclosed.
+ * Performs one Docs, Sheets, Slides, PDF or file content read and authorizes it before the value
+ * is disclosed.
  *
  * The fetch is a thunk rather than a value so a scope check can refuse before the provider is
  * contacted at all.
@@ -363,6 +364,22 @@ abstract class DriveCoreBase {
     check.commit();
   }
 
+  /** Validate one file against this scope and authorize opening it as a `description`. */
+  abstract openFile(fileId: string, description: string): Promise<DriveFile>;
+
+  /** {@link openFile} for a native file of one type, before a nested content session is created. */
+  async openNativeFile(
+    fileId: string,
+    expectedMimeType: string,
+    description: string,
+  ): Promise<string> {
+    let file = await this.openFile(fileId, description);
+    if (file.mimeType !== expectedMimeType) {
+      throw new Error(`The requested Drive file is not a ${description}.`);
+    }
+    return file.id;
+  }
+
   /** Current metadata for one file, or `undefined` when it is invisible to this account. */
   protected async tryFetchFile(fileId: string): Promise<DriveFile | undefined> {
     try {
@@ -463,21 +480,13 @@ export class DriveSessionCore extends DriveCoreBase {
     return driveFileToEntry(file);
   }
 
-  /** Validate and authorize one native file before a nested content session is created. */
-  async openNativeFile(
-    fileId: string,
-    expectedMimeType: string,
-    description: string,
-  ): Promise<string> {
+  async openFile(fileId: string, description: string): Promise<DriveFile> {
     if (this.#scope.kind === "file" && fileId !== this.#scope.fileId) outsideScope();
     let file = await this.#fetchFile(fileId);
     if (file.id !== fileId) outsideScope();
     await this.authorizeFiles([file.id], `Open ${description} from Google Drive`,
       `Check current metadata for Drive file ${file.id} and open it as a ${description}.`);
-    if (file.mimeType !== expectedMimeType) {
-      throw new Error(`The requested Drive file is not a ${description}.`);
-    }
-    return file.id;
+    return file;
   }
 
   /** Native reads need no moving-scope check for immutable account/file capabilities. */
@@ -613,22 +622,15 @@ export class DriveFolderSessionCore extends DriveCoreBase {
     return driveFileToEntry(file);
   }
 
-  /** Validate and authorize one direct native child before its content session is created. */
-  async openNativeFile(
-    fileId: string,
-    expectedMimeType: string,
-    description: string,
-  ): Promise<string> {
+  /** Only a live direct child of the positioned folder can be opened. */
+  async openFile(fileId: string, description: string): Promise<DriveFile> {
     let file = await this.#requireDirectFile(fileId);
     await this.authorizeUnits(
       [this.#folderObservation(), {kind: "file", fileId: file.id}],
       `Open ${description} from Google Drive`,
       `Check current metadata for Drive file ${file.id} and open it as a ${description}.`,
     );
-    if (file.mimeType !== expectedMimeType) {
-      throw new Error(`The requested Drive file is not a ${description}.`);
-    }
-    return file.id;
+    return file;
   }
 
   /**
@@ -658,7 +660,7 @@ export class DriveFolderSessionCore extends DriveCoreBase {
     return {folderIds: [...this.#location.folderIds, folder.id]};
   }
 
-  /** Revalidate the saved path and direct child on every Docs, Sheets, Slides or PDF read. */
+  /** Revalidate the saved path and direct child on every Docs, Sheets, Slides, PDF or file read. */
   nativeRead(fileId: string, expectedMimeType: string): NativeRead {
     return async <T>(fetch: () => Promise<T>, observe: (value: T) => NativeObservation) => {
       let before = await this.#requireDirectFile(fileId);
