@@ -11,8 +11,8 @@ const RETRY_MS = 30_000;
 /** Independent, fail-closed deployment grants; gatekeepers cannot assert their own permissions. */
 export function agentIntegrationGrant(config: string | undefined, vendor: string) {
   try {
-    return JSON.parse(config ?? "null")?.[vendor]?.lifecycle === true ? {lifecycle: true} : {};
-  } catch { return {}; }
+    return JSON.parse(config ?? "null")?.[vendor]?.lifecycle === true;
+  } catch { return false; }
 }
 
 /** Lifecycle output of the existing execution row. This class never starts or resumes an agent. */
@@ -65,12 +65,7 @@ export class AgentIntegrations {
 
   checkContext(gatekeeperId: number, origin: AgentIntegrationOrigin): AgentTurnInfo {
     this.impl.assertGatekeeperUsable(gatekeeperId);
-    const grant = this.impl.integrationGrant(gatekeeperId);
-    if (!grant.lifecycle) throw new Error("Agent integration grant revoked.");
-    return this.turn(origin);
-  }
-
-  turn(origin: AgentIntegrationOrigin): AgentTurnInfo {
+    if (!this.impl.integrationGrant(gatekeeperId)) throw new Error("Agent integration grant revoked.");
     const row = this.impl.storage.activeAgents.get(origin.chatId);
     if (row?.finishing || row?.integration?.turnId !== origin.turnId || row.integration.segmentId !== origin.segmentId ||
         !this.impl.storage.chatMeta.get(origin.chatId)?.activeAgent) {
@@ -95,7 +90,7 @@ export class AgentIntegrations {
     // Old deliveries retain only cleanup authority, even after revocation or chat deletion.
     const closing = receipt.pending.findLast(e => e.kind === "suspended" || e.kind === "finished");
     const allowed = this.impl.gatekeeperUsable(receipt.gatekeeperId) &&
-      this.impl.integrationGrant(receipt.gatekeeperId).lifecycle;
+      this.impl.integrationGrant(receipt.gatekeeperId);
     let phase: AgentTurnInfo["phase"] = "running";
     if (!allowed || row?.finishing || closing?.kind === "finished" || row?.integration?.turnId !== event.turnId) {
       phase = "finishing";

@@ -56,10 +56,12 @@ entry-ready/deferred states, or cancellation-raced lifecycle waits.
 The indexed participant outbox stores ordered pending events, stable event IDs and retry
 deadlines. Receivers durably deduplicate IDs, including when cleanup succeeded but its
 reply was lost. A failed delivery retains its receipt with a 30-second retry deadline;
-the existing shared alarm and immediate best-effort delivery drive retries. There is no
-second polling interval. End-of-turn finalization also drains outstanding notifications
-in order, so receivers must ACK advisory events promptly rather than doing long work in
-those callbacks.
+the existing shared alarm and immediate best-effort delivery drive retries. While the alarm
+is already running, failed terminal handoffs also schedule a guarded retry for that chat,
+so another chat holding the alarm open cannot delay its release. The durable row/outbox
+recover a lost in-memory timer on reset. There is no workspace polling interval. End-of-turn
+finalization also drains outstanding notifications in order, so receivers must ACK advisory
+events promptly rather than doing long work in those callbacks.
 
 Each delivery attempt has a one-hour wait timeout, not an abandonment deadline. This
 does not cancel the receiver's invocation: a retry can overlap an earlier attempt that
@@ -80,6 +82,9 @@ Contexts expire at segment boundaries. Delayed callbacks must read their fresh c
 phase; it may now authorize cleanup only. Revocation and connector/chat removal retain
 cleanup receipts and their cleanup-only delivery capability, not permission to run new
 commands. Removing a connector is not an escape hatch for abandoning cleanup.
+While a connection is quarantined pending a scope-widening restart, ordinary contexts
+reject and delivery contexts permit cleanup only; they do not retain forward authority
+until the reset lands. Constructing the agent's environment does not itself require access.
 
 Workspace deletion durably fences new work, stops turns and drains finalization before
 erasing storage. Failed finalization intentionally retains the fence across resets; repair
@@ -89,3 +94,6 @@ so the owner can work or retry deletion.
 
 Workerd tests exercise real capability routing, nonblocking notifications, all-participant
 finalization, queued-turn ordering, Stop, removal, lost ACKs and real DO eviction.
+`packages/integration-tests/__tests__/workshop-agent-lifecycle.test.ts` also drives the
+unwrapped agent-env/loopback/session/queue route in real Workers, including absent grants,
+non-agent callers and a saved binding used after its original turn ended.

@@ -46,45 +46,16 @@ async function deletionClient(impl: Impl) {
 
 describe("trusted integration grants", () => {
   it("is exact, independent of ambience, and fails closed on malformed/unknown grants", () => {
-    expect(agentIntegrationGrant(grants, "test")).toEqual({lifecycle: true});
-    expect(agentIntegrationGrant(grants, "TEST")).toEqual({});
+    expect(agentIntegrationGrant(grants, "test")).toBe(true);
+    expect(agentIntegrationGrant(grants, "TEST")).toBe(false);
     for (const config of [undefined, "invalid", "null", "[]", '{"test":true}',
       '{"test":{"lifecycle":"true"}}', '{"test":{"recoverableActions":true}}']) {
-      expect(agentIntegrationGrant(config, "test")).toEqual({});
+      expect(agentIntegrationGrant(config, "test")).toBe(false);
     }
   });
 });
 
 describe("lifecycle outbox", () => {
-  it("scopes a real facet/session capability to its original agent segment", async () => {
-    const {visit} = await fixture();
-    await visit(async impl => {
-      vi.spyOn(impl.ctx.storage, "setAlarm").mockResolvedValue();
-      const origin = seed(impl);
-      const caller = {from: "agent" as const, chatId: 1};
-      const captured = impl.captureIntegrationOrigin(caller, 7);
-      expect(captured).toEqual(origin);
-      using session = await impl.startGatekeeperSession({type: "gatekeeper", id: 7}, caller, captured);
-      using context = await session.getAgentContext();
-      expect(await context!.getTurn()).toMatchObject({turnId: origin.turnId, phase: "running"});
-      using userSession = await impl.openGatekeeperSession(7, await impl.getGatekeeperFacet(7), {from: "user"});
-      expect(await userSession.getAgentContext()).toBeNull();
-      impl.env.AGENT_INTEGRATION_GRANTS = undefined;
-      expect(impl.captureIntegrationOrigin(caller, 7)).toBeUndefined();
-      using ungranted = await impl.startGatekeeperSession({type: "gatekeeper", id: 7}, caller);
-      expect(await ungranted.getAgentContext()).toBeNull();
-      impl.env.AGENT_INTEGRATION_GRANTS = grants;
-      const row = impl.storage.activeAgents.get(1)!;
-      row.integration!.segmentId = crypto.randomUUID();
-      impl.storage.activeAgents.put(row);
-      await expect(impl.startGatekeeperSession({type: "gatekeeper", id: 7}, caller, captured)).rejects.toThrow("expired");
-      // Capturing a binding must not fail just because a connection is awaiting a restart.
-      vi.spyOn(impl, "assertGatekeeperUsable").mockImplementation(() => { throw new Error("Restart pending"); });
-      expect(() => impl.captureIntegrationOrigin(caller, 7)).not.toThrow();
-      impl.storage.activeAgents.delete(1);
-    });
-  });
-
   it.each(["segment", "stop"] as const)("keeps callback re-registration a no-op across %s cleanup", async change => {
     const {visit} = await fixture();
     await visit(async impl => {
@@ -92,8 +63,13 @@ describe("lifecycle outbox", () => {
       vi.spyOn(impl.ctx.storage, "setAlarm").mockResolvedValue();
       const origin = seed(impl), receiver = participant(impl, crypto.randomUUID());
       await receiver.setReregister();
+      const context = impl.integrations.context(7, origin)!;
+      await context.participate(receiver);
+      await context.participate(receiver);
+      await impl.integrations.drain(1);
+      expect(await receiver.calls()).toEqual([]); // Registration sends no started notification.
+      expect([...impl.storage.agentParticipants.list()]).toHaveLength(1);
       await receiver.hold("resumed");
-      await impl.integrations.context(7, origin)!.participate(receiver);
       impl.integrations.emit(impl.storage.activeAgents.get(1)!, "resumed");
       const draining = impl.integrations.drain(1);
       // Observe rejection immediately so the deliberately failing pre-fix run cannot leak it.
@@ -117,13 +93,14 @@ describe("lifecycle outbox", () => {
     });
   });
 
-  it.each(["grant", "connection"] as const)("downgrades an in-flight delivery after %s revocation", async change => {
+  it.each(["grant", "connection"] as const)("revokes retained contexts and downgrades in-flight delivery after %s removal", async change => {
     const {visit} = await fixture();
     await visit(async impl => {
       vi.spyOn(impl.ctx.storage, "setAlarm").mockResolvedValue();
       const origin = seed(impl), receiver = participant(impl, crypto.randomUUID());
+      const context = impl.integrations.context(7, origin)!;
       await receiver.hold("resumed");
-      await impl.integrations.context(7, origin)!.participate(receiver);
+      await context.participate(receiver);
       impl.integrations.emit(impl.storage.activeAgents.get(1)!, "resumed");
       const draining = impl.integrations.drain(1);
       await receiver.waitUntilHeld();
@@ -131,33 +108,51 @@ describe("lifecycle outbox", () => {
         expect((await receiver.calls())[0].turn.phase).toBe("running");
         if (change === "grant") impl.env.AGENT_INTEGRATION_GRANTS = '{"test":{}}';
         else impl.storage.gatekeepers.delete(7);
+        await expect(context.getTurn()).rejects.toThrow("revoked");
+        await expect(context.participate(receiver)).rejects.toThrow("revoked");
         expect((await receiver.release())?.phase).toBe("finishing");
+        await draining; // Complete this notification before queueing a distinct terminal drain.
       } finally {
         impl.storage.activeAgents.delete(1);
         await receiver.release();
         await draining;
+        await impl.integrations.drain(1);
       }
       expect((await receiver.calls()).at(-1)?.turn.phase).toBe("finishing");
       expect([...impl.storage.agentParticipants.list()]).toHaveLength(0);
     });
   });
 
-  it("registers once without sending a started callback", async () => {
+  it("keeps retained and in-flight contexts fail-closed until a scope-widening restart lands", async () => {
     const {visit} = await fixture();
     await visit(async impl => {
       vi.spyOn(impl.ctx.storage, "setAlarm").mockResolvedValue();
+      const restarting = vi.spyOn(impl, "scheduleAccessRestart").mockResolvedValue();
       const origin = seed(impl), receiver = participant(impl, crypto.randomUUID());
-      await receiver.setReregister();
       const context = impl.integrations.context(7, origin)!;
       await context.participate(receiver);
-      await context.participate(receiver);
-      await impl.integrations.drain(1);
-      expect(await receiver.calls()).toEqual([]);
-      expect([...impl.storage.agentParticipants.list()]).toHaveLength(1);
-      impl.storage.activeAgents.delete(1);
-      await impl.integrations.drain(1);
-      expect((await receiver.calls()).at(-1)?.turn.phase).toBe("finishing");
-      expect([...impl.storage.agentParticipants.list()]).toHaveLength(0);
+      await receiver.hold("resumed");
+      impl.integrations.emit(impl.storage.activeAgents.get(1)!, "resumed");
+      const draining = impl.integrations.drain(1);
+      await receiver.waitUntilHeld();
+      const leave = impl.joinSession("use");
+      try {
+        impl.storage.gadgets.put({type: "gadget", id: 100, title: "Probe", created: new Date(0),
+          bindingName: "PROBE", bindings: {}});
+        impl.bindWorkpiece(100, "CONNECTION", 7);
+        expect(restarting).toHaveBeenCalledOnce();
+        // Env construction remains possible; neither retained nor newly used contexts gain authority.
+        expect(() => impl.captureIntegrationOrigin({from: "agent", chatId: 1}, 7)).not.toThrow();
+        await expect(context.getTurn()).rejects.toThrow("restarting");
+        expect((await receiver.release())?.phase).toBe("finishing");
+        await draining;
+      } finally {
+        leave();
+        await receiver.release();
+        await draining;
+        impl.storage.activeAgents.delete(1);
+        await impl.integrations.drain(1);
+      }
     });
   });
 
@@ -186,17 +181,6 @@ describe("lifecycle outbox", () => {
       expect(calls.at(-1)?.event.eventId).toBe(ids[1]);
       expect(calls.at(-1)?.turn.phase).toBe("finishing");
       expect([...impl.storage.agentParticipants.list()]).toHaveLength(0);
-    });
-  });
-
-  it("rechecks grants on retained contexts, not only at creation", async () => {
-    const {visit} = await fixture();
-    await visit(async impl => {
-      const origin = seed(impl), context = impl.integrations.context(7, origin)!;
-      impl.env.AGENT_INTEGRATION_GRANTS = undefined;
-      await expect(context.getTurn()).rejects.toThrow("revoked");
-      await expect(context.participate(participant(impl, crypto.randomUUID()))).rejects.toThrow("revoked");
-      impl.storage.activeAgents.delete(1);
     });
   });
 
@@ -247,5 +231,4 @@ describe("lifecycle outbox", () => {
       expect(() => impl.assertChatNotActive(1)).not.toThrow();
     });
   });
-
 });

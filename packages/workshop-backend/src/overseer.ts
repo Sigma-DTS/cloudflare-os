@@ -935,13 +935,11 @@ class OverseerImpl implements AgentHooks {
       this.#updateAlarm();
     }
     let ctx = this.#liveChats.get(chatId);
-    if (!ctx) { this.ctx.waitUntil(this.#finishAgentTurn(chatId)); return; }
-
-    // Cancel running agent.
-    ctx.cancelController?.abort(new Error("Chat deleted."));
-
-    this.#liveChats.delete(chatId);
-    this.invalidateChatContent(chatId);
+    if (ctx) {
+      ctx.cancelController.abort(new Error("Chat deleted."));
+      this.#liveChats.delete(chatId);
+      this.invalidateChatContent(chatId);
+    }
     this.ctx.waitUntil(this.#finishAgentTurn(chatId));
   }
 
@@ -955,7 +953,6 @@ class OverseerImpl implements AgentHooks {
     this.storage.transaction(() => {
       this.storage.deleting.put(true);
       // Buffer before writes (including lifecycle subscribers), preserving the single KV cursor.
-      for (const call of Array.from(this.storage.pendingAgentCalls.list())) this.storage.pendingAgentCalls.deleteRecord(call);
       for (const row of Array.from(this.storage.activeAgents.list())) {
         this.storage.activeAgents.delete(row.chatId);
         const meta = this.storage.chatMeta.get(row.chatId);
@@ -1202,7 +1199,7 @@ class OverseerImpl implements AgentHooks {
 
   // A segment ending is either an approval pause or finalization of the logical turn. Only
   // finalization waits for participants before releasing the chat and handing off queued work.
-  async #finishAgentTurn(chatId: number, paused = false): Promise<void> {
+  async #finishAgentTurn(chatId: number, paused = false, finished = false): Promise<void> {
     const record = this.storage.activeAgents.get(chatId);
     paused &&= !record?.finishing;
     if (record && !paused) {
@@ -1213,16 +1210,25 @@ class OverseerImpl implements AgentHooks {
       try {
         await this.integrations.drain(chatId);
       } catch (error) {
-        // The durable terminal marker and outbox survive. The alarm retries cleanup only.
+        // The alarm recovers resets. While another chat holds it open, retry this handoff
+        // locally too; delivering its receipt alone would leave the chat busy.
         this.logger.warn("agent finalization deferred", {
           event: "agent.lifecycle.finalization.deferred", chatId, error,
         });
         this.#unregisterRunningAgent(chatId);
+        if (this.#inAlarmHandler) {
+          this.ctx.waitUntil(scheduler.wait(30_000).then(() => {
+            const current = this.storage.activeAgents.get(chatId);
+            if (current?.finishing && current.integration?.turnId === record.integration?.turnId &&
+                !this.#runningAgents.has(chatId)) return this.#finishAgentTurn(chatId, false, finished);
+          }));
+        }
         return;
       }
       // Stop/deletion can join this same drain. Only one completion performs the handoff.
       const current = this.storage.activeAgents.get(chatId);
-      if (!current?.finishing || current.integration?.turnId !== record.integration?.turnId) return;
+      if (!current) { this.#unregisterRunningAgent(chatId); return; }
+      if (!current.finishing || current.integration?.turnId !== record.integration?.turnId) return;
       this.storage.activeAgents.delete(chatId);
       const meta = this.storage.chatMeta.get(chatId);
       const wait = this.#decisionWait(chatId);
@@ -1231,7 +1237,7 @@ class OverseerImpl implements AgentHooks {
         delete meta.activeAgent;
         this.storage.chatMeta.put(meta);
       }
-      if (wait === null || wait?.denied) {
+      if (finished || wait === null || wait?.denied) {
         this.#publishAgentTurnNotification(chatId, record.initiator, record.initiatorUserId);
       }
     } else if (record) {
@@ -1253,7 +1259,8 @@ class OverseerImpl implements AgentHooks {
         this.#logQueuedSteers(meta, false);
         const {finishing: _, integration: __, resumeAttempts: ___, ...next} = record;
         this.storage.activeAgents.put(next);
-        this.#resumeInterruptedAgents();
+        this.#registerRunningAgent(chatId);
+        this.#resumeAgent(next, this.#getLiveChat(chatId));
         return;
       }
       this.#logQueuedSteers(meta, true);
@@ -6399,25 +6406,25 @@ class OverseerImpl implements AgentHooks {
       id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller,
       integrationOrigin?: AgentIntegrationOrigin)
       : Promise<RpcStub<Session>> {
-    this.assertGatekeeperUsable(id);
     if (integrationOrigin) this.integrations.checkContext(id, integrationOrigin);
+    else this.assertGatekeeperUsable(id);
     let queue = this.storage.gatekeepers.get(id)?.creationSpec?.type === "agentSpawner"
-        ? new AgentSpawnerQueueImpl(this, id, caller, undefined, integrationOrigin ?? undefined) : new ApprovalQueueImpl(this, id, caller, undefined, integrationOrigin ?? undefined);
+        ? new AgentSpawnerQueueImpl(this, id, caller, undefined, integrationOrigin)
+        : new ApprovalQueueImpl(this, id, caller, undefined, integrationOrigin);
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
     return facet.startSession(queue);
   }
 
   integrationGrant(gatekeeperId: number) {
-    if (this.storage.deleting.get()) return {};
+    if (this.storage.deleting.get()) return false;
     const record = this.storage.gatekeepers.get(gatekeeperId);
     const vendorId = record && gatekeeperVendorId(record);
-    return vendorId ? agentIntegrationGrant(this.env.AGENT_INTEGRATION_GRANTS, vendorId) : {};
+    return !!vendorId && agentIntegrationGrant(this.env.AGENT_INTEGRATION_GRANTS, vendorId);
   }
 
   captureIntegrationOrigin(caller: GatekeeperCaller, gatekeeperId: number): AgentIntegrationOrigin | undefined {
     if (caller.from !== "agent") return;
-    const grant = this.integrationGrant(gatekeeperId);
-    if (grant.lifecycle) return this.integrations.capture(caller.chatId);
+    if (this.integrationGrant(gatekeeperId)) return this.integrations.capture(caller.chatId);
   }
 
   // Sessions are authorized and verified only at open(), so widening what a live session's holder
@@ -6526,7 +6533,7 @@ class OverseerImpl implements AgentHooks {
 
   assertChatNotActive(chatId: number, allowMessagePreparation = false): AiChatMetadata {
     let meta = this.getChatMetaOrThrow(chatId);
-    if (meta.activeAgent || this.storage.activeAgents.get(chatId)?.finishing ||
+    if (this.storage.deleting.get() || meta.activeAgent || this.storage.activeAgents.get(chatId)?.finishing ||
         !allowMessagePreparation && this.isPreparingChatMessage(chatId)) {
       throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
     }
@@ -6713,6 +6720,7 @@ class OverseerImpl implements AgentHooks {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
       if (decision.reuseExisting) return decision.record.chatId;
     }
+    if (this.storage.deleting.get()) throw new Error("Workspace deletion is in progress.");
     if (typeof initialMessage !== "string" && (capsules?.length || attachments?.length)) {
       throw new Error("Slash commands cannot include resources or attachments.");
     }
@@ -6727,6 +6735,7 @@ class OverseerImpl implements AgentHooks {
     let attachmentFiles = await this.#prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
     let scratchWorktree = await this.#prepareScratchWorktree(
         chatId, attachmentFiles, userMeta.profile);
+    if (this.storage.deleting.get()) throw new Error("Workspace deletion is in progress.");
     let timestamp = this.getChatTimestamp();
     this.ctx.storage.transactionSync(() => {
       let meta: AiChatMetadata = {
@@ -7057,6 +7066,10 @@ class OverseerImpl implements AgentHooks {
     // A retryable lookup has already released its task to the alarm, so no finally is left to
     // clear the busy marker. Stop must finish that handoff synchronously too.
     if (!this.#runningAgents.has(chatId)) {
+      if (!record && meta?.activeAgent) {
+        delete meta.activeAgent;
+        this.storage.chatMeta.put(meta);
+      }
       this.ctx.waitUntil(this.#finishAgentTurn(chatId));
     }
   }
@@ -7532,7 +7545,7 @@ class OverseerImpl implements AgentHooks {
         if (owns()) {
           // Note: We no longer emit a stream "clear" event here. The client performs a full clear of
           // provisional streaming state when it observes that the agent is no longer running (i.e. when
-          // chat metadata's activeAgent becomes unset, which happens just below).
+          // chat metadata's activeAgent becomes unset, after required finalization).
 
           let meta = this.storage.chatMeta.get(chatId);
           const wait = this.#decisionWait(chatId);
@@ -7553,14 +7566,14 @@ class OverseerImpl implements AgentHooks {
           // A subsequent execution ends this warming as it registers.
           if (lastRequest && meta) this.cacheWarmer.start(chatId, lastRequest, aiModel.profile.id);
 
-          if (finished && meta && paused) {
+          if (paused) {
             // Classified here, past the turn's last await, so a decision made as it ended counts.
             this.#publishAgentTurnNotification(chatId, initiator, initiatorUserId);
           }
 
           // A failed turn logged its unread steers before its error (see postAgentErrorMessage),
           // so it starts no follow-up, which would likely fail the same way.
-          await this.#finishAgentTurn(chatId, paused);
+          await this.#finishAgentTurn(chatId, paused, finished);
         }
       }
     }
@@ -7657,6 +7670,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   async #drainPendingAgentCalls(chatId: number): Promise<void> {
+    if (this.storage.deleting.get()) return;
     let author: AiChatAuthorInfo | undefined;
     try {
       let [first] = Array.from(this.storage.pendingAgentCalls.list(
@@ -7691,7 +7705,7 @@ class OverseerImpl implements AgentHooks {
       }
       let meta = this.storage.chatMeta.get(chatId);
       if (!meta) return;  // deleted meanwhile; deleteChat removed the calls too
-      if (meta.activeAgent || this.storage.activeAgents.get(chatId)?.finishing) return;
+      if (this.storage.deleting.get() || meta.activeAgent || this.storage.activeAgents.get(chatId)?.finishing) return;
 
       // Move every recorded call into the chat log. No awaits from here to the turn start, so a
       // crash cannot leave a call half-delivered, and a call recorded after this point waits for
@@ -13555,7 +13569,6 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   }
 
   async getAgentContext(): Promise<AgentContext | null> {
-    if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
     return this.impl.integrations.context(this.gatekeeperId, this.integrationOrigin);
   }
 
