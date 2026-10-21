@@ -781,6 +781,10 @@ class OverseerImpl implements AgentHooks {
   #inAlarmHandler = false;
   #scheduledAlarm: number | null | undefined;
 
+  // A failed deletion retains its durable fence until cleanup ACKs, but a live deleter must
+  // keep the fence even after cleanup while it disables hooks and removes owner/storage state.
+  #activeDeletions = 0;
+
   // Drains of pending agent calls currently in flight, by chat (see drainPendingAgentCalls).
   #pendingCallDrains = new Map<number, Promise<void>>();
 
@@ -962,10 +966,24 @@ class OverseerImpl implements AgentHooks {
     this.destroyAllLiveChats();
   }
 
-  // Register a newly-started (or resumed) agent turn. Called at the start of `startAgent` /
-  // `#resumeAgent`, in the same synchronous step that sets `chatMeta.activeAgent` and writes the
-  // `activeAgents` record, so that the three representations of "an agent is running for this chat"
-  // stay consistent. `#unregisterRunningAgent` performs the matching teardown.
+  beginDeletion(): () => void {
+    this.#activeDeletions++;
+    this.closeAgentsForDeletion();
+    return () => {
+      this.#activeDeletions--;
+      this.#releaseDeletionFence();
+    };
+  }
+
+  #releaseDeletionFence(): void {
+    if (!this.#activeDeletions && this.storage.deleting.get() &&
+        ![...this.storage.agentParticipants.list({limit: 1})].length) {
+      this.storage.deleting.put(false);
+    }
+  }
+
+  // Track live inference or required cleanup. The durable execution row outlives this task
+  // during approval waits and failed handoffs; #unregisterRunningAgent releases only the task.
   #registerRunningAgent(chatId: number) {
     this.#runningAgents.add(chatId);
     this.#updateAlarm();
@@ -1280,6 +1298,7 @@ class OverseerImpl implements AgentHooks {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.integrations = new AgentIntegrations(this, () => {
+      this.#releaseDeletionFence();
       this.#updateAlarm();
       // Defer RPC until the transaction that wrote the receipt has closed.
       this.ctx.waitUntil(Promise.resolve().then(() => this.integrations.deliverDue()));
@@ -1326,9 +1345,7 @@ class OverseerImpl implements AgentHooks {
       migrateToSpawnerBindings(this);
       // Only unacknowledged finalization needs a durable deletion fence. If a later deletion
       // step reset the DO, there is no live deleter left and the owner can work or retry.
-      if (this.storage.deleting.get() && ![...this.storage.agentParticipants.list({limit: 1})].length) {
-        this.storage.deleting.put(false);
-      }
+      this.#releaseDeletionFence();
       // Do not replace an existing alarm during constructor recovery: setAlarm would reset the
       // platform's retry budget. Cache its time before registering any recovered executions.
       this.#scheduledAlarm = await this.ctx.storage.getAlarm();
@@ -7067,6 +7084,7 @@ class OverseerImpl implements AgentHooks {
     // clear the busy marker. Stop must finish that handoff synchronously too.
     if (!this.#runningAgents.has(chatId)) {
       if (!record && meta?.activeAgent) {
+        meta = this.storage.chatMeta.get(chatId)!; // addChatMessages advanced lastActive.
         delete meta.activeAgent;
         this.storage.chatMeta.put(meta);
       }
@@ -7374,7 +7392,21 @@ class OverseerImpl implements AgentHooks {
         event: "agent.lifecycle.finalization.deferred", chatId, error,
       });
       if (this.storage.activeAgents.get(chatId)?.finishing) await this.#finishAgentTurn(chatId);
-      else this.#unregisterRunningAgent(chatId);
+      else {
+        this.#unregisterRunningAgent(chatId);
+        // Like terminal handoff, a queued successor cannot rely on the shared alarm while
+        // another chat holds it open. Re-resolve the original model through normal recovery.
+        if (this.#inAlarmHandler) {
+          this.ctx.waitUntil(scheduler.wait(30_000).then(() => {
+            const current = this.storage.activeAgents.get(chatId);
+            if (current && !current.finishing && this.#liveChats.get(chatId) === liveChat &&
+                !liveChat.cancelController.signal.aborted && !this.#runningAgents.has(chatId)) {
+              this.#registerRunningAgent(chatId);
+              return this.#resumeAgent(current, liveChat);
+            }
+          }));
+        }
+      }
       return;
     }
     if (this.#liveChats.get(chatId) !== liveChat) return;
@@ -11508,9 +11540,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     let startedAt = Date.now();
 
-    this.impl.closeAgentsForDeletion();
-    await this.impl.integrations.drain();
+    const endDeletion = this.impl.beginDeletion();
     try {
+      await this.impl.integrations.drain();
       // TODO: Revoke user sessions.
 
       // Disable all enabled hooks so that the gatekeepers stop delivering events to this gadget.
@@ -11541,12 +11573,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       this.impl.logger.info("deleted workspace", {
         event: "workspace.delete.completed", durationMs: Date.now() - startedAt,
       });
-    } catch (error) {
-      // Required cleanup is complete. An unrelated hook/owner failure must not leave the
-      // workspace permanently fenced; the owner can continue working or retry deletion.
-      this.impl.storage.deleting.put(false);
-      throw error;
-    }
+    } finally { endDeletion(); }
   }
 
   async submitCodeChange(chatId: number, submission: CodeChangeSubmission)

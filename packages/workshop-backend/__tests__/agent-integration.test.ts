@@ -38,7 +38,7 @@ async function fixture() {
 async function deletionClient(impl: Impl) {
   return openFakeOverseer(impl.storage, {impl: {
     ctx: impl.ctx, logger: impl.logger, integrations: impl.integrations,
-    closeAgentsForDeletion: impl.closeAgentsForDeletion.bind(impl),
+    beginDeletion: impl.beginDeletion.bind(impl),
     users: {idFromString: (id: string) => id,
       get: () => ({deleteGadget: async () => { throw new Error("Owner deletion failed"); }})},
   }});
@@ -184,7 +184,7 @@ describe("lifecycle outbox", () => {
     });
   });
 
-  it("keeps failed cleanup receipts and the deletion fence after connector removal and eviction", async () => {
+  it.each([false, true])("retains failed deletion cleanup after connector removal (reset: %s)", async reset => {
     const {stub, visit} = await fixture();
     const name = crypto.randomUUID();
     const pending = await visit(async impl => {
@@ -204,7 +204,7 @@ describe("lifecycle outbox", () => {
       expect([...impl.storage.agentParticipants.list()][0].pending).toEqual(pending);
       return pending;
     });
-    await evictDurableObject(stub);
+    if (reset) await evictDurableObject(stub);
     await visit(async impl => {
       expect(impl.storage.deleting.get()).toBe(true);
       await expect(impl.deliverAgentCallback(1, "late", [], "unused", null)).rejects.toThrow("deleted");
@@ -213,8 +213,11 @@ describe("lifecycle outbox", () => {
       expect([...impl.storage.agentParticipants.list()][0].pending).toEqual(pending);
       expect((await receiver.calls()).at(-1)?.turn.phase).toBe("finishing");
       await receiver.setFailure(false);
-      await impl.integrations.drain();
+      const [receipt] = impl.storage.agentParticipants.list();
+      impl.storage.agentParticipants.put({...receipt, retryAt: Date.now() - 1});
+      await impl.integrations.deliverDue();
       expect([...impl.storage.agentParticipants.list()]).toHaveLength(0);
+      expect(impl.storage.deleting.get()).toBe(false);
     });
   });
 

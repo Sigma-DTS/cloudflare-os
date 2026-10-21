@@ -87,10 +87,10 @@ reject and delivery contexts permit cleanup only; they do not retain forward aut
 until the reset lands. Constructing the agent's environment does not itself require access.
 
 Workspace deletion durably fences new work, stops turns and drains finalization before
-erasing storage. Failed finalization intentionally retains the fence across resets; repair
-the receiver and retry deletion. Removing the connector does not bypass this requirement.
-Once finalization has succeeded, an unrelated hook/owner deletion failure releases the fence
-so the owner can work or retry deletion.
+erasing storage. Failed finalization retains the fence across resets until every cleanup
+receipt is acknowledged; removing the connector does not bypass this requirement. Once
+cleanup succeeds and no deletion call is still running, the fence releases so the owner
+can work or retry deletion, including after background delivery repairs a failed attempt.
 
 Workerd tests exercise real capability routing, nonblocking notifications, all-participant
 finalization, queued-turn ordering, Stop, removal, lost ACKs and real DO eviction.
