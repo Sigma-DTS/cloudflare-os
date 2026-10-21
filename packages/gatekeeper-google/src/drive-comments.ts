@@ -119,7 +119,11 @@ export type DriveCommentQueue = {
 };
 
 /** A send that may have reached Drive, recorded before it went. */
-export type CommentAttempt = { at: number };
+export type CommentAttempt = {
+  at: number;
+  /** The account's replies already on the comment that look like what this send posts. */
+  existing?: string[];
+};
 
 /** What applying a Drive comment write needs. */
 export type DriveCommentsHost = {
@@ -259,15 +263,18 @@ async function scopedFile(
   return file && path && isDirectChild(file, path[path.length - 1]) ? file : undefined;
 }
 
-/** Refuses, as known not to have posted anything, a write that may not be made at apply. */
+/**
+ * Refuses, as known not to have posted anything, a write that may not be made at apply.
+ * @returns The comment a reply or resolve answers, as it stands now.
+ */
 async function requireStillAllowed(
   host: DriveCommentsHost, action: DriveCommentAction,
-): Promise<void> {
+): Promise<DriveCommentRecord | undefined> {
   if (!(await host.holdsGrant())) throw new ActionApplyError(COMMENT_GRANT_MISSING);
   let file = await scopedFile(host, action.payload);
   if (!file) throw new ActionApplyError(NO_LONGER_IN_SCOPE);
   if (file.canComment !== true) throw new ActionApplyError(CANNOT_COMMENT);
-  if (action.kind === "createComment") return;
+  if (action.kind === "createComment") return undefined;
   let comment = await readLiveComment(host.api, action.payload.fileId, action.payload.commentId);
   if (!comment) throw new ActionApplyError(COMMENT_NOT_FOUND);
   if (action.kind === "resolveComment" && comment.resolved) {
@@ -277,6 +284,7 @@ async function requireStillAllowed(
   if (action.kind === "createReply" && comment.resolved && !action.payload.reopens) {
     throw new ActionApplyError(RESOLVED_SINCE_QUEUED);
   }
+  return comment;
 }
 
 /** Every item a list read yields, page by page, refusing a token Drive hands back twice. */
@@ -298,6 +306,24 @@ async function readAll<T>(
     "Google Drive listed more comments than one check reads. Approve it again later.");
 }
 
+/** Whether `item` is the connected account's, not deleted, and dated within `from`..`until`. */
+function mineFrom(
+  item: DriveCommentRecord | DriveReplyRecord, from: number, until = Infinity,
+): boolean {
+  let created = Date.parse(item.createdTime);
+  return item.author.me && !item.deleted && created >= from && created <= until;
+}
+
+/** Whether `reply` has the content and action a send of `action` posts. */
+function looksSent(
+  action: Extract<DriveCommentAction, { kind: "createReply" | "resolveComment" }>,
+  reply: DriveReplyRecord,
+): boolean {
+  return reply.content === (action.payload.content ?? "") &&
+    // Drive marks a plain reply to a resolved comment as reopening it.
+    (action.kind === "resolveComment" ? reply.action === "resolve" : reply.action !== "resolve");
+}
+
 /**
  * Finds what the send `attempt` records posted, so a retry binds it rather than posting twice:
  * the connected account's one comment or reply from around the attempt, with exactly the content
@@ -311,10 +337,8 @@ async function findPosted(
 ): Promise<string | undefined> {
   let from = attempt.at - CLOCK_SKEW_MS;
   let until = attempt.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS;
-  let around = (item: DriveCommentRecord | DriveReplyRecord) => {
-    let created = Date.parse(item.createdTime);
-    return item.author.me && !item.deleted && created >= from && created <= until;
-  };
+  let around = (item: DriveCommentRecord | DriveReplyRecord) =>
+    mineFrom(item, from, until) && !attempt.existing?.includes(item.id);
   let { payload } = action;
   let candidates: (DriveCommentRecord | DriveReplyRecord)[];
   try {
@@ -328,15 +352,11 @@ async function findPosted(
       })).filter(comment => around(comment) && comment.content === action.payload.content);
     } else {
       let { commentId } = action.payload;
-      let content = action.payload.content ?? "";
-      let resolving = action.kind === "resolveComment";
       candidates = (await readAll(async pageToken => {
         let page = await host.api.listReplies(payload.fileId, commentId,
           pageToken ? { pageToken } : {});
         return { items: page.replies, nextPageToken: page.nextPageToken };
-      })).filter(reply => around(reply) && reply.content === content &&
-        // Drive marks a plain reply to a resolved comment as reopening it.
-        (resolving ? reply.action === "resolve" : reply.action !== "resolve"));
+      })).filter(reply => around(reply) && looksSent(action, reply));
     }
   } catch (error) {
     if (!isFileInvisible(error)) throw error;
@@ -425,8 +445,14 @@ async function post(
     host.attempts.delete(id);
   }
 
-  await requireStillAllowed(host, action);
-  host.attempts.put(id, { at: Date.now() });
+  let comment = await requireStillAllowed(host, action);
+  let at = Date.now();
+  // A reply already there, such as an earlier resolve of a since reopened comment, is not this
+  // send's. Comments are not listed first: taking an identical one for this send drops a duplicate.
+  let existing = action.kind === "createComment" || !comment ? [] : comment.replies
+    .filter(reply => mineFrom(reply, at - CLOCK_SKEW_MS) && looksSent(action, reply))
+    .map(reply => reply.id);
+  host.attempts.put(id, { at, ...(existing.length ? { existing } : {}) });
   try {
     let created = await send(host.api, action);
     host.attempts.delete(id);

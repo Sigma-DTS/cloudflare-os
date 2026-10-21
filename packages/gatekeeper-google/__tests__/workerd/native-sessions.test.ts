@@ -1593,6 +1593,26 @@ describe("Drive comment actions", () => {
       expect(existing.replies).toHaveLength(4);
     });
 
+    it("does not take a reply already on the comment for what a send posted", async () => {
+      let drive = binding();
+      let existing = provider.seed("doc-1");
+      let first = await drive.queued("resolve", "doc-1", existing.id);
+      expect(await drive.apply(first.actionId)).toBeNull();
+      let reopen = await drive.queued("reply", "doc-1", existing.id, "Not yet.");
+      expect(await drive.apply(reopen.actionId)).toBeNull();
+      let { actionId } = await drive.queued("resolve", "doc-1", existing.id);
+      provider.nextWrite = { status: 503, reason: "backendError", message: "Backend Error" };
+      expect(await drive.apply(actionId)).toMatch(/did not confirm/);
+
+      expect(await drive.apply(actionId)).toMatch(/^Google Drive may still be posting this/);
+      expect(existing.resolved).toBe(false);
+
+      await drive.age(actionId, 6 * 60 * 1000);
+      expect(await drive.apply(actionId)).toBeNull();
+      expect(existing).toMatchObject({ resolved: true });
+      expect(existing.replies.map(reply => reply.action)).toEqual(["resolve", "reopen", "resolve"]);
+    });
+
     it("waits out the window rather than send again while Google may still show the send", async () => {
       let drive = binding();
       let { actionId } = await drive.queued("comment", "doc-1", "Should this be June?");
