@@ -4978,6 +4978,8 @@ class OverseerImpl implements AgentHooks {
       let gatekeeper = await this.getGatekeeperFacet(record.gatekeeperId);
       await gatekeeper.rejectAction(record.action);
     } catch (error) {
+      // An approval that landed during the await is a reason a gatekeeper refuses, and it stands.
+      if (this.storage.actions.get(record.id)?.state !== "pending") throw error;
       this.logger.warn("gatekeeper could not withdraw a denied action", {
         event: "action.reject.unconfirmed",
         actionId: record.id,
