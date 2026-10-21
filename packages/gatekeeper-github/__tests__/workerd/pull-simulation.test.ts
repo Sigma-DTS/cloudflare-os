@@ -855,12 +855,15 @@ describe("pushing to a pull request", () => {
       .rejects.toThrow(`Provisional pull request ${pr.provisionalId} is no longer available.`);
   });
 
-  it("refuses a fork's pull request, and one whose head branch is gone", async () => {
-    const { github, cache } = topicScenario();
+  it("refuses a fork's or merged pull request, and one whose head branch is gone", async () => {
+    const { github, cache, pull } = topicScenario();
     github.pulls.set(9, pullResponse(9, { ref: "topic", sha: HEAD2, repo: FORK }, { ref: "main", sha: BASE }));
+    github.pulls.set(8, { ...pull, number: 8, state: "closed", merged_at: "2026-01-02T00:00:00Z" });
     const gk = await repoGatekeeper();
     await expect(gk.preparePullRequestPush("9", HEAD1, cache))
       .rejects.toThrow("its head branch is in the fork contributor/widgets");
+    // Its head branch is still there, so only the merge says the push would not reach it.
+    await expect(gk.preparePullRequestPush("8", HEAD1, cache)).rejects.toThrow("it has been merged");
 
     github.branches.delete("topic");
     await expect(gk.preparePullRequestPush("7", HEAD1, cache))

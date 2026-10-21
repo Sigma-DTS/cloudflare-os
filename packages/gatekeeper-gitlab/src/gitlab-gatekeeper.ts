@@ -2705,8 +2705,8 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
 
   /**
    * `GitLabMergeRequest.push()`: `preparePush` to the merge request's source branch, never forced.
-   * Refused for a merge request from a fork, whose source branch is in a project this connection
-   * does not reach.
+   * Refused for a merged merge request, which no push can reach, and for one from a fork, whose
+   * source branch is in a project this connection does not reach.
    */
   async prepareMergeRequestPush(mergeRequestId: string, commitId: GitOid, gitCache: RpcStub<GitCache>): Promise<PushAction | null> {
     const label = mergeRequestId.startsWith("~") ? mergeRequestId : `!${mergeRequestId}`;
@@ -2718,6 +2718,10 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       branch = create.options.sourceBranch;
     } else {
       const mr = await this.#getRawMergeRequest(realId);
+      if (mr.state === "merged") {
+        throw new Error(`Cannot push to merge request ${label}: it has been merged, so a push would not reach it. ` +
+          `Push to a new branch and open a merge request instead.`);
+      }
       if (mr.source_project_id !== mr.target_project_id) {
         throw new Error(`Cannot push to merge request ${label}: its source branch is in a fork, and pushing to a fork is not supported.`);
       }

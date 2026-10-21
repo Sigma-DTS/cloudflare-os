@@ -283,8 +283,9 @@ export interface GitLabMergeRequest extends GitLabIssuable {
    * The push must be a fast-forward: if the merge request has moved past the head your work was
    * based on, the push fails with an error saying so; read its new head and rebase onto it, or
    * merge it in. A merge request from a fork cannot be pushed to, since its source branch is in
-   * another project. GitLab's protected-branch and push rules are checked by GitLab when the push
-   * is made: a push they reject is not made, and GitLab's reason is reported.
+   * another project, and neither can a merged one. GitLab's protected-branch and push rules are
+   * checked by GitLab when the push is made: a push they reject is not made, and GitLab's reason
+   * is reported.
    */
   push(commitId: string): Promise<void>;
 

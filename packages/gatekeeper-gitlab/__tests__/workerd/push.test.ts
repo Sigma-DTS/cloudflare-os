@@ -281,13 +281,13 @@ describe("queueing a push", () => {
   });
 });
 
-/** Merge request !133 from `feature` (at BASE) into `main`; `sourceProjectId` 2 makes it a fork's. */
-async function mergeRequest(sourceProjectId = 1) {
+/** Merge request !133 from `feature` (at BASE) into `main`, as `overrides` change it. */
+async function mergeRequest(overrides: object = {}) {
   const { gitlab, props, name } = await setup();
   gitlab.branches.set("feature", BASE);
   gitlab.on("GET", new RegExp(`^/api/v4/projects/${P}/merge_requests/133\\?`), () => json({
     ...fx.mergeRequestResponse.data, iid: 133, source_branch: "feature", target_branch: "main", sha: BASE,
-    source_project_id: sourceProjectId, target_project_id: 1,
+    source_project_id: 1, target_project_id: 1, ...overrides,
   }));
   const push = async (commit: string, cache: TestGitCache) =>
     await unwrap(await hooks().queueAction(name, props, "prepareMergeRequestPush", ["133", commit, stubOf(cache)], DESC));
@@ -318,8 +318,9 @@ describe("pushing to a merge request", () => {
     await expect(push()).rejects.toThrow("Provisional merge request ~1 is no longer available.");
   });
 
-  it("refuses a merge request from a fork, and one whose source branch is gone", async () => {
-    await expect((await mergeRequest(2)).push(HEAD1, cacheWithChain())).rejects.toThrow("its source branch is in a fork");
+  it("refuses a merge request from a fork or merged, and one whose source branch is gone", async () => {
+    await expect((await mergeRequest({ source_project_id: 2 })).push(HEAD1, cacheWithChain())).rejects.toThrow("its source branch is in a fork");
+    await expect((await mergeRequest({ state: "merged" })).push(HEAD1, cacheWithChain())).rejects.toThrow("it has been merged");
     const { gitlab, push } = await mergeRequest();
     gitlab.branches.delete("feature");
     await expect(push(HEAD1, cacheWithChain())).rejects.toThrow(`its source branch "feature" no longer exists`);

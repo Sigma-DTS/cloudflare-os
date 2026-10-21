@@ -5602,8 +5602,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   /**
    * `GitHubPullRequest.push()`: `preparePush` to the pull request's head branch, never forced.
-   * Refused for a fork's pull request, whose head branch is in a repository this connection
-   * does not reach.
+   * Refused for a merged pull request, which no push can reach, and for a fork's, whose head
+   * branch is in a repository this connection does not reach.
    */
   async preparePullRequestPush(pullId: string, commitId: string,
                                gitCache: RpcStub<GitCache>): Promise<PushAction | null> {
@@ -5616,6 +5616,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       branch = create.options.head;
     } else {
       const pull = await this.#getRemotePullRequestDetails(realId);
+      if (pull.merged) {
+        throw new Error(`Cannot push to pull request ${label}: it has been merged, so a push would ` +
+          `not reach it. Push to a new branch and open a pull request instead.`);
+      }
       if (!isOwnHead(pull)) {
         const fork = pull.head.repo ? `is in the fork ${pull.head.repo.fullName}` : "was in a fork since deleted";
         throw new Error(`Cannot push to pull request ${label}: its head branch ${fork}, and pushing ` +

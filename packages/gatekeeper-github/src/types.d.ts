@@ -310,7 +310,7 @@ export interface GitHubPullRequest extends GitHubIssue {
    * The push must be a fast-forward: if the pull request has moved past the head your work was
    * based on, the push fails with an error saying so; read its new head and rebase onto it, or
    * merge it in. A pull request from a fork cannot be pushed to, since its head branch is in
-   * another repository.
+   * another repository, and neither can a merged one.
    */
   push(commitId: string): Promise<void>;
 
