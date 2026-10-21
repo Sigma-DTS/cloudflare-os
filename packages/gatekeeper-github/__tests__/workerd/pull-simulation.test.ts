@@ -155,25 +155,14 @@ function commitResponse(commit: FakeCommit) {
 /** A branch's repository in a pull request's REST shape. */
 type RestRepo = { owner: { login: string }, name: string };
 
-/** A pull request branch's REST shape. GitHub nulls `repo` once a fork is deleted. */
-type RestBranch = { ref: string, sha: string, label: string, repo: RestRepo | null };
+/** A pull request branch's REST shape, its `repo` null once its fork is deleted. */
+type RestBranch = { ref: string, sha: string, repo?: RestRepo | null };
 
-/**
- * `repo` names the branch's repository as GitHub spells it; omitted, it is the bound repo as the
- * binding spells it.
- */
-function restBranch(
-  { ref, sha, repo = { owner: { login: OWNER }, name: REPO } }: { ref: string, sha: string, repo?: RestRepo },
-): RestBranch {
-  return { ref, sha, label: `${repo.owner.login}:${ref}`, repo };
-}
+/** The bound repository as the binding spells it: an omitted branch `repo`. */
+const BOUND_REPO: RestRepo = { owner: { login: OWNER }, name: REPO };
 
 /** A pull request's REST shape. */
-function pullResponse(
-  number: number,
-  head: { ref: string, sha: string, repo?: RestRepo },
-  base: { ref: string, sha: string, repo?: RestRepo },
-) {
+function pullResponse(number: number, head: RestBranch, base: RestBranch) {
   return {
     number,
     html_url: `https://github.com/${OWNER}/${REPO}/pull/${number}`,
@@ -195,8 +184,8 @@ function pullResponse(
     additions: 1,
     deletions: 0,
     changed_files: 1,
-    head: restBranch(head),
-    base: restBranch(base),
+    head: { repo: BOUND_REPO, ...head },
+    base: { repo: BOUND_REPO, ...base },
   };
 }
 
@@ -880,12 +869,12 @@ describe("pushing to a pull request", () => {
 
   it("refuses a deleted fork's pull request, though this repository has a branch of its name", async () => {
     const { github, cache } = topicScenario();
-    const pull = pullResponse(9, { ref: "topic", sha: HEAD2, repo: FORK }, { ref: "main", sha: BASE });
-    github.pulls.set(9, { ...pull, head: { ...pull.head, repo: null } });
+    // GitHub reports no owner for a deleted fork, so this holds for a fork in this repository's own
+    // account too. HEAD1 fast-forwards this repository's `topic`, which the push must not move.
+    github.pulls.set(9, pullResponse(9, { ref: "topic", sha: HEAD2, repo: null }, { ref: "main", sha: BASE }));
     const gk = await repoGatekeeper();
-    // HEAD1 fast-forwards this repository's own `topic`, which the push must not move.
     await expect(gk.preparePullRequestPush("9", HEAD1, cache))
-      .rejects.toThrow("its head branch is in the fork contributor/widgets");
+      .rejects.toThrow("its head branch was in a fork since deleted");
   });
 });
 

@@ -398,7 +398,8 @@ export type GitHubIssueDetails = GitHubIssueSummary & {
 export type GitHubPullRequestBranchRef = {
   ref: string;
   sha: string;
-  repo: GitHubRepoRef;
+  /** Null once the fork the branch was in has been deleted. */
+  repo: GitHubRepoRef | null;
 }
 
 /** A compact pull request summary returned from list and search operations. */

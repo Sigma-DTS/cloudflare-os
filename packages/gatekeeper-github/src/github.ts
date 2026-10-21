@@ -824,30 +824,20 @@ function normalizeIssueDetails(owner: string, repo: string, response: GitHubIssu
   };
 }
 
-/**
- * A deleted fork's branch has a null `repo`, so its owner comes from `label`: falling back to the
- * bound repository's would mistake it for one of this repository's own branches. The fork's name
- * went with it; the bound repository's stands in.
- */
-function normalizePullBranchRef(
-  fallbackRepo: string,
-  response: GitHubPullRequestResponse["head"],
-): GitHubPullRequestBranchRef {
-  const owner = response.repo?.owner.login ?? response.label.split(":", 1)[0];
-  return {
-    ref: response.ref,
-    sha: response.sha,
-    repo: repoRef(owner, response.repo?.name ?? fallbackRepo),
-  };
+/** A deleted fork's branch keeps its `ref` and `sha`, but GitHub nulls its `repo`. */
+function normalizePullBranchRef(response: GitHubPullRequestResponse["head"]): GitHubPullRequestBranchRef {
+  const { ref, sha, repo } = response;
+  return { ref, sha, repo: repo && repoRef(repo.owner.login, repo.name) };
 }
 
 /**
  * Whether a pull request's head branch is in the bound repository rather than a fork. Compared
  * with the base repository from the same response, not with props: those keep the case the
- * binding's URL was typed in, and the name from before a rename.
+ * binding's URL was typed in, and the name from before a rename. A head with no repository was
+ * in a fork since deleted, even one under this repository's owner.
  */
 function isOwnHead(pull: Pick<GitHubPullRequestSummary, "head" | "base">): boolean {
-  return pull.head.repo.fullName === pull.base.repo.fullName;
+  return !!pull.head.repo && pull.head.repo.fullName === pull.base.repo?.fullName;
 }
 
 function normalizePullSummary(
@@ -859,8 +849,8 @@ function normalizePullSummary(
     ...normalizeIssueSummary(owner, repo, response),
     draft: response.draft,
     merged: !!response.merged_at,
-    head: normalizePullBranchRef(repo, response.head),
-    base: normalizePullBranchRef(repo, response.base),
+    head: normalizePullBranchRef(response.head),
+    base: normalizePullBranchRef(response.base),
   };
 }
 
@@ -936,7 +926,7 @@ function pullMatchesFilter(item: GitHubPullRequestSummary, filter?: GitHubPullRe
     // `owner:ref` or a bare `ref`; refs are case-sensitive, owners are logins.
     const colon = filter.head.indexOf(":");
     if (item.head.ref !== filter.head.slice(colon + 1)) return false;
-    if (colon >= 0 && !sameLogin(item.head.repo.owner, filter.head.slice(0, colon))) return false;
+    if (colon >= 0 && !sameLogin(item.head.repo?.owner, filter.head.slice(0, colon))) return false;
   }
   if (filter.base && item.base.ref !== filter.base) return false;
   return true;
@@ -5627,8 +5617,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     } else {
       const pull = await this.#getRemotePullRequestDetails(realId);
       if (!isOwnHead(pull)) {
-        throw new Error(`Cannot push to pull request ${label}: its head branch is in the fork ` +
-          `${pull.head.repo.fullName}, and pushing to a fork is not supported.`);
+        const fork = pull.head.repo ? `is in the fork ${pull.head.repo.fullName}` : "was in a fork since deleted";
+        throw new Error(`Cannot push to pull request ${label}: its head branch ${fork}, and pushing ` +
+          `to a fork is not supported.`);
       }
       branch = pull.head.ref;
     }
