@@ -106,7 +106,7 @@ function activityStatus(
   }
   if (record.state === 'rejected') {
     return {
-      label: record.outcomeUnconfirmed ? 'Denied (unconfirmed)' : 'Denied',
+      label: record.outcomeUnconfirmed ? 'Denied (may have already happened)' : 'Denied',
       dotClass: 'bg-kumo-danger',
       textClass: 'text-kumo-danger',
     }

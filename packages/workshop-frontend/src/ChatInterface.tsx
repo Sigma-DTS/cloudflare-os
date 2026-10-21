@@ -5077,7 +5077,7 @@ function ChatInterface({
     const stateLabel = isApproved
       ? "Approved"
       : isRejected
-        ? log.outcomeUnconfirmed ? "Denied (unconfirmed)" : "Denied"
+        ? log.outcomeUnconfirmed ? "Denied (may have already happened)" : "Denied"
         : null;
     const stateLabelCls = isRejected
       ? "text-kumo-danger"
