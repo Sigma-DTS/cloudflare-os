@@ -110,25 +110,49 @@ describe("rejectPendingAction", () => {
     });
   });
 
-  it("keeps an approval that landed while the gatekeeper was being asked", async () => {
+  it("keeps an approval whose apply is in flight when the gatekeeper refuses the denial", async () => {
     await inOverseer("reject-raced", async impl => {
+      let applying = Promise.withResolvers<void>();
+      let release = Promise.withResolvers<void>();
+      impl.getGatekeeperFacet = async () => ({
+        async applyAction() {
+          applying.resolve();
+          await release.promise;
+        },
+        async rejectAction() { throw new Error("Action 1 is already applying."); },
+      });
+      queue(impl, 1, SEND);
+      const BOB = { type: "user" as const, id: "bob@example.com", name: "Bob" };
+
+      let approval = impl.applyPendingAction(impl.storage.actions.get(1), BOB, false);
+      await applying.promise;
+      await expect(impl.rejectPendingAction(impl.storage.actions.get(1), USER))
+          .rejects.toThrow(/already applying/);
+      expect(impl.storage.actions.get(1).state).toBe("pending");
+
+      release.resolve();
+      await approval;
+      let stored = impl.storage.actions.get(1);
+      expect(stored.state).toBe("approved");
+      expect(stored.resolvedBy).toEqual(BOB);
+      expect(stored.outcomeUnconfirmed).toBeUndefined();
+    });
+  });
+
+  it("keeps an approval that landed while the gatekeeper was being asked", async () => {
+    await inOverseer("reject-landed", async impl => {
       let send = queue(impl, 1, SEND);
       impl.getGatekeeperFacet = async () => ({
         async rejectAction() {
           let approved = impl.storage.actions.get(1);
           approved.state = "approved";
-          approved.resolvedBy = { type: "user", id: "bob@example.com", name: "Bob" };
           impl.storage.actions.put(approved);
           throw new Error("Action 1 is no longer pending.");
         },
       });
 
       await expect(impl.rejectPendingAction(send, USER)).rejects.toThrow(/no longer pending/);
-
-      let stored = impl.storage.actions.get(1);
-      expect(stored.state).toBe("approved");
-      expect(stored.resolvedBy.id).toBe("bob@example.com");
-      expect(stored.outcomeUnconfirmed).toBeUndefined();
+      expect(impl.storage.actions.get(1).state).toBe("approved");
     });
   });
 

@@ -4888,6 +4888,20 @@ class OverseerImpl implements AgentHooks {
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
                            creation?: {creator: Fetcher<GatekeeperUserVerifier>,
                                        configuration: string | null}): Promise<void> {
+    // A second apply of the same action leaves the mark to the first.
+    let marked = !this.#actionsApplying.has(record.id);
+    this.#actionsApplying.add(record.id);
+    try {
+      await this.#applyPendingAction(record, resolvedBy, autoApproved, creation);
+    } finally {
+      if (marked) this.#actionsApplying.delete(record.id);
+    }
+  }
+
+  async #applyPendingAction(record: ActionRecord & {type: "action"},
+                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
+                            creation?: {creator: Fetcher<GatekeeperUserVerifier>,
+                                        configuration: string | null}): Promise<void> {
     let id = record.gatekeeperId;
     // A created resource exists only once its creation applies, and that stays pending until then.
     if (record.action !== "create" && this.#creationPending(id)) {
@@ -4978,8 +4992,12 @@ class OverseerImpl implements AgentHooks {
       let gatekeeper = await this.getGatekeeperFacet(record.gatekeeperId);
       await gatekeeper.rejectAction(record.action);
     } catch (error) {
-      // An approval that landed during the await is a reason a gatekeeper refuses, and it stands.
-      if (this.storage.actions.get(record.id)?.state !== "pending") throw error;
+      // An approval running or landed during the await is a reason a gatekeeper refuses, and it
+      // stands: it records "approved" only once the gatekeeper's apply returns.
+      if (this.#actionsApplying.has(record.id) ||
+          this.storage.actions.get(record.id)?.state !== "pending") {
+        throw error;
+      }
       this.logger.warn("gatekeeper could not withdraw a denied action", {
         event: "action.reject.unconfirmed",
         actionId: record.id,
@@ -6305,6 +6323,9 @@ class OverseerImpl implements AgentHooks {
   // scheduled -- marking without one would brick the connection until some unrelated restart came
   // along.
   #gatekeepersPendingRestart = new Set<number>();
+
+  // Actions whose applyPendingAction is in flight, which a denial must not override.
+  #actionsApplying = new Set<number>();
 
   // Whether `id` is NOT blocked pending a scheduled restart (see #gatekeepersPendingRestart).
   // For callers that enumerate connections (listSlashCommands, prepareChatBindings' ambient
