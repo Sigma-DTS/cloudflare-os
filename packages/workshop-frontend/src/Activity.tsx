@@ -105,7 +105,11 @@ function activityStatus(
     return { label: 'Pending', dotClass: 'bg-kumo-brand', textClass: 'text-kumo-strong' }
   }
   if (record.state === 'rejected') {
-    return { label: 'Denied', dotClass: 'bg-kumo-danger', textClass: 'text-kumo-danger' }
+    return {
+      label: record.outcomeUnconfirmed ? 'Denied (unconfirmed)' : 'Denied',
+      dotClass: 'bg-kumo-danger',
+      textClass: 'text-kumo-danger',
+    }
   }
   return { label: 'Approved', dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
 }
