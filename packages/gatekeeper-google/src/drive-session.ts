@@ -75,6 +75,20 @@ export type NativeRead = <T>(
   observe: (value: T) => NativeObservation,
 ) => Promise<T>;
 
+/** How a session core's `nativeRead` treats one read. */
+export type NativeReadOptions = {
+  /**
+   * Discloses the file's content -- its bytes or a PDF's text -- rather than what a viewer sees, so
+   * the read is recorded as a content unit, which an observer passes only with leave to download.
+   */
+  content?: boolean;
+  /**
+   * Folder bindings only: sees the file's metadata from each re-proof, before and after the fetch,
+   * and throws to refuse a read of a file that has changed since it was opened.
+   */
+  unchanged?: (file: DriveFile) => void;
+};
+
 /** Reads and authorizes with no live scope check, for a binding whose scope cannot move. */
 export function unguardedNativeRead(
   authorize: (description: ObservationDescription) => Promise<void>,
@@ -333,11 +347,18 @@ abstract class DriveCoreBase {
   }
 
   /** Stage, authorize, and commit one disclosure of `observations`. */
-  protected async authorizeUnits(
+  protected authorizeUnits(
     observations: DriveObservation[], title: string, description: string,
   ): Promise<void> {
+    return this.authorizeDisclosure(observations, {title, description});
+  }
+
+  /** {@link authorizeUnits} for a description built elsewhere, as a native read's is. */
+  protected async authorizeDisclosure(
+    observations: DriveObservation[], description: NativeObservation,
+  ): Promise<void> {
     let check = await this.prepareObservation(observations);
-    await this.authorize({title, description, excludeObservers: check.excludeObservers});
+    await this.authorize({...description, excludeObservers: check.excludeObservers});
     check.commit();
   }
 
@@ -490,13 +511,18 @@ export class DriveSessionCore extends DriveCoreBase {
   }
 
   /**
-   * Native reads need no moving-scope check for immutable account/file capabilities, so no
-   * metadata is re-read for `_unchanged` to see.
+   * An account or exact-file capability's scope cannot move, so its reads need no live scope check.
+   * A content read is still recorded, since observers need more to see it than the file opened.
    */
   nativeRead(
-    _fileId: string, _expectedMimeType: string, _unchanged?: (file: DriveFile) => void,
+    fileId: string, _expectedMimeType: string, {content}: NativeReadOptions = {},
   ): NativeRead {
-    return unguardedNativeRead(this.authorize);
+    if (!content) return unguardedNativeRead(this.authorize);
+    return async <T>(fetch: () => Promise<T>, observe: (value: T) => NativeObservation) => {
+      let value = await fetch();
+      await this.authorizeDisclosure([{kind: "content", fileId}], observe(value));
+      return value;
+    };
   }
 
   async #cursor(query: DriveListFilesOptions, denyEmptySearch = false): Promise<Pager<DriveEntry>> {
@@ -665,13 +691,9 @@ export class DriveFolderSessionCore extends DriveCoreBase {
     return {folderIds: [...this.#location.folderIds, folder.id]};
   }
 
-  /**
-   * Revalidate the saved path and direct child on every Docs, Sheets, Slides, PDF or file read.
-   * `unchanged` sees the file's metadata from each check, before and after the fetch, and throws
-   * to refuse a read of a file that has changed since it was opened.
-   */
+  /** Revalidate the saved path and direct child on every Docs, Sheets, Slides, PDF or file read. */
   nativeRead(
-    fileId: string, expectedMimeType: string, unchanged?: (file: DriveFile) => void,
+    fileId: string, expectedMimeType: string, {content, unchanged}: NativeReadOptions = {},
   ): NativeRead {
     let requireCurrent = async () => {
       let file = await this.#requireDirectFile(fileId);
@@ -682,10 +704,8 @@ export class DriveFolderSessionCore extends DriveCoreBase {
       await requireCurrent();
       let value = await fetch();
       await requireCurrent();
-      let check = await this.prepareObservation(
-        [this.#folderObservation(), {kind: "file", fileId}]);
-      await this.authorize({...observe(value), excludeObservers: check.excludeObservers});
-      check.commit();
+      await this.authorizeDisclosure(
+        [this.#folderObservation(), {kind: content ? "content" : "file", fileId}], observe(value));
       return value;
     };
   }

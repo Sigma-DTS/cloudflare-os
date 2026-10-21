@@ -10,6 +10,7 @@ import type { DriveBindingScope } from "../../src/drive-session";
 import { MAX_CONCURRENT_FILE_READS } from "../../src/drive-file-read";
 import { Semaphore } from "../../src/mutex";
 import type { PdfConverter } from "../../src/drive-pdf";
+import type { DriveObservation } from "../../src/drive-observers";
 import { GoogleDriveSessionImpl } from "../../src/google";
 import type { DrivePdfText, DriveSessionSearchQuery } from "../../src/drive-types";
 import { GoogleSheetsApi } from "../../src/sheets-api";
@@ -240,8 +241,11 @@ function newSession(
 ) {
   const queue = new TestApprovalQueue();
   const queueStub: RpcStub<ApprovalQueue> = new RpcStub(queue);
+  /** The disclosure units of each observation, in order. */
+  const prepared: DriveObservation[][] = [];
   return {
     queue,
+    prepared,
     session: new RpcStub(new GoogleDriveSessionImpl(
       new DriveApi(getAccessToken),
       new GoogleDocsApi(getAccessToken),
@@ -251,7 +255,10 @@ function newSession(
       new Semaphore(MAX_CONCURRENT_FILE_READS),
       scope,
       queueStub,
-      async fileIds => ({ pendingSets: fileIds, commit() {} }),
+      async units => {
+        prepared.push(units);
+        return { pendingSets: units, commit() {} };
+      },
       () => ({ pendingSets: [], commit() {} }),
     )),
   };
@@ -376,7 +383,7 @@ describe("Drive PDF reads", () => {
     const converter = fakeConverter(() => {
       authorizedAtConversion = queue.observations.map(o => o.title);
     });
-    const { queue, session } = newSession(converter.convert);
+    const { queue, prepared, session } = newSession(converter.convert);
     using owned = session;
 
     const result = await owned.readPdf("pdf-1");
@@ -396,6 +403,8 @@ describe("Drive PDF reads", () => {
       },
       { title: "Read PDF from Google Drive", description: "Read the text of Drive file pdf-1." },
     ]);
+    // The text is the file's content, so a collaborator needs leave to download the PDF to see it.
+    expect(prepared).toEqual([[{ kind: "file", fileId: "pdf-1" }], [{ kind: "content", fileId: "pdf-1" }]]);
   });
 
   it("withholds the text when its read is not authorized, releasing its stream", async () => {
@@ -552,7 +561,7 @@ describe("Drive file reads", () => {
   });
 
   it("reads a whole small file, authorizing the read before returning it", async () => {
-    const { queue, session } = newSession();
+    const { queue, prepared, session } = newSession();
     using owned = session;
 
     const read = await owned.readFile("csv-1");
@@ -576,6 +585,8 @@ describe("Drive file reads", () => {
         description: `Read ${CSV_BYTES.byteLength} bytes of Drive file csv-1, from byte 0.`,
       },
     ]);
+    // The bytes are the file's content, so a collaborator needs leave to download it to see them.
+    expect(prepared).toEqual([[{ kind: "file", fileId: "csv-1" }], [{ kind: "content", fileId: "csv-1" }]]);
   });
 
   it("reads a large file in ranges, clamping the last one to the end of the file", async () => {

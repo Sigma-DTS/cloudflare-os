@@ -3313,7 +3313,7 @@ export class GoogleDriveSessionImpl extends RpcTarget
     let convert = this.#convertPdf;
     if (!convert) throw new Error("PDF reading is not available on this deployment.");
     let converted: DrivePdfText | undefined;
-    return core.nativeRead(id, PDF_MIME_TYPE)(async () => {
+    return core.nativeRead(id, PDF_MIME_TYPE, {content: true})(async () => {
       let download = (await this.#driveApi.openDownload(id).catch((error: unknown) => {
         throw lacksFileContentAccess(error) ? new Error(contentAccessMissing("PDFs")) : error;
       })).getReader();
@@ -3361,8 +3361,11 @@ export class GoogleDriveSessionImpl extends RpcTarget
     // The range is read whole inside the fetch, so a folder binding's re-proof after it covers
     // every byte returned. That re-proof re-reads the file's metadata anyway, so a folder binding
     // also refuses a rewrite that kept the size: its modification time moved.
-    return this.#fileReads.run(() => core.nativeRead(file.id, mimeType, current => {
-      if (current.modifiedTime !== file.modifiedTime) throw new Error(FILE_CHANGED);
+    return this.#fileReads.run(() => core.nativeRead(file.id, mimeType, {
+      content: true,
+      unchanged: current => {
+        if (current.modifiedTime !== file.modifiedTime) throw new Error(FILE_CHANGED);
+      },
     })(async (): Promise<DriveFileBytes> => {
       if (count === 0) return {mimeType, size, modifiedTime, offset, content: new ArrayBuffer(0)};
       let {content, fileSize} = await this.#driveApi.downloadRange(file.id, offset, count)
