@@ -1133,12 +1133,13 @@ class OverseerImpl implements AgentHooks {
     let wait = this.#decisionWait(record.chatId);
     let meta = this.storage.chatMeta.get(record.chatId);
     if (wait !== undefined) {
-      if (meta && wait) {
+      let paused = !!wait && !wait.denied;
+      if (meta && paused) {
         delete meta.activeAgent;
         this.storage.chatMeta.put(meta);
       }
-      if (wait) this.#publishAgentTurnNotification(record.chatId, record.initiator, record.initiatorUserId);
-      this.ctx.waitUntil(this.#finishAgentTurn(record.chatId, !!wait));
+      if (paused) this.#publishAgentTurnNotification(record.chatId, record.initiator, record.initiatorUserId);
+      this.ctx.waitUntil(this.#finishAgentTurn(record.chatId, paused));
       return;
     }
     if ((record.resumeAttempts ?? 0) >= AGENT_RESUME_MAX_ATTEMPTS) {

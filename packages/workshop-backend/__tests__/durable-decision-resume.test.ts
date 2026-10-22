@@ -676,6 +676,51 @@ describe("decision handoff using the existing execution row", () => {
     expect(requests()).toBe(2);
   });
 
+  it.each([
+    {kind: "connection", participant: false}, {kind: "connection", participant: true},
+    {kind: "action", participant: false}, {kind: "action", participant: true},
+  ] as const)("recovers a $kind denial with one completion after cleanup (participant: $participant)",
+      async ({kind, participant}) => {
+    const notifications = recordNotifications(), requests = inference();
+    const s = await scenario(kind, true), name = crypto.randomUUID();
+    const received = () => notifications.filter(([, n]) => n.workspaceId === s.stub.id.toString());
+    await s.visit(async impl => {
+      if (participant) {
+        const {receiver} = await participate(impl, 31, name);
+        await receiver.hold("finished");
+      }
+      // Denial committed while the segment was still active, immediately before eviction.
+      if (kind === "action") {
+        impl.storage.actions.put({...impl.storage.actions.get(7)!, state: "rejected"});
+      } else {
+        const message = [...impl.storage.chats.list()].findLast(m => m.type === "connectionRequest")!;
+        if (message.type !== "connectionRequest") throw new Error("Missing request");
+        impl.storage.chats.put({...message, state: "denied"});
+      }
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(s.stub);
+    await s.visit(async impl => {
+      if (participant) {
+        const receiver = lifecycleExports(impl).TestLifecycleParticipant({props: {name}});
+        await receiver.waitUntilHeld();
+        try {
+          expect(received()).toEqual([]);
+          expect(impl.storage.activeAgents.get(CHAT)?.finishing).toBe(true);
+          expect((await receiver.calls()).map(c => c.event.kind)).toEqual(["finished"]);
+        } finally { await receiver.release(); await impl.waitForAllAgentsToComplete(); }
+      }
+      await impl.waitForAllAgentsToComplete();
+      expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
+      expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
+      expect([...impl.storage.agentParticipants.list()]).toEqual([]);
+    });
+    await vi.waitFor(() => expect(received()).toEqual([[s.user.id.toString(), expect.objectContaining({
+      kind: "taskCompleted", workspaceId: s.stub.id.toString(), chatId: CHAT, chatTitle: "Resume",
+    })]]));
+    expect(requests()).toBe(0);
+  });
+
   it("claims the row, note, busy state and alarm before model lookup; recovery needs no browser", async () => {
     const requests = inference(), s = await scenario();
     const gate = Promise.withResolvers<void>();
