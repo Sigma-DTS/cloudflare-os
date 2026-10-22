@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { Badge, Button, Loader, Select, Table, useKumoToastManager } from '@cloudflare/kumo'
+import { Badge, Button, Loader, Select, Switch, Table, useKumoToastManager } from '@cloudflare/kumo'
 import { ArrowsClockwise } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
 import {
@@ -72,7 +72,14 @@ const dayName = (day: string) => {
 type Activity =
   | { state: 'loading' }
   | { state: 'failed' }
-  | { state: 'loaded'; stats: AdminAuditStats; records: AdminAuditRecord[]; refreshing: boolean }
+  | {
+    state: 'loaded'
+    stats: AdminAuditStats
+    records: AdminAuditRecord[]
+    /** Whether `records` were loaded as content reads only. */
+    contentOnly: boolean
+    refreshing: boolean
+  }
 
 const changeName = (change: AdminSettingChange) => {
   if (change.key !== undefined) return `${change.setting} · ${change.key}`
@@ -131,6 +138,7 @@ const WorkspaceAccess = ({ record }: { record: AdminAccessRecord }) => (
     <p className="flex flex-wrap items-center gap-2">
       <span className="font-medium text-kumo-default break-all">{record.workspaceTitle || record.workspaceId}</span>
       <span className="font-mono text-xs text-kumo-subtle">{record.method}</span>
+      {record.exposed === 'content' && <Badge variant="info">Content read</Badge>}
       {record.refused && <Badge variant="warning">{REFUSAL_NAMES[record.refused]}</Badge>}
     </p>
     <p className="text-kumo-subtle break-words">
@@ -138,6 +146,7 @@ const WorkspaceAccess = ({ record }: { record: AdminAccessRecord }) => (
     </p>
     <p className="text-kumo-subtle">
       <span className="text-kumo-default">Access:</span> {ACCESS_LEVEL_NAMES[record.access]}
+      {record.requested !== record.access && ` (${ACCESS_LEVEL_NAMES[record.requested]} requested)`}
     </p>
   </div>
 )
@@ -163,7 +172,15 @@ const EmptyNote = ({ children }: { children: string }) => (
   <p className="text-sm text-kumo-subtle">{children}</p>
 )
 
-const ActivityCards = ({ stats, records }: { stats: AdminAuditStats; records: AdminAuditRecord[] }) => (
+const ActivityCards = ({ stats, records, recordsContentOnly, contentOnly, onContentOnlyChange }: {
+  stats: AdminAuditStats
+  records: AdminAuditRecord[]
+  /** Whether `records` are content reads only. */
+  recordsContentOnly: boolean
+  /** Whether the filter asks for content reads only, which a load may not have answered yet. */
+  contentOnly: boolean
+  onContentOnlyChange: (contentOnly: boolean) => void
+}) => (
   <>
     <div className="grid items-start gap-6 md:grid-cols-2">
       <div className={CARD}>
@@ -171,6 +188,9 @@ const ActivityCards = ({ stats, records }: { stats: AdminAuditStats; records: Ad
         <p className="text-sm text-kumo-subtle mb-4">
           <span className="text-2xl font-semibold text-kumo-default tabular-nums">{NUMBER.format(stats.totalEvents)}</span>
           {' '}{stats.totalEvents === 1 ? 'event' : 'events'}, by UTC day
+          <span className="block mt-1">
+            {NUMBER.format(stats.contentReads)} {stats.contentReads === 1 ? 'content read' : 'content reads'}
+          </span>
         </p>
         <Table>
           <Table.Header>
@@ -228,12 +248,19 @@ const ActivityCards = ({ stats, records }: { stats: AdminAuditStats; records: Ad
       </div>
     </div>
 
-    <div className={CARD}>
-      <h3 className="text-lg font-semibold text-kumo-strong mb-4">Recent activity</h3>
+    <div className={`${CARD} grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4`}>
+      <h3 className="text-lg font-semibold text-kumo-strong">Recent activity</h3>
+      <Switch label="Content reads only" checked={contentOnly} onCheckedChange={onContentOnlyChange} />
       {records.length === 0
-        ? <EmptyNote>No admin activity is recorded yet.</EmptyNote>
+        ? (
+          <div className="col-span-2">
+            <EmptyNote>
+              {recordsContentOnly ? 'No content reads are recorded yet.' : 'No admin activity is recorded yet.'}
+            </EmptyNote>
+          </div>
+        )
         : (
-          <ul className="divide-y divide-kumo-line">
+          <ul className="col-span-2 divide-y divide-kumo-line">
             {records.map((record, index) => (
               <RecentRecord key={`${record.at.getTime()}:${index}`} record={record} />
             ))}
@@ -245,10 +272,11 @@ const ActivityCards = ({ stats, records }: { stats: AdminAuditStats; records: Ad
 
 const accessHelp = ({ chosen, effective, max }: AuditSettings['adminWorkspaceAccess']): string[] => {
   const help = [
-    'How much of a workspace an admin sees when inspecting it. Metadata only withholds chat ' +
-      'messages, file contents, and the descriptions of actions, observations and hooks; titles ' +
-      'stay, and can echo content. Off refuses inspection. A change reaches views already open ' +
-      'within about a minute.',
+    'The most of a workspace an admin may see when inspecting it: each inspection asks for ' +
+      'Metadata only (the default) or Full, and gets the lower of that and this level. Metadata ' +
+      'only withholds chat messages, file contents, and the descriptions of actions, observations ' +
+      'and hooks; titles stay, and can echo content. Off refuses inspection. Lowering it reaches ' +
+      'views already open within about a minute.',
   ]
   if (max === 'off') {
     help.push('This deployment’s ADMIN_WORKSPACE_ACCESS_MAX allows no inspection (a value that is ' +
@@ -267,13 +295,15 @@ const accessHelp = ({ chosen, effective, max }: AuditSettings['adminWorkspaceAcc
 
 /**
  * The admin Audit tab: what the deployment-wide admin audit log holds for the last week, its most
- * recent records, and the settings that bound admin access to workspaces and the log's retention.
+ * recent records (all of them, or only the content reads), and the settings that bound admin access
+ * to workspaces and the log's retention.
  */
 export const AdminAuditPanel = ({ admin, settings, onSettingsChanged }: AdminAuditPanelProps) => {
   const toasts = useKumoToastManager()
   const [activity, setActivity] = useState<Activity>({ state: 'loading' })
   // Each load is one value of this; a new one supersedes those before it.
   const [loads, setLoads] = useState(0)
+  const [contentOnly, setContentOnly] = useState(false)
   const [savingAccess, setSavingAccess] = useState(false)
   const activityHeading = useId()
   const { adminWorkspaceAccess: access, adminAuditRetentionDays: retention } = settings
@@ -283,10 +313,10 @@ export const AdminAuditPanel = ({ admin, settings, onSettingsChanged }: AdminAud
     // Both or neither: a backend older than the audit log rejects either as an unknown method.
     Promise.all([
       admin.getAdminAuditStats({ days: STATS_DAYS }),
-      admin.listAdminAudit({ limit: RECENT_LIMIT }),
+      admin.listAdminAudit(contentOnly ? { limit: RECENT_LIMIT, exposed: 'content' } : { limit: RECENT_LIMIT }),
     ]).then(
       ([stats, page]) => {
-        if (current) setActivity({ state: 'loaded', stats, records: page.records, refreshing: false })
+        if (current) setActivity({ state: 'loaded', stats, records: page.records, contentOnly, refreshing: false })
       },
       (err: unknown) => {
         if (!current) return
@@ -295,12 +325,19 @@ export const AdminAuditPanel = ({ admin, settings, onSettingsChanged }: AdminAud
       },
     )
     return () => { current = false }
-  }, [admin, loads])
+  }, [admin, loads, contentOnly])
 
-  // Loads the log again, keeping what is shown until the new load answers.
-  const reload = () => {
+  // reload() and changeContentOnly() load the log again, keeping what is shown until the new load
+  // answers.
+  const showRefreshing = () =>
     setActivity((shown) => shown.state === 'loaded' ? { ...shown, refreshing: true } : { state: 'loading' })
+  const reload = () => {
+    showRefreshing()
     setLoads((n) => n + 1)
+  }
+  const changeContentOnly = (on: boolean) => {
+    showRefreshing()
+    setContentOnly(on)
   }
 
   // The access select is disabled while its change is in flight, and a browser takes focus from a
@@ -385,7 +422,15 @@ export const AdminAuditPanel = ({ admin, settings, onSettingsChanged }: AdminAud
             <Button variant="secondary" size="sm" className="mt-3" onClick={reload}>Retry</Button>
           </div>
         )}
-        {activity.state === 'loaded' && <ActivityCards stats={activity.stats} records={activity.records} />}
+        {activity.state === 'loaded' && (
+          <ActivityCards
+            stats={activity.stats}
+            records={activity.records}
+            recordsContentOnly={activity.contentOnly}
+            contentOnly={contentOnly}
+            onContentOnlyChange={changeContentOnly}
+          />
+        )}
       </section>
 
       <div className={CARD}>

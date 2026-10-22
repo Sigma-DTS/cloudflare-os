@@ -72,6 +72,9 @@ const testStats = (patch: Partial<AdminAuditStats> = {}): AdminAuditStats => ({
     { workspaceId: 'ws-titled', title: 'Quarterly report', count: 2 },
     { workspaceId: 'ws-untitled', title: '', count: 1 },
   ],
+  contentReads: 2,
+  topAdminsByContentReads: [{ admin: 'admin', count: 2 }],
+  topWorkspacesByContentReads: [{ workspaceId: 'ws-titled', title: 'Quarterly report', count: 2 }],
   ...patch,
 })
 
@@ -89,7 +92,9 @@ const accessRecord = (patch: Partial<AdminAccessRecord> = {}): AdminAccessRecord
   method: 'getChat',
   args: { chatId: 3 },
   reason: 'Ticket 42: agent stuck',
+  requested: 'metadata',
   access: 'metadata',
+  exposed: 'metadata',
   refused: 'ADMIN_CONTENT_WITHHELD',
   ...patch,
 })
@@ -126,6 +131,15 @@ const button = (name: string) => {
     .find((b) => (b.getAttribute('aria-label') ?? b.textContent?.trim()) === name)
   if (!element) throw new Error(`no button ${name}`)
   return element
+}
+
+// What a screen reader names an element by: the elements its aria-labelledby names, which take
+// precedence, or else its aria-label.
+const accessibleName = (element: HTMLElement) => {
+  const labelledBy = element.getAttribute('aria-labelledby')
+  return labelledBy
+    ? labelledBy.split(' ').map((id) => document.getElementById(id)?.textContent ?? '').join(' ')
+    : element.getAttribute('aria-label')
 }
 
 describe('AdminAuditPanel', () => {
@@ -200,6 +214,24 @@ describe('AdminAuditPanel', () => {
 
   const recentItems = () => [...card('Recent activity').querySelectorAll('li')]
     .filter((li) => li.parentElement?.parentElement === card('Recent activity'))
+
+  const contentOnlySwitch = () => {
+    const element = card('Recent activity').querySelector<HTMLElement>('[role="switch"]')
+    if (!element) throw new Error('no content reads switch')
+    return element
+  }
+
+  // The switch forwards a click as a PointerEvent, which jsdom lacks, so the window has a stand-in
+  // for as long as the click takes.
+  const flipContentOnly = async () => {
+    const view: { PointerEvent?: typeof MouseEvent } = window
+    view.PointerEvent = MouseEvent
+    try {
+      await click(contentOnlySwitch())
+    } finally {
+      delete view.PointerEvent
+    }
+  }
 
   beforeEach(() => {
     container = document.createElement('div')
@@ -343,6 +375,127 @@ describe('AdminAuditPanel', () => {
       expect(getAdminAuditStats).toHaveBeenCalledTimes(2)
       expect(listAdminAudit).toHaveBeenCalledTimes(2)
       expect(recentItems()[0].textContent).toContain('newest-admin')
+    })
+
+    it('counts the week’s content reads', async () => {
+      await render()
+      expect(card('Last 7 days').textContent).toContain('2 content reads')
+    })
+
+    it('counts a single content read in the singular', async () => {
+      const admin = fakeAdmin()
+      admin.getAdminAuditStats.mockResolvedValue(testStats({ contentReads: 1 }))
+
+      await render(settingsWith(), admin)
+
+      expect(card('Last 7 days').textContent).toContain('1 content read')
+      expect(card('Last 7 days').textContent).not.toContain('content reads')
+    })
+
+    it('marks a content read, and only a content read', async () => {
+      const admin = fakeAdmin()
+      admin.listAdminAudit.mockResolvedValue(testPage([
+        accessRecord({ requested: 'full', access: 'full', exposed: 'content', refused: undefined }),
+        accessRecord({ method: 'listChats', args: {}, requested: 'full', access: 'full', refused: undefined }),
+      ]))
+
+      await render(settingsWith(), admin)
+
+      const [content, metadata] = recentItems()
+      expect(content.textContent).toContain('Content read')
+      expect(metadata.textContent).not.toContain('Content read')
+    })
+
+    it('shows the level asked for only where it differs from the level granted', async () => {
+      const admin = fakeAdmin()
+      admin.listAdminAudit.mockResolvedValue(testPage([
+        accessRecord({ requested: 'full', access: 'metadata' }),
+        accessRecord({ requested: 'metadata', access: 'off', refused: 'ADMIN_WORKSPACE_ACCESS_OFF' }),
+        accessRecord({ requested: 'full', access: 'full', refused: undefined }),
+      ]))
+
+      await render(settingsWith(), admin)
+
+      const [capped, off, granted] = recentItems()
+      expect(capped.textContent).toContain('Access: Metadata only (Full requested)')
+      expect(off.textContent).toContain('Access: Off (Metadata only requested)')
+      expect(granted.textContent).toContain('Access: Full')
+      expect(granted.textContent).not.toContain('requested')
+    })
+
+    describe('the content reads filter', () => {
+      it('is a switch named “Content reads only”, off at first', async () => {
+        await render()
+
+        expect(accessibleName(contentOnlySwitch())).toBe('Content reads only')
+        expect(contentOnlySwitch().getAttribute('aria-checked')).toBe('false')
+      })
+
+      it('loads only the content reads while on, and every record again once off', async () => {
+        const { getAdminAuditStats, listAdminAudit } = await render()
+        listAdminAudit.mockResolvedValueOnce(testPage([
+          accessRecord({ reason: 'Ticket 43: read the chat', requested: 'full', access: 'full', exposed: 'content', refused: undefined }),
+        ]))
+
+        await flipContentOnly()
+
+        expect(listAdminAudit).toHaveBeenLastCalledWith({ limit: 20, exposed: 'content' })
+        expect(getAdminAuditStats).toHaveBeenCalledTimes(2)
+        expect(contentOnlySwitch().getAttribute('aria-checked')).toBe('true')
+        expect(recentItems()).toHaveLength(1)
+        expect(recentItems()[0].textContent).toContain('Ticket 43: read the chat')
+
+        await flipContentOnly()
+
+        expect(listAdminAudit).toHaveBeenLastCalledWith({ limit: 20 })
+        expect(listAdminAudit).toHaveBeenCalledTimes(3)
+        expect(recentItems()).toHaveLength(2)
+      })
+
+      it('says when no content read is recorded', async () => {
+        const { listAdminAudit } = await render()
+        listAdminAudit.mockResolvedValueOnce(testPage([]))
+
+        await flipContentOnly()
+
+        expect(card('Recent activity').textContent).toContain('No content reads are recorded yet.')
+        expect(card('Recent activity').textContent).not.toContain('No admin activity is recorded yet.')
+      })
+
+      it('stays on through Refresh', async () => {
+        const { listAdminAudit } = await render()
+        await flipContentOnly()
+
+        await click(button('Refresh'))
+
+        expect(listAdminAudit).toHaveBeenCalledTimes(3)
+        expect(listAdminAudit).toHaveBeenLastCalledWith({ limit: 20, exposed: 'content' })
+      })
+
+      it('stays on through the reload after a settings change', async () => {
+        const { listAdminAudit } = await render()
+        await flipContentOnly()
+
+        await choose('Full')
+
+        expect(listAdminAudit).toHaveBeenCalledTimes(3)
+        expect(listAdminAudit).toHaveBeenLastCalledWith({ limit: 20, exposed: 'content' })
+      })
+
+      it('ignores the load it superseded', async () => {
+        const admin = fakeAdmin()
+        await render(settingsWith(), admin)
+        const unfiltered = deferred<AdminAuditPage>()
+        admin.listAdminAudit.mockReturnValueOnce(unfiltered.promise as ReturnType<AdminApi['listAdminAudit']>)
+        await click(button('Refresh'))
+        admin.listAdminAudit.mockResolvedValueOnce(testPage([accessRecord({ reason: 'filtered', exposed: 'content' })]))
+
+        await flipContentOnly()
+        await act(async () => unfiltered.resolve(testPage([settingRecord({ admin: 'unfiltered-admin' })])))
+
+        expect(recentItems()[0].textContent).toContain('filtered')
+        expect(container.textContent).not.toContain('unfiltered-admin')
+      })
     })
 
     // A change reloads the log so that its own record shows, even while an earlier load is out.
