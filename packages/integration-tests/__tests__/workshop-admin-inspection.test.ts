@@ -4,9 +4,9 @@ import {
   ADMIN_ACCESS_ERROR_CODES, getAdminAccessErrorCode, getOpenGadgetErrorCode,
   MAX_ADMIN_AUDIT_ARG_LENGTH, MAX_DIRECTORY_TEXT_LENGTH, OPEN_GADGET_ERROR_CODES,
   type ActionLogEntry, type ActionsSubscriber, type AdminAccessErrorCode, type AdminAccessRecord,
-  type AdminApi, type AdminAuditQuery, type AdminAuditRecord, type AdminWorkspaceAccess,
-  type AuthenticatedApi, type Overseer, type PresenceParticipant, type PresenceSubscriber,
-  type WorkpieceId,
+  type AdminApi, type AdminAuditQuery, type AdminAuditRecord, type AdminViewAccess,
+  type AdminWorkspaceAccess, type AuthenticatedApi, type Overseer, type PresenceParticipant,
+  type PresenceSubscriber, type WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import { diffFiles } from "@gadgets/workshop-shared/code-change";
 import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
@@ -216,7 +216,7 @@ it("refuses every admin method to a non-admin", async () => {
   // The bypass is on the Overseer's Durable Object, never on a capability a user holds.
   const looseWs = ws as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
   await expect(looseWs.openForAdmin!(ownerName, REASON, "session", {
-    via: "api", access: "full", expiresAt: new Date(Date.now() + 60_000),
+    via: "api", requested: "full", access: "full", expiresAt: new Date(Date.now() + 60_000),
   })).rejects.toThrow();
 });
 
@@ -304,19 +304,24 @@ it("records an inspection apart from the workspace, where its members never see 
     await view.listActions();
     const { recentAdminAccess } = await view.getDiagnostics();
 
+    // getDiagnostics() reads the records before it writes its own, so its own is not among them.
     expect(recentAdminAccess.map(record => record.method))
-        .toEqual(["getDiagnostics", "listActions", "listChats", "describe", "inspectWorkspace"]);
+        .toEqual(["listActions", "listChats", "describe", "inspectWorkspace"]);
     const sessionId = recentAdminAccess[0]!.sessionId;
     for (const record of recentAdminAccess) {
       expect(record).toMatchObject({
         kind: "workspace", workspaceId: id, workspaceTitle: title, admin: ADMIN_USERNAME,
-        reason: REASON, sessionId, via: "api", access: "metadata",
+        reason: REASON, sessionId, via: "api", requested: "metadata", access: "metadata",
+        exposed: "metadata",
       });
       expect(record.refused).toBeUndefined();
     }
 
     const logged = await workspaceRecords(id);
-    expect(logged).toEqual(recentAdminAccess);
+    expect(logged[0]).toMatchObject({
+      method: "getDiagnostics", sessionId, requested: "metadata", exposed: "metadata",
+    });
+    expect(logged.slice(1)).toEqual(recentAdminAccess);
 
     const pages: AdminAuditRecord[][] = [];
     let cursor: string | undefined;
@@ -379,12 +384,12 @@ it("withholds content below full access, and turns inspection off", async () => 
     // Refused by the level after being recorded, so each refusal is in the log.
     const [readRefusal, chatRefusal] = (await workspaceRecords(id)).map(accessRecord);
     expect(readRefusal).toMatchObject({
-      method: "readFile", args: { gadgetId, path: "notes.txt" }, access: "metadata",
-      refused: ADMIN_ACCESS_ERROR_CODES.contentWithheld,
+      method: "readFile", args: { gadgetId, path: "notes.txt" }, requested: "metadata",
+      access: "metadata", exposed: "metadata", refused: ADMIN_ACCESS_ERROR_CODES.contentWithheld,
     });
     expect(chatRefusal).toMatchObject({
-      method: "getChat", args: { chatId }, access: "metadata",
-      refused: ADMIN_ACCESS_ERROR_CODES.contentWithheld,
+      method: "getChat", args: { chatId }, requested: "metadata", access: "metadata",
+      exposed: "metadata", refused: ADMIN_ACCESS_ERROR_CODES.contentWithheld,
     });
 
     const withheld = (await metadataView.listActions()).entries
@@ -399,7 +404,7 @@ it("withholds content below full access, and turns inspection off", async () => 
     expect(await metadataView.listFiles(gadgetId)).toEqual([{ name: "notes.txt", kind: "file" }]);
 
     await admin.setAdminWorkspaceAccess("full");
-    using fullView = await admin.inspectWorkspace(id, REASON);
+    using fullView = await admin.inspectWorkspace(id, REASON, { access: "full" });
     expect((await fullView.getChat(chatId)).messages)
         .toContainEqual(expect.objectContaining({ type: "message", message: "hello" }));
     expect(await fullView.readFile(gadgetId, "notes.txt")).toEqual({ kind: "text", text: NOTES });
@@ -407,11 +412,8 @@ it("withholds content below full access, and turns inspection off", async () => 
         ?.description.description).toBe(OBSERVATION_DESCRIPTION);
     expect((await fullView.describe()).workpieces.find(workpiece => workpiece.id === gadgetId))
         .toMatchObject({ upstream: {} });
-    // A view keeps the level it was minted at: raising the setting does not reach it.
-    expect(await refusalOf(metadataView.getChat(chatId)))
-        .toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
 
-    // Lowering the setting does.
+    // Lowering the setting reaches a live view.
     await admin.setAdminWorkspaceAccess("metadata");
     await waitFor("the full view to be lowered", async () =>
       await outcomeOf(fullView.getChat(chatId)) === ADMIN_ACCESS_ERROR_CODES.contentWithheld
@@ -448,6 +450,127 @@ it("withholds content below full access, and turns inspection off", async () => 
   } finally {
     await admin.setAdminWorkspaceAccess("metadata");
     await admin.setAdminAuditRetentionDays(90);
+  }
+});
+
+it("opens a view at the lower of the level asked for and the deployment's", async () => {
+  using stack = new DisposableStack();
+  const { id, chatId } = await populatedWorkspace(stack, "requested");
+  const heldReason = "Asked for full, held to metadata";
+  const defaultReason = "Asked for nothing";
+  const fullReason = "Asked for full, granted it";
+
+  // The setting is "metadata", so asking for "full" opens the view at "metadata", unrefused.
+  using held = await admin.inspectWorkspace(id, heldReason, { access: "full" });
+  expect((await held.describe()).access).toBe("metadata");
+  expect(await refusalOf(held.getChat(chatId))).toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
+
+  try {
+    await admin.setAdminWorkspaceAccess("full");
+    // A view keeps the level it was minted at: raising the setting does not reach it.
+    expect(await refusalOf(held.getChat(chatId))).toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
+    expect((await held.describe()).access).toBe("metadata");
+
+    // An open that asks for nothing gets "metadata", whatever the deployment allows.
+    {
+      using view = await admin.inspectWorkspace(id, defaultReason);
+      expect((await view.describe()).access).toBe("metadata");
+      expect(await refusalOf(view.getChat(chatId))).toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
+    }
+
+    {
+      using view = await admin.inspectWorkspace(id, fullReason, { access: "full" });
+      expect((await view.describe()).access).toBe("full");
+      expect((await view.getChat(chatId)).messages)
+          .toContainEqual(expect.objectContaining({ type: "message", message: "hello" }));
+      expect(await newestRecord({ workspace: id })).toMatchObject({
+        method: "getChat", reason: fullReason, requested: "full", access: "full",
+        exposed: "content",
+      });
+    }
+
+    const records = (await workspaceRecords(id)).map(accessRecord);
+    const heldRecords = records.filter(record => record.reason === heldReason);
+    expect(heldRecords.map(record => record.method).toSorted())
+        .toEqual(["describe", "describe", "getChat", "getChat", "inspectWorkspace"]);
+    for (const record of heldRecords) {
+      expect(record).toMatchObject({ requested: "full", access: "metadata", exposed: "metadata" });
+    }
+    const defaultRecords = records.filter(record => record.reason === defaultReason);
+    expect(defaultRecords).toHaveLength(3);
+    for (const record of defaultRecords) {
+      expect(record).toMatchObject({ requested: "metadata", access: "metadata" });
+    }
+
+    // A level that is not a view level is refused before anything is recorded. The server's
+    // validator throws, and capnweb delivers the throw as a rejection that keeps its TypeError.
+    const newest = await newestRecord({ workspace: id });
+    await expect(admin.inspectWorkspace(id, REASON, { access: "off" as AdminViewAccess }))
+        .rejects.toThrow(TypeError);
+    expect(await newestRecord({ workspace: id })).toEqual(newest);
+  } finally {
+    await admin.setAdminWorkspaceAccess("metadata");
+  }
+});
+
+it("records what each call returned, and lists content reads apart", async () => {
+  using stack = new DisposableStack();
+  const { id, chatId, gadgetId } = await populatedWorkspace(stack, "exposed");
+
+  try {
+    await admin.setAdminWorkspaceAccess("full");
+    using view = await admin.inspectWorkspace(id, REASON, { access: "full" });
+    const calls: [string, () => PromiseLike<unknown>][] = [
+      ["getChat", () => view.getChat(chatId)],
+      // The answer is absent, so it holds no content.
+      ["readFile", () => view.readFile(gadgetId, "missing.txt")],
+      ["readFile", () => view.readFile(gadgetId, "notes.txt")],
+      ["listFiles", () => view.listFiles(gadgetId)],
+      // The workspace queues no steer.
+      ["listChats", () => view.listChats()],
+      // The observation's description.
+      ["listActions", () => view.listActions()],
+      // The test connection binds no hooks.
+      ["listGatekeepers", () => view.listGatekeepers()],
+      // The gadget was built from scratch, so its upstream {} names no blueprint.
+      ["describe", () => view.describe()],
+      ["getDiagnostics", () => view.getDiagnostics()],
+    ];
+    const recorded: { method: string; exposed: string }[] = [];
+    for (const [method, call] of calls) {
+      await call();
+      const record = accessRecord(await newestRecord({ workspace: id }));
+      expect(record).toMatchObject({ method, requested: "full", access: "full" });
+      expect(record.refused).toBeUndefined();
+      recorded.push({ method, exposed: record.exposed });
+    }
+    expect(recorded).toEqual([
+      { method: "getChat", exposed: "content" },
+      { method: "readFile", exposed: "metadata" },
+      { method: "readFile", exposed: "content" },
+      { method: "listFiles", exposed: "metadata" },
+      { method: "listChats", exposed: "metadata" },
+      { method: "listActions", exposed: "content" },
+      { method: "listGatekeepers", exposed: "metadata" },
+      { method: "describe", exposed: "metadata" },
+      { method: "getDiagnostics", exposed: "metadata" },
+    ]);
+
+    const logged = (await workspaceRecords(id)).map(accessRecord);
+    expect(logged.at(-1)).toMatchObject({ method: "inspectWorkspace", exposed: "metadata" });
+    const contentReads = (await admin.listAdminAudit({ workspace: id, exposed: "content" }))
+        .records;
+    expect(contentReads.map(record => accessRecord(record).method))
+        .toEqual(["listActions", "readFile", "getChat"]);
+    expect(contentReads).toEqual(logged.filter(record => record.exposed === "content"));
+    const metadataReads = (await admin.listAdminAudit({ workspace: id, exposed: "metadata" }))
+        .records;
+    expect(metadataReads).toHaveLength(7);
+    expect(metadataReads).toEqual(logged.filter(record => record.exposed === "metadata"));
+    expect((await admin.listAdminAudit({ kind: "setting", exposed: "content" })).records)
+        .toEqual([]);
+  } finally {
+    await admin.setAdminWorkspaceAccess("metadata");
   }
 });
 
@@ -499,25 +622,38 @@ it("refuses a workspace that does not exist without creating it", async () => {
       .toBe(ADMIN_ACCESS_ERROR_CODES.workspaceNotFound);
 });
 
-it("fails a view call whose audit record cannot be written", async () => {
+it("fails a view call whose audit record cannot be written, returning nothing", async () => {
   using stack = new DisposableStack();
-  const { id } = await newWorkspace(stack, "unaudited");
+  const { id, chatId } = await populatedWorkspace(stack, "unaudited");
   // Addresses the deployment-wide log, which is always getByName("").
   const storage = await harness.server.getWorker("workshop-backend")
       .getDurableObjectStorage("AdminAuditDurableObject", { name: "" });
-  using view = await admin.inspectWorkspace(id, REASON);
-  const logged = await workspaceRecords(id);
-  expect(logged).toHaveLength(1);
 
   try {
-    await storage.exec(`CREATE TRIGGER admin_audit_unavailable BEFORE INSERT ON admin_audit
-        BEGIN SELECT RAISE(ABORT, 'admin audit unavailable'); END`);
-    await expect(view.listChats()).rejects.toThrow();
-    await expect(admin.inspectWorkspace(id, REASON)).rejects.toThrow();
+    await admin.setAdminWorkspaceAccess("full");
+    using view = await admin.inspectWorkspace(id, REASON, { access: "full" });
+    const logged = await workspaceRecords(id);
+    expect(logged).toHaveLength(1);
+
+    // Dropped before the setting is restored: no setting change can be recorded while it stands.
+    try {
+      await storage.exec(`CREATE TRIGGER admin_audit_unavailable BEFORE INSERT ON admin_audit
+          BEGIN SELECT RAISE(ABORT, 'admin audit unavailable'); END`);
+      await expect(view.listChats()).rejects.toThrow();
+      await expect(view.getChat(chatId)).rejects.toThrow();
+      await expect(admin.inspectWorkspace(id, REASON)).rejects.toThrow();
+    } finally {
+      await storage.exec("DROP TRIGGER IF EXISTS admin_audit_unavailable");
+    }
+    expect(await workspaceRecords(id)).toEqual(logged);
+
+    // The workspace's own record says what the answer that never left would have exposed.
+    using later = await admin.inspectWorkspace(id, REASON);
+    expect((await later.getDiagnostics()).recentAdminAccess).toContainEqual(
+        expect.objectContaining({ method: "getChat", access: "full", exposed: "content" }));
   } finally {
-    await storage.exec("DROP TRIGGER IF EXISTS admin_audit_unavailable");
+    await admin.setAdminWorkspaceAccess("metadata");
   }
-  expect(await workspaceRecords(id)).toEqual(logged);
 });
 
 it("stops a view once it expires, recording nothing more", async () => {

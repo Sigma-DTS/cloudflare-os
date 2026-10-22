@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import {
   ADMIN_ACCESS_ERROR_CODES, DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS, MAX_ADMIN_AUDIT_ARG_LENGTH,
   createAdminAccessError, getAdminAccessErrorCode,
-  type AdminAccessRecord, type AdminVia,
+  type AdminAccessRecord, type AdminVia, type AdminViewAccess,
 } from "@gadgets/workshop-shared/api";
 import { AdminApiImpl } from "../src/admin-settings.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
@@ -106,6 +106,17 @@ describe("AdminApiImpl.inspectWorkspace", () => {
     expect(calls).toEqual([]);
   });
 
+  it("never runs with a level that is not \"metadata\" or \"full\"", () => {
+    // The validator refuses it before the method's body runs: synchronously, on a direct call.
+    const { mint, calls } = deployment();
+    const api = mint();
+    const id = workspaceId();
+    expect(() => api.inspectWorkspace(id, REASON, { access: "off" as any })).toThrow(TypeError);
+    expect(() => api.inspectWorkspace(id, REASON, { access: "everything" as any }))
+        .toThrow(TypeError);
+    expect(calls).toEqual([]);
+  });
+
   it("refuses a caller no longer an admin before touching anything", async () => {
     const { mint, calls } = deployment();
     const error = await rejection(
@@ -148,7 +159,8 @@ describe("AdminApiImpl.inspectWorkspace", () => {
       expect(record).toMatchObject({
         kind: "workspace", admin: ADMIN, via: "cli", workspaceId: id,
         workspaceTitle: "Quarterly plan", method: "inspectWorkspace", reason: REASON,
-        access: "off", refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
+        requested: "metadata", access: "off", exposed: "metadata",
+        refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
       });
       expect(Object.keys(record.args)).toEqual(["expiresAt"]);
       const expiresAt = Date.parse(record.args.expiresAt as string);
@@ -161,6 +173,11 @@ describe("AdminApiImpl.inspectWorkspace", () => {
       await rejection(api.inspectWorkspace(id, REASON));
       const [second] = callsTo("audit", "append")[1]!.args as [AdminAccessRecord];
       expect(second.sessionId).toBe(record.sessionId);
+
+      // A level asked for is recorded too, refused alike.
+      await rejection(api.inspectWorkspace(id, REASON, { access: "full" }));
+      const [third] = callsTo("audit", "append")[2]!.args as [AdminAccessRecord];
+      expect(third).toMatchObject({ requested: "full", access: "off" });
     });
 
     it("cuts a long title as the audit log cuts any", async () => {
@@ -192,10 +209,13 @@ describe("AdminApiImpl.inspectWorkspace", () => {
   });
 
   it.each([
-    ["full", "full", "full"],
-    ["full", undefined, "metadata"],
-    ["metadata", "full", "metadata"],
-  ] as const)("opens a view at the lower of %s and the cap %s", async (chosen, max, access) => {
+    ["full", "full", undefined, "metadata"],
+    ["full", "full", "full", "full"],
+    ["full", undefined, "full", "metadata"],
+    ["metadata", "full", "full", "metadata"],
+    ["metadata", "full", "metadata", "metadata"],
+  ] as const)("opens a view at the lowest of %s, the cap %s and the level asked for, %s",
+      async (chosen, max, requested, access) => {
     // The view comes back wrapped in its validator, so it is told apart by what it answers.
     const view = { describe: async () => "the minted view" };
     const { mint, callsTo } = deployment({
@@ -205,7 +225,8 @@ describe("AdminApiImpl.inspectWorkspace", () => {
     });
     const id = workspaceId();
     const before = Date.now();
-    const minted = await mint(ADMIN, "api").inspectWorkspace(id, ` ${REASON} `);
+    const minted = await mint(ADMIN, "api").inspectWorkspace(
+        id, ` ${REASON} `, requested === undefined ? undefined : { access: requested });
     expect(await minted.describe()).toBe("the minted view");
     const after = Date.now();
 
@@ -213,9 +234,11 @@ describe("AdminApiImpl.inspectWorkspace", () => {
     const opens = callsTo("overseer", "openForAdmin");
     expect(opens).toHaveLength(1);
     const [adminId, reason, sessionId, terms] = opens[0]!.args as
-        [string, string, string, { via: string; access: string; expiresAt: Date }];
+        [string, string, string,
+         { via: string; requested: AdminViewAccess; access: AdminViewAccess; expiresAt: Date }];
     expect([adminId, reason, typeof sessionId]).toEqual([ADMIN, REASON, "string"]);
     expect(terms.via).toBe("api");
+    expect(terms.requested).toBe(requested ?? "metadata");
     expect(terms.access).toBe(access);
     const lifetime = DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS * 1000;
     expect(terms.expiresAt.getTime()).toBeGreaterThanOrEqual(before + lifetime);
@@ -328,11 +351,15 @@ describe("AdminApiImpl audit log", () => {
     });
     const since = new Date("2026-01-01T00:00:00Z");
     expect(await mint().listAdminAudit({
-      kind: "workspace", admin: ADMIN, workspace: "w", since, cursor: "next",
+      kind: "workspace", admin: ADMIN, workspace: "w", exposed: "content", since, cursor: "next",
       extra: true,
     } as Parameters<AdminApiImpl["listAdminAudit"]>[0])).toBe(page);
     expect(callsTo("audit", "list")[0]!.args).toStrictEqual([
-      { kind: "workspace", admin: ADMIN, workspace: "w", since, cursor: "next", limit: 50 }, 120,
+      {
+        kind: "workspace", admin: ADMIN, workspace: "w", exposed: "content", since,
+        cursor: "next", limit: 50,
+      },
+      120,
     ]);
   });
 

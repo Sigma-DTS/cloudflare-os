@@ -27,8 +27,9 @@ method except workspace inspection, which checks again (see [Inspection](#inspec
   resource and gatekeeper availability, models, update checks, ...), plus
   `setAdminWorkspaceAccess()` and `setAdminAuditRetentionDays()`. Every setter is audited.
 - **The directory**: `listUsers()` and `listWorkspaces()`.
-- **Inspection**: `inspectWorkspace(workspaceId, reason, { lifetimeSeconds })`, which returns an
-  `AdminWorkspaceView`.
+- **Inspection**: `inspectWorkspace(workspaceId, reason, { lifetimeSeconds, access })`, which
+  returns an `AdminWorkspaceView` at the lower of the level asked for (`"metadata"` by default) and
+  the deployment's.
 - **The audit log**: `listAdminAudit()` and `getAdminAuditStats()`.
 
 `via` is `"api"` (the default, the Workshop's admin panel included) or `"cli"` for a command-line
@@ -118,10 +119,12 @@ never empty while rows remain), and cursors and owner filters take any length.
 
 ## Inspection
 
-`AdminApi.inspectWorkspace()` validates the reason and lifetime, re-checks that the caller is an
-admin, reads the access policy from the authoritative `AdminSettings` config (not the KV mirror: a
-mirror still saying `"full"` after an admin lowered the level must not mint a view at the old one),
-and then calls `OverseerDurableObject.openForAdmin(adminId, reason, sessionId, terms)`.
+`AdminApi.inspectWorkspace()` validates the reason, the lifetime and the level asked for,
+re-checks that the caller is an admin, reads the access policy from the authoritative
+`AdminSettings` config (not the KV mirror: a mirror still saying `"full"` after an admin lowered the
+level must not mint a view at the old one), and then calls
+`OverseerDurableObject.openForAdmin(adminId, reason, sessionId, terms)`. The terms carry the level
+asked for (`requested`) and the view's own `access`, the lower of that and the authoritative policy.
 
 `openForAdmin()`:
 
@@ -136,9 +139,12 @@ and then calls `OverseerDurableObject.openForAdmin(adminId, reason, sessionId, t
   [observers.md](observers.md#admin-access-a-deliberate-exception));
 - reads its environment only through the `OverseerImpl` (`impl.env`), never through the Durable
   Object's own `env`;
-- rejects malformed terms with a `TypeError`. An expiry already past when the workspace answers is
-  not malformed: the open is refused as any call on an expired view is (`viewExpired`, unrecorded),
-  so a slow hop never surfaces as a validation error.
+- rejects malformed terms with a `TypeError`, unrecorded: a blank or over-long reason, a `via` that
+  is not `"api"` or `"cli"`, an `access` or a `requested` that is not `"metadata"` or `"full"`, an
+  `access` above `requested`, and an expiry that is not a valid time or lies beyond the longest
+  lifetime. An expiry already past when the workspace answers is not malformed: the open is refused
+  as any call on an expired view is (`viewExpired`, unrecorded), so a slow hop never surfaces as a
+  validation error.
 
 The view (`AdminWorkspaceViewImpl`) is not an `Overseer`. It joins no presence, session count or
 outputs fan-out, and starts no agent, ambient capsule or gatekeeper facet; waking the Durable Object
@@ -146,29 +152,68 @@ still resumes turns a previous instance left running, as any wake does. It offer
 `listChats`, `getChat`, `listActions`, `listFiles`, `readFile`, `listGatekeepers` and
 `getDiagnostics`, shaped as the matching `Overseer` reads are.
 
-File reads are limited to a permanent gadget's committed head, and read only the objects the
-workspace stores (`readLocalCommitTree`, `readLocalFileAtCommit`, built on `readLocalObject`). The
-ordinary reads pull a missing object through the workspace's connections; these never do, so an
-inspection never reaches a connection. A missing object is an error, not a fetch.
+An admin read never reaches a connection. File reads are limited to a permanent gadget's committed
+head, and read only the objects the workspace stores (`readLocalCommitTree`,
+`readLocalFileAtCommit`, built on `readLocalObject`). The ordinary reads pull a missing object
+through the workspace's connections; these never do. A missing object is an error, not a fetch.
+Beyond the workspace's own storage, a view reads only its owner's profile, from their account
+(`describe()`).
+
+### The level an inspection asks for
+
+An inspection asks for `"metadata"` (the default) or `"full"` (`AdminInspectOptions.access`), and
+its view gets the lower of that and the deployment's effective level.
+Asking for `"full"` where the deployment allows only `"metadata"` is not an error: the view opens at
+`"metadata"`, and its `describe()` reports the level granted. While the effective level is `"off"`,
+every open is refused, whatever it asks for. Any other level is refused with a `TypeError` before
+the open runs, by `AdminApiImpl`'s RPC validation.
+
+Every record the view makes keeps the level asked for (`requested`) beside the level the call ran
+at (`access`). Reading content is therefore a separate step: an investigation starts at
+`"metadata"`, and moves to `"full"` deliberately, in a new `inspectWorkspace()` call with a reason
+of its own, and the log shows when it did.
+
+A view never rises. Its level is fixed when it is minted, and later calls only lower it (see
+[Each call](#each-call)): raising the setting leaves a view that asked for `"full"` but got
+`"metadata"` at `"metadata"`, and the admin inspects again to read content. `openForAdmin()` rejects
+terms whose `access` is above `requested`, so no caller can mint a view above what it asked for.
 
 ### Each call
 
-Every view method, the open included, runs `#audit()` before it reads anything:
+Every view method, the open included, runs through `#call()`:
 
 1. The view's checks: it has not expired (`viewExpired`), its admin is still an admin (`notAdmin`),
    and the workspace still exists (`workspaceNotFound`). A call these stop is not recorded.
-2. The deployment's setting is read (`readAdminConfig`, the KV mirror), the call's one await before
-   it writes.
-3. The checks again, synchronously with the write that follows, so a call that expiry, a demotion
-   or the workspace's deletion overtakes while it reads the setting writes nothing into the
-   workspace and appends nothing for it.
-4. The level the call runs at: the view's own, fixed when it was minted, lowered to the current
-   setting and the environment's cap. Lowering the setting reaches live views within about a minute
-   (the KV mirror's propagation); raising it never raises a view.
-5. The record, in the workspace's admin access table and then in the deployment-wide log.
-6. The level's refusal, if any: `accessOff` once the level is `"off"`, `contentWithheld` for
-   `getChat()` or `readFile()` below `"full"`.
-7. The read.
+2. The deployment's setting is read (`readAdminConfig`, the KV mirror).
+3. The checks again, since that read may have spanned the expiry, a demotion or the workspace's
+   deletion.
+4. The level the call runs at: the view's own (the lower of `requested` and the deployment's level
+   when it was minted), lowered to the current setting and the environment's cap. Lowering the
+   setting reaches live views within about a minute (the KV mirror's propagation); raising it never
+   raises a view.
+5. A call that level refuses is recorded, exposing `"metadata"` and with `refused` set, and then
+   refused without reading anything: `accessOff` once the level is `"off"`, `contentWithheld` for
+   `getChat()` or `readFile()` below `"full"`. Its local write is synchronous with step 3's check.
+6. The read, on the server and never through a connection. A read that throws (a missing object, a
+   gadget whose code is pending, an invalid path) is recorded as an attempt exposing `"metadata"`,
+   once the checks pass again, and the call fails with the read's error.
+7. The checks again, synchronously with the local write that follows, since the read may have
+   awaited. A call that expiry, a demotion or the workspace's deletion overtakes while it reads
+   writes nothing, appends nothing for the workspace and returns nothing.
+8. What the call exposed (`exposed`), computed from the answer it read (see
+   [What a call exposed](#what-a-call-exposed)).
+9. The record, in the workspace's admin access table (synchronously) and then in the
+   deployment-wide log.
+10. The answer.
+
+The record follows the read because it says what the call returned, which only the answer can
+tell; it is why the records `getDiagnostics()` lists never include its own. The point a record
+must precede is the answer leaving the server, since that is what an admin sees. Holding the answer
+until both records exist means that nothing reaches an admin unrecorded and that a call whose record
+cannot be written returns nothing, and a call its level refuses is still recorded without reading
+anything. An answer that never left the server, because its record failed or the view stopped
+meanwhile, exposed nothing. No check follows the deployment-wide append: the answer was read while
+the view was live, and both of its records exist.
 
 A view lasts `DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS` (15 minutes) unless the open asks for up to
 `MAX_ADMIN_VIEW_LIFETIME_SECONDS` (an hour). A workspace restart (a revocation, a deletion, a
@@ -178,7 +223,8 @@ redeploy) ends every view along with every other session on it; inspect again.
 
 ### The levels
 
-`adminWorkspaceAccess` is `"off"`, `"metadata"` (the default) or `"full"`:
+`adminWorkspaceAccess` is `"off"`, `"metadata"` (the default) or `"full"`, the most an inspection
+gets (see [The level an inspection asks for](#the-level-an-inspection-asks-for)):
 
 - **off**: `inspectWorkspace()` is refused.
 - **metadata**: the workspace's structure. Withheld: chat messages and queued steers, file contents,
@@ -237,23 +283,55 @@ typed, so type the number of days you want kept, even the minimum.
 ### Two kinds of record
 
 - **`AdminAccessRecord`** (`kind: "workspace"`): one admin call into a workspace, the open or a view
-  method. It holds `at`, `admin`, `sessionId`, `via`, `workspaceId`, the workspace's title at the
-  time, `method`, the call's arguments by name, the `reason` given at the open, the `access` level
-  the call ran at, and `refused` when the level refused it.
+  method. It holds `at` (when the record was written), `admin`, `sessionId`, `via`, `workspaceId`,
+  the workspace's title at the time, `method`, the call's arguments by name, the `reason` given at
+  the open, the level the open asked for (`requested`), the `access` level the call ran at (never
+  above `requested`), what its answer exposed (`exposed`), and `refused` when the level refused
+  it.
 - **`AdminSettingRecord`** (`kind: "setting"`): one `AdminApi` setter's change. It holds `at`,
   `admin`, `sessionId`, `via`, `method`, and `changes`, each naming a setting, an entry `key` for a
   map or list setting, and its value `before` and `after`.
 
-`listAdminAudit()` filters by kind, admin, workspace and time; `getAdminAuditStats()` by kind.
+`listAdminAudit()` filters by kind, admin, workspace, what a call exposed (`exposed`) and time;
+`getAdminAuditStats()` by kind.
 
-### Write before read, in two stores
+### What a call exposed
+
+`exposed` is `"content"` when a call's answer held something the `"metadata"` level withholds, and
+`"metadata"` otherwise. Only a call at `"full"` can record `"content"`:
+
+| Call | Records `"content"` when its answer holds |
+| --- | --- |
+| The open (`inspectWorkspace`) | never |
+| `describe()` | a gadget that names the blueprint it follows |
+| `listChats()` | a queued steer |
+| `getChat()` | a message or a compaction summary |
+| `listActions()` | an action, observation or hook entry with a description, or an action or observation with a field |
+| `listFiles()` | never |
+| `readFile()` | any file at the path, an `unreadable` one included |
+| `listGatekeepers()` | a hook with a description |
+| `getDiagnostics()` | never: nothing it returns depends on the level |
+
+A refused call, or one whose read failed, records `"metadata"`. Present but empty is not content:
+no queued steers, an empty description or field list, an `upstream` naming no blueprint (a gadget
+built from scratch), and an empty chat page all record `"metadata"`. `readFile()` counts any file
+it finds, because an unreadable file's message can quote it (a symlink's quotes its target), and
+overstating is the safe direction. The predicates (`chatHoldsContent()` and its siblings in
+`admin-access.ts`) mirror the withholding helpers beside them, so each is false for anything a
+metadata view returns.
+
+`exposed` is set from the answer, never from the level, so the content-read counts (see
+[Statistics](#statistics)) count reads that returned content, not calls made at `"full"`.
+
+### Recorded before anything leaves, in two stores
 
 An access record is written first in the workspace's own `adminAccess` collection
-(`OverseerImpl.recordAdminAccess()`, synchronous, so it is durable before anything the call reads
-can leave), and then in the deployment-wide `AdminAuditDurableObject`. The workspace copy is a
-collection of its own, not part of the action log, so `listActions()`, `subscribeToActions()` and
-everything else a member reads can never show it. If the deployment-wide write fails, the call
-fails having read nothing, and the local row stands as the record of the attempt.
+(`OverseerImpl.recordAdminAccess()`, synchronous, so it is durable before the call's answer can
+leave), then in the deployment-wide `AdminAuditDurableObject`, and only then is the answer
+returned. The workspace copy is a collection of its own, not part of the action log, so
+`listActions()`, `subscribeToActions()` and everything else a member reads can never show it. If
+the deployment-wide write fails, the call fails and returns nothing, and the local row stands as
+the record of the attempt, with what its answer would have exposed.
 
 A setting record is written to the deployment-wide log before the change is stored: a change whose
 record cannot be written is refused.
@@ -263,9 +341,10 @@ record cannot be written is refused.
 | Refusal | Recorded | Why |
 | --- | --- | --- |
 | A live view's call refused by its level (`accessOff`, `contentWithheld`) | Yes, in both stores, with `refused` | The admin reached the workspace and asked for something. |
+| A live view's call whose read throws (a missing object, a pending gadget, an invalid path) | Yes, in both stores, exposing `"metadata"` | The admin reached the workspace and asked for something; the call returned only its error. |
 | An open refused because the authoritative setting or the cap is `"off"` | Yes, deployment-wide only, titled from the directory (cut) or `""` | No workspace is reached, so there is no local store to write. |
 | An open refused because only the workspace's KV mirror still says `"off"` | Yes, in both stores | The workspace's own check refused it. |
-| A dead capability (no longer an admin), an expired view, a deleted workspace, a malformed or unknown id | No | Nothing was read or reachable, and recording a gone workspace would write into storage that must stay empty. |
+| A dead capability (no longer an admin), an expired view, a deleted workspace, a malformed or unknown id, including a call that expiry, a demotion or a deletion overtakes while it reads | No | Nothing was reachable, or nothing the call read left the server, and recording a gone workspace would write into storage that must stay empty. |
 
 ### Setting records
 
@@ -305,10 +384,10 @@ surrogate pair: a record marks its cuts, never passing a fragment off as the who
 capped at `MAX_ADMIN_ACCESS_REASON_LENGTH` (500), values at 10,000 with excerpts, and a setter's diff
 has a bounded number of changes, so every record, and every page of them, is bounded.
 
-The deployment-wide store keeps each field once (kind, time, admin, workspace id and title in
-columns, the rest as JSON) and cuts the title itself, whatever its caller sent. The title is the one
-field of a record that a workspace member writes, and it has no length limit of its own: kept
-whole, an over-long title would overflow the row (the platform caps one at 8 MiB), failing every
+The deployment-wide store keeps each field once (kind, time, admin, workspace id and title, and
+`exposed` in columns, the rest as JSON) and cuts the title itself, whatever its caller sent. The
+title is the one field of a record that a workspace member writes, and it has no length limit of
+its own: kept whole, an over-long title would overflow the row (the platform caps one at 8 MiB), failing every
 audit write and so refusing every investigation of that workspace, or push a listing past the RPC
 size limit.
 
@@ -319,14 +398,22 @@ never below the floor). The deployment-wide log deletes up to 1000 expired rows 
 call and never lists or counts one, and it holds the floor itself whatever retention a caller
 passes. A workspace's copy prunes up to 64 expired records each time it writes one, so it goes when
 the workspace is next inspected. `getDiagnostics()` shows a workspace's most recent records within
-the retention.
+the retention, never its own record, which it writes after reading them.
 
 ### Statistics
 
 `getAdminAuditStats({ days, kind })` counts the last `days` UTC days, today included (7 by default,
 at most 366): the total, one count per day (empty days included), the ten admins and the ten
-workspaces with the most records. A top workspace takes the newest non-empty title among its records
-in the window. A window reaching past the retention counts nothing there.
+workspaces with the most records, the content reads (`contentReads`, the records whose `exposed` is
+`"content"`), and the ten admins and the ten workspaces with the most content reads
+(`topAdminsByContentReads`, `topWorkspacesByContentReads`). These are lists of their own, so an
+admin or workspace that ranks low overall still shows when it reads content most. A top workspace,
+in either list, takes the newest non-empty title among its records in the window. Only access
+records name a workspace or read content, so for the `"setting"` kind the content reads are 0 and
+the workspace and content-read lists are empty. A window reaching past the retention counts nothing there.
+
+The Audit tab shows the week's content reads, marks each content read in its recent activity, shows
+the level an inspection asked for where its view got less, and can list content reads alone.
 
 ## Error codes
 
@@ -338,7 +425,7 @@ Expected refusals carry a code from `ADMIN_ACCESS_ERROR_CODES` (read with
 | `ADMIN_NOT_ADMIN` | The caller, or a view's admin, is no longer named in `ADMINS`. |
 | `ADMIN_WORKSPACE_NOT_FOUND` | A malformed id, or one naming no workspace (never initialised or since deleted). |
 | `ADMIN_WORKSPACE_ACCESS_OFF` | The level is `"off"`, by the setting or the cap. |
-| `ADMIN_CONTENT_WITHHELD` | `getChat()` or `readFile()` below `"full"`. |
+| `ADMIN_CONTENT_WITHHELD` | `getChat()` or `readFile()` on a view below `"full"`, whether its inspection asked for `"metadata"` (the default) or the deployment held it there. |
 | `ADMIN_VIEW_EXPIRED` | The view's lifetime has run out. |
 
 ## Tests
@@ -346,15 +433,22 @@ Expected refusals carry a code from `ADMIN_ACCESS_ERROR_CODES` (read with
 Unit suites, in `packages/workshop-backend/__tests__/`:
 
 - `admin-access.test.ts`: admin status, the bounds' parsing (failing closed), the policy, validation,
-  the per-call level, the cuts, and setting values and excerpts.
+  the per-call level, the cuts, setting values and excerpts, withholding, and whether an answer
+  holds content (each predicate, empty values included).
 - `admin-config.test.ts` (`diffAdminConfig`) and `admin-settings-audit.test.ts`: what each setter
   records, before which write, and the setters' bounds.
-- `admin-audit.test.ts`: the deployment-wide log's listing, filters, cursors, schema, retention,
-  stats, and multi-MiB titles.
-- `admin-api-impl.test.ts`: `AdminApiImpl`'s inspection path, refused opens, listings and forwarding.
+- `admin-audit.test.ts`: the deployment-wide log's listing, filters (`exposed` alone and with the
+  others), cursors, schema (the `exposed` column and the CHECK tying it to access records),
+  retention, stats (content reads, their rankings and titles, by kind), and multi-MiB titles.
+- `admin-api-impl.test.ts`: `AdminApiImpl`'s inspection path, the level asked for (the lower of it
+  and the deployment's, and the validator's `TypeError` for any other level), refused opens,
+  listings and forwarding.
 - `admin-workspace-view.test.ts`: the view, from an uninitialised id that stays uninitialised to the
-  per-call checks, the races with deletion and expiry, withholding, a 2,000,000-character title, and
-  file reads that never pull.
+  per-call checks; `requested` and `exposed` on each method's record; a view that asked for
+  `"full"` held at `"metadata"` and never raised; a failed read recorded; a failed record returning
+  nothing; the races with deletion and expiry, at the setting read and while a call reads its
+  answer, writing nothing; withholding; a 2,000,000-character title; and file reads that never
+  pull.
 - `user-directory.test.ts`, `user-directory-feed.test.ts` and `workspace-directory-feed.test.ts`: the
   directory and both feeds. The last includes the deletion regression test, which parks a sync on a
   real call to another Durable Object (a plain-JavaScript fake cannot reproduce workerd's hold-back)
@@ -362,12 +456,15 @@ Unit suites, in `packages/workshop-backend/__tests__/`:
 
 Integration suites, in `packages/integration-tests/__tests__/`:
 
-- `workshop-admin-inspection.test.ts`: every admin method this surface adds refused to a non-admin; the directory; an
-  inspection recorded apart from the workspace and absent from the owner's `listActions()` and
-  `subscribeToActions()`; metadata and off; a deleted id refused without being written; an audit
-  write failure; expiry; and long text end to end.
+- `workshop-admin-inspection.test.ts`: every admin method this surface adds refused to a non-admin;
+  the directory; an inspection recorded apart from the workspace and absent from the owner's
+  `listActions()` and `subscribeToActions()`; metadata and off; the level asked for, and raising
+  the setting not raising a view; what each call returned and the `exposed` filter; a deleted id
+  refused without being written; an audit write failure, where a content read returns nothing while
+  the workspace keeps the attempt; expiry; and long text end to end.
 - `workshop-admin-audit.test.ts`: every setting change recorded before it takes effect, `via`,
-  filters, stats across two admins, and a refused change when its record cannot be written.
+  filters, stats and content reads across two admins, and a refused change when its record cannot
+  be written.
 - `workshop-admin-bounds.test.ts`: the bounds' defaults, and a redeploy that tightens them (an
   invalid cap failing closed) and demotes an admin. The redeploy ends every session, the demoted
   admin's view among them, so the per-call re-check that stops a live view once its admin is demoted

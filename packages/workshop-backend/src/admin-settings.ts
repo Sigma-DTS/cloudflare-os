@@ -1367,6 +1367,7 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
       : Promise<RpcStub<AdminWorkspaceView>> {
     reason = validateAdminAccessReason(reason);
     let lifetimeMs = adminViewLifetimeMs(options.lifetimeSeconds);
+    let requested = options.access ?? "metadata";
     if (!isDeploymentAdmin(this.env, this.adminUserId)) {
       throw createAdminAccessError(ADMIN_ACCESS_ERROR_CODES.notAdmin);
     }
@@ -1391,14 +1392,18 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
         kind: "workspace", at: new Date(), admin: this.adminUserId, sessionId: this.#sessionId,
         via: this.via, workspaceId: id.toString(), workspaceTitle,
         method: "inspectWorkspace", args: { expiresAt: expiresAt.toISOString() }, reason,
-        access: "off", refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
+        requested, access: "off", exposed: "metadata", refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
       }, retentionDays);
       throw createAdminAccessError(ADMIN_ACCESS_ERROR_CODES.accessOff);
     }
 
+    // The view runs at the lower of the level asked for and the deployment's. Asking for more than
+    // the deployment allows is not refused, and every record of the view keeps what was asked.
     // @ts-expect-error Cap'n Web RPC stubs and native RPC stubs are compatible but the type
     //     system doesn't know this.
-    return this.#openForAdmin(id, reason, { via: this.via, access, expiresAt });
+    return this.#openForAdmin(id, reason, {
+      via: this.via, requested, access: lowerAdminWorkspaceAccess(requested, access), expiresAt,
+    });
   }
 
   // Mint the view. A workspace that turns out not to exist leaves the directory, which lists it
@@ -1437,9 +1442,9 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async listAdminAudit(options: AdminAuditQuery = {}): Promise<AdminAuditPage> {
     let limit = adminListLimit(options.limit);
-    let { kind, admin, workspace, since, cursor } = options;
+    let { kind, admin, workspace, exposed, since, cursor } = options;
     return await this.audits.getByName("").list(
-        { kind, admin, workspace, since, cursor, limit }, await this.#retentionDays());
+        { kind, admin, workspace, exposed, since, cursor, limit }, await this.#retentionDays());
   }
 
   async getAdminAuditStats(options: AdminAuditStatsQuery = {}): Promise<AdminAuditStats> {

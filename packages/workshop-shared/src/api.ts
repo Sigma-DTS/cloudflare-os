@@ -456,7 +456,9 @@ const adminAccessErrors = codedErrorFamily<AdminAccessErrorCode>({
   [ADMIN_ACCESS_ERROR_CODES.accessOff]:
       "Admin access to workspaces is turned off on this deployment.",
   [ADMIN_ACCESS_ERROR_CODES.contentWithheld]:
-      "This deployment limits admin access to workspace metadata, so this content is withheld.",
+      "This view is limited to workspace metadata, so this content is withheld. Content needs a " +
+      "view whose inspection asked for \"full\" access, on a deployment that allows it: " +
+      "describe() reports this view's level, and getSettings() the deployment's.",
   [ADMIN_ACCESS_ERROR_CODES.viewExpired]:
       "This admin view has expired. Inspect the workspace again.",
   [ADMIN_ACCESS_ERROR_CODES.notAdmin]: "Only a deployment admin can inspect a workspace.",
@@ -1164,8 +1166,9 @@ export type AdminSettingsView = {
   /** Whether users may search the user directory to find collaborators. */
   userSearchEnabled: boolean;
   /**
-   * How much of a workspace an admin may inspect (see AdminApi.setAdminWorkspaceAccess).
-   * inspectWorkspace() enforces `effective`.
+   * How much of a workspace an admin may inspect (see AdminApi.setAdminWorkspaceAccess):
+   * inspectWorkspace() opens each view at the lower of `effective` and the level the inspection
+   * asks for (AdminInspectOptions.access).
    */
   adminWorkspaceAccess: {
     /** The level enforced: the lower of `chosen` and `max`. */
@@ -1493,6 +1496,17 @@ export type AdminInspectOptions = {
   /** How long the view lasts: a whole number of seconds from 1 to
    * MAX_ADMIN_VIEW_LIFETIME_SECONDS, DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS when absent. */
   lifetimeSeconds?: number;
+  /**
+   * The level asked for: "metadata" when absent. The view gets the lower of this and the
+   * deployment's level (AdminSettingsView.adminWorkspaceAccess.effective). Asking for "full" where
+   * the deployment allows only "metadata" is not refused: the view opens at "metadata", and its
+   * describe() reports that. While the deployment's level is "off", every open is refused, whatever
+   * it asks for. Every record the view makes keeps the level asked for
+   * (AdminAccessRecord.requested). An investigation therefore starts at "metadata" and asks for
+   * "full" deliberately, in a new inspectWorkspace() call with a reason of its own, only to read
+   * content. The audit log shows when it did.
+   */
+  access?: AdminViewAccess;
 };
 
 /** The workspace calls the audit log records: the open (AdminApi.inspectWorkspace()) and each
@@ -1538,19 +1552,29 @@ export const MAX_ADMIN_AUDIT_ARG_LENGTH = 256;
 export const MAX_ADMIN_AUDIT_VALUE_LENGTH = 10_000;
 
 /**
+ * What one admin call into a workspace answered with (see AdminAccessRecord.exposed): "content"
+ * when its answer held something the "metadata" access level withholds (see
+ * ADMIN_WORKSPACE_ACCESS_LEVELS), "metadata" when it held none of it.
+ */
+export type AdminAccessExposure = "metadata" | "content";
+
+/**
  * One admin call into a workspace: the open that minted an AdminWorkspaceView, or a call made
- * through one. Recorded before the call reads anything, twice: in the workspace, apart from its
- * action log so that nothing a workspace member can read ever shows it, and in the deployment-wide
- * log behind AdminApi.listAdminAudit(). A call the view itself stops is not recorded: one made
- * after the view expired or its admin stopped being an admin, or after the workspace was deleted.
- * A call the access level refuses is recorded, with `refused` set. An open refused before it
- * reaches the workspace, because the deployment's access level is "off", is recorded in the
- * deployment-wide log only.
+ * through one. It is recorded once the call has read what it answers with, and before any of that
+ * leaves the server, so that the record can say what the answer exposed. It is recorded twice: in
+ * the workspace, apart from its action log so that nothing a workspace member can read ever shows
+ * it, and in the deployment-wide log behind AdminApi.listAdminAudit(). A call the view itself stops
+ * is not recorded. That covers a call made after the view expired, after its admin stopped being an
+ * admin or after the workspace was deleted, and a call that any of these overtakes while it reads.
+ * A call the access level refuses is recorded, with `refused` set, and so is a call whose read
+ * fails. An open refused before it reaches the workspace, because the deployment's access level is
+ * "off", is recorded in the deployment-wide log only.
  */
 export type AdminAccessRecord = {
   /** Distinguishes this from an AdminSettingRecord. */
   kind: "workspace";
-  /** When the call was made. */
+  /** When the call was recorded: once it had read its answer (or failed to), or as it was
+   * refused. */
   at: Date;
   /** The admin who made it, by canonical user id. */
   admin: string;
@@ -1574,11 +1598,34 @@ export type AdminAccessRecord = {
   args: Record<string, string | number>;
   /** The reason the admin gave inspectWorkspace() for the view. */
   reason: string;
-  /** The level the call ran at: the view's own, lowered to the deployment's setting at the time
-   * (see AdminWorkspaceView); "off" when the call was refused for that. */
+  /** The level the view's open asked for (AdminInspectOptions.access; "metadata" when it named
+   * none). It is the same on every record of one view, so the log shows when an investigation asked
+   * for more. */
+  requested: AdminViewAccess;
+  /** The level the call ran at: the view's own level (the lower of `requested` and the
+   * deployment's level when the view was opened), lowered to the deployment's setting at the time
+   * (see AdminWorkspaceView); "off" when the call was refused for that. Never above `requested`. */
   access: AdminWorkspaceAccess;
-  /** Present when the access level refused the call after it was recorded, so that it read
-   * nothing: the code it was refused with. */
+  /**
+   * What the call's answer exposed. Only a call at "full" can record "content", and only when its
+   * answer held something the "metadata" level withholds:
+   *   - getChat(): chat messages or a compaction summary;
+   *   - readFile(): any file found at the path, `unreadable` ones included, because that message
+   *     can quote the file (a symlink's quotes its target);
+   *   - listChats(): a queued steer;
+   *   - describe(): the blueprint a gadget follows;
+   *   - listActions(), listGatekeepers(): a non-empty description, or a field, of an action,
+   *     observation or hook.
+   * Otherwise "metadata": always for the open, listFiles() and getDiagnostics(), for a call that was
+   * refused or whose read failed, and for a call at "full" whose answer held none of these. It is
+   * set from the answer itself, never from the level. An answer leaves the server only once both
+   * records exist. When the deployment-wide record could not be written, the call returned nothing,
+   * and the workspace's own record of it (AdminWorkspaceDiagnostics.recentAdminAccess) says what
+   * its answer would have exposed.
+   */
+  exposed: AdminAccessExposure;
+  /** Present when the access level refused the call, which then read nothing: the code it was
+   * refused with. */
   refused?: typeof ADMIN_ACCESS_ERROR_CODES.accessOff
       | typeof ADMIN_ACCESS_ERROR_CODES.contentWithheld;
 };
@@ -1666,6 +1713,10 @@ export type AdminAuditQuery = {
   admin?: string;
   /** Only records of access to this workspace. At most 1000 characters. */
   workspace?: string;
+  /** Only records of calls into a workspace whose answer exposed this (see
+   * AdminAccessRecord.exposed): "content" lists the content reads. Only access records carry it,
+   * so no setting record matches. */
+  exposed?: AdminAccessExposure;
   /** Only records made at or after this time. */
   since?: Date;
   /** The previous page's `nextCursor`; absent for the first page. */
@@ -1697,9 +1748,10 @@ export type AdminAuditStatsQuery = {
 
 /**
  * What the admin audit log holds for one window, from AdminApi.getAdminAuditStats(). Every count
- * covers the records of the queried kind (both kinds when none is given), except `topWorkspaces`,
- * which only AdminAccessRecords can name. A record older than the retention is gone, so a window
- * reaching past it counts nothing there.
+ * covers the records of the queried kind (both kinds when none is given), except `topWorkspaces`
+ * and the content reads. Only AdminAccessRecords can make those, so they are empty for the
+ * "setting" kind. A record older than the retention is gone, so a window reaching past it counts
+ * nothing there.
  */
 export type AdminAuditStats = {
   /** The window's length in UTC days, today included. */
@@ -1715,6 +1767,15 @@ export type AdminAuditStats = {
    * 10, each with the newest non-empty title among its records in the window, as they hold it (see
    * AdminAccessRecord.workspaceTitle; "" when none has one). */
   topWorkspaces: { workspaceId: string; title: string; count: number }[];
+  /** The calls into a workspace in the window whose answer exposed content
+   * (AdminAccessRecord.exposed is "content"). */
+  contentReads: number;
+  /** The admins with the most content reads in the window, most first (ties by id), at most 10.
+   * An admin with none is left out. */
+  topAdminsByContentReads: { admin: string; count: number }[];
+  /** The workspaces with the most content reads in the window, most first (ties by id), at most
+   * 10, each titled as in `topWorkspaces`. A workspace with none is left out. */
+  topWorkspacesByContentReads: { workspaceId: string; title: string; count: number }[];
 };
 
 /**
@@ -2038,12 +2099,14 @@ export interface AdminApi {
   listWorkspaces(options?: AdminWorkspaceQuery): Promise<AdminWorkspacePage>;
 
   /**
-   * Open a read-only view of a workspace to investigate it (see AdminWorkspaceView), at the
-   * deployment's access level (AdminSettingsView.adminWorkspaceAccess.effective). `reason` is
-   * required: it is recorded with the open and with every call made through the view, and is
-   * rejected when blank or, once trimmed, longer than MAX_ADMIN_ACCESS_REASON_LENGTH. The open is
-   * recorded as an AdminAccessRecord ("inspectWorkspace") before the view is returned, so an open
-   * whose record cannot be written is refused.
+   * Open a read-only view of a workspace to investigate it (see AdminWorkspaceView). The view runs
+   * at the lower of the level `options.access` asks for ("metadata" when absent) and the
+   * deployment's level (AdminSettingsView.adminWorkspaceAccess.effective). Asking for "full" where
+   * the deployment allows only "metadata" opens the view at "metadata", and its describe() reports
+   * that. `reason` is required: it is recorded with the open and with every call made through the
+   * view, and is rejected when blank or, once trimmed, longer than MAX_ADMIN_ACCESS_REASON_LENGTH.
+   * The open is recorded as an AdminAccessRecord ("inspectWorkspace") before the view is returned,
+   * so an open whose record cannot be written is refused.
    *
    * Refused with a code from ADMIN_ACCESS_ERROR_CODES, checked in this order: `notAdmin` once the
    * caller is no longer a deployment admin; `workspaceNotFound` for a malformed id; `accessOff`
@@ -2102,7 +2165,9 @@ export type AdminWorkspaceDescription = Pick<GadgetMetadata,
   workpieces: WorkpieceSummary[];
   /** Everyone the workspace is shared with, as Overseer.listCollaborators() lists them. */
   collaborators: CollaboratorInfo[];
-  /** The level this call ran at (see AdminWorkspaceView). */
+  /** The level this call ran at: the view's own level (the lower of the level its open asked for
+   * and the deployment's level then), lowered to the deployment's current setting (see
+   * AdminWorkspaceView). */
   access: AdminViewAccess;
   /** When this view stops working. */
   expiresAt: Date;
@@ -2157,8 +2222,9 @@ export type AdminWorkspaceDiagnostics = {
   nextAlarm?: Date;
   /** Whether an external message created the workspace before its owner's account recorded it. */
   ownerRegistrationPending: boolean;
-  /** The workspace's most recent admin access records, newest first (this call's own first), at
-   * most ADMIN_DIAGNOSTICS_ACCESS_LIMIT, within the retention. */
+  /** The workspace's most recent admin access records, newest first, at most
+   * ADMIN_DIAGNOSTICS_ACCESS_LIMIT, within the retention. This call's own record is written after
+   * it reads them, so it is not among them. */
   recentAdminAccess: AdminAccessRecord[];
 };
 
@@ -2169,14 +2235,20 @@ export type AdminWorkspaceDiagnostics = {
  *
  * Each call first passes three checks, refused unrecorded with a code from
  * ADMIN_ACCESS_ERROR_CODES: the view has not expired (`viewExpired`), its admin is still a
- * deployment admin (`notAdmin`), and the workspace still exists (`workspaceNotFound`). They are
- * checked again once the call has read the deployment's setting, so a call that the workspace's
- * deletion overtakes writes nothing into it. It then runs at an access level: the view's own,
- * fixed when it was minted, lowered to the deployment's current setting, so lowering the setting
- * reaches live views (within about a minute) and raising it does not. The call is recorded as an
- * AdminAccessRecord, in the workspace and in the deployment-wide log, and only then answered, or
- * refused by its level: `accessOff` once the setting is "off", `contentWithheld` for getChat() or
- * readFile() below "full". A call whose record cannot be written fails, having read nothing.
+ * deployment admin (`notAdmin`), and the workspace still exists (`workspaceNotFound`). It then
+ * runs at an access level: the view's own, fixed when it was minted at the lower of the level its
+ * open asked for (AdminInspectOptions.access) and the deployment's, then lowered to the
+ * deployment's current setting. So lowering the setting reaches live views (within about a minute)
+ * and raising it does not. A call that level refuses is recorded and refused, having read nothing:
+ * `accessOff` once the setting is "off", `contentWithheld` for getChat() or readFile() below
+ * "full". Any other call reads its answer, never through a connection. It is then recorded as an
+ * AdminAccessRecord, with what that answer exposed, in the workspace and then in the
+ * deployment-wide log. Only then is the call answered: nothing it read leaves the server before
+ * both records exist, and a call whose record cannot be written fails and returns nothing. The
+ * checks run again once the call has read the deployment's setting, and again once it has read its
+ * answer, just before it writes. So a call that expiry, a demotion or the workspace's deletion
+ * overtakes while it reads writes nothing. A call whose read fails is recorded as an attempt that
+ * exposed nothing, and fails with the read's error.
  *
  * A workspace restart (a revocation, a deletion, a redeploy) ends the view along with every other
  * session on the workspace; inspect again.

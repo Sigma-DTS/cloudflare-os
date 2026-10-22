@@ -1140,11 +1140,12 @@ export type BlueprintGadgetRecord = {
 // Admin access
 
 /**
- * One admin call into this workspace (see OverseerDurableObject.openForAdmin()), written before
- * the call reads anything. Kept in its own collection rather than `actions`, so listActions(),
- * subscribeToActions() and everything else that reads the action log can never show it to the
- * workspace's members. One whose deployment-wide copy then failed records an attempt that read
- * nothing. Pruned to the deployment's retention as new ones are written.
+ * One admin call into this workspace (see OverseerDurableObject.openForAdmin()), written once the
+ * call has read what it answers with, before any of that leaves the server. Kept in its own
+ * collection rather than `actions`, so listActions(), subscribeToActions() and everything else
+ * that reads the action log can never show it to the workspace's members. One whose
+ * deployment-wide copy then failed records an attempt whose answer never left, with what it would
+ * have exposed. Pruned to the deployment's retention as new ones are written.
  */
 export type AdminAccessLogRecord = Omit<AdminAccessRecord, "kind" | "workspaceId"> & {
   /** Allocated from `nextAdminAccessId`, so id order is time order. */

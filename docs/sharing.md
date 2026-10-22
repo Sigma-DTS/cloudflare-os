@@ -154,7 +154,7 @@ Because the role is recomputed from the graph on every `open()`, the live comput
 
 A share-key redemption goes through the same gate. The redeeming open() then verifies the recipient as an observer like any other collaborator; a recipient whose verification fails persists as an unverified collaborator until removed (see Known limitations).
 
-Deployment admins can inspect a workspace outside the sharing graph: `AdminApi.inspectWorkspace()` mints a read-only `AdminWorkspaceView` through `openForAdmin()`, which never consults the permission graph, adds no collaborator and joins no session. It is a deliberate exception, bounded by an environment-set access cap and an audit recorded before every read; see [admin-access.md](admin-access.md).
+Deployment admins can inspect a workspace outside the sharing graph: `AdminApi.inspectWorkspace()` mints a read-only `AdminWorkspaceView` through `openForAdmin()`, which never consults the permission graph, adds no collaborator and joins no session. It is a deliberate exception, bounded by an environment-set access cap and an audit recorded before anything an admin reads leaves the server; see [admin-access.md](admin-access.md).
 
 ### `ownerInvitesOnly`
 

@@ -147,9 +147,11 @@ async function seed(ws: Workspace): Promise<void> {
   });
 }
 
+// A view asks for the level it is minted at unless `overrides` says otherwise.
 function terms(overrides: Partial<AdminViewTerms> = {}): AdminViewTerms {
   return {
     via: "api", access: "metadata", expiresAt: new Date(Date.now() + 600_000), ...overrides,
+    requested: overrides.requested ?? overrides.access ?? "metadata",
   };
 }
 
@@ -206,6 +208,14 @@ describe("opening an admin view", () => {
         .rejects.toThrow(TypeError);
     await expect(open(ws, { via: "gatekeeper" as any })).rejects.toThrow(TypeError);
     await expect(open(ws, { access: "off" as any })).rejects.toThrow(TypeError);
+    await expect(open(ws, { requested: "off" as any })).rejects.toThrow(TypeError);
+    await expect(open(ws, { requested: "everything" as any })).rejects.toThrow(TypeError);
+    await expect(open(ws, { requested: "full", access: "off" as any })).rejects.toThrow(TypeError);
+    await expect(open(ws, { requested: "metadata", access: "full" })).rejects.toThrow(TypeError);
+    // Past the helper, which fills in a missing level.
+    await expect(ws.instance.openForAdmin(ADMIN, REASON, "session-1",
+        { ...terms(), requested: undefined } as unknown as AdminViewTerms))
+        .rejects.toThrow(TypeError);
     await expect(open(ws, { expiresAt: new Date(NaN) })).rejects.toThrow(TypeError);
     await expect(open(ws, { expiresAt: "tomorrow" as any })).rejects.toThrow(TypeError);
     await expect(open(ws, {
@@ -228,7 +238,7 @@ describe("opening an admin view", () => {
       kind: "workspace", workspaceId: ws.id, at: expect.any(Date), admin: ADMIN,
       sessionId: "session-1", via: "cli", workspaceTitle: "Quarterly plan",
       method: "inspectWorkspace", args: { expiresAt: expiresAt.toISOString() }, reason: REASON,
-      access: "metadata",
+      requested: "metadata", access: "metadata", exposed: "metadata",
     });
   }));
 
@@ -282,6 +292,8 @@ describe("a metadata view", () => {
       ["getDiagnostics", {}, "metadata", undefined],
     ]);
     expect(new Set(records.map(r => r.reason))).toStrictEqual(new Set([REASON]));
+    expect(new Set(records.map(r => r.requested))).toStrictEqual(new Set(["metadata"]));
+    expect(new Set(records.map(r => r.exposed))).toStrictEqual(new Set(["metadata"]));
   }));
 
   it("withholds content but keeps structure", () => withWorkspace(async ws => {
@@ -368,11 +380,76 @@ describe("a full view", () => {
     expect(localRecords(ws).every(r => r.access === "full")).toBe(true);
   }));
 
+  it("records what each call's answer exposed", () => withWorkspace(async ws => {
+    setEnv(ws, { ADMIN_WORKSPACE_ACCESS_MAX: "full" });
+    ws.config.adminWorkspaceAccess = "full";
+    let view = await open(ws, { access: "full" });
+
+    await view.getChat(CHAT_ID);
+    await view.readFile(ws.gadgetId, "notes.txt");
+    await view.listChats();
+    await view.describe();
+    await view.listGatekeepers();
+    await view.listActions();
+    await view.listFiles(ws.gadgetId);
+    await view.getDiagnostics();
+    expect(await view.readFile(ws.gadgetId, "missing.txt")).toStrictEqual({ kind: "absent" });
+    expect((await view.getChat(999)).messages).toStrictEqual([]);
+    expect((await view.listActions({ beforeId: 0 })).entries).toStrictEqual([]);
+
+    let records = await expectRecordsMatch(ws);
+    expect(records.map(r => [r.method, r.exposed])).toStrictEqual([
+      ["inspectWorkspace", "metadata"],
+      ["getChat", "content"],
+      ["readFile", "content"],
+      ["listChats", "content"],
+      ["describe", "content"],
+      ["listGatekeepers", "content"],
+      ["listActions", "content"],
+      ["listFiles", "metadata"],
+      ["getDiagnostics", "metadata"],
+      ["readFile", "metadata"],
+      ["getChat", "metadata"],
+      ["listActions", "metadata"],
+    ]);
+    expect(records.every(r => r.requested === "full" && r.access === "full")).toBe(true);
+  }));
+
+  it("returns nothing when the deployment-wide record cannot be written",
+      () => withWorkspace(async ws => {
+    setEnv(ws, { ADMIN_WORKSPACE_ACCESS_MAX: "full" });
+    ws.config.adminWorkspaceAccess = "full";
+    let view = await open(ws, { access: "full" });
+    ws.impl.adminAudits = {
+      getByName: () => ({ append: async () => { throw new Error("audit store down"); } }),
+    };
+    await expect(view.getChat(CHAT_ID)).rejects.toThrow("audit store down");
+    expect(localRecords(ws).at(-1))
+        .toMatchObject({ method: "getChat", access: "full", exposed: "content" });
+  }));
+
   it("is held to the environment's cap whatever the setting says", () => withWorkspace(async ws => {
     ws.config.adminWorkspaceAccess = "full";
     let view = await open(ws, { access: "full" });
     expect(await codeOf(view.getChat(CHAT_ID))).toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
     expect(localRecords(ws).map(r => r.access)).toStrictEqual(["metadata", "metadata"]);
+  }));
+
+  it("opens at the deployment's level when it asks for more, and is never raised",
+      () => withWorkspace(async ws => {
+    // As AdminApiImpl mints a view that asked for "full" while the deployment allows "metadata".
+    let view = await open(ws, { requested: "full", access: "metadata" });
+    expect(await codeOf(view.getChat(CHAT_ID))).toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
+    expect((await expectRecordsMatch(ws)).map(r => [r.method, r.requested, r.access, r.exposed]))
+        .toStrictEqual([
+          ["inspectWorkspace", "full", "metadata", "metadata"],
+          ["getChat", "full", "metadata", "metadata"],
+        ]);
+
+    setEnv(ws, { ADMIN_WORKSPACE_ACCESS_MAX: "full" });
+    ws.config.adminWorkspaceAccess = "full";
+    expect(await codeOf(view.getChat(CHAT_ID))).toBe(ADMIN_ACCESS_ERROR_CODES.contentWithheld);
+    expect((await view.describe()).access).toBe("metadata");
   }));
 
   it("withholds from its next call once the setting drops to metadata",
@@ -466,6 +543,50 @@ describe("a live view's checks", () => {
   }));
 });
 
+// Holds describe() at its read of the owner's profile until `release`.
+function holdDescribe(ws: Workspace): { reached: Promise<void>, release: () => void } {
+  let reach!: () => void;
+  let reached = new Promise<void>(resolve => { reach = resolve; });
+  let release!: () => void;
+  let released = new Promise<void>(resolve => { release = resolve; });
+  ws.impl.users = {
+    idFromString: (id: string) => id,
+    get: () => ({ whoami: async () => { reach(); await released; return OWNER; } }),
+  };
+  return { reached, release };
+}
+
+describe("a call overtaken while it reads its answer", () => {
+  it("writes nothing when the workspace is deleted", () => withWorkspace(async ws => {
+    let view = await open(ws);
+    let hold = holdDescribe(ws);
+
+    let call = view.describe();
+    await hold.reached;
+    await ws.state.storage.deleteAll();
+    ws.impl.ownerId = undefined;
+    hold.release();
+
+    expect(await codeOf(call)).toBe(ADMIN_ACCESS_ERROR_CODES.workspaceNotFound);
+    expect(storageKeys(ws)).toStrictEqual([]);
+    expect((await deploymentRecords(ws)).map(r => r.method)).toStrictEqual(["inspectWorkspace"]);
+  }));
+
+  it("writes nothing when the view expires", () => withWorkspace(async ws => {
+    let view = await open(ws, { expiresAt: new Date(Date.now() + 300) });
+    let hold = holdDescribe(ws);
+
+    let call = view.describe();
+    await hold.reached;
+    await scheduler.wait(400);
+    hold.release();
+
+    expect(await codeOf(call)).toBe(ADMIN_ACCESS_ERROR_CODES.viewExpired);
+    expect(localRecords(ws).map(r => r.method)).toStrictEqual(["inspectWorkspace"]);
+    await expectRecordsMatch(ws);
+  }));
+});
+
 describe("the records' bounds", () => {
   it("cut a long title in both stores, while describe() returns it whole",
       () => withWorkspace(async ws => {
@@ -484,7 +605,8 @@ describe("the records' bounds", () => {
     let old = new Date(Date.now() - (RETENTION + 1) * DAY_MS);
     ws.impl.storage.adminAccess.put({
       id: 0, at: old, admin: ADMIN, sessionId: "old", via: "api", workspaceTitle: "",
-      method: "describe", args: {}, reason: "old", access: "metadata",
+      method: "describe", args: {}, reason: "old", requested: "metadata", access: "metadata",
+      exposed: "metadata",
     });
     ws.impl.storage.nextAdminAccessId.put(1);
 
@@ -497,9 +619,10 @@ describe("the records' bounds", () => {
     let view = await open(ws);
     await view.listChats();
     let diagnostics = await view.getDiagnostics();
+    // Its own record is written after it reads them.
     expect(diagnostics.recentAdminAccess.map(r => r.method))
-        .toStrictEqual(["getDiagnostics", "listChats", "inspectWorkspace"]);
-    expect(diagnostics.recentAdminAccess).toStrictEqual(localRecords(ws).toReversed());
+        .toStrictEqual(["listChats", "inspectWorkspace"]);
+    expect(diagnostics.recentAdminAccess).toStrictEqual(localRecords(ws).toReversed().slice(1));
     expect(diagnostics).toMatchObject({
       chats: 1, pendingActions: 3, hooks: { total: 1, enabled: 1 }, observers: 0,
       ownerRegistrationPending: false, activeAgentChatIds: [], pendingAgentCalls: 0,
@@ -532,6 +655,11 @@ describe("file reads", () => {
     await expect(view.readFile(ws.gadgetId, "notes.txt"))
         .rejects.toThrow(`git object ${entry.oid} is not stored in this workspace`);
     expect(pulls.pulled).toBe(false);
+    // Recorded as an attempt that exposed nothing.
+    let records = await expectRecordsMatch(ws);
+    expect(records.at(-1))
+        .toMatchObject({ method: "readFile", access: "full", exposed: "metadata" });
+    expect(records.at(-1)).not.toHaveProperty("refused");
   }));
 
   it("never pull a missing tree through a connection", () => withWorkspace(async ws => {

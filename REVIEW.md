@@ -45,9 +45,14 @@ through logs and errors, then everything else.
   `getAdminAuditStats()`.
 - `OverseerDurableObject.openForAdmin()` stays reachable only over the Durable Object binding, never
   through a capability a user holds, and refuses an uninitialised workspace without writing. Every
-  `AdminWorkspaceView` method records its access before it reads, re-checking the view after its one
-  await; admin file reads never pull through a connection. Flag any path that reads workspace data
-  for an admin without these.
+  `AdminWorkspaceView` method runs through `#call()`, which checks the view again once it has read
+  the deployment's setting and once it has read its answer, synchronously with its first write;
+  never reaches a connection (admin file reads never pull); and records the call, with what its
+  answer exposed, in the workspace and then deployment-wide before anything it read leaves the
+  server, so that a call whose record cannot be written returns nothing. The record follows the
+  read because `exposed` must describe the answer actually returned. Flag a path that returns
+  workspace data to an admin without these, or that sets `exposed` from anything but that
+  answer.
 - `ADMIN_WORKSPACE_ACCESS_MAX` and `ADMIN_AUDIT_RETENTION_MIN_DAYS` are env-driven, like auth
   config, and the cap fails closed. Flag a read of `adminWorkspaceAccess` or
   `adminAuditRetentionDays` that bypasses `adminAccessPolicy()`.

@@ -4,9 +4,9 @@ import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, Work
 import {
   ADMIN_ACCESS_ERROR_CODES, ADMIN_DIAGNOSTICS_ACCESS_LIMIT, MAX_ADMIN_AUDIT_ARG_LENGTH,
   MAX_ADMIN_VIEW_LIFETIME_SECONDS, createAdminAccessError,
-  type AdminAccessRecord, type AdminGatekeeperInfo, type AdminViewAccess,
-  type AdminWorkspaceDescription, type AdminWorkspaceDiagnostics, type AdminWorkspaceMethod,
-  type AdminWorkspaceView,
+  type AdminAccessExposure, type AdminAccessRecord, type AdminGatekeeperInfo, type AdminViewAccess,
+  type AdminWorkspaceAccess, type AdminWorkspaceDescription, type AdminWorkspaceDiagnostics,
+  type AdminWorkspaceMethod, type AdminWorkspaceView,
 } from "@gadgets/workshop-shared/api";
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
   MAX_CODE_CHANGE_SIZE, transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
@@ -60,9 +60,11 @@ import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import {
-  adminAccessPolicy, adminViewCallAccess, assertAdminViewLive, cutAdminAuditText,
-  redactAdminAuditArgs, validateAdminAccessReason, withholdActionContent, withholdChatContent,
-  withholdHookContent, type AdminAccessPolicy, type AdminViewTerms,
+  actionHoldsContent, adminAccessPolicy, adminViewCallAccess, assertAdminViewLive,
+  chatHoldsContent, chatPageHoldsContent, cutAdminAuditText, fileHoldsContent, hookHoldsContent,
+  lowerAdminWorkspaceAccess, redactAdminAuditArgs, validateAdminAccessReason,
+  withholdActionContent, withholdChatContent, withholdHookContent, workpieceHoldsContent,
+  type AdminAccessPolicy, type AdminViewTerms,
 } from "./admin-access";
 import type { AdminAuditDurableObject } from "./admin-audit";
 import { DIRECTORY_ACTIVITY_INTERVAL_MS, type UserDirectoryDurableObject } from "./user-directory";
@@ -6345,7 +6347,7 @@ class OverseerImpl implements AgentHooks {
   // --- Admin access --------------------------------------------------------------------
 
   /** Record one admin view call in `adminAccess` after pruning (at most 64) records older than
-   * `retentionDays`. Synchronous, so it is durable before anything the call reads can leave. */
+   * `retentionDays`. Synchronous, so it is durable before the call's answer can leave. */
   recordAdminAccess(entry: Omit<AdminAccessLogRecord, "id">, retentionDays: number)
       : AdminAccessLogRecord {
     let cutoff = Date.now() - retentionDays * 24 * 60 * 60_000;
@@ -10581,11 +10583,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    * Refuses (`workspaceNotFound`) a workspace never initialised or since deleted, before anything
    * else and writing nothing: unlike open()'s first-open path it never asks a user DO whether the
    * workspace is theirs and never claims ownership. Rejects (TypeError) malformed terms: a blank or
-   * over-long reason, a `via` that is not "api" or "cli", an `access` that is not "metadata" or
-   * "full", and an `expiresAt` that is not a valid Date or lies more than
-   * MAX_ADMIN_VIEW_LIFETIME_SECONDS (plus a minute of clock skew) ahead. An `expiresAt` already
-   * past is not malformed: the open is then refused `viewExpired`, unrecorded, as any call on an
-   * expired view is.
+   * over-long reason, a `via` that is not "api" or "cli", an `access` or a `requested` that is not
+   * "metadata" or "full", an `access` above `requested`, and an `expiresAt` that is not a valid
+   * Date or lies more than MAX_ADMIN_VIEW_LIFETIME_SECONDS (plus a minute of clock skew) ahead. An
+   * `expiresAt` already past is not malformed: the open is then refused `viewExpired`, unrecorded,
+   * as any call on an expired view is.
    *
    * By explicit policy it skips authorizeCollaborator() and observer verification (see
    * docs/observers.md): the admin is not a collaborator, is never registered with the workspace's
@@ -10612,6 +10614,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (terms.access !== "metadata" && terms.access !== "full") {
       throw new TypeError("An admin view's access must be \"metadata\" or \"full\".");
     }
+    if (terms.requested !== "metadata" && terms.requested !== "full") {
+      throw new TypeError("An admin view's requested level must be \"metadata\" or \"full\".");
+    }
+    if (lowerAdminWorkspaceAccess(terms.access, terms.requested) !== terms.access) {
+      throw new TypeError("An admin view's access must not be above the level it asked for.");
+    }
     let expiresAt = terms.expiresAt instanceof Date ? terms.expiresAt.getTime() : NaN;
     if (Number.isNaN(expiresAt) ||
         expiresAt > Date.now() + (MAX_ADMIN_VIEW_LIFETIME_SECONDS + 60) * 1000) {
@@ -10619,8 +10627,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
           "An admin view's expiry must be a valid time within its longest lifetime.");
     }
 
-    // The terms' level is not clamped here: the open's own audit, like every call's, lowers it to
-    // the deployment's current level, the environment's cap included.
+    // The terms' level is not clamped here: the open, like every call, runs at most at the
+    // deployment's current level, the environment's cap included.
     let view = await AdminWorkspaceViewImpl.open(
         this.impl, adminId, trimmedReason, sessionId, terms);
     this.impl.logger.info("admin workspace view opened", {event: "admin.view.opened"});
@@ -13138,8 +13146,10 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
 // A deployment admin's read-only view of the workspace (see AdminWorkspaceView in api.ts and
 // OverseerDurableObject.openForAdmin()). Deliberately not an Overseer: it holds no session, joins
-// no presence or fan-out, and reads only what the workspace already stores. Every method records
-// itself first (#audit), so nothing is read before both audit records exist.
+// no presence or fan-out, and never reads through a connection: its file reads never pull, and
+// beyond the workspace's own storage it reads only the owner's profile, from their account
+// (describe()). Every method runs through #call, which reads the call's answer and records the
+// call, with what that answer exposed, in both stores before returning anything.
 @validateRpc()
 class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
   #impl: OverseerImpl;
@@ -13163,7 +13173,8 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
   static async open(impl: OverseerImpl, adminId: string, reason: string, sessionId: string,
                     terms: AdminViewTerms): Promise<AdminWorkspaceViewImpl> {
     let view = new AdminWorkspaceViewImpl(impl, adminId, reason, sessionId, terms);
-    await view.#audit("inspectWorkspace", {expiresAt: terms.expiresAt.toISOString()});
+    await view.#call(
+        "inspectWorkspace", {expiresAt: terms.expiresAt.toISOString()}, () => undefined);
     return view;
   }
 
@@ -13176,21 +13187,52 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
     }
   }
 
-  // Records one call in both audit stores, then returns the level it runs at and the policy it
-  // read, or throws the refusal that level makes. A call whose record cannot be written fails,
-  // having read nothing.
-  async #audit(method: AdminWorkspaceMethod, args: Record<string, string | number | undefined>)
-      : Promise<{access: AdminViewAccess, policy: AdminAccessPolicy}> {
-    let impl = this.#impl;
+  // Runs one call: checks the view, reads the deployment's setting, checks again, and takes the
+  // level that gives. A call that level refuses is recorded and refused, having read nothing. Any
+  // other call reads its answer with `read` (never through a connection), is checked once more,
+  // and is recorded in both stores with what that answer exposed (`holdsContent`). Only then is it
+  // answered, so nothing it read leaves the server unrecorded, and a call whose record cannot be
+  // written fails and returns nothing. A read that fails is recorded as an attempt that exposed
+  // nothing, and the call fails with the read's error.
+  async #call<T>(method: AdminWorkspaceMethod, args: Record<string, string | number | undefined>,
+      read: (access: AdminViewAccess, policy: AdminAccessPolicy) => T | Promise<T>,
+      holdsContent: (answer: T) => boolean = () => false): Promise<T> {
     this.#assertLive();
-    let config = await readAdminConfig(impl.env);
-    // Checked again, with nothing awaited from here to the local write: the read may have spanned
-    // the expiry, a demotion or the workspace's deletion, and a deleted workspace's storage must
-    // stay empty, with nothing appended for it deployment-wide either.
+    let config = await readAdminConfig(this.#impl.env);
+    // Checked again, with nothing awaited from here to a refusal's local write: the read may have
+    // spanned the expiry, a demotion or the workspace's deletion, and a deleted workspace's storage
+    // must stay empty, with nothing appended for it deployment-wide either.
     this.#assertLive();
 
-    let policy = adminAccessPolicy(config, impl.env);
+    let policy = adminAccessPolicy(config, this.#impl.env);
     let {access, refused} = adminViewCallAccess(this.#terms, method, policy);
+    if (refused !== undefined || access === "off") {
+      let code = refused ?? ADMIN_ACCESS_ERROR_CODES.accessOff;
+      await this.#record(method, args, access, "metadata", policy, code);
+      throw createAdminAccessError(code);
+    }
+
+    let answer: T;
+    try {
+      answer = await read(access, policy);
+    } catch (err) {
+      this.#assertLive();
+      await this.#record(method, args, access, "metadata", policy);
+      throw err;
+    }
+    // Checked again, synchronously with the local write, for the same reasons: the read may have
+    // awaited.
+    this.#assertLive();
+    await this.#record(method, args, access, holdsContent(answer) ? "content" : "metadata", policy);
+    return answer;
+  }
+
+  // Records one call in this workspace's admin access table, before the first await, so that the
+  // caller's last check still holds, and then in the deployment-wide log.
+  async #record(method: AdminWorkspaceMethod, args: Record<string, string | number | undefined>,
+      access: AdminWorkspaceAccess, exposed: AdminAccessExposure, policy: AdminAccessPolicy,
+      refused?: AdminAccessRecord["refused"]): Promise<void> {
+    let impl = this.#impl;
     let {id: _id, ...record} = impl.recordAdminAccess({
       at: new Date(),
       admin: this.#adminId,
@@ -13202,7 +13244,9 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
       method,
       args: redactAdminAuditArgs(args),
       reason: this.#reason,
+      requested: this.#terms.requested,
       access,
+      exposed,
       ...(refused ? {refused} : {}),
     }, policy.retentionDays);
     try {
@@ -13215,15 +13259,6 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
       });
       throw err;
     }
-
-    if (refused !== undefined || access === "off") {
-      throw createAdminAccessError(refused ?? ADMIN_ACCESS_ERROR_CODES.accessOff);
-    }
-    // Deleted while the record was written: the records stand as the attempt.
-    if (!impl.ownerId) {
-      throw createAdminAccessError(ADMIN_ACCESS_ERROR_CODES.workspaceNotFound);
-    }
-    return {access, policy};
   }
 
   // The head commit of a permanent gadget, the only workpiece with committed code to read.
@@ -13236,111 +13271,119 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
   }
 
   async describe(): Promise<AdminWorkspaceDescription> {
-    let {access} = await this.#audit("describe", {});
     let impl = this.#impl;
-    let ownerId = impl.ownerId!;
-    let owner = await retryOnDoReset(
-        () => impl.wrapUserDo(impl.users.get(impl.users.idFromString(ownerId))).whoami(),
-        impl.logger);
-    let collaborators = await (await impl.getSharingManager()).listCollaborators();
-    return {
-      id: impl.ctx.id.toString(),
-      // Live data, not a record, so whole.
-      title: impl.storage.title.get(),
-      totalCost: impl.storage.totalCost.get(),
-      containsRestrictedData: impl.storage.containsRestrictedData.get(),
-      ownerInvitesOnly: impl.storage.ownerInvitesOnly.get(),
-      defaultGadgetId: impl.defaultGadgetId,
-      owner,
-      workpieces: [...impl.storage.gadgets.list()]
-          .map(record => workpieceSummary(record, access === "full")),
-      collaborators,
-      access,
-      expiresAt: this.#terms.expiresAt,
-    };
+    return this.#call("describe", {}, async access => {
+      let ownerId = impl.ownerId!;
+      let owner = await retryOnDoReset(
+          () => impl.wrapUserDo(impl.users.get(impl.users.idFromString(ownerId))).whoami(),
+          impl.logger);
+      let collaborators = await (await impl.getSharingManager()).listCollaborators();
+      return {
+        id: impl.ctx.id.toString(),
+        // Live data, not a record, so whole.
+        title: impl.storage.title.get(),
+        totalCost: impl.storage.totalCost.get(),
+        containsRestrictedData: impl.storage.containsRestrictedData.get(),
+        ownerInvitesOnly: impl.storage.ownerInvitesOnly.get(),
+        defaultGadgetId: impl.defaultGadgetId,
+        owner,
+        workpieces: [...impl.storage.gadgets.list()]
+            .map(record => workpieceSummary(record, access === "full")),
+        collaborators,
+        access,
+        expiresAt: this.#terms.expiresAt,
+      };
+    }, description => description.workpieces.some(workpieceHoldsContent));
   }
 
   async listChats(): Promise<AiChatMetadata[]> {
-    let {access} = await this.#audit("listChats", {});
-    return [...this.#impl.storage.chatMeta.list({reverse: true})]
-        .map(meta => this.#impl.chatMetaForClient(meta))
-        .map(meta => access === "full" ? meta : withholdChatContent(meta));
+    return this.#call("listChats", {},
+        access => [...this.#impl.storage.chatMeta.list({reverse: true})]
+            .map(meta => this.#impl.chatMetaForClient(meta))
+            .map(meta => access === "full" ? meta : withholdChatContent(meta)),
+        chats => chats.some(chatHoldsContent));
   }
 
   async getChat(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage> {
-    await this.#audit("getChat", {chatId, beforeSequence});
-    return chatHistoryPage(this.#impl, chatId, beforeSequence);
+    return this.#call("getChat", {chatId, beforeSequence},
+        () => chatHistoryPage(this.#impl, chatId, beforeSequence), chatPageHoldsContent);
   }
 
   async listActions(options?: {beforeId?: number, filter?: ActionHistoryFilter})
       : Promise<ActionHistoryPage> {
     validateBeforeId(options?.beforeId);
-    let {access} = await this.#audit(
-        "listActions", {beforeId: options?.beforeId, filter: options?.filter});
-    let page = actionHistoryPage(this.#impl.storage, options);
-    return access === "full" ? page : {...page, entries: page.entries.map(withholdActionContent)};
+    return this.#call("listActions", {beforeId: options?.beforeId, filter: options?.filter},
+        access => {
+          let page = actionHistoryPage(this.#impl.storage, options);
+          return access === "full"
+              ? page : {...page, entries: page.entries.map(withholdActionContent)};
+        },
+        page => page.entries.some(actionHoldsContent));
   }
 
   async listFiles(gadgetId: WorkpieceId): Promise<TreeNode[]> {
-    await this.#audit("listFiles", {gadgetId});
-    return this.#impl.gitCache.readLocalCommitTree(this.#committedHead(gadgetId));
+    return this.#call("listFiles", {gadgetId},
+        () => this.#impl.gitCache.readLocalCommitTree(this.#committedHead(gadgetId)));
   }
 
   async readFile(gadgetId: WorkpieceId, path: string): Promise<FileAtCommit> {
-    await this.#audit("readFile", {gadgetId, path});
-    return this.#impl.gitCache.readLocalFileAtCommit(this.#committedHead(gadgetId), path);
+    return this.#call("readFile", {gadgetId, path},
+        () => this.#impl.gitCache.readLocalFileAtCommit(this.#committedHead(gadgetId), path),
+        fileHoldsContent);
   }
 
   async listGatekeepers(): Promise<AdminGatekeeperInfo[]> {
-    let {access} = await this.#audit("listGatekeepers", {});
-    let storage = this.#impl.storage;
-    let gadgets = [...storage.gadgets.list()].filter(record => record.type === "gadget");
-    let hooks = boundHookInfos(this.#impl);
-    return [...storage.gatekeepers.list()].map(record => ({
-      id: record.id,
-      resourceTitle: record.resourceTitle,
-      resourceUrl: record.resourceUrl,
-      vendorId: gatekeeperVendorId(record),
-      creationSpec: record.creationSpec,
-      bindings: gadgets.flatMap(gadget => Object.entries(gadget.bindings)
-          .filter(([, edge]) => edge.target === record.id)
-          .map(([name, edge]) => ({
-            gadgetId: gadget.id, name, ...(edge.pending ? {chatId: edge.pending.chatId} : {}),
-          }))),
-      hooks: hooks.filter(hook => hook.gatekeeperId === record.id)
-          .map(hook => access === "full" ? hook : withholdHookContent(hook)),
-    }));
+    return this.#call("listGatekeepers", {}, access => {
+      let storage = this.#impl.storage;
+      let gadgets = [...storage.gadgets.list()].filter(record => record.type === "gadget");
+      let hooks = boundHookInfos(this.#impl);
+      return [...storage.gatekeepers.list()].map(record => ({
+        id: record.id,
+        resourceTitle: record.resourceTitle,
+        resourceUrl: record.resourceUrl,
+        vendorId: gatekeeperVendorId(record),
+        creationSpec: record.creationSpec,
+        bindings: gadgets.flatMap(gadget => Object.entries(gadget.bindings)
+            .filter(([, edge]) => edge.target === record.id)
+            .map(([name, edge]) => ({
+              gadgetId: gadget.id, name, ...(edge.pending ? {chatId: edge.pending.chatId} : {}),
+            }))),
+        hooks: hooks.filter(hook => hook.gatekeeperId === record.id)
+            .map(hook => access === "full" ? hook : withholdHookContent(hook)),
+      }));
+    }, gatekeepers => gatekeepers.some(gatekeeper => gatekeeper.hooks.some(hookHoldsContent)));
   }
 
   async getDiagnostics(): Promise<AdminWorkspaceDiagnostics> {
-    let {policy} = await this.#audit("getDiagnostics", {});
-    let impl = this.#impl;
-    let storage = impl.storage;
-    let cutoff = Date.now() - policy.retentionDays * 24 * 60 * 60_000;
-    let recentAdminAccess: AdminAccessRecord[] = [];
-    for (let {id: _id, ...record} of storage.adminAccess.list({reverse: true})) {
-      if (record.at.getTime() < cutoff ||
-          recentAdminAccess.length >= ADMIN_DIAGNOSTICS_ACCESS_LIMIT) {
-        break;
+    return this.#call("getDiagnostics", {}, async (_access, policy) => {
+      let impl = this.#impl;
+      let storage = impl.storage;
+      let cutoff = Date.now() - policy.retentionDays * 24 * 60 * 60_000;
+      let recentAdminAccess: AdminAccessRecord[] = [];
+      for (let {id: _id, ...record} of storage.adminAccess.list({reverse: true})) {
+        if (record.at.getTime() < cutoff ||
+            recentAdminAccess.length >= ADMIN_DIAGNOSTICS_ACCESS_LIMIT) {
+          break;
+        }
+        recentAdminAccess.push({kind: "workspace", workspaceId: impl.ctx.id.toString(), ...record});
       }
-      recentAdminAccess.push({kind: "workspace", workspaceId: impl.ctx.id.toString(), ...record});
-    }
-    let hooks = [...storage.boundHooks.list()];
-    let nextAlarm = await impl.ctx.storage.getAlarm();
-    return {
-      storageVersion: storage.version.get(),
-      instanceStartedAt: new Date(impl.streamGeneration),
-      sessions: impl.liveSessionCounts(),
-      activeAgentChatIds: [...storage.activeAgents.list()].map(record => record.chatId),
-      pendingAgentCalls: [...storage.pendingAgentCalls.list()].length,
-      pendingActions: [...storage.actions.byHistoryFilter.get("pending")].length,
-      chats: [...storage.chatMeta.list()].length,
-      hooks: {total: hooks.length, enabled: hooks.filter(hook => hook.enabled).length},
-      observers: [...storage.observers.list()].length,
-      nextAlarm: nextAlarm === null ? undefined : new Date(nextAlarm),
-      ownerRegistrationPending: storage.ownerRegistrationPending.get(),
-      recentAdminAccess,
-    };
+      let hooks = [...storage.boundHooks.list()];
+      let nextAlarm = await impl.ctx.storage.getAlarm();
+      return {
+        storageVersion: storage.version.get(),
+        instanceStartedAt: new Date(impl.streamGeneration),
+        sessions: impl.liveSessionCounts(),
+        activeAgentChatIds: [...storage.activeAgents.list()].map(record => record.chatId),
+        pendingAgentCalls: [...storage.pendingAgentCalls.list()].length,
+        pendingActions: [...storage.actions.byHistoryFilter.get("pending")].length,
+        chats: [...storage.chatMeta.list()].length,
+        hooks: {total: hooks.length, enabled: hooks.filter(hook => hook.enabled).length},
+        observers: [...storage.observers.list()].length,
+        nextAlarm: nextAlarm === null ? undefined : new Date(nextAlarm),
+        ownerRegistrationPending: storage.ownerRegistrationPending.get(),
+        recentAdminAccess,
+      };
+    });
   }
 }
 

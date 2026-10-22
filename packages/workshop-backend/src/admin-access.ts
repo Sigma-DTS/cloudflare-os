@@ -15,7 +15,8 @@ import {
   MAX_ADMIN_VIEW_LIFETIME_SECONDS, createAdminAccessError, isAdminWorkspaceAccess,
   type ActionLogEntry, type AdminAccessRecord, type AdminSettingChange, type AdminSettingRecord,
   type AdminViewAccess, type AdminVia, type AdminWorkspaceAccess, type AdminWorkspaceMethod,
-  type AiChatMetadata, type BoundHookInfo,
+  type AiChatHistoryPage, type AiChatMetadata, type BoundHookInfo, type FileAtCommit,
+  type WorkpieceSummary,
 } from "@gadgets/workshop-shared/api";
 import type { AdminConfig } from "./storage-schema/admin-settings-storage.js";
 import { createWorkshopLogger } from "./observability";
@@ -109,8 +110,7 @@ export function minAdminAuditRetentionDays(env: Cloudflare.Env): number {
 }
 
 /** The lower of two access levels (ADMIN_WORKSPACE_ACCESS_LEVELS lists them in order). */
-export function lowerAdminWorkspaceAccess(a: AdminWorkspaceAccess, b: AdminWorkspaceAccess)
-    : AdminWorkspaceAccess {
+export function lowerAdminWorkspaceAccess<L extends AdminWorkspaceAccess>(a: L, b: L): L {
   let order = ADMIN_WORKSPACE_ACCESS_LEVELS;
   return order.indexOf(a) <= order.indexOf(b) ? a : b;
 }
@@ -147,8 +147,11 @@ export type AdminSettingActor = Pick<AdminSettingRecord, "admin" | "sessionId" |
 export type AdminViewTerms = {
   /** Recorded on every record the view makes (see AdminApiOptions.via). */
   via: AdminVia;
-  /** The view's level when minted, within the deployment's policy then. Each call runs at this
-   * level or lower (see adminViewCallAccess()). */
+  /** The level the open asked for (AdminInspectOptions.access), recorded on every record the view
+   * makes (AdminAccessRecord.requested). */
+  requested: AdminViewAccess;
+  /** The view's level when minted: the lower of `requested` and the deployment's policy then. Each
+   * call runs at this level or lower (see adminViewCallAccess()). */
   access: AdminViewAccess;
   /** When the view stops working. */
   expiresAt: Date;
@@ -224,7 +227,7 @@ export function assertAdminViewLive(terms: AdminViewTerms, adminId: string, env:
 
 /** The level one view call runs at (the view's own lowered to `policy.access`) and the refusal that
  * level makes, if any: accessOff at "off", contentWithheld for one of ADMIN_CONTENT_METHODS at
- * "metadata". Never throws: the caller records the call first. */
+ * "metadata". Never throws: the caller records a refused call before refusing it. */
 export function adminViewCallAccess(terms: AdminViewTerms, method: AdminWorkspaceMethod,
     policy: AdminAccessPolicy)
     : { access: AdminWorkspaceAccess; refused?: AdminAccessRecord["refused"] } {
@@ -360,12 +363,21 @@ export function adminSettingChange(setting: string, key: string | undefined, bef
   return change;
 }
 
-// --- What a view below "full" withholds ---
+// --- What a view below "full" withholds, and whether an answer holds any of it ---
+//
+// Each *HoldsContent() predicate takes what a view returns at any level and says whether it holds
+// something the "metadata" level withholds (AdminAccessRecord.exposed). Present but empty is not
+// content, so each is false for anything its withholder returns.
 
 /** A copy of `meta` as a view below "full" lists it: without `queuedSteers`. */
 export function withholdChatContent(meta: AiChatMetadata): AiChatMetadata {
   let { queuedSteers: _queuedSteers, ...rest } = meta;
   return rest;
+}
+
+/** Whether `meta` holds what withholdChatContent() drops: a queued steer. */
+export function chatHoldsContent(meta: AiChatMetadata): boolean {
+  return (meta.queuedSteers?.length ?? 0) > 0;
 }
 
 /** A copy of `entry` as a view below "full" lists it: `description.description` emptied for an
@@ -385,7 +397,35 @@ export function withholdActionContent(entry: ActionLogEntry): ActionLogEntry {
   }
 }
 
+/** Whether `entry` holds what withholdActionContent() withholds: a description, or a field. */
+export function actionHoldsContent(entry: ActionLogEntry): boolean {
+  return entry.description.description !== "" ||
+      (entry.type !== "bindHook" && (entry.description.fields?.length ?? 0) > 0);
+}
+
 /** A copy of `hook` as a view below "full" lists it: `description.description` emptied. */
 export function withholdHookContent(hook: BoundHookInfo): BoundHookInfo {
   return { ...hook, description: { ...hook.description, description: "" } };
+}
+
+/** Whether `hook` holds what withholdHookContent() empties: a description. */
+export function hookHoldsContent(hook: BoundHookInfo): boolean {
+  return hook.description.description !== "";
+}
+
+/** Whether `summary` holds what workpieceSummary() drops below "full": the blueprint a gadget
+ * follows (`upstream: {}` marks a gadget built from scratch, which follows none). */
+export function workpieceHoldsContent(summary: WorkpieceSummary): boolean {
+  return summary.type === "gadget" && summary.upstream?.blueprintId !== undefined;
+}
+
+/** Whether `page` holds what getChat() refuses below "full": a message or a compaction summary. */
+export function chatPageHoldsContent(page: AiChatHistoryPage): boolean {
+  return page.messages.length > 0 || page.compacted !== undefined;
+}
+
+/** Whether `file` holds what readFile() refuses below "full": any file found at the path, an
+ * unreadable one too, since its message can quote the file (a symlink's quotes its target). */
+export function fileHoldsContent(file: FileAtCommit): boolean {
+  return file.kind !== "absent";
 }

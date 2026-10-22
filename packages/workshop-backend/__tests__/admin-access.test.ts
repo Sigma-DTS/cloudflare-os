@@ -3,15 +3,17 @@ import {
   ADMIN_ACCESS_ERROR_CODES, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS, MAX_ADMIN_AUDIT_ARG_LENGTH,
   MAX_ADMIN_AUDIT_RETENTION_DAYS, MAX_ADMIN_AUDIT_VALUE_LENGTH, MAX_ANNOUNCEMENT_LENGTH,
   MAX_INSTANCE_INSTRUCTIONS_LENGTH, getAdminAccessErrorCode,
-  type ActionLogEntry, type AiChatMetadata, type BoundHookInfo,
+  type ActionLogEntry, type AiChatHistoryPage, type AiChatMetadata, type BoundHookInfo,
+  type FileAtCommit, type WorkpieceSummary,
 } from "@gadgets/workshop-shared/api";
 import {
-  ADMIN_AUDIT_EXCERPT_CONTEXT, adminAccessPolicy, adminAuditStatsDays, adminAuditValue,
-  adminListLimit, adminSettingChange, adminViewCallAccess, adminViewLifetimeMs,
-  assertAdminViewLive, cutAdminAuditText, deploymentAdmins, isDeploymentAdmin,
+  ADMIN_AUDIT_EXCERPT_CONTEXT, actionHoldsContent, adminAccessPolicy, adminAuditStatsDays,
+  adminAuditValue, adminListLimit, adminSettingChange, adminViewCallAccess, adminViewLifetimeMs,
+  assertAdminViewLive, chatHoldsContent, chatPageHoldsContent, cutAdminAuditText,
+  deploymentAdmins, fileHoldsContent, hookHoldsContent, isDeploymentAdmin,
   lowerAdminWorkspaceAccess, maxAdminWorkspaceAccess, minAdminAuditRetentionDays,
   redactAdminAuditArgs, validateAdminAccessReason, withholdActionContent, withholdChatContent,
-  withholdHookContent, type AdminViewTerms,
+  withholdHookContent, workpieceHoldsContent, type AdminViewTerms,
 } from "../src/admin-access.js";
 
 // The variables these helpers read, as a deployment's environment carries them: a secret or a
@@ -33,7 +35,10 @@ const ADMIN = "admin@example.test";
 const adminEnv = envWith({ ADMINS: [ADMIN] });
 
 function terms(overrides: Partial<AdminViewTerms> = {}): AdminViewTerms {
-  return { via: "api", access: "full", expiresAt: new Date(Date.now() + 60_000), ...overrides };
+  return {
+    via: "api", requested: "full", access: "full", expiresAt: new Date(Date.now() + 60_000),
+    ...overrides,
+  };
 }
 
 describe("deployment admins", () => {
@@ -258,6 +263,89 @@ describe("withholding content", () => {
     } as unknown as BoundHookInfo;
     expect(withholdHookContent(hook).description).toEqual({ title: "Hook", description: "" });
     expect(hook.description.description).toBe("what it does");
+  });
+});
+
+// Answers as a view returns them, for the *HoldsContent() predicates.
+function chatMeta(extra: Partial<AiChatMetadata> = {}): AiChatMetadata {
+  return { id: 1, title: "t", started: new Date(0), lastActive: new Date(0), ...extra } as
+      AiChatMetadata;
+}
+function logEntry(type: ActionLogEntry["type"], description: object): ActionLogEntry {
+  return {
+    id: 1, resourceTitle: "r", createdAt: new Date(0), state: "approved", type,
+    ...(type === "bindHook" ? { enabled: true } : {}), description,
+  } as unknown as ActionLogEntry;
+}
+function boundHook(description: string): BoundHookInfo {
+  return {
+    id: 1, gatekeeperId: 2, gadgetId: 3, enabled: true,
+    description: { title: "Hook", description },
+  } as unknown as BoundHookInfo;
+}
+function gadgetSummary(extra: Partial<WorkpieceSummary> = {}): WorkpieceSummary {
+  return { id: "g", type: "gadget", title: "G", ...extra } as WorkpieceSummary;
+}
+const STEERS = [{ text: "secret", author: { id: "u", name: "U" } }];
+const FIELDS = [{ label: "To", value: "x@example.com" }];
+
+describe("whether an answer holds content", () => {
+  it("finds a queued steer in a chat", () => {
+    let full = chatMeta({ queuedSteers: STEERS } as Partial<AiChatMetadata>);
+    expect(chatHoldsContent(full)).toBe(true);
+    expect(chatHoldsContent(chatMeta({ queuedSteers: [] }))).toBe(false);
+    expect(chatHoldsContent(chatMeta())).toBe(false);
+    expect(chatHoldsContent(withholdChatContent(full))).toBe(false);
+  });
+
+  it("finds a description or a field in an action log entry", () => {
+    for (let type of ["action", "observation"] as const) {
+      let full = logEntry(type, { title: "T", description: "body", fields: FIELDS });
+      expect(actionHoldsContent(full)).toBe(true);
+      expect(actionHoldsContent(logEntry(type, { title: "T", description: "", fields: FIELDS })))
+          .toBe(true);
+      expect(actionHoldsContent(logEntry(type, { title: "T", description: "" }))).toBe(false);
+      expect(actionHoldsContent(logEntry(type, { title: "T", description: "", fields: [] })))
+          .toBe(false);
+      expect(actionHoldsContent(withholdActionContent(full))).toBe(false);
+    }
+    let bound = logEntry("bindHook", { title: "Hook", description: "what it does" });
+    expect(actionHoldsContent(bound)).toBe(true);
+    expect(actionHoldsContent(logEntry("bindHook", { title: "Hook", description: "" })))
+        .toBe(false);
+    expect(actionHoldsContent(withholdActionContent(bound))).toBe(false);
+  });
+
+  it("finds a hook's description", () => {
+    expect(hookHoldsContent(boundHook("what it does"))).toBe(true);
+    expect(hookHoldsContent(boundHook(""))).toBe(false);
+    expect(hookHoldsContent(withholdHookContent(boundHook("what it does")))).toBe(false);
+  });
+
+  it("finds the blueprint a gadget follows", () => {
+    let upstream = { blueprintId: "bp-1", commitId: "c" };
+    expect(workpieceHoldsContent(gadgetSummary({ upstream }))).toBe(true);
+    expect(workpieceHoldsContent(gadgetSummary({ upstream: {} }))).toBe(false);
+    expect(workpieceHoldsContent(gadgetSummary())).toBe(false);
+    expect(workpieceHoldsContent({ id: "w", type: "worktree", title: "W" } as WorkpieceSummary))
+        .toBe(false);
+  });
+
+  it("finds messages or a compaction summary in a chat page", () => {
+    let message = { sequence: 1 } as unknown as AiChatHistoryPage["messages"][number];
+    let compacted = { to: 1, summary: "s" } as AiChatHistoryPage["compacted"];
+    expect(chatPageHoldsContent({ messages: [message] })).toBe(true);
+    expect(chatPageHoldsContent({ messages: [], compacted })).toBe(true);
+    expect(chatPageHoldsContent({ messages: [] })).toBe(false);
+    expect(chatPageHoldsContent({ messages: [], compacted: undefined })).toBe(false);
+  });
+
+  it("finds any file at the path, an unreadable one too", () => {
+    let files: FileAtCommit[] = [
+      { kind: "text", text: "x" }, { kind: "unreadable", message: "a is a symlink to b" },
+      { kind: "absent" },
+    ];
+    expect(files.map(fileHoldsContent)).toEqual([true, true, false]);
   });
 });
 

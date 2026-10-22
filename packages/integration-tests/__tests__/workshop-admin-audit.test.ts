@@ -4,7 +4,7 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import {
   MAX_ADMIN_AUDIT_VALUE_LENGTH, MAX_SITE_NAME_LENGTH,
   type AdminApi, type AdminApiOptions, type AdminAuditKind, type AdminAuditRecord,
-  type AdminAuditStats, type AdminSettingRecord, type AuthenticatedApi,
+  type AdminAuditStats, type AdminSettingRecord, type AuthenticatedApi, type Overseer,
 } from "@gadgets/workshop-shared/api";
 import {
   ADMIN_USERNAME, startHarness, TEST_GATEKEEPER_BINDING, TEST_GATEKEEPER_DIR, TEST_VENDOR_ID,
@@ -79,13 +79,13 @@ async function newSetting(previous: AdminSettingRecord | undefined): Promise<Adm
 
 /** A fresh owner's workspace, retitled so that its records can be recognised. */
 async function newWorkspace(stack: DisposableStack, prefix: string)
-    : Promise<{ id: string; title: string }> {
+    : Promise<{ id: string; title: string; ws: RpcStub<Overseer> }> {
   const [ownerName] = nextUsernames(prefix);
   const owner = stack.use(await signUp(stack.use(connect(harness.url)), ownerName!));
   const ws = stack.use(await owner.newGadget());
   const title = `Workspace of ${ownerName}`;
   await ws.setTitle(title);
-  return { id: (await ws.getMetadata()).id, title };
+  return { id: (await ws.getMetadata()).id, title, ws };
 }
 
 // The smallest PNG a site logo accepts: the signature and a 1x1 IHDR chunk, 33 bytes.
@@ -366,6 +366,58 @@ it("counts the log across two admins", async () => {
   expect((await admin.getAdminAuditStats({ days: 1 })).byDay).toHaveLength(1);
   for (const days of [0, 367, 1.5]) {
     await expect(admin.getAdminAuditStats({ days }), `days ${days}`).rejects.toThrow();
+  }
+});
+
+it("counts content reads, by admin and by workspace", async () => {
+  using stack = new DisposableStack();
+  const a = await newWorkspace(stack, "contenta");
+  const b = await newWorkspace(stack, "contentb");
+  const chatA = await a.ws.newChat("hello", null);
+  const chatB = await b.ws.newChat("hello", null);
+
+  try {
+    await admin.setAdminWorkspaceAccess("full");
+    const before = await admin.getAdminAuditStats();
+    {
+      using view = await admin.inspectWorkspace(a.id, REASON, { access: "full" });
+      await view.getChat(chatA);
+      await view.getChat(chatA);
+      // No steer is queued, so this exposes no content.
+      await view.listChats();
+    }
+    {
+      using view = await auditor.inspectWorkspace(b.id, REASON, { access: "full" });
+      await view.getChat(chatB);
+    }
+    const after = await admin.getAdminAuditStats();
+
+    // Every content read in this harness happens during the run, so none has left the window.
+    expect(after.contentReads - before.contentReads).toBe(3);
+    const admins = growth(before.topAdminsByContentReads, after.topAdminsByContentReads,
+        entry => entry.admin, entry => entry.count);
+    expect(admins.get(ADMIN_USERNAME)).toBe(2);
+    expect(admins.get(AUDITOR_USERNAME)).toBe(1);
+    expect(after.topWorkspacesByContentReads)
+        .toContainEqual({ workspaceId: a.id, title: a.title, count: 2 });
+    expect(after.topWorkspacesByContentReads)
+        .toContainEqual({ workspaceId: b.id, title: b.title, count: 1 });
+
+    const settings = await admin.getAdminAuditStats({ kind: "setting" });
+    expect(settings.contentReads).toBe(0);
+    expect(settings.topAdminsByContentReads).toEqual([]);
+    expect(settings.topWorkspacesByContentReads).toEqual([]);
+    expect((await admin.getAdminAuditStats({ kind: "workspace" })).contentReads)
+        .toBe(after.contentReads);
+
+    const [newest] = (await admin.listAdminAudit(
+        { exposed: "content", admin: AUDITOR_USERNAME, limit: 1 })).records;
+    expect(newest).toMatchObject({
+      kind: "workspace", workspaceId: b.id, method: "getChat", args: { chatId: chatB },
+      requested: "full", access: "full", exposed: "content",
+    });
+  } finally {
+    await admin.setAdminWorkspaceAccess("metadata");
   }
 });
 
