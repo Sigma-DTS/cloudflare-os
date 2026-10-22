@@ -56,7 +56,7 @@
       ]
     },
     "AdminApi": {
-      "doc": "Capability for managing deployment-wide admin settings, obtained via\nAuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the\ncapability is minted, so these methods don't re-check. Covers branding, agent instructions,\nwhich gatekeeper connectors/resources are offered, and the models an AI Gateway deployment\nprovides — NOT authentication config (that's env-var driven). Each setter throws on invalid\ninput.",
+      "doc": "Capability for managing and investigating the deployment, obtained via\nAuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the\ncapability is minted, so these methods don't re-check, with one exception: inspectWorkspace()\nre-checks, and so does every call on the AdminWorkspaceView it mints, since a view is the one\nthing an admin holds that reads users' data. Covers branding, agent instructions, which\ngatekeeper connectors/resources are offered, the models an AI Gateway deployment provides, the\nuser and workspace directory, and admin access to workspaces — NOT authentication config (that's\nenv-var driven). Each setter throws on invalid input, and records the change it makes in the\ndeployment's audit log before making it (see AdminSettingRecord).",
       "direction": "server",
       "methods": [
         {
@@ -95,6 +95,25 @@
           }
         },
         {
+          "name": "getAdminAuditStats",
+          "doc": "Counts from the admin audit log over the last `days` UTC days, today included (7 by\ndefault). Throws unless `days` is a whole number from 1 to MAX_ADMIN_AUDIT_STATS_DAYS.",
+          "params": [
+            {
+              "name": "options",
+              "type": {
+                "kind": "ref",
+                "name": "AdminAuditStatsQuery"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "AdminAuditStats"
+          }
+        },
+        {
           "name": "getSettings",
           "doc": "Read all admin-managed settings for the admin UI in one call.",
           "params": [],
@@ -121,6 +140,41 @@
           }
         },
         {
+          "name": "inspectWorkspace",
+          "doc": "Open a read-only view of a workspace to investigate it (see AdminWorkspaceView). The view runs\nat the lower of the level `options.access` asks for (\"metadata\" when absent) and the\ndeployment's level (AdminSettingsView.adminWorkspaceAccess.effective). Asking for \"full\" where\nthe deployment allows only \"metadata\" opens the view at \"metadata\", and its describe() reports\nthat. `reason` is required: it is recorded with the open and with every call made through the\nview, and is rejected when blank or, once trimmed, longer than MAX_ADMIN_ACCESS_REASON_LENGTH.\nThe open is recorded as an AdminAccessRecord (\"inspectWorkspace\") before the view is returned,\nso an open whose record cannot be written is refused.\n\nRefused with a code from ADMIN_ACCESS_ERROR_CODES, checked in this order: `notAdmin` once the\ncaller is no longer a deployment admin; `workspaceNotFound` for a malformed id; `accessOff`\nwhile the access level is \"off\", recorded in the deployment-wide log without the workspace\nbeing reached; `workspaceNotFound` for an id that names no workspace (never initialised or\nsince deleted), which this neither creates nor claims; `viewExpired` should the view's\nlifetime run out before the workspace answers. Only `accessOff` refusals are recorded.\n\nAdmin access is a deliberate exception to observer verification (see docs/observers.md): the\nadmin is never verified against the workspace's connections nor registered as an observer, and\nthe audit log is the compensating control.",
+          "params": [
+            {
+              "name": "workspaceId",
+              "type": {
+                "kind": "string"
+              },
+              "optional": false,
+              "doc": ""
+            },
+            {
+              "name": "reason",
+              "type": {
+                "kind": "string"
+              },
+              "optional": false,
+              "doc": ""
+            },
+            {
+              "name": "options",
+              "type": {
+                "kind": "ref",
+                "name": "AdminInspectOptions"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "stub",
+            "service": "AdminWorkspaceView"
+          }
+        },
+        {
           "name": "isBlueprintFeatured",
           "doc": "Returns whether the blueprint is featured on the deployment. Returns null when the blueprint\ncan't be featured (e.g. it isn't a listable blueprint).",
           "params": [
@@ -143,6 +197,63 @@
                 "kind": "null"
               }
             ]
+          }
+        },
+        {
+          "name": "listAdminAudit",
+          "doc": "One page of the deployment-wide admin audit log, newest first: access to workspaces and\nchanges to settings, filtered as `options` says. Rejects a `limit` that is not a whole number\nfrom 1 to ADMIN_LIST_MAX_LIMIT, a filter over 1000 characters, and a malformed `cursor`.",
+          "params": [
+            {
+              "name": "options",
+              "type": {
+                "kind": "ref",
+                "name": "AdminAuditQuery"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "AdminAuditPage"
+          }
+        },
+        {
+          "name": "listUsers",
+          "doc": "One page of the deployment's users, in id order: every account that has started a session\nsince the directory began recording accounts. Unaffected by setUserSearchEnabled(). A page\nholds at most `limit` users and stops early, with a `nextCursor`, once their ids and names\nwould pass a million characters: an id has no length limit of its own, so a count alone cannot\nbound a page. Rejects a `query` over 1000 characters or with a line break, and a `limit` that\nis not a whole number from 1 to ADMIN_LIST_MAX_LIMIT.",
+          "params": [
+            {
+              "name": "options",
+              "type": {
+                "kind": "ref",
+                "name": "AdminUserQuery"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "AdminUserPage"
+          }
+        },
+        {
+          "name": "listWorkspaces",
+          "doc": "One page of the deployment's workspaces, in id order: every workspace opened since the\ndirectory began recording workspaces, deleted ones left out. A page stops early as\nlistUsers()'s does, counting ids, titles and owners. Rejects what listUsers() rejects.",
+          "params": [
+            {
+              "name": "options",
+              "type": {
+                "kind": "ref",
+                "name": "AdminWorkspaceQuery"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "AdminWorkspacePage"
           }
         },
         {
@@ -204,6 +315,54 @@
               "name": "color",
               "type": {
                 "kind": "string"
+              },
+              "optional": false,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "void"
+          }
+        },
+        {
+          "name": "setAdminAuditRetentionDays",
+          "doc": "Set how many days the admin audit log keeps a record, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS by\ndefault. A record older than that is no longer listed or counted, and is deleted as the log is\nnext used; the copy kept in its workspace goes when that workspace is next inspected. Throws\nunless `days` is a whole number from the deployment's minimum\n(AdminSettingsView.adminAuditRetentionDays.min, set by its ADMIN_AUDIT_RETENTION_MIN_DAYS\nenvironment variable) to MAX_ADMIN_AUDIT_RETENTION_DAYS.",
+          "params": [
+            {
+              "name": "days",
+              "type": {
+                "kind": "number"
+              },
+              "optional": false,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "void"
+          }
+        },
+        {
+          "name": "setAdminWorkspaceAccess",
+          "doc": "Set how much of a workspace inspectWorkspace() may show (see ADMIN_WORKSPACE_ACCESS_LEVELS),\nDEFAULT_ADMIN_WORKSPACE_ACCESS by default. Throws for a level above the deployment's maximum\n(AdminSettingsView.adminWorkspaceAccess.max), which only its ADMIN_WORKSPACE_ACCESS_MAX\nenvironment variable can raise. A view already minted runs at the lower of its own level and\nthe new one from its next call once the setting reaches it, within about a minute.",
+          "params": [
+            {
+              "name": "access",
+              "type": {
+                "kind": "union",
+                "branches": [
+                  {
+                    "kind": "literal",
+                    "value": "full"
+                  },
+                  {
+                    "kind": "literal",
+                    "value": "metadata"
+                  },
+                  {
+                    "kind": "literal",
+                    "value": "off"
+                  }
+                ]
               },
               "optional": false,
               "doc": ""
@@ -805,6 +964,170 @@
         }
       ]
     },
+    "AdminWorkspaceView": {
+      "doc": "A deployment admin's read-only view of one workspace, minted by AdminApi.inspectWorkspace().\nNothing it does changes the workspace or is seen by its members: it joins no presence and no\nsession count, and starts no agent or connection.\n\nEach call first passes three checks, refused unrecorded with a code from\nADMIN_ACCESS_ERROR_CODES: the view has not expired (`viewExpired`), its admin is still a\ndeployment admin (`notAdmin`), and the workspace still exists (`workspaceNotFound`). It then\nruns at an access level: the view's own, fixed when it was minted at the lower of the level its\nopen asked for (AdminInspectOptions.access) and the deployment's, then lowered to the\ndeployment's current setting. So lowering the setting reaches live views (within about a minute)\nand raising it does not. A call that level refuses is recorded and refused, having read nothing:\n`accessOff` once the setting is \"off\", `contentWithheld` for getChat() or readFile() below\n\"full\". Any other call reads its answer, never through a connection. It is then recorded as an\nAdminAccessRecord, with what that answer exposed, in the workspace and then in the\ndeployment-wide log. Only then is the call answered: nothing it read leaves the server before\nboth records exist, and a call whose record cannot be written fails and returns nothing. The\nchecks run again once the call has read the deployment's setting, and again once it has read its\nanswer, just before it writes. So a call that expiry, a demotion or the workspace's deletion\novertakes while it reads writes nothing. A call whose read fails is recorded as an attempt that\nexposed nothing, and fails with the read's error.\n\nA workspace restart (a revocation, a deletion, a redeploy) ends the view along with every other\nsession on the workspace; inspect again.",
+      "direction": "server",
+      "methods": [
+        {
+          "name": "describe",
+          "doc": "The workspace's metadata, owner, workpieces and collaborators, with the level this call ran\nat and the view's expiry.",
+          "params": [],
+          "returns": {
+            "kind": "ref",
+            "name": "AdminWorkspaceDescription"
+          }
+        },
+        {
+          "name": "getChat",
+          "doc": "One page of a chat's messages, as Overseer.getChatHistory() pages them. Content: refused below\n\"full\".",
+          "params": [
+            {
+              "name": "chatId",
+              "type": {
+                "kind": "number"
+              },
+              "optional": false,
+              "doc": ""
+            },
+            {
+              "name": "beforeSequence",
+              "type": {
+                "kind": "number"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "AiChatHistoryPage"
+          }
+        },
+        {
+          "name": "getDiagnostics",
+          "doc": "The workspace's operational state, with its most recent admin access records.",
+          "params": [],
+          "returns": {
+            "kind": "ref",
+            "name": "AdminWorkspaceDiagnostics"
+          }
+        },
+        {
+          "name": "listActions",
+          "doc": "One page of the workspace's action log, as Overseer.listActions() pages it. Admin access is\nnever in it (see AdminAccessRecord). Below \"full\", every action, observation and hook entry has\nan empty `description.description` and no `description.fields`: titles, states, resources and\ntimes remain.",
+          "params": [
+            {
+              "name": "options",
+              "type": {
+                "kind": "object",
+                "properties": {
+                  "beforeId": {
+                    "kind": "union",
+                    "branches": [
+                      {
+                        "kind": "number"
+                      },
+                      {
+                        "kind": "undefined"
+                      }
+                    ]
+                  },
+                  "filter": {
+                    "kind": "union",
+                    "branches": [
+                      {
+                        "kind": "ref",
+                        "name": "ActionHistoryFilter"
+                      },
+                      {
+                        "kind": "undefined"
+                      }
+                    ]
+                  }
+                }
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "ActionHistoryPage"
+          }
+        },
+        {
+          "name": "listChats",
+          "doc": "The workspace's chats, newest first, as Overseer.listChats() lists them; below \"full\", without\n`queuedSteers`, which hold message text.",
+          "params": [],
+          "returns": {
+            "kind": "array",
+            "element": {
+              "kind": "ref",
+              "name": "AiChatMetadata"
+            }
+          }
+        },
+        {
+          "name": "listFiles",
+          "doc": "The tree of a gadget's committed head, as Overseer.listTree() gives it, read only from the\nobjects the workspace stores: it never pulls through a connection, and throws when an object\nis missing. Only a permanent gadget has a head to read: throws for a pending gadget, a\nworktree, or an id that names no gadget.",
+          "params": [
+            {
+              "name": "gadgetId",
+              "type": {
+                "kind": "number"
+              },
+              "optional": false,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "array",
+            "element": {
+              "kind": "ref",
+              "name": "TreeNode"
+            }
+          }
+        },
+        {
+          "name": "listGatekeepers",
+          "doc": "The workspace's connections, oldest first, with their bindings and hooks.",
+          "params": [],
+          "returns": {
+            "kind": "array",
+            "element": {
+              "kind": "ref",
+              "name": "AdminGatekeeperInfo"
+            }
+          }
+        },
+        {
+          "name": "readFile",
+          "doc": "One file of a gadget's committed head, as Overseer.readFilesAtCommit() reports it, read as\nlistFiles() reads and refused as it is. Content: refused below \"full\".",
+          "params": [
+            {
+              "name": "gadgetId",
+              "type": {
+                "kind": "number"
+              },
+              "optional": false,
+              "doc": ""
+            },
+            {
+              "name": "path",
+              "type": {
+                "kind": "string"
+              },
+              "optional": false,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "ref",
+            "name": "FileAtCommit"
+          }
+        }
+      ]
+    },
     "AiChatSubscriber": {
       "doc": "Interface implemented by the client to receive callback notifications whenever there is new\nchat activity. Use Overseer.subscribeToChat() to register a subscriber.",
       "direction": "client",
@@ -1292,8 +1615,18 @@
         },
         {
           "name": "getAdminApi",
-          "doc": "Returns a capability for managing deployment-wide admin settings, or null when the caller is not\nan admin. The access check happens once here, so the returned stub's methods need no per-call\nchecks. (Authentication config — sign-in providers, password login — is intentionally not\nmanaged here; it stays env-var driven.)",
-          "params": [],
+          "doc": "Returns a capability for managing and investigating the deployment as an admin, or null when\nthe caller is not one. The access check happens here, once, for every AdminApi method but\nworkspace inspection: AdminApi.inspectWorkspace() and each call on the view it mints check\nagain (see AdminWorkspaceView). `options.via` labels every audit record the capability makes.\n(Authentication config — sign-in providers, password login — is intentionally not managed\nhere; it stays env-var driven.)",
+          "params": [
+            {
+              "name": "options",
+              "type": {
+                "kind": "ref",
+                "name": "AdminApiOptions"
+              },
+              "optional": true,
+              "doc": ""
+            }
+          ],
           "returns": {
             "kind": "union",
             "branches": [
@@ -5656,6 +5989,410 @@
         }
       ]
     },
+    "AdminAccessExposure": {
+      "kind": "union",
+      "branches": [
+        {
+          "kind": "literal",
+          "value": "content"
+        },
+        {
+          "kind": "literal",
+          "value": "metadata"
+        }
+      ]
+    },
+    "AdminAccessRecord": {
+      "kind": "object",
+      "properties": {
+        "access": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "literal",
+              "value": "full"
+            },
+            {
+              "kind": "literal",
+              "value": "metadata"
+            },
+            {
+              "kind": "literal",
+              "value": "off"
+            }
+          ]
+        },
+        "admin": {
+          "kind": "string"
+        },
+        "args": {
+          "kind": "object",
+          "properties": {},
+          "index": {
+            "kind": "union",
+            "branches": [
+              {
+                "kind": "number"
+              },
+              {
+                "kind": "string"
+              }
+            ]
+          }
+        },
+        "at": {
+          "kind": "date"
+        },
+        "exposed": {
+          "kind": "ref",
+          "name": "AdminAccessExposure"
+        },
+        "kind": {
+          "kind": "literal",
+          "value": "workspace"
+        },
+        "method": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "literal",
+              "value": "describe"
+            },
+            {
+              "kind": "literal",
+              "value": "getChat"
+            },
+            {
+              "kind": "literal",
+              "value": "getDiagnostics"
+            },
+            {
+              "kind": "literal",
+              "value": "inspectWorkspace"
+            },
+            {
+              "kind": "literal",
+              "value": "listActions"
+            },
+            {
+              "kind": "literal",
+              "value": "listChats"
+            },
+            {
+              "kind": "literal",
+              "value": "listFiles"
+            },
+            {
+              "kind": "literal",
+              "value": "listGatekeepers"
+            },
+            {
+              "kind": "literal",
+              "value": "readFile"
+            }
+          ]
+        },
+        "reason": {
+          "kind": "string"
+        },
+        "refused": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "literal",
+              "value": "ADMIN_CONTENT_WITHHELD"
+            },
+            {
+              "kind": "literal",
+              "value": "ADMIN_WORKSPACE_ACCESS_OFF"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "requested": {
+          "kind": "ref",
+          "name": "AdminViewAccess"
+        },
+        "sessionId": {
+          "kind": "string"
+        },
+        "via": {
+          "kind": "ref",
+          "name": "AdminVia"
+        },
+        "workspaceId": {
+          "kind": "string"
+        },
+        "workspaceTitle": {
+          "kind": "string"
+        }
+      }
+    },
+    "AdminApiOptions": {
+      "kind": "object",
+      "properties": {
+        "via": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "ref",
+              "name": "AdminVia"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        }
+      }
+    },
+    "AdminAuditPage": {
+      "kind": "object",
+      "properties": {
+        "nextCursor": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "records": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "AdminAuditRecord"
+          }
+        }
+      }
+    },
+    "AdminAuditQuery": {
+      "kind": "object",
+      "properties": {
+        "admin": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "cursor": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "exposed": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "ref",
+              "name": "AdminAccessExposure"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "kind": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "literal",
+              "value": "setting"
+            },
+            {
+              "kind": "literal",
+              "value": "workspace"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "limit": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "since": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "date"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "workspace": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        }
+      }
+    },
+    "AdminAuditRecord": {
+      "kind": "union",
+      "branches": [
+        {
+          "kind": "ref",
+          "name": "AdminAccessRecord"
+        },
+        {
+          "kind": "ref",
+          "name": "AdminSettingRecord"
+        }
+      ]
+    },
+    "AdminAuditStats": {
+      "kind": "object",
+      "properties": {
+        "byDay": {
+          "kind": "array",
+          "element": {
+            "kind": "object",
+            "properties": {
+              "count": {
+                "kind": "number"
+              },
+              "day": {
+                "kind": "string"
+              }
+            }
+          }
+        },
+        "contentReads": {
+          "kind": "number"
+        },
+        "days": {
+          "kind": "number"
+        },
+        "topAdmins": {
+          "kind": "array",
+          "element": {
+            "kind": "object",
+            "properties": {
+              "admin": {
+                "kind": "string"
+              },
+              "count": {
+                "kind": "number"
+              }
+            }
+          }
+        },
+        "topAdminsByContentReads": {
+          "kind": "array",
+          "element": {
+            "kind": "object",
+            "properties": {
+              "admin": {
+                "kind": "string"
+              },
+              "count": {
+                "kind": "number"
+              }
+            }
+          }
+        },
+        "topWorkspaces": {
+          "kind": "array",
+          "element": {
+            "kind": "object",
+            "properties": {
+              "count": {
+                "kind": "number"
+              },
+              "title": {
+                "kind": "string"
+              },
+              "workspaceId": {
+                "kind": "string"
+              }
+            }
+          }
+        },
+        "topWorkspacesByContentReads": {
+          "kind": "array",
+          "element": {
+            "kind": "object",
+            "properties": {
+              "count": {
+                "kind": "number"
+              },
+              "title": {
+                "kind": "string"
+              },
+              "workspaceId": {
+                "kind": "string"
+              }
+            }
+          }
+        },
+        "totalEvents": {
+          "kind": "number"
+        }
+      }
+    },
+    "AdminAuditStatsQuery": {
+      "kind": "object",
+      "properties": {
+        "days": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "kind": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "literal",
+              "value": "setting"
+            },
+            {
+              "kind": "literal",
+              "value": "workspace"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        }
+      }
+    },
     "AdminFormat": {
       "kind": "object",
       "properties": {
@@ -5933,6 +6670,91 @@
         }
       }
     },
+    "AdminGatekeeperInfo": {
+      "kind": "object",
+      "properties": {
+        "bindings": {
+          "kind": "array",
+          "element": {
+            "kind": "object",
+            "properties": {
+              "chatId": {
+                "kind": "union",
+                "branches": [
+                  {
+                    "kind": "number"
+                  },
+                  {
+                    "kind": "undefined"
+                  }
+                ]
+              },
+              "gadgetId": {
+                "kind": "number"
+              },
+              "name": {
+                "kind": "string"
+              }
+            }
+          }
+        },
+        "creationSpec": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "ref",
+              "name": "GatekeeperCreationSpec"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "hooks": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "BoundHookInfo"
+          }
+        },
+        "id": {
+          "kind": "number"
+        },
+        "resourceTitle": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "resourceUrl": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "vendorId": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        }
+      }
+    },
     "AdminGatewayProvider": {
       "kind": "object",
       "properties": {
@@ -5958,6 +6780,34 @@
         "provider": {
           "kind": "ref",
           "name": "AiModelProvider"
+        }
+      }
+    },
+    "AdminInspectOptions": {
+      "kind": "object",
+      "properties": {
+        "access": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "ref",
+              "name": "AdminViewAccess"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "lifetimeSeconds": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
         }
       }
     },
@@ -6237,11 +7087,310 @@
         }
       ]
     },
+    "AdminSettingChange": {
+      "kind": "object",
+      "properties": {
+        "after": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "before": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "excerpt": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "object",
+              "properties": {
+                "afterLength": {
+                  "kind": "union",
+                  "branches": [
+                    {
+                      "kind": "number"
+                    },
+                    {
+                      "kind": "undefined"
+                    }
+                  ]
+                },
+                "beforeLength": {
+                  "kind": "union",
+                  "branches": [
+                    {
+                      "kind": "number"
+                    },
+                    {
+                      "kind": "undefined"
+                    }
+                  ]
+                },
+                "offset": {
+                  "kind": "number"
+                }
+              }
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "key": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "setting": {
+          "kind": "string"
+        }
+      }
+    },
+    "AdminSettingRecord": {
+      "kind": "object",
+      "properties": {
+        "admin": {
+          "kind": "string"
+        },
+        "at": {
+          "kind": "date"
+        },
+        "changes": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "AdminSettingChange"
+          }
+        },
+        "kind": {
+          "kind": "literal",
+          "value": "setting"
+        },
+        "method": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "literal",
+              "value": "addGatewayModel"
+            },
+            {
+              "kind": "literal",
+              "value": "promoteFormat"
+            },
+            {
+              "kind": "literal",
+              "value": "removeFormat"
+            },
+            {
+              "kind": "literal",
+              "value": "removeGatewayModel"
+            },
+            {
+              "kind": "literal",
+              "value": "setAccentColor"
+            },
+            {
+              "kind": "literal",
+              "value": "setAdminAuditRetentionDays"
+            },
+            {
+              "kind": "literal",
+              "value": "setAdminWorkspaceAccess"
+            },
+            {
+              "kind": "literal",
+              "value": "setAnnouncement"
+            },
+            {
+              "kind": "literal",
+              "value": "setBanner"
+            },
+            {
+              "kind": "literal",
+              "value": "setBlueprintFeatured"
+            },
+            {
+              "kind": "literal",
+              "value": "setDefaultReasoning"
+            },
+            {
+              "kind": "literal",
+              "value": "setFormatOrder"
+            },
+            {
+              "kind": "literal",
+              "value": "setGatekeeperMode"
+            },
+            {
+              "kind": "literal",
+              "value": "setGatewayModelMode"
+            },
+            {
+              "kind": "literal",
+              "value": "setGatewayModelSettings"
+            },
+            {
+              "kind": "literal",
+              "value": "setGatewayProviderEnabled"
+            },
+            {
+              "kind": "literal",
+              "value": "setInstanceInstructions"
+            },
+            {
+              "kind": "literal",
+              "value": "setModelsDevSuggestions"
+            },
+            {
+              "kind": "literal",
+              "value": "setResourceEnabled"
+            },
+            {
+              "kind": "literal",
+              "value": "setSignupsEnabled"
+            },
+            {
+              "kind": "literal",
+              "value": "setSiteLogo"
+            },
+            {
+              "kind": "literal",
+              "value": "setSiteName"
+            },
+            {
+              "kind": "literal",
+              "value": "setUpdateCheckIntervalMinutes"
+            },
+            {
+              "kind": "literal",
+              "value": "setUpdateChecksEnabled"
+            },
+            {
+              "kind": "literal",
+              "value": "setUpdateMinimumAgeHours"
+            },
+            {
+              "kind": "literal",
+              "value": "setUpdateNoticeSnoozeHours"
+            },
+            {
+              "kind": "literal",
+              "value": "setUserModelsEnabled"
+            },
+            {
+              "kind": "literal",
+              "value": "setUserSearchEnabled"
+            },
+            {
+              "kind": "literal",
+              "value": "updateFormat"
+            }
+          ]
+        },
+        "sessionId": {
+          "kind": "string"
+        },
+        "via": {
+          "kind": "ref",
+          "name": "AdminVia"
+        }
+      }
+    },
     "AdminSettingsView": {
       "kind": "object",
       "properties": {
         "accentColor": {
           "kind": "string"
+        },
+        "adminAuditRetentionDays": {
+          "kind": "object",
+          "properties": {
+            "chosen": {
+              "kind": "number"
+            },
+            "effective": {
+              "kind": "number"
+            },
+            "min": {
+              "kind": "number"
+            }
+          }
+        },
+        "adminWorkspaceAccess": {
+          "kind": "object",
+          "properties": {
+            "chosen": {
+              "kind": "union",
+              "branches": [
+                {
+                  "kind": "literal",
+                  "value": "full"
+                },
+                {
+                  "kind": "literal",
+                  "value": "metadata"
+                },
+                {
+                  "kind": "literal",
+                  "value": "off"
+                }
+              ]
+            },
+            "effective": {
+              "kind": "union",
+              "branches": [
+                {
+                  "kind": "literal",
+                  "value": "full"
+                },
+                {
+                  "kind": "literal",
+                  "value": "metadata"
+                },
+                {
+                  "kind": "literal",
+                  "value": "off"
+                }
+              ]
+            },
+            "max": {
+              "kind": "union",
+              "branches": [
+                {
+                  "kind": "literal",
+                  "value": "full"
+                },
+                {
+                  "kind": "literal",
+                  "value": "metadata"
+                },
+                {
+                  "kind": "literal",
+                  "value": "off"
+                }
+              ]
+            }
+          }
         },
         "announcement": {
           "kind": "string"
@@ -6363,6 +7512,393 @@
         },
         "userSearchEnabled": {
           "kind": "boolean"
+        }
+      }
+    },
+    "AdminUserPage": {
+      "kind": "object",
+      "properties": {
+        "nextCursor": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "users": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "AdminUserRecord"
+          }
+        }
+      }
+    },
+    "AdminUserQuery": {
+      "kind": "object",
+      "properties": {
+        "cursor": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "limit": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "query": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        }
+      }
+    },
+    "AdminUserRecord": {
+      "kind": "object",
+      "properties": {
+        "created": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "date"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "id": {
+          "kind": "string"
+        },
+        "isAdmin": {
+          "kind": "boolean"
+        },
+        "lastLogin": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "date"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "name": {
+          "kind": "string"
+        }
+      }
+    },
+    "AdminVia": {
+      "kind": "union",
+      "branches": [
+        {
+          "kind": "literal",
+          "value": "api"
+        },
+        {
+          "kind": "literal",
+          "value": "cli"
+        }
+      ]
+    },
+    "AdminViewAccess": {
+      "kind": "union",
+      "branches": [
+        {
+          "kind": "literal",
+          "value": "full"
+        },
+        {
+          "kind": "literal",
+          "value": "metadata"
+        }
+      ]
+    },
+    "AdminWorkspaceDescription": {
+      "kind": "object",
+      "properties": {
+        "access": {
+          "kind": "ref",
+          "name": "AdminViewAccess"
+        },
+        "collaborators": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "CollaboratorInfo"
+          }
+        },
+        "containsRestrictedData": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "boolean"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "defaultGadgetId": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "expiresAt": {
+          "kind": "date"
+        },
+        "id": {
+          "kind": "string"
+        },
+        "owner": {
+          "kind": "ref",
+          "name": "AiChatAuthorInfo"
+        },
+        "ownerInvitesOnly": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "boolean"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "title": {
+          "kind": "string"
+        },
+        "totalCost": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "workpieces": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "WorkpieceSummary"
+          }
+        }
+      }
+    },
+    "AdminWorkspaceDiagnostics": {
+      "kind": "object",
+      "properties": {
+        "activeAgentChatIds": {
+          "kind": "array",
+          "element": {
+            "kind": "number"
+          }
+        },
+        "chats": {
+          "kind": "number"
+        },
+        "hooks": {
+          "kind": "object",
+          "properties": {
+            "enabled": {
+              "kind": "number"
+            },
+            "total": {
+              "kind": "number"
+            }
+          }
+        },
+        "instanceStartedAt": {
+          "kind": "date"
+        },
+        "nextAlarm": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "date"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "observers": {
+          "kind": "number"
+        },
+        "ownerRegistrationPending": {
+          "kind": "boolean"
+        },
+        "pendingActions": {
+          "kind": "number"
+        },
+        "pendingAgentCalls": {
+          "kind": "number"
+        },
+        "recentAdminAccess": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "AdminAccessRecord"
+          }
+        },
+        "sessions": {
+          "kind": "object",
+          "properties": {
+            "build": {
+              "kind": "number"
+            },
+            "owner": {
+              "kind": "number"
+            },
+            "use": {
+              "kind": "number"
+            }
+          }
+        },
+        "storageVersion": {
+          "kind": "number"
+        }
+      }
+    },
+    "AdminWorkspacePage": {
+      "kind": "object",
+      "properties": {
+        "nextCursor": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "workspaces": {
+          "kind": "array",
+          "element": {
+            "kind": "ref",
+            "name": "AdminWorkspaceRecord"
+          }
+        }
+      }
+    },
+    "AdminWorkspaceQuery": {
+      "kind": "object",
+      "properties": {
+        "cursor": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "limit": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "number"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "owner": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "query": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "string"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        }
+      }
+    },
+    "AdminWorkspaceRecord": {
+      "kind": "object",
+      "properties": {
+        "created": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "date"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "id": {
+          "kind": "string"
+        },
+        "lastActive": {
+          "kind": "union",
+          "branches": [
+            {
+              "kind": "date"
+            },
+            {
+              "kind": "undefined"
+            }
+          ]
+        },
+        "owner": {
+          "kind": "ref",
+          "name": "UserDirectoryRecord"
+        },
+        "title": {
+          "kind": "string"
         }
       }
     },

@@ -188,6 +188,172 @@
       }
     },
     {
+      "id": "AdminApi.getAdminAuditStats",
+      "service": "AdminApi",
+      "method": "getAdminAuditStats",
+      "description": "Counts from the admin audit log over the last `days` UTC days, today included (7 by\ndefault). Throws unless `days` is a whole number from 1 to MAX_ADMIN_AUDIT_STATS_DAYS.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "options": {
+            "$ref": "#/$defs/AdminAuditStatsQuery"
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "$defs": {
+          "AdminAuditStatsQuery": {
+            "type": "object",
+            "properties": {
+              "days": {
+                "type": "number"
+              },
+              "kind": {
+                "enum": [
+                  "setting",
+                  "workspace"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "returns": {
+        "$ref": "#/$defs/AdminAuditStats",
+        "$defs": {
+          "AdminAuditStats": {
+            "type": "object",
+            "properties": {
+              "byDay": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "number"
+                    },
+                    "day": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "count",
+                    "day"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "contentReads": {
+                "type": "number"
+              },
+              "days": {
+                "type": "number"
+              },
+              "topAdmins": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "admin": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "admin",
+                    "count"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "topAdminsByContentReads": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "admin": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "admin",
+                    "count"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "topWorkspaces": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "number"
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "workspaceId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "count",
+                    "title",
+                    "workspaceId"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "topWorkspacesByContentReads": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "number"
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "workspaceId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "count",
+                    "title",
+                    "workspaceId"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "totalEvents": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "byDay",
+              "contentReads",
+              "days",
+              "topAdmins",
+              "topAdminsByContentReads",
+              "topWorkspaces",
+              "topWorkspacesByContentReads",
+              "totalEvents"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
       "id": "AdminApi.getSettings",
       "service": "AdminApi",
       "method": "getSettings",
@@ -486,6 +652,58 @@
               "accentColor": {
                 "type": "string"
               },
+              "adminAuditRetentionDays": {
+                "type": "object",
+                "properties": {
+                  "chosen": {
+                    "type": "number"
+                  },
+                  "effective": {
+                    "type": "number"
+                  },
+                  "min": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "chosen",
+                  "effective",
+                  "min"
+                ],
+                "additionalProperties": false
+              },
+              "adminWorkspaceAccess": {
+                "type": "object",
+                "properties": {
+                  "chosen": {
+                    "enum": [
+                      "full",
+                      "metadata",
+                      "off"
+                    ]
+                  },
+                  "effective": {
+                    "enum": [
+                      "full",
+                      "metadata",
+                      "off"
+                    ]
+                  },
+                  "max": {
+                    "enum": [
+                      "full",
+                      "metadata",
+                      "off"
+                    ]
+                  }
+                },
+                "required": [
+                  "chosen",
+                  "effective",
+                  "max"
+                ],
+                "additionalProperties": false
+              },
               "announcement": {
                 "type": "string"
               },
@@ -588,6 +806,8 @@
             },
             "required": [
               "accentColor",
+              "adminAuditRetentionDays",
+              "adminWorkspaceAccess",
               "announcement",
               "banner",
               "formats",
@@ -854,6 +1074,56 @@
       }
     },
     {
+      "id": "AdminApi.inspectWorkspace",
+      "service": "AdminApi",
+      "method": "inspectWorkspace",
+      "description": "Open a read-only view of a workspace to investigate it (see AdminWorkspaceView). The view runs\nat the lower of the level `options.access` asks for (\"metadata\" when absent) and the\ndeployment's level (AdminSettingsView.adminWorkspaceAccess.effective). Asking for \"full\" where\nthe deployment allows only \"metadata\" opens the view at \"metadata\", and its describe() reports\nthat. `reason` is required: it is recorded with the open and with every call made through the\nview, and is rejected when blank or, once trimmed, longer than MAX_ADMIN_ACCESS_REASON_LENGTH.\nThe open is recorded as an AdminAccessRecord (\"inspectWorkspace\") before the view is returned,\nso an open whose record cannot be written is refused.\n\nRefused with a code from ADMIN_ACCESS_ERROR_CODES, checked in this order: `notAdmin` once the\ncaller is no longer a deployment admin; `workspaceNotFound` for a malformed id; `accessOff`\nwhile the access level is \"off\", recorded in the deployment-wide log without the workspace\nbeing reached; `workspaceNotFound` for an id that names no workspace (never initialised or\nsince deleted), which this neither creates nor claims; `viewExpired` should the view's\nlifetime run out before the workspace answers. Only `accessOff` refusals are recorded.\n\nAdmin access is a deliberate exception to observer verification (see docs/observers.md): the\nadmin is never verified against the workspace's connections nor registered as an observer, and\nthe audit log is the compensating control.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspaceId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "options": {
+            "$ref": "#/$defs/AdminInspectOptions"
+          }
+        },
+        "required": [
+          "workspaceId",
+          "reason"
+        ],
+        "additionalProperties": false,
+        "$defs": {
+          "AdminInspectOptions": {
+            "type": "object",
+            "properties": {
+              "access": {
+                "$ref": "#/$defs/AdminViewAccess"
+              },
+              "lifetimeSeconds": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          },
+          "AdminViewAccess": {
+            "enum": [
+              "full",
+              "metadata"
+            ]
+          }
+        }
+      },
+      "returns": {
+        "x-capnweb-kind": "capability",
+        "x-capnweb-service": "AdminWorkspaceView"
+      },
+      "continuesOn": "AdminWorkspaceView"
+    },
+    {
       "id": "AdminApi.isBlueprintFeatured",
       "service": "AdminApi",
       "method": "isBlueprintFeatured",
@@ -879,6 +1149,507 @@
             "type": "null"
           }
         ]
+      }
+    },
+    {
+      "id": "AdminApi.listAdminAudit",
+      "service": "AdminApi",
+      "method": "listAdminAudit",
+      "description": "One page of the deployment-wide admin audit log, newest first: access to workspaces and\nchanges to settings, filtered as `options` says. Rejects a `limit` that is not a whole number\nfrom 1 to ADMIN_LIST_MAX_LIMIT, a filter over 1000 characters, and a malformed `cursor`.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "options": {
+            "$ref": "#/$defs/AdminAuditQuery"
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "$defs": {
+          "AdminAccessExposure": {
+            "enum": [
+              "content",
+              "metadata"
+            ]
+          },
+          "AdminAuditQuery": {
+            "type": "object",
+            "properties": {
+              "admin": {
+                "type": "string"
+              },
+              "cursor": {
+                "type": "string"
+              },
+              "exposed": {
+                "$ref": "#/$defs/AdminAccessExposure"
+              },
+              "kind": {
+                "enum": [
+                  "setting",
+                  "workspace"
+                ]
+              },
+              "limit": {
+                "type": "number"
+              },
+              "since": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "returns": {
+        "$ref": "#/$defs/AdminAuditPage",
+        "$defs": {
+          "AdminAccessExposure": {
+            "enum": [
+              "content",
+              "metadata"
+            ]
+          },
+          "AdminAccessRecord": {
+            "type": "object",
+            "properties": {
+              "access": {
+                "enum": [
+                  "full",
+                  "metadata",
+                  "off"
+                ]
+              },
+              "admin": {
+                "type": "string"
+              },
+              "args": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "exposed": {
+                "$ref": "#/$defs/AdminAccessExposure"
+              },
+              "kind": {
+                "const": "workspace"
+              },
+              "method": {
+                "enum": [
+                  "describe",
+                  "getChat",
+                  "getDiagnostics",
+                  "inspectWorkspace",
+                  "listActions",
+                  "listChats",
+                  "listFiles",
+                  "listGatekeepers",
+                  "readFile"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "refused": {
+                "enum": [
+                  "ADMIN_CONTENT_WITHHELD",
+                  "ADMIN_WORKSPACE_ACCESS_OFF"
+                ]
+              },
+              "requested": {
+                "$ref": "#/$defs/AdminViewAccess"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "via": {
+                "$ref": "#/$defs/AdminVia"
+              },
+              "workspaceId": {
+                "type": "string"
+              },
+              "workspaceTitle": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "access",
+              "admin",
+              "args",
+              "at",
+              "exposed",
+              "kind",
+              "method",
+              "reason",
+              "requested",
+              "sessionId",
+              "via",
+              "workspaceId",
+              "workspaceTitle"
+            ],
+            "additionalProperties": false
+          },
+          "AdminAuditPage": {
+            "type": "object",
+            "properties": {
+              "nextCursor": {
+                "type": "string"
+              },
+              "records": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AdminAuditRecord"
+                }
+              }
+            },
+            "required": [
+              "records"
+            ],
+            "additionalProperties": false
+          },
+          "AdminAuditRecord": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/AdminAccessRecord"
+              },
+              {
+                "$ref": "#/$defs/AdminSettingRecord"
+              }
+            ]
+          },
+          "AdminSettingChange": {
+            "type": "object",
+            "properties": {
+              "after": {
+                "type": "string"
+              },
+              "before": {
+                "type": "string"
+              },
+              "excerpt": {
+                "type": "object",
+                "properties": {
+                  "afterLength": {
+                    "type": "number"
+                  },
+                  "beforeLength": {
+                    "type": "number"
+                  },
+                  "offset": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "offset"
+                ],
+                "additionalProperties": false
+              },
+              "key": {
+                "type": "string"
+              },
+              "setting": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "setting"
+            ],
+            "additionalProperties": false
+          },
+          "AdminSettingRecord": {
+            "type": "object",
+            "properties": {
+              "admin": {
+                "type": "string"
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "changes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AdminSettingChange"
+                }
+              },
+              "kind": {
+                "const": "setting"
+              },
+              "method": {
+                "enum": [
+                  "addGatewayModel",
+                  "promoteFormat",
+                  "removeFormat",
+                  "removeGatewayModel",
+                  "setAccentColor",
+                  "setAdminAuditRetentionDays",
+                  "setAdminWorkspaceAccess",
+                  "setAnnouncement",
+                  "setBanner",
+                  "setBlueprintFeatured",
+                  "setDefaultReasoning",
+                  "setFormatOrder",
+                  "setGatekeeperMode",
+                  "setGatewayModelMode",
+                  "setGatewayModelSettings",
+                  "setGatewayProviderEnabled",
+                  "setInstanceInstructions",
+                  "setModelsDevSuggestions",
+                  "setResourceEnabled",
+                  "setSignupsEnabled",
+                  "setSiteLogo",
+                  "setSiteName",
+                  "setUpdateCheckIntervalMinutes",
+                  "setUpdateChecksEnabled",
+                  "setUpdateMinimumAgeHours",
+                  "setUpdateNoticeSnoozeHours",
+                  "setUserModelsEnabled",
+                  "setUserSearchEnabled",
+                  "updateFormat"
+                ]
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "via": {
+                "$ref": "#/$defs/AdminVia"
+              }
+            },
+            "required": [
+              "admin",
+              "at",
+              "changes",
+              "kind",
+              "method",
+              "sessionId",
+              "via"
+            ],
+            "additionalProperties": false
+          },
+          "AdminVia": {
+            "enum": [
+              "api",
+              "cli"
+            ]
+          },
+          "AdminViewAccess": {
+            "enum": [
+              "full",
+              "metadata"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminApi.listUsers",
+      "service": "AdminApi",
+      "method": "listUsers",
+      "description": "One page of the deployment's users, in id order: every account that has started a session\nsince the directory began recording accounts. Unaffected by setUserSearchEnabled(). A page\nholds at most `limit` users and stops early, with a `nextCursor`, once their ids and names\nwould pass a million characters: an id has no length limit of its own, so a count alone cannot\nbound a page. Rejects a `query` over 1000 characters or with a line break, and a `limit` that\nis not a whole number from 1 to ADMIN_LIST_MAX_LIMIT.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "options": {
+            "$ref": "#/$defs/AdminUserQuery"
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "$defs": {
+          "AdminUserQuery": {
+            "type": "object",
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "number"
+              },
+              "query": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "returns": {
+        "$ref": "#/$defs/AdminUserPage",
+        "$defs": {
+          "AdminUserPage": {
+            "type": "object",
+            "properties": {
+              "nextCursor": {
+                "type": "string"
+              },
+              "users": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AdminUserRecord"
+                }
+              }
+            },
+            "required": [
+              "users"
+            ],
+            "additionalProperties": false
+          },
+          "AdminUserRecord": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "id": {
+                "type": "string"
+              },
+              "isAdmin": {
+                "type": "boolean"
+              },
+              "lastLogin": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "isAdmin",
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminApi.listWorkspaces",
+      "service": "AdminApi",
+      "method": "listWorkspaces",
+      "description": "One page of the deployment's workspaces, in id order: every workspace opened since the\ndirectory began recording workspaces, deleted ones left out. A page stops early as\nlistUsers()'s does, counting ids, titles and owners. Rejects what listUsers() rejects.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "options": {
+            "$ref": "#/$defs/AdminWorkspaceQuery"
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "$defs": {
+          "AdminWorkspaceQuery": {
+            "type": "object",
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "number"
+              },
+              "owner": {
+                "type": "string"
+              },
+              "query": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "returns": {
+        "$ref": "#/$defs/AdminWorkspacePage",
+        "$defs": {
+          "AdminWorkspacePage": {
+            "type": "object",
+            "properties": {
+              "nextCursor": {
+                "type": "string"
+              },
+              "workspaces": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AdminWorkspaceRecord"
+                }
+              }
+            },
+            "required": [
+              "workspaces"
+            ],
+            "additionalProperties": false
+          },
+          "AdminWorkspaceRecord": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "id": {
+                "type": "string"
+              },
+              "lastActive": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "owner": {
+                "$ref": "#/$defs/UserDirectoryRecord"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "owner",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "UserDirectoryRecord": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        }
       }
     },
     {
@@ -961,6 +1732,54 @@
         },
         "required": [
           "color"
+        ],
+        "additionalProperties": false
+      },
+      "returns": {
+        "type": "null",
+        "x-capnweb-kind": "undefined"
+      }
+    },
+    {
+      "id": "AdminApi.setAdminAuditRetentionDays",
+      "service": "AdminApi",
+      "method": "setAdminAuditRetentionDays",
+      "description": "Set how many days the admin audit log keeps a record, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS by\ndefault. A record older than that is no longer listed or counted, and is deleted as the log is\nnext used; the copy kept in its workspace goes when that workspace is next inspected. Throws\nunless `days` is a whole number from the deployment's minimum\n(AdminSettingsView.adminAuditRetentionDays.min, set by its ADMIN_AUDIT_RETENTION_MIN_DAYS\nenvironment variable) to MAX_ADMIN_AUDIT_RETENTION_DAYS.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "days": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "days"
+        ],
+        "additionalProperties": false
+      },
+      "returns": {
+        "type": "null",
+        "x-capnweb-kind": "undefined"
+      }
+    },
+    {
+      "id": "AdminApi.setAdminWorkspaceAccess",
+      "service": "AdminApi",
+      "method": "setAdminWorkspaceAccess",
+      "description": "Set how much of a workspace inspectWorkspace() may show (see ADMIN_WORKSPACE_ACCESS_LEVELS),\nDEFAULT_ADMIN_WORKSPACE_ACCESS by default. Throws for a level above the deployment's maximum\n(AdminSettingsView.adminWorkspaceAccess.max), which only its ADMIN_WORKSPACE_ACCESS_MAX\nenvironment variable can raise. A view already minted runs at the lower of its own level and\nthe new one from its next call once the setting reaches it, within about a minute.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "access": {
+            "enum": [
+              "full",
+              "metadata",
+              "off"
+            ]
+          }
+        },
+        "required": [
+          "access"
         ],
         "additionalProperties": false
       },
@@ -2025,6 +2844,4438 @@
       }
     },
     {
+      "id": "AdminWorkspaceView.describe",
+      "service": "AdminWorkspaceView",
+      "method": "describe",
+      "description": "The workspace's metadata, owner, workpieces and collaborators, with the level this call ran\nat and the view's expiry.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "returns": {
+        "$ref": "#/$defs/AdminWorkspaceDescription",
+        "$defs": {
+          "AdminViewAccess": {
+            "enum": [
+              "full",
+              "metadata"
+            ]
+          },
+          "AdminWorkspaceDescription": {
+            "type": "object",
+            "properties": {
+              "access": {
+                "$ref": "#/$defs/AdminViewAccess"
+              },
+              "collaborators": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/CollaboratorInfo"
+                }
+              },
+              "containsRestrictedData": {
+                "type": "boolean"
+              },
+              "defaultGadgetId": {
+                "type": "number"
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "id": {
+                "type": "string"
+              },
+              "owner": {
+                "$ref": "#/$defs/AiChatAuthorInfo"
+              },
+              "ownerInvitesOnly": {
+                "type": "boolean"
+              },
+              "title": {
+                "type": "string"
+              },
+              "totalCost": {
+                "type": "number"
+              },
+              "workpieces": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/WorkpieceSummary"
+                }
+              }
+            },
+            "required": [
+              "access",
+              "collaborators",
+              "expiresAt",
+              "id",
+              "owner",
+              "title",
+              "workpieces"
+            ],
+            "additionalProperties": false
+          },
+          "AiChatAuthorInfo": {
+            "type": "object",
+            "properties": {
+              "commitEmail": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "agent",
+                  "gadget",
+                  "user"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "BlueprintOutput": {
+            "type": "object",
+            "properties": {
+              "icon": {
+                "enum": [
+                  "appWindow",
+                  "chartBar",
+                  "fileText",
+                  "flowArrow",
+                  "gridNine",
+                  "kanban",
+                  "listChecks",
+                  "notebook",
+                  "presentation",
+                  "table"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "noun": {
+                "type": "string"
+              },
+              "plural": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "icon",
+              "id",
+              "noun",
+              "plural"
+            ],
+            "additionalProperties": false
+          },
+          "CollaboratorInfo": {
+            "type": "object",
+            "properties": {
+              "addedBy": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/PermissionEdge"
+                }
+              },
+              "profile": {
+                "$ref": "#/$defs/AiChatAuthorInfo"
+              },
+              "role": {
+                "$ref": "#/$defs/CollaboratorRole"
+              }
+            },
+            "required": [
+              "addedBy",
+              "profile"
+            ],
+            "additionalProperties": false
+          },
+          "CollaboratorRole": {
+            "enum": [
+              "build",
+              "use"
+            ]
+          },
+          "GadgetSummary": {
+            "type": "object",
+            "properties": {
+              "chatId": {
+                "type": "number"
+              },
+              "commitId": {
+                "type": "string"
+              },
+              "id": {
+                "type": "number"
+              },
+              "output": {
+                "$ref": "#/$defs/BlueprintOutput"
+              },
+              "title": {
+                "type": "string"
+              },
+              "type": {
+                "const": "gadget"
+              },
+              "upstream": {
+                "$ref": "#/$defs/GadgetUpstream"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "GadgetUpstream": {
+            "type": "object",
+            "properties": {
+              "blueprintId": {
+                "type": "string"
+              },
+              "commitId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "PermissionEdge": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "keyId": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "$ref": "#/$defs/CollaboratorRole"
+                  },
+                  "type": {
+                    "const": "shareKey"
+                  }
+                },
+                "required": [
+                  "created",
+                  "keyId",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "$ref": "#/$defs/CollaboratorRole"
+                  },
+                  "sharer": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "user"
+                  }
+                },
+                "required": [
+                  "created",
+                  "sharer",
+                  "type"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "WorkpieceSummary": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/GadgetSummary"
+              },
+              {
+                "$ref": "#/$defs/WorktreeSummary"
+              }
+            ]
+          },
+          "WorktreeSummary": {
+            "type": "object",
+            "properties": {
+              "baseCommit": {
+                "type": "string"
+              },
+              "chatId": {
+                "type": "number"
+              },
+              "headCommit": {
+                "type": "string"
+              },
+              "id": {
+                "type": "number"
+              },
+              "pinBase": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "type": {
+                "const": "worktree"
+              }
+            },
+            "required": [
+              "baseCommit",
+              "chatId",
+              "headCommit",
+              "id",
+              "pinBase",
+              "title",
+              "type"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.getChat",
+      "service": "AdminWorkspaceView",
+      "method": "getChat",
+      "description": "One page of a chat's messages, as Overseer.getChatHistory() pages them. Content: refused below\n\"full\".",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "chatId": {
+            "type": "number"
+          },
+          "beforeSequence": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "chatId"
+        ],
+        "additionalProperties": false
+      },
+      "returns": {
+        "$ref": "#/$defs/AiChatHistoryPage",
+        "$defs": {
+          "ActionDescription": {
+            "type": "object",
+            "properties": {
+              "actionKind": {
+                "$ref": "#/$defs/ActionKind"
+              },
+              "autoApprovable": {
+                "type": "boolean"
+              },
+              "awaitDecision": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "descriptionIsComplete": {
+                "type": "boolean"
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ActionField"
+                }
+              },
+              "implementsRevert": {
+                "type": "boolean"
+              },
+              "pushedCommits": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "implementsRevert",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "ActionField": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "kind": {
+                    "const": "list"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "items",
+                  "kind",
+                  "label"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "file"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "origin": {
+                    "enum": [
+                      "agent",
+                      "provider"
+                    ]
+                  },
+                  "sha256": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "number"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "mediaType",
+                  "name",
+                  "origin",
+                  "size"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "inline"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "value"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "json"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "value"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "syntax": {
+                    "$ref": "#/$defs/ActionFieldSyntax"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "ActionFieldSyntax": {
+            "enum": [
+              "html",
+              "markdown",
+              "sql"
+            ]
+          },
+          "ActionKind": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "tag": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "tag"
+            ],
+            "additionalProperties": false
+          },
+          "ActionLogEntry": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "appliedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "autoApproved": {
+                    "type": "boolean"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "creation": {
+                    "const": true
+                  },
+                  "description": {
+                    "$ref": "#/$defs/ActionDescription"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "id": {
+                    "type": "number"
+                  },
+                  "resolvedBy": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/ActionState"
+                  },
+                  "type": {
+                    "const": "action"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "description",
+                  "id",
+                  "resourceTitle",
+                  "state",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "appliedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "description": {
+                    "$ref": "#/$defs/HookDescription"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "hookId": {
+                    "type": "number"
+                  },
+                  "id": {
+                    "type": "number"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/ActionState"
+                  },
+                  "type": {
+                    "const": "bindHook"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "description",
+                  "enabled",
+                  "id",
+                  "resourceTitle",
+                  "state",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "appliedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "description": {
+                    "$ref": "#/$defs/ObservationDescription"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "id": {
+                    "type": "number"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/ActionState"
+                  },
+                  "type": {
+                    "const": "observation"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "description",
+                  "id",
+                  "resourceTitle",
+                  "state",
+                  "type"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "ActionState": {
+            "enum": [
+              "approved",
+              "pending",
+              "rejected"
+            ]
+          },
+          "AgentCatalog": {
+            "type": "object",
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AgentCatalogEntry"
+                }
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "entries"
+            ],
+            "additionalProperties": false
+          },
+          "AgentCatalogEntry": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "id",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "AiChatAuthorInfo": {
+            "type": "object",
+            "properties": {
+              "commitEmail": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "agent",
+                  "gadget",
+                  "user"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "AiChatHistoryPage": {
+            "type": "object",
+            "properties": {
+              "compacted": {
+                "type": "object",
+                "properties": {
+                  "proposedChange": {
+                    "$ref": "#/$defs/CodeChange"
+                  },
+                  "summary": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "summary",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              "messages": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AiChatMessage"
+                }
+              }
+            },
+            "required": [
+              "messages"
+            ],
+            "additionalProperties": false
+          },
+          "AiChatMessage": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "actionId": {
+                    "type": "number"
+                  },
+                  "actionLog": {
+                    "$ref": "#/$defs/ActionLogEntry"
+                  },
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "action"
+                  }
+                },
+                "required": [
+                  "actionId",
+                  "author",
+                  "chatId",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "addedBindings": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "gadgetId": {
+                          "type": "number"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "target": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "gadgetId",
+                        "name",
+                        "target"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "blueprintMerges": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/BlueprintMerge"
+                    }
+                  },
+                  "change": {
+                    "$ref": "#/$defs/CodeChange"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "conversionBoundary": {
+                    "const": true
+                  },
+                  "createdGadgets": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "bindingName": {
+                          "type": "string"
+                        },
+                        "gadgetId": {
+                          "type": "number"
+                        },
+                        "title": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "bindingName",
+                        "gadgetId",
+                        "title"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "createdWorktrees": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "bindingName": {
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": "string"
+                        },
+                        "worktreeId": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "bindingName",
+                        "title",
+                        "worktreeId"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "mainlineMerge": {
+                    "type": "object",
+                    "properties": {
+                      "conflictPaths": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "gadgets": {
+                        "type": "array",
+                        "items": {
+                          "$ref": "#/$defs/MainlineMergeGadget"
+                        }
+                      }
+                    },
+                    "required": [
+                      "conflictPaths"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "pins": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/ChatGadgetPinRecord"
+                    }
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "changes"
+                  },
+                  "watermark": {
+                    "type": "object",
+                    "properties": {
+                      "changesGeneration": {
+                        "type": "number"
+                      },
+                      "throughRevision": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "changesGeneration",
+                      "throughRevision"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "worktreeCommits": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "commit": {
+                          "type": "string"
+                        },
+                        "previousHead": {
+                          "type": "string"
+                        },
+                        "worktreeId": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "commit",
+                        "previousHead",
+                        "worktreeId"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "argsSummary": {
+                    "type": "string"
+                  },
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "bindingName": {
+                    "type": "string"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "methodName": {
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "agentCallback"
+                  }
+                },
+                "required": [
+                  "argsSummary",
+                  "author",
+                  "chatId",
+                  "methodName",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "attachments": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/ChatAttachmentRef"
+                    }
+                  },
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "capsules": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/CapsuleSpecifier"
+                    }
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "formats": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/MessageFormatRef"
+                    }
+                  },
+                  "generatedBySlashCommandSequence": {
+                    "type": "number"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "reasoning": {
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "steered": {
+                    "const": true
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "toolCalls": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/AiToolCall"
+                    }
+                  },
+                  "type": {
+                    "const": "message"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "message",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "bindingName": {
+                    "type": "string"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "requestId": {
+                    "type": "string"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "resourceUrlPattern": {
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "state": {
+                    "enum": [
+                      "accepted",
+                      "denied",
+                      "pending"
+                    ]
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "connectionRequest"
+                  },
+                  "vendorId": {
+                    "type": "string"
+                  },
+                  "vendorLogoUrl": {
+                    "type": "string"
+                  },
+                  "vendorName": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "reason",
+                  "requestId",
+                  "sequence",
+                  "state",
+                  "timestamp",
+                  "type",
+                  "vendorId",
+                  "vendorName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "error"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "message",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "commits": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "commitId": {
+                          "type": "string"
+                        },
+                        "gadgetId": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "commitId",
+                        "gadgetId"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "epochBoundary": {
+                    "const": true
+                  },
+                  "mergeThrough": {
+                    "type": "number"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "merge"
+                  },
+                  "version": {
+                    "type": "number"
+                  },
+                  "worktreePins": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "baseCommit": {
+                          "type": "string"
+                        },
+                        "worktreeId": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "baseCommit",
+                        "worktreeId"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "commits",
+                  "mergeThrough",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "request": {
+                    "$ref": "#/$defs/SlashCommandRequest"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "skillName": {
+                    "type": "string"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "slashCommand"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "request",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "resources": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/AlwaysAvailableResource"
+                    }
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "catalogChange"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "resources",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "revertFrom": {
+                    "type": "number"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "revert"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "revertFrom",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "agentNudge"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "sequence",
+                  "text",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "author": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "chatId": {
+                    "type": "number"
+                  },
+                  "sequence": {
+                    "type": "number"
+                  },
+                  "timestamp": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "type": {
+                    "const": "useGadget"
+                  }
+                },
+                "required": [
+                  "author",
+                  "chatId",
+                  "sequence",
+                  "timestamp",
+                  "type"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "AiToolCall": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "bindingName": {
+                        "type": "string"
+                      },
+                      "blueprintId": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "bindingName",
+                      "title"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "object",
+                    "properties": {
+                      "blueprintNotes": {
+                        "type": "string"
+                      },
+                      "changeId": {
+                        "type": "number"
+                      },
+                      "gadgetId": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "gadgetId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "createGadget"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "bindingName": {
+                        "type": "string"
+                      },
+                      "capsuleId": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "bindingName",
+                      "capsuleId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "saveCapsuleAsBinding"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "bindingName": {
+                        "type": "string"
+                      },
+                      "commitId": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "bindingName",
+                      "commitId",
+                      "title"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "object",
+                    "properties": {
+                      "baseCommit": {
+                        "type": "string"
+                      },
+                      "changeId": {
+                        "type": "number"
+                      },
+                      "worktreeId": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "baseCommit",
+                      "worktreeId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "createWorktree"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "bindingName": {
+                        "type": "string"
+                      },
+                      "entrypoint": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "bindingName",
+                      "entrypoint"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "setBindingHook"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "bindingName": {
+                        "type": "string"
+                      },
+                      "resourceUrlPattern": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": "string"
+                      },
+                      "vendorId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "bindingName",
+                      "resourceUrlPattern",
+                      "title",
+                      "vendorId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "object",
+                    "properties": {
+                      "gatekeeperId": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "gatekeeperId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "createExternalResource"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "bindingName": {
+                        "type": "string"
+                      },
+                      "reason": {
+                        "type": "string"
+                      },
+                      "resourceUrl": {
+                        "type": "string"
+                      },
+                      "vendorId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "reason",
+                      "vendorId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "requestConnection"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "code": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "code"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "executeCode"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "content": {
+                        "type": "string"
+                      },
+                      "filename": {
+                        "type": "string"
+                      },
+                      "workpiece": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "content",
+                      "filename"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "writeFile"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "error": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "error"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "giveUp"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "filename": {
+                        "type": "string"
+                      },
+                      "lineCount": {
+                        "type": "number"
+                      },
+                      "startLine": {
+                        "type": "number"
+                      },
+                      "workpiece": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "filename"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "observedCommit": {
+                    "type": "string"
+                  },
+                  "observedOid": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "readFile"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "filename": {
+                        "type": "string"
+                      },
+                      "replacement": {
+                        "type": "string"
+                      },
+                      "textToReplace": {
+                        "type": "string"
+                      },
+                      "workpiece": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "filename",
+                      "replacement",
+                      "textToReplace"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "editFile"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "gadget": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "source": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "gadget",
+                      "source"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "object",
+                    "properties": {
+                      "changeId": {
+                        "type": "number"
+                      },
+                      "gadgetId": {
+                        "type": "number"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "target": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "changeId",
+                      "gadgetId",
+                      "name",
+                      "target"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "setGadgetBinding"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "gadget": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "describeBinding"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "pattern": {
+                        "type": "string"
+                      },
+                      "workpiece": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "pattern",
+                      "workpiece"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "grep"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "raw": {
+                        "type": "boolean"
+                      },
+                      "url": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "url"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "webFetch"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "vendorId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "vendorId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "listConnectableResources"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "listBlueprints"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                  },
+                  "observedCodeVersion": {
+                    "type": "number"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "toolName": {
+                    "const": "observeUserChanges"
+                  }
+                },
+                "required": [
+                  "input",
+                  "toolCallId",
+                  "toolName"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "AlwaysAvailableResource": {
+            "type": "object",
+            "properties": {
+              "catalog": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/$defs/AgentCatalog"
+                  }
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "catalog",
+              "name",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "BlueprintBinding": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string"
+                  },
+                  "env": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": {
+                      "$ref": "#/$defs/SpawnerEnvTarget"
+                    }
+                  },
+                  "spawnerOnly": {
+                    "const": true
+                  },
+                  "suggestedModel": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "modelName": {
+                            "type": "string"
+                          },
+                          "provider": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "modelName",
+                          "provider"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "agentSpawner"
+                  }
+                },
+                "required": [
+                  "description",
+                  "env",
+                  "title",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string"
+                  },
+                  "gatekeeperName": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "spawnerOnly": {
+                    "const": true
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "gatekeeper"
+                  },
+                  "typeUrlPattern": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "description",
+                  "gatekeeperName",
+                  "title",
+                  "type",
+                  "typeUrlPattern"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string"
+                  },
+                  "modelKind": {
+                    "$ref": "#/$defs/ModelKind"
+                  },
+                  "spawnerOnly": {
+                    "const": true
+                  },
+                  "suggestedModel": {
+                    "type": "object",
+                    "properties": {
+                      "modelName": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "modelName",
+                      "provider"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "aiModel"
+                  }
+                },
+                "required": [
+                  "description",
+                  "title",
+                  "type"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "BlueprintMerge": {
+            "type": "object",
+            "properties": {
+              "baseCommit": {
+                "type": "string"
+              },
+              "blueprintId": {
+                "type": "string"
+              },
+              "commitId": {
+                "type": "string"
+              },
+              "conflictPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "gadgetId": {
+                "type": "number"
+              },
+              "kind": {
+                "enum": [
+                  "fastForward",
+                  "follow",
+                  "merge"
+                ]
+              },
+              "missingBindings": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {
+                  "$ref": "#/$defs/BlueprintBinding"
+                }
+              },
+              "title": {
+                "type": "string"
+              },
+              "unverifiedBase": {
+                "const": true
+              },
+              "version": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "blueprintId",
+              "commitId",
+              "conflictPaths",
+              "gadgetId",
+              "kind",
+              "title",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "BytesRef": {
+            "type": "object",
+            "properties": {
+              "byteLength": {
+                "type": "number"
+              },
+              "oid": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "byteLength",
+              "oid"
+            ],
+            "additionalProperties": false
+          },
+          "CapsuleSpecifier": {
+            "type": "object",
+            "properties": {
+              "bindingName": {
+                "type": "string"
+              },
+              "description": {
+                "$ref": "#/$defs/ResourceDescription"
+              },
+              "gatekeeperId": {
+                "type": "number"
+              },
+              "length": {
+                "type": "number"
+              },
+              "position": {
+                "type": "number"
+              },
+              "vendorId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "gatekeeperId",
+              "length",
+              "position"
+            ],
+            "additionalProperties": false
+          },
+          "ChatAttachmentRef": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "string",
+                "contentEncoding": "base64",
+                "x-capnweb-kind": "bytes"
+              },
+              "id": {
+                "type": "string"
+              },
+              "mimeType": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "oid": {
+                "type": "string"
+              },
+              "size": {
+                "type": "number"
+              },
+              "workspacePath": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "mimeType",
+              "size"
+            ],
+            "additionalProperties": false
+          },
+          "ChatGadgetPinRecord": {
+            "type": "object",
+            "properties": {
+              "baseCommit": {
+                "type": "string"
+              },
+              "gadgetId": {
+                "type": "number"
+              },
+              "mergedCommit": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "baseCommit",
+              "gadgetId"
+            ],
+            "additionalProperties": false
+          },
+          "CodeChange": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/FileChange"
+                  }
+                ],
+                "minItems": 2,
+                "items": false
+              }
+            }
+          },
+          "FileChange": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "edit": {
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "array",
+                          "prefixItems": [
+                            {
+                              "type": "number"
+                            }
+                          ],
+                          "minItems": 1,
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "edit"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "remove": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "remove"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "set": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "set"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "setBytes": {
+                    "$ref": "#/$defs/BytesRef"
+                  }
+                },
+                "required": [
+                  "setBytes"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "HookDescription": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "MainlineMergeGadget": {
+            "type": "object",
+            "properties": {
+              "baseCommit": {
+                "type": "string"
+              },
+              "chatCommit": {
+                "type": "string"
+              },
+              "conflictPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "gadgetId": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "baseCommit",
+              "chatCommit",
+              "conflictPaths",
+              "gadgetId"
+            ],
+            "additionalProperties": false
+          },
+          "MessageFormatRef": {
+            "type": "object",
+            "properties": {
+              "icon": {
+                "enum": [
+                  "appWindow",
+                  "chartBar",
+                  "fileText",
+                  "flowArrow",
+                  "gridNine",
+                  "kanban",
+                  "listChecks",
+                  "notebook",
+                  "presentation",
+                  "table"
+                ]
+              },
+              "length": {
+                "type": "number"
+              },
+              "noun": {
+                "type": "string"
+              },
+              "position": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "icon",
+              "length",
+              "noun",
+              "position"
+            ],
+            "additionalProperties": false
+          },
+          "ModelKind": {
+            "enum": [
+              "decision",
+              "language"
+            ]
+          },
+          "ObservationDescription": {
+            "type": "object",
+            "properties": {
+              "containsRestrictedData": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "excludeObservers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ActionField"
+                }
+              },
+              "ownerInvitesOnly": {
+                "type": "boolean"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "ResourceDescription": {
+            "type": "object",
+            "properties": {
+              "hasSlashCommands": {
+                "const": true
+              },
+              "hookTsType": {
+                "type": "string"
+              },
+              "snippet": {
+                "type": "string"
+              },
+              "suggestedBindingName": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "tsType": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "snippet",
+              "suggestedBindingName",
+              "title",
+              "tsType",
+              "url"
+            ],
+            "additionalProperties": false
+          },
+          "SlashCommandId": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "builtin": {
+                    "const": true
+                  },
+                  "commandId": {
+                    "const": "compact"
+                  }
+                },
+                "required": [
+                  "builtin",
+                  "commandId"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "builtin": {
+                    "type": "null",
+                    "x-capnweb-kind": "undefined"
+                  },
+                  "commandId": {
+                    "type": "string"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "commandId",
+                  "gatekeeperId"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "SlashCommandRequest": {
+            "type": "object",
+            "properties": {
+              "args": {
+                "type": "string"
+              },
+              "commandPosition": {
+                "type": "number"
+              },
+              "id": {
+                "$ref": "#/$defs/SlashCommandId"
+              }
+            },
+            "required": [
+              "args",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "SpawnerEnvTarget": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "binding"
+                  }
+                },
+                "required": [
+                  "name",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "gadget"
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.getDiagnostics",
+      "service": "AdminWorkspaceView",
+      "method": "getDiagnostics",
+      "description": "The workspace's operational state, with its most recent admin access records.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "returns": {
+        "$ref": "#/$defs/AdminWorkspaceDiagnostics",
+        "$defs": {
+          "AdminAccessExposure": {
+            "enum": [
+              "content",
+              "metadata"
+            ]
+          },
+          "AdminAccessRecord": {
+            "type": "object",
+            "properties": {
+              "access": {
+                "enum": [
+                  "full",
+                  "metadata",
+                  "off"
+                ]
+              },
+              "admin": {
+                "type": "string"
+              },
+              "args": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "exposed": {
+                "$ref": "#/$defs/AdminAccessExposure"
+              },
+              "kind": {
+                "const": "workspace"
+              },
+              "method": {
+                "enum": [
+                  "describe",
+                  "getChat",
+                  "getDiagnostics",
+                  "inspectWorkspace",
+                  "listActions",
+                  "listChats",
+                  "listFiles",
+                  "listGatekeepers",
+                  "readFile"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "refused": {
+                "enum": [
+                  "ADMIN_CONTENT_WITHHELD",
+                  "ADMIN_WORKSPACE_ACCESS_OFF"
+                ]
+              },
+              "requested": {
+                "$ref": "#/$defs/AdminViewAccess"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "via": {
+                "$ref": "#/$defs/AdminVia"
+              },
+              "workspaceId": {
+                "type": "string"
+              },
+              "workspaceTitle": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "access",
+              "admin",
+              "args",
+              "at",
+              "exposed",
+              "kind",
+              "method",
+              "reason",
+              "requested",
+              "sessionId",
+              "via",
+              "workspaceId",
+              "workspaceTitle"
+            ],
+            "additionalProperties": false
+          },
+          "AdminVia": {
+            "enum": [
+              "api",
+              "cli"
+            ]
+          },
+          "AdminViewAccess": {
+            "enum": [
+              "full",
+              "metadata"
+            ]
+          },
+          "AdminWorkspaceDiagnostics": {
+            "type": "object",
+            "properties": {
+              "activeAgentChatIds": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              },
+              "chats": {
+                "type": "number"
+              },
+              "hooks": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "number"
+                  },
+                  "total": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "enabled",
+                  "total"
+                ],
+                "additionalProperties": false
+              },
+              "instanceStartedAt": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "nextAlarm": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "observers": {
+                "type": "number"
+              },
+              "ownerRegistrationPending": {
+                "type": "boolean"
+              },
+              "pendingActions": {
+                "type": "number"
+              },
+              "pendingAgentCalls": {
+                "type": "number"
+              },
+              "recentAdminAccess": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/AdminAccessRecord"
+                }
+              },
+              "sessions": {
+                "type": "object",
+                "properties": {
+                  "build": {
+                    "type": "number"
+                  },
+                  "owner": {
+                    "type": "number"
+                  },
+                  "use": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "build",
+                  "owner",
+                  "use"
+                ],
+                "additionalProperties": false
+              },
+              "storageVersion": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "activeAgentChatIds",
+              "chats",
+              "hooks",
+              "instanceStartedAt",
+              "observers",
+              "ownerRegistrationPending",
+              "pendingActions",
+              "pendingAgentCalls",
+              "recentAdminAccess",
+              "sessions",
+              "storageVersion"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.listActions",
+      "service": "AdminWorkspaceView",
+      "method": "listActions",
+      "description": "One page of the workspace's action log, as Overseer.listActions() pages it. Admin access is\nnever in it (see AdminAccessRecord). Below \"full\", every action, observation and hook entry has\nan empty `description.description` and no `description.fields`: titles, states, resources and\ntimes remain.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "options": {
+            "type": "object",
+            "properties": {
+              "beforeId": {
+                "type": "number"
+              },
+              "filter": {
+                "$ref": "#/$defs/ActionHistoryFilter"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "$defs": {
+          "ActionHistoryFilter": {
+            "enum": [
+              "action",
+              "all",
+              "bindHook",
+              "observation",
+              "pending"
+            ]
+          }
+        }
+      },
+      "returns": {
+        "$ref": "#/$defs/ActionHistoryPage",
+        "$defs": {
+          "ActionDescription": {
+            "type": "object",
+            "properties": {
+              "actionKind": {
+                "$ref": "#/$defs/ActionKind"
+              },
+              "autoApprovable": {
+                "type": "boolean"
+              },
+              "awaitDecision": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "descriptionIsComplete": {
+                "type": "boolean"
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ActionField"
+                }
+              },
+              "implementsRevert": {
+                "type": "boolean"
+              },
+              "pushedCommits": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "implementsRevert",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "ActionField": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "kind": {
+                    "const": "list"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "items",
+                  "kind",
+                  "label"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "file"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "origin": {
+                    "enum": [
+                      "agent",
+                      "provider"
+                    ]
+                  },
+                  "sha256": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "number"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "mediaType",
+                  "name",
+                  "origin",
+                  "size"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "inline"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "value"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "json"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "value"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "syntax": {
+                    "$ref": "#/$defs/ActionFieldSyntax"
+                  },
+                  "truncated": {
+                    "type": "object",
+                    "properties": {
+                      "shownBytes": {
+                        "type": "number"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "shownBytes",
+                      "totalBytes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "label",
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "ActionFieldSyntax": {
+            "enum": [
+              "html",
+              "markdown",
+              "sql"
+            ]
+          },
+          "ActionHistoryPage": {
+            "type": "object",
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ActionLogEntry"
+                }
+              },
+              "nextBeforeId": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "entries"
+            ],
+            "additionalProperties": false
+          },
+          "ActionKind": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "tag": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "tag"
+            ],
+            "additionalProperties": false
+          },
+          "ActionLogEntry": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "appliedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "autoApproved": {
+                    "type": "boolean"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "creation": {
+                    "const": true
+                  },
+                  "description": {
+                    "$ref": "#/$defs/ActionDescription"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "id": {
+                    "type": "number"
+                  },
+                  "resolvedBy": {
+                    "$ref": "#/$defs/AiChatAuthorInfo"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/ActionState"
+                  },
+                  "type": {
+                    "const": "action"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "description",
+                  "id",
+                  "resourceTitle",
+                  "state",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "appliedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "description": {
+                    "$ref": "#/$defs/HookDescription"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "hookId": {
+                    "type": "number"
+                  },
+                  "id": {
+                    "type": "number"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/ActionState"
+                  },
+                  "type": {
+                    "const": "bindHook"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "description",
+                  "enabled",
+                  "id",
+                  "resourceTitle",
+                  "state",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "appliedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "x-capnweb-kind": "date"
+                  },
+                  "description": {
+                    "$ref": "#/$defs/ObservationDescription"
+                  },
+                  "gatekeeperId": {
+                    "type": "number"
+                  },
+                  "id": {
+                    "type": "number"
+                  },
+                  "resourceTitle": {
+                    "type": "string"
+                  },
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/ActionState"
+                  },
+                  "type": {
+                    "const": "observation"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "description",
+                  "id",
+                  "resourceTitle",
+                  "state",
+                  "type"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "ActionState": {
+            "enum": [
+              "approved",
+              "pending",
+              "rejected"
+            ]
+          },
+          "AiChatAuthorInfo": {
+            "type": "object",
+            "properties": {
+              "commitEmail": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "agent",
+                  "gadget",
+                  "user"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "HookDescription": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "ObservationDescription": {
+            "type": "object",
+            "properties": {
+              "containsRestrictedData": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "excludeObservers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ActionField"
+                }
+              },
+              "ownerInvitesOnly": {
+                "type": "boolean"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "title"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.listChats",
+      "service": "AdminWorkspaceView",
+      "method": "listChats",
+      "description": "The workspace's chats, newest first, as Overseer.listChats() lists them; below \"full\", without\n`queuedSteers`, which hold message text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "returns": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AiChatMetadata"
+        },
+        "$defs": {
+          "AiChatAuthorInfo": {
+            "type": "object",
+            "properties": {
+              "commitEmail": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "agent",
+                  "gadget",
+                  "user"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "AiChatMetadata": {
+            "type": "object",
+            "properties": {
+              "activeAgent": {
+                "$ref": "#/$defs/AiChatAuthorInfo"
+              },
+              "cacheReadTokens": {
+                "type": "number"
+              },
+              "cacheWriteTokens": {
+                "type": "number"
+              },
+              "codeBase": {
+                "$ref": "#/$defs/ChatCodeBase"
+              },
+              "compactedTo": {
+                "type": "number"
+              },
+              "id": {
+                "type": "number"
+              },
+              "lastActive": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "promptTokens": {
+                "type": "number"
+              },
+              "proposedChangeWorkpieces": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              },
+              "queuedSteers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "author": {
+                      "$ref": "#/$defs/AiChatAuthorInfo"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "author",
+                    "text"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "spawnerName": {
+                "type": "string"
+              },
+              "started": {
+                "type": "string",
+                "format": "date-time",
+                "x-capnweb-kind": "date"
+              },
+              "title": {
+                "type": "string"
+              },
+              "totalCost": {
+                "type": "number"
+              },
+              "totalTokens": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "id",
+              "lastActive",
+              "started",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "ChatCodeBase": {
+            "type": "object",
+            "properties": {
+              "epoch": {
+                "type": "number"
+              },
+              "generation": {
+                "type": "number"
+              },
+              "pins": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ChatGadgetPinState"
+                }
+              },
+              "prior": {
+                "type": "object",
+                "properties": {
+                  "discontinuousGadgets": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    }
+                  },
+                  "finalRevision": {
+                    "type": "number"
+                  },
+                  "generation": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "discontinuousGadgets",
+                  "finalRevision",
+                  "generation"
+                ],
+                "additionalProperties": false
+              },
+              "revision": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "generation",
+              "pins",
+              "revision"
+            ],
+            "additionalProperties": false
+          },
+          "ChatGadgetPinState": {
+            "type": "object",
+            "properties": {
+              "baseCommit": {
+                "type": "string"
+              },
+              "gadgetId": {
+                "type": "number"
+              },
+              "mergedCommit": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "baseCommit",
+              "gadgetId",
+              "mergedCommit"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.listFiles",
+      "service": "AdminWorkspaceView",
+      "method": "listFiles",
+      "description": "The tree of a gadget's committed head, as Overseer.listTree() gives it, read only from the\nobjects the workspace stores: it never pulls through a connection, and throws when an object\nis missing. Only a permanent gadget has a head to read: throws for a pending gadget, a\nworktree, or an id that names no gadget.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "gadgetId": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "gadgetId"
+        ],
+        "additionalProperties": false
+      },
+      "returns": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/TreeNode"
+        },
+        "$defs": {
+          "TreeNode": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "children": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/TreeNode"
+                    }
+                  },
+                  "kind": {
+                    "const": "dir"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "children",
+                  "kind",
+                  "name"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "executable",
+                      "file",
+                      "submodule",
+                      "symlink"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.listGatekeepers",
+      "service": "AdminWorkspaceView",
+      "method": "listGatekeepers",
+      "description": "The workspace's connections, oldest first, with their bindings and hooks.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "returns": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AdminGatekeeperInfo"
+        },
+        "$defs": {
+          "AdminGatekeeperInfo": {
+            "type": "object",
+            "properties": {
+              "bindings": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "chatId": {
+                      "type": "number"
+                    },
+                    "gadgetId": {
+                      "type": "number"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "gadgetId",
+                    "name"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "creationSpec": {
+                "$ref": "#/$defs/GatekeeperCreationSpec"
+              },
+              "hooks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/BoundHookInfo"
+                }
+              },
+              "id": {
+                "type": "number"
+              },
+              "resourceTitle": {
+                "type": "string"
+              },
+              "resourceUrl": {
+                "type": "string"
+              },
+              "vendorId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "bindings",
+              "hooks",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "AgentSpawnerConfig": {
+            "type": "object",
+            "properties": {
+              "displayName": {
+                "type": "string"
+              },
+              "env": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {
+                  "type": "number"
+                }
+              },
+              "modelId": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "displayName",
+              "env",
+              "modelId"
+            ],
+            "additionalProperties": false
+          },
+          "BoundHookInfo": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "$ref": "#/$defs/HookDescription"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "gadgetId": {
+                "type": "number"
+              },
+              "gatekeeperId": {
+                "type": "number"
+              },
+              "id": {
+                "type": "number"
+              },
+              "resourceTitle": {
+                "type": "string"
+              },
+              "resourceUrl": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "enabled",
+              "gadgetId",
+              "gatekeeperId",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "GatekeeperCreationSpec": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "accountId": {
+                    "type": "number"
+                  },
+                  "type": {
+                    "const": "ambient"
+                  },
+                  "vendorId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "accountId",
+                  "type",
+                  "vendorId"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "config": {
+                    "$ref": "#/$defs/AgentSpawnerConfig"
+                  },
+                  "modelName": {
+                    "type": "string"
+                  },
+                  "modelProvider": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "agentSpawner"
+                  }
+                },
+                "required": [
+                  "config",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "modelId": {
+                    "type": "string"
+                  },
+                  "modelName": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "aiModel"
+                  }
+                },
+                "required": [
+                  "modelId",
+                  "modelName",
+                  "provider",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "resourceUrl": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "gatekeeper"
+                  },
+                  "typeUrlPattern": {
+                    "type": "string"
+                  },
+                  "vendorId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "typeUrlPattern",
+                  "vendorId"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "HookDescription": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "title"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "AdminWorkspaceView.readFile",
+      "service": "AdminWorkspaceView",
+      "method": "readFile",
+      "description": "One file of a gadget's committed head, as Overseer.readFilesAtCommit() reports it, read as\nlistFiles() reads and refused as it is. Content: refused below \"full\".",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "gadgetId": {
+            "type": "number"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "gadgetId",
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "returns": {
+        "$ref": "#/$defs/FileAtCommit",
+        "$defs": {
+          "FileAtCommit": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "absent"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "text"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "text"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "unreadable"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "id": "AuthenticatedApi.addBlueprintToLibrary",
       "service": "AuthenticatedApi",
       "method": "addBlueprintToLibrary",
@@ -2518,12 +7769,33 @@
       "id": "AuthenticatedApi.getAdminApi",
       "service": "AuthenticatedApi",
       "method": "getAdminApi",
-      "description": "Returns a capability for managing deployment-wide admin settings, or null when the caller is not\nan admin. The access check happens once here, so the returned stub's methods need no per-call\nchecks. (Authentication config — sign-in providers, password login — is intentionally not\nmanaged here; it stays env-var driven.)",
+      "description": "Returns a capability for managing and investigating the deployment as an admin, or null when\nthe caller is not one. The access check happens here, once, for every AdminApi method but\nworkspace inspection: AdminApi.inspectWorkspace() and each call on the view it mints check\nagain (see AdminWorkspaceView). `options.via` labels every audit record the capability makes.\n(Authentication config — sign-in providers, password login — is intentionally not managed\nhere; it stays env-var driven.)",
       "inputSchema": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "options": {
+            "$ref": "#/$defs/AdminApiOptions"
+          }
+        },
         "required": [],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "$defs": {
+          "AdminApiOptions": {
+            "type": "object",
+            "properties": {
+              "via": {
+                "$ref": "#/$defs/AdminVia"
+              }
+            },
+            "additionalProperties": false
+          },
+          "AdminVia": {
+            "enum": [
+              "api",
+              "cli"
+            ]
+          }
+        }
       },
       "returns": {
         "anyOf": [
