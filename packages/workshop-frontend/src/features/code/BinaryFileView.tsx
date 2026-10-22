@@ -74,8 +74,8 @@ export const BinaryFileView = ({ filename, blob, readBlob }: BinaryFileViewProps
     )
   }
   return (
-    <div className="flex h-full items-center justify-center overflow-auto bg-kumo-base p-4">
-      <img src={loaded.url} alt={filename} className="max-h-full max-w-full object-contain" />
+    <div className="h-full bg-kumo-base p-4">
+      <img src={loaded.url} alt={filename} className="h-full w-full object-contain" />
     </div>
   )
 }
