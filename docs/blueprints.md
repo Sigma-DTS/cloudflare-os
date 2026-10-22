@@ -210,7 +210,7 @@ Importing a version 2 archive stores the same release commit under a new bluepri
 
 ## Admin Features and Featured Blueprints
 
-Deployments can optionally configure a set of admin usernames through the backend worker's `ADMINS` binding as an array of usernames.
+Deployments can optionally configure a set of admin usernames through the backend worker's `ADMINS` binding as an array of usernames. `ADMIN_WORKSPACE_ACCESS_MAX` and `ADMIN_AUDIT_RETENTION_MIN_DAYS` bound what those admins may choose for workspace inspection and audit retention; see [admin-access.md](admin-access.md).
 
 Admins get access to two extra RPCs:
 

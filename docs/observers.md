@@ -94,6 +94,31 @@ The check works as follows:
   every exclusion/enforcement decision keys off whether a user is still *authorized* in the
   sharing graph (`computeEffectiveRoles`), never off whether they currently have the Gadget open.
 
+### Admin access: a deliberate exception
+
+A deployment admin (a user the backend's `ADMINS` variable lists) can inspect a workspace through
+`AdminApi.inspectWorkspace()` without being verified against its gatekeepers and without being
+seen by its members: `OverseerDurableObject.openForAdmin()` skips `authorizeCollaborator()` and
+observer verification by explicit policy, and the admin is never registered as an observer. So
+`excludeObservers` never names an admin, and no observation is blocked on an admin's account.
+
+The exception is bounded. Restricted data (chat messages, file contents, the descriptions and
+fields of observations) is visible only at the `"full"` access level, which only a deployment config
+change permits: `ADMIN_WORKSPACE_ACCESS_MAX` caps the level, `metadata` by default, and fails closed
+to `off` for any value that is not a level. Titles stay visible at `"metadata"`, and can echo
+content. The compensating controls are:
+
+- the admin list and the access cap are environment variables, out of reach of an admin session;
+- every inspection takes a reason, recorded with every call made through the view;
+- the default level is `"metadata"`;
+- a view expires (15 minutes by default, an hour at most);
+- every call re-checks that the view is live and its admin still an admin;
+- every call is recorded before it reads anything, in the workspace (apart from its action log) and
+  in a deployment-wide log, and a call whose record cannot be written fails;
+- `ADMIN_AUDIT_RETENTION_MIN_DAYS` sets a floor on how long those records are kept.
+
+[admin-access.md](admin-access.md) is the design record.
+
 ---
 
 ## 2. Background: relevant existing code

@@ -436,8 +436,49 @@ export const createAuthError = authErrors.create;
 export const getAuthErrorCode = authErrors.getCode;
 
 /**
- * One user as listed in the deployment-wide user directory (see
- * `AuthenticatedApi.searchUsers`).
+ * Stable error codes attached to expected refusals of AdminApi.inspectWorkspace() and of
+ * AdminWorkspaceView calls.
+ */
+export const ADMIN_ACCESS_ERROR_CODES = {
+  workspaceNotFound: "ADMIN_WORKSPACE_NOT_FOUND",
+  accessOff: "ADMIN_WORKSPACE_ACCESS_OFF",
+  contentWithheld: "ADMIN_CONTENT_WITHHELD",
+  viewExpired: "ADMIN_VIEW_EXPIRED",
+  notAdmin: "ADMIN_NOT_ADMIN",
+} as const;
+
+/** An expected refusal code from ADMIN_ACCESS_ERROR_CODES. */
+export type AdminAccessErrorCode =
+    typeof ADMIN_ACCESS_ERROR_CODES[keyof typeof ADMIN_ACCESS_ERROR_CODES];
+
+const adminAccessErrors = codedErrorFamily<AdminAccessErrorCode>({
+  [ADMIN_ACCESS_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
+  [ADMIN_ACCESS_ERROR_CODES.accessOff]:
+      "Admin access to workspaces is turned off on this deployment.",
+  [ADMIN_ACCESS_ERROR_CODES.contentWithheld]:
+      "This deployment limits admin access to workspace metadata, so this content is withheld.",
+  [ADMIN_ACCESS_ERROR_CODES.viewExpired]:
+      "This admin view has expired. Inspect the workspace again.",
+  [ADMIN_ACCESS_ERROR_CODES.notAdmin]: "Only a deployment admin can inspect a workspace.",
+});
+
+/** Creates an expected admin-access refusal with a machine-readable code. */
+export const createAdminAccessError = adminAccessErrors.create;
+
+/** Reads the machine-readable code from an expected admin-access refusal. */
+export const getAdminAccessErrorCode = adminAccessErrors.getCode;
+
+/**
+ * The most characters of a display name or a workspace title the deployment directory keeps (see
+ * AuthenticatedApi.searchUsers(), AdminApi.listUsers() and AdminApi.listWorkspaces()): it lists a
+ * longer one as its first MAX_DIRECTORY_TEXT_LENGTH characters, since nothing else bounds either.
+ * Ids are kept whole.
+ */
+export const MAX_DIRECTORY_TEXT_LENGTH = 1000;
+
+/**
+ * One user as listed in the deployment-wide user directory (see `AuthenticatedApi.searchUsers`
+ * and `AdminApi.listUsers`).
  */
 export type UserDirectoryRecord = {
   /**
@@ -446,7 +487,7 @@ export type UserDirectoryRecord = {
    */
   id: string;
 
-  /** The user's current display name. */
+  /** The user's current display name: its first MAX_DIRECTORY_TEXT_LENGTH characters when longer. */
   name: string;
 };
 
@@ -933,12 +974,14 @@ export interface AuthenticatedApi extends RpcTarget {
   amIAdmin(): Promise<boolean>;
 
   /**
-   * Returns a capability for managing deployment-wide admin settings, or null when the caller is not
-   * an admin. The access check happens once here, so the returned stub's methods need no per-call
-   * checks. (Authentication config — sign-in providers, password login — is intentionally not
-   * managed here; it stays env-var driven.)
+   * Returns a capability for managing and investigating the deployment as an admin, or null when
+   * the caller is not one. The access check happens here, once, for every AdminApi method but
+   * workspace inspection: AdminApi.inspectWorkspace() and each call on the view it mints check
+   * again (see AdminWorkspaceView). `options.via` labels every audit record the capability makes.
+   * (Authentication config — sign-in providers, password login — is intentionally not managed
+   * here; it stays env-var driven.)
    */
-  getAdminApi(): Promise<RpcStub<AdminApi> | null>;
+  getAdminApi(options?: AdminApiOptions): Promise<RpcStub<AdminApi> | null>;
 
   // TODO:
   // - Edit permissions on a connected account.
@@ -1120,6 +1163,36 @@ export type AdminSettingsView = {
   signupsEnabled: boolean;
   /** Whether users may search the user directory to find collaborators. */
   userSearchEnabled: boolean;
+  /**
+   * How much of a workspace an admin may inspect (see AdminApi.setAdminWorkspaceAccess).
+   * inspectWorkspace() enforces `effective`.
+   */
+  adminWorkspaceAccess: {
+    /** The level enforced: the lower of `chosen` and `max`. */
+    effective: AdminWorkspaceAccess;
+    /** The level an admin set, DEFAULT_ADMIN_WORKSPACE_ACCESS until one does. Kept, but not
+     * enforced, while it is above `max`. */
+    chosen: AdminWorkspaceAccess;
+    /** The highest level the deployment allows, which its ADMIN_WORKSPACE_ACCESS_MAX environment
+     * variable sets: "metadata" while that is unset or blank, and "off" while it holds anything
+     * that is not a level, so a misconfiguration never grants access. Only a deployment config
+     * change can raise it. */
+    max: AdminWorkspaceAccess;
+  };
+  /**
+   * How many days the admin audit log keeps a record (see AdminApi.setAdminAuditRetentionDays).
+   * Both copies of the log keep `effective`.
+   */
+  adminAuditRetentionDays: {
+    /** The retention enforced: the higher of `chosen` and `min`. */
+    effective: number;
+    /** The retention an admin set, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS until one does. */
+    chosen: number;
+    /** The fewest days the deployment allows, which its ADMIN_AUDIT_RETENTION_MIN_DAYS environment
+     * variable sets: DEFAULT_ADMIN_AUDIT_RETENTION_DAYS while that is unset, blank or not a
+     * positive whole number. */
+    min: number;
+  };
   /** Site name shown next to the top-bar logo ("" falls back to DEFAULT_SITE_NAME). */
   siteName: string;
   /** Custom deployment logo, or undefined to use the default Cloudflare OS mark. */
@@ -1273,12 +1346,387 @@ export type DeploymentUpdateStatus = {
 };
 
 /**
- * Capability for managing deployment-wide admin settings, obtained via
+ * How an admin's calls reach the deployment, as their audit records say: "api" for a client of the
+ * API itself (the Workshop's admin panel among them), "cli" for a command-line client.
+ */
+export type AdminVia = "api" | "cli";
+
+/** Options for AuthenticatedApi.getAdminApi(). */
+export type AdminApiOptions = {
+  /** What the caller is, recorded on every audit record the capability makes; "api" when absent.
+   * Stated by the client and unverified: it labels records and grants nothing. */
+  via?: AdminVia;
+};
+
+/** How many records one page of an admin listing (AdminApi.listUsers(), listWorkspaces(),
+ * listAdminAudit()) holds when the caller gives no `limit`. */
+export const ADMIN_LIST_DEFAULT_LIMIT = 50;
+
+/** The most records one page of an admin listing may hold. */
+export const ADMIN_LIST_MAX_LIMIT = 200;
+
+/**
+ * One account of this deployment, as AdminApi.listUsers() lists it. `id` is the username of a
+ * password account and the email of a sign-in or Cloudflare Access account, kept whole; `name` is
+ * the display name, at most MAX_DIRECTORY_TEXT_LENGTH characters (see UserDirectoryRecord).
+ */
+export type AdminUserRecord = UserDirectoryRecord & {
+  /** When the account was created. Absent for one created before the deployment recorded it. */
+  created?: Date;
+  /** When the user last started a session (signed in, or connected with a stored session), to
+   * within an hour. Absent until their first session after the deployment began recording it. */
+  lastLogin?: Date;
+  /** Whether the user is a deployment admin now: named in the deployment's ADMINS variable. */
+  isAdmin: boolean;
+};
+
+/** Options for AdminApi.listUsers(). */
+export type AdminUserQuery = {
+  /** Only users whose id or display name contains this, case-insensitively. At most 1000
+   * characters, with no line break; absent or blank lists everyone. */
+  query?: string;
+  /** The previous page's `nextCursor`; absent for the first page. */
+  cursor?: string;
+  /** The page size: a whole number from 1 to ADMIN_LIST_MAX_LIMIT, ADMIN_LIST_DEFAULT_LIMIT when
+   * absent. */
+  limit?: number;
+};
+
+/** One page of AdminApi.listUsers(). */
+export type AdminUserPage = {
+  /** The page's users, in id order: at most the query's `limit`, and fewer when their ids and
+   * names are long (see AdminApi.listUsers()). */
+  users: AdminUserRecord[];
+  /** Pass as `cursor` for the next page; absent once there is none. */
+  nextCursor?: string;
+};
+
+/** One workspace of this deployment, as AdminApi.listWorkspaces() lists it. */
+export type AdminWorkspaceRecord = {
+  /** The workspace id, as AdminApi.inspectWorkspace() and AuthenticatedApi.openGadget() take it. */
+  id: string;
+  /** The workspace title, as the workspace last reported it: its first MAX_DIRECTORY_TEXT_LENGTH
+   * characters when longer. */
+  title: string;
+  /** The owner: their canonical user id, kept whole, and their display name as the directory last
+   * saw it (their id until they next start a session), at most MAX_DIRECTORY_TEXT_LENGTH
+   * characters. */
+  owner: UserDirectoryRecord;
+  /** When the workspace was created. Absent until known: an older workspace's is read from its
+   * owner's records when it is first opened after the deployment began recording workspaces. */
+  created?: Date;
+  /** When the workspace was last active (an agent turn, a code change, an action), to within an
+   * hour. Absent until it is next active. */
+  lastActive?: Date;
+};
+
+/** Options for AdminApi.listWorkspaces(). */
+export type AdminWorkspaceQuery = {
+  /** Only workspaces this user owns, by canonical user id (AdminUserRecord.id), matched exactly. */
+  owner?: string;
+  /** Only workspaces whose id, title or owner id contains this, case-insensitively. At most 1000
+   * characters, with no line break; absent or blank matches every workspace. */
+  query?: string;
+  /** The previous page's `nextCursor`; absent for the first page. */
+  cursor?: string;
+  /** The page size: a whole number from 1 to ADMIN_LIST_MAX_LIMIT, ADMIN_LIST_DEFAULT_LIMIT when
+   * absent. */
+  limit?: number;
+};
+
+/** One page of AdminApi.listWorkspaces(). */
+export type AdminWorkspacePage = {
+  /** The page's workspaces, in id order: at most the query's `limit`, and fewer when their ids,
+   * titles and owners are long (see AdminApi.listWorkspaces()). */
+  workspaces: AdminWorkspaceRecord[];
+  /** Pass as `cursor` for the next page; absent once there is none. */
+  nextCursor?: string;
+};
+
+/**
+ * How much of a workspace a deployment admin may inspect through AdminApi.inspectWorkspace(), in
+ * increasing order:
+ *   - "off":      nothing; inspectWorkspace() is refused.
+ *   - "metadata": its structure: titles, workpieces, collaborators, connections, the chat and
+ *                 action lists, file names and diagnostics. Chat messages, queued steers, file
+ *                 contents, which blueprint a gadget follows, and the descriptions and fields of
+ *                 actions, observations and hooks are withheld. Titles stay, and can echo content.
+ *   - "full":     everything, what "metadata" withholds included.
+ */
+export const ADMIN_WORKSPACE_ACCESS_LEVELS = ["off", "metadata", "full"] as const;
+
+/** One of ADMIN_WORKSPACE_ACCESS_LEVELS. */
+export type AdminWorkspaceAccess = typeof ADMIN_WORKSPACE_ACCESS_LEVELS[number];
+
+/** Whether `value` is an AdminWorkspaceAccess. */
+export function isAdminWorkspaceAccess(value: unknown): value is AdminWorkspaceAccess {
+  return ADMIN_WORKSPACE_ACCESS_LEVELS.includes(value as AdminWorkspaceAccess);
+}
+
+/** The access level of a working AdminWorkspaceView: never "off", at which none works. */
+export type AdminViewAccess = Exclude<AdminWorkspaceAccess, "off">;
+
+/** The access level a deployment has until an admin sets one. */
+export const DEFAULT_ADMIN_WORKSPACE_ACCESS: AdminWorkspaceAccess = "metadata";
+
+/**
+ * How many days the admin audit log keeps a record until an admin sets otherwise, and the fewest
+ * an admin may set unless the deployment's ADMIN_AUDIT_RETENTION_MIN_DAYS says otherwise.
+ */
+export const DEFAULT_ADMIN_AUDIT_RETENTION_DAYS = 90;
+
+/** The longest retention an admin may set, in days: ten years. */
+export const MAX_ADMIN_AUDIT_RETENTION_DAYS = 3650;
+
+/** How long an AdminWorkspaceView lasts unless AdminInspectOptions.lifetimeSeconds says: 15
+ * minutes. */
+export const DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS = 900;
+
+/** The longest an AdminWorkspaceView may last, in seconds: an hour. */
+export const MAX_ADMIN_VIEW_LIFETIME_SECONDS = 3600;
+
+/** The longest reason AdminApi.inspectWorkspace() takes, in characters, once trimmed. */
+export const MAX_ADMIN_ACCESS_REASON_LENGTH = 500;
+
+/** Options for AdminApi.inspectWorkspace(). */
+export type AdminInspectOptions = {
+  /** How long the view lasts: a whole number of seconds from 1 to
+   * MAX_ADMIN_VIEW_LIFETIME_SECONDS, DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS when absent. */
+  lifetimeSeconds?: number;
+};
+
+/** The workspace calls the audit log records: the open (AdminApi.inspectWorkspace()) and each
+ * AdminWorkspaceView method. */
+export const ADMIN_WORKSPACE_METHODS = [
+  "inspectWorkspace", "describe", "listChats", "getChat", "listActions", "listFiles", "readFile",
+  "listGatekeepers", "getDiagnostics",
+] as const satisfies readonly ("inspectWorkspace" | keyof AdminWorkspaceView)[];
+
+/** One of ADMIN_WORKSPACE_METHODS. */
+export type AdminWorkspaceMethod = typeof ADMIN_WORKSPACE_METHODS[number];
+
+/**
+ * The AdminApi methods that change a deployment setting, each recorded as an AdminSettingRecord
+ * before its change takes effect. inspectWorkspace() is recorded as an AdminAccessRecord. The rest
+ * change no setting and are not recorded: the reads (getSettings, isBlueprintFeatured,
+ * getUpdateStatus, listUsers, listWorkspaces, listAdminAudit, getAdminAuditStats), the gateway
+ * tests, and checkForUpdates.
+ */
+export const ADMIN_SETTING_METHODS = [
+  "setSignupsEnabled", "setUserSearchEnabled", "setSiteName", "setSiteLogo",
+  "setInstanceInstructions", "setResourceEnabled", "setGatekeeperMode", "setAnnouncement",
+  "setBanner", "setAccentColor", "setBlueprintFeatured", "promoteFormat", "removeFormat",
+  "updateFormat", "setFormatOrder", "setGatewayModelMode", "addGatewayModel",
+  "removeGatewayModel", "setUserModelsEnabled", "setModelsDevSuggestions",
+  "setGatewayModelSettings", "setDefaultReasoning", "setGatewayProviderEnabled",
+  "setUpdateChecksEnabled", "setUpdateCheckIntervalMinutes", "setUpdateMinimumAgeHours",
+  "setUpdateNoticeSnoozeHours", "setAdminWorkspaceAccess", "setAdminAuditRetentionDays",
+] as const satisfies readonly (keyof AdminApi)[];
+
+/** One of ADMIN_SETTING_METHODS. */
+export type AdminSettingMethod = typeof ADMIN_SETTING_METHODS[number];
+
+/** The longest string an audit record keeps as a call's argument, a workspace's title or a
+ * setting entry's key, in characters: a longer one is cut to this, its last character replaced
+ * with "…". */
+export const MAX_ADMIN_AUDIT_ARG_LENGTH = 256;
+
+/** The longest value an AdminSettingChange keeps whole, in characters: more than any bounded
+ * setting holds (the longest, the agent instructions, are at most
+ * MAX_INSTANCE_INSTRUCTIONS_LENGTH characters, recorded as themselves). A longer value is kept as
+ * an excerpt (see AdminSettingChange.excerpt). */
+export const MAX_ADMIN_AUDIT_VALUE_LENGTH = 10_000;
+
+/**
+ * One admin call into a workspace: the open that minted an AdminWorkspaceView, or a call made
+ * through one. Recorded before the call reads anything, twice: in the workspace, apart from its
+ * action log so that nothing a workspace member can read ever shows it, and in the deployment-wide
+ * log behind AdminApi.listAdminAudit(). A call the view itself stops is not recorded: one made
+ * after the view expired or its admin stopped being an admin, or after the workspace was deleted.
+ * A call the access level refuses is recorded, with `refused` set. An open refused before it
+ * reaches the workspace, because the deployment's access level is "off", is recorded in the
+ * deployment-wide log only.
+ */
+export type AdminAccessRecord = {
+  /** Distinguishes this from an AdminSettingRecord. */
+  kind: "workspace";
+  /** When the call was made. */
+  at: Date;
+  /** The admin who made it, by canonical user id. */
+  admin: string;
+  /** Opaque. Shared by every record made through one AuthenticatedApi.getAdminApi() capability,
+   * so one admin session's records can be read together. */
+  sessionId: string;
+  /** How the admin's calls reached the deployment (see AdminApiOptions.via). */
+  via: AdminVia;
+  /** The workspace. */
+  workspaceId: string;
+  /** The workspace's title when the call was made, cut like an argument (see
+   * MAX_ADMIN_AUDIT_ARG_LENGTH), since a title has no length limit of its own. For an open refused
+   * before it reached the workspace, the title the deployment directory lists, cut the same way,
+   * "" when it lists none. */
+  workspaceTitle: string;
+  /** "inspectWorkspace" for the open, else the view method called. */
+  method: AdminWorkspaceMethod;
+  /** The call's arguments by name: only those it declares, an absent optional one left out, each
+   * string cut to MAX_ADMIN_AUDIT_ARG_LENGTH. The open records `expiresAt` (ISO 8601). No view
+   * method takes content, so none is recorded. */
+  args: Record<string, string | number>;
+  /** The reason the admin gave inspectWorkspace() for the view. */
+  reason: string;
+  /** The level the call ran at: the view's own, lowered to the deployment's setting at the time
+   * (see AdminWorkspaceView); "off" when the call was refused for that. */
+  access: AdminWorkspaceAccess;
+  /** Present when the access level refused the call after it was recorded, so that it read
+   * nothing: the code it was refused with. */
+  refused?: typeof ADMIN_ACCESS_ERROR_CODES.accessOff
+      | typeof ADMIN_ACCESS_ERROR_CODES.contentWithheld;
+};
+
+/**
+ * One setting an AdminSettingRecord changed, with its value before and after. `setting` names a
+ * field of the deployment's stored settings ("siteName", "modelModes", ...) or one of the two kept
+ * apart from them, "siteLogo" and "featured". The names are those the settings are stored under: a
+ * diagnostic vocabulary, not a schema clients may depend on.
+ *
+ * A setting holding a map (an object keyed by id or name, such as "modelModes" or "banner") or a
+ * list of entries with ids ("formats", by blueprint id; "addedModels", by model id) is recorded
+ * one entry at a time: `key` names the entry, and the values are that entry's alone. A change to
+ * the order of such a list is one more change, without `key`, whose values are the lists of every
+ * entry's id, in order.
+ *
+ * A string is recorded as itself, any other value as JSON with object keys sorted. A value is kept
+ * whole up to MAX_ADMIN_AUDIT_VALUE_LENGTH characters, more than any bounded setting holds; past
+ * that both values are excerpts (see `excerpt`). A key is cut like an argument (see
+ * MAX_ADMIN_AUDIT_ARG_LENGTH). The settings hold no secrets (provider keys and tokens live in the
+ * environment); a logo is recorded as its size and SHA-256, never its bytes.
+ */
+export type AdminSettingChange = {
+  /** The setting. */
+  setting: string;
+  /** The entry of a map or list setting: a model id, a vendor id, a blueprint id, a field name;
+   * cut past MAX_ADMIN_AUDIT_ARG_LENGTH characters, a length no real entry's id reaches. */
+  key?: string;
+  /** The value before; absent when there was none. */
+  before?: string;
+  /** The value after; absent when the change removed it. */
+  after?: string;
+  /**
+   * Present when a value was longer than MAX_ADMIN_AUDIT_VALUE_LENGTH. `before` and `after` are
+   * then excerpts: each starts at character `offset` of its value, a little before the first
+   * character at which the two differ, and holds at most MAX_ADMIN_AUDIT_VALUE_LENGTH characters.
+   */
+  excerpt?: {
+    /** Where both excerpts start, in characters (UTF-16 code units) into their values. */
+    offset: number;
+    /** The whole `before` value's length, when there was one. */
+    beforeLength?: number;
+    /** The whole `after` value's length, when there is one. */
+    afterLength?: number;
+  };
+};
+
+/**
+ * One change an admin made to the deployment's settings through an AdminApi method (see
+ * ADMIN_SETTING_METHODS), recorded in the deployment-wide audit log before the change takes
+ * effect, so that a change whose record cannot be written is refused. A call that changes nothing
+ * records nothing. A record is kept if its change then fails to take effect (the setter throws):
+ * it records the attempt.
+ */
+export type AdminSettingRecord = {
+  /** Distinguishes this from an AdminAccessRecord. */
+  kind: "setting";
+  /** When the change was made. */
+  at: Date;
+  /** The admin who made it, by canonical user id. */
+  admin: string;
+  /** As AdminAccessRecord.sessionId. */
+  sessionId: string;
+  /** As AdminAccessRecord.via. */
+  via: AdminVia;
+  /** The AdminApi method called. */
+  method: AdminSettingMethod;
+  /** What it changed; never empty. */
+  changes: AdminSettingChange[];
+};
+
+/** One record of the deployment-wide admin audit log, kept for the deployment's retention
+ * (AdminSettingsView.adminAuditRetentionDays). */
+export type AdminAuditRecord = AdminAccessRecord | AdminSettingRecord;
+
+/** The kinds of AdminAuditRecord: "workspace" for access to a workspace, "setting" for a change to
+ * the deployment's settings. */
+export type AdminAuditKind = AdminAuditRecord["kind"];
+
+/** Options for AdminApi.listAdminAudit(). The filters combine. */
+export type AdminAuditQuery = {
+  /** Only records of this kind. */
+  kind?: AdminAuditKind;
+  /** Only this admin's records, by canonical user id. At most 1000 characters. */
+  admin?: string;
+  /** Only records of access to this workspace. At most 1000 characters. */
+  workspace?: string;
+  /** Only records made at or after this time. */
+  since?: Date;
+  /** The previous page's `nextCursor`; absent for the first page. */
+  cursor?: string;
+  /** The page size: a whole number from 1 to ADMIN_LIST_MAX_LIMIT, ADMIN_LIST_DEFAULT_LIMIT when
+   * absent. */
+  limit?: number;
+};
+
+/** One page of AdminApi.listAdminAudit(). */
+export type AdminAuditPage = {
+  /** The page's records, newest first. */
+  records: AdminAuditRecord[];
+  /** Pass as `cursor` for the next page; absent once there is none. */
+  nextCursor?: string;
+};
+
+/** The longest window AdminApi.getAdminAuditStats() reports on, in days. */
+export const MAX_ADMIN_AUDIT_STATS_DAYS = 366;
+
+/** Options for AdminApi.getAdminAuditStats(). */
+export type AdminAuditStatsQuery = {
+  /** The window: the last `days` UTC days, today included. A whole number from 1 to
+   * MAX_ADMIN_AUDIT_STATS_DAYS, 7 when absent. */
+  days?: number;
+  /** Only records of this kind; both kinds when absent. */
+  kind?: AdminAuditKind;
+};
+
+/**
+ * What the admin audit log holds for one window, from AdminApi.getAdminAuditStats(). Every count
+ * covers the records of the queried kind (both kinds when none is given), except `topWorkspaces`,
+ * which only AdminAccessRecords can name. A record older than the retention is gone, so a window
+ * reaching past it counts nothing there.
+ */
+export type AdminAuditStats = {
+  /** The window's length in UTC days, today included. */
+  days: number;
+  /** The records in the window. */
+  totalEvents: number;
+  /** One entry per UTC day of the window, oldest first, days with no records included. `day` is
+   * the date as YYYY-MM-DD. */
+  byDay: { day: string; count: number }[];
+  /** The admins with the most records in the window, most first (ties by id), at most 10. */
+  topAdmins: { admin: string; count: number }[];
+  /** The workspaces with the most access records in the window, most first (ties by id), at most
+   * 10, each with the newest non-empty title among its records in the window, as they hold it (see
+   * AdminAccessRecord.workspaceTitle; "" when none has one). */
+  topWorkspaces: { workspaceId: string; title: string; count: number }[];
+};
+
+/**
+ * Capability for managing and investigating the deployment, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions,
- * which gatekeeper connectors/resources are offered, and the models an AI Gateway deployment
- * provides — NOT authentication config (that's env-var driven). Each setter throws on invalid
- * input.
+ * capability is minted, so these methods don't re-check, with one exception: inspectWorkspace()
+ * re-checks, and so does every call on the AdminWorkspaceView it mints, since a view is the one
+ * thing an admin holds that reads users' data. Covers branding, agent instructions, which
+ * gatekeeper connectors/resources are offered, the models an AI Gateway deployment provides, the
+ * user and workspace directory, and admin access to workspaces — NOT authentication config (that's
+ * env-var driven). Each setter throws on invalid input, and records the change it makes in the
+ * deployment's audit log before making it (see AdminSettingRecord).
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
@@ -1563,6 +2011,215 @@ export interface AdminApi {
    * visit to Home. Throws unless `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
    */
   setUpdateNoticeSnoozeHours(hours: number): Promise<void>;
+
+  // --- Users, workspaces and admin access ---
+  //
+  // listUsers() and listWorkspaces() read the deployment-wide directory that user search reads
+  // (see setUserSearchEnabled). Durable Objects cannot be enumerated, so the directory fills as
+  // accounts and workspaces are used. An account is listed once it has started a session since the
+  // directory began recording accounts for user search, so most are listed at once, without
+  // `lastLogin` until their next session; one with no session since then is listed at its next. A workspace is listed when it is next opened. One never used again is never listed.
+
+  /**
+   * One page of the deployment's users, in id order: every account that has started a session
+   * since the directory began recording accounts. Unaffected by setUserSearchEnabled(). A page
+   * holds at most `limit` users and stops early, with a `nextCursor`, once their ids and names
+   * would pass a million characters: an id has no length limit of its own, so a count alone cannot
+   * bound a page. Rejects a `query` over 1000 characters or with a line break, and a `limit` that
+   * is not a whole number from 1 to ADMIN_LIST_MAX_LIMIT.
+   */
+  listUsers(options?: AdminUserQuery): Promise<AdminUserPage>;
+
+  /**
+   * One page of the deployment's workspaces, in id order: every workspace opened since the
+   * directory began recording workspaces, deleted ones left out. A page stops early as
+   * listUsers()'s does, counting ids, titles and owners. Rejects what listUsers() rejects.
+   */
+  listWorkspaces(options?: AdminWorkspaceQuery): Promise<AdminWorkspacePage>;
+
+  /**
+   * Open a read-only view of a workspace to investigate it (see AdminWorkspaceView), at the
+   * deployment's access level (AdminSettingsView.adminWorkspaceAccess.effective). `reason` is
+   * required: it is recorded with the open and with every call made through the view, and is
+   * rejected when blank or, once trimmed, longer than MAX_ADMIN_ACCESS_REASON_LENGTH. The open is
+   * recorded as an AdminAccessRecord ("inspectWorkspace") before the view is returned, so an open
+   * whose record cannot be written is refused.
+   *
+   * Refused with a code from ADMIN_ACCESS_ERROR_CODES, checked in this order: `notAdmin` once the
+   * caller is no longer a deployment admin; `workspaceNotFound` for a malformed id; `accessOff`
+   * while the access level is "off", recorded in the deployment-wide log without the workspace
+   * being reached; `workspaceNotFound` for an id that names no workspace (never initialised or
+   * since deleted), which this neither creates nor claims; `viewExpired` should the view's
+   * lifetime run out before the workspace answers. Only `accessOff` refusals are recorded.
+   *
+   * Admin access is a deliberate exception to observer verification (see docs/observers.md): the
+   * admin is never verified against the workspace's connections nor registered as an observer, and
+   * the audit log is the compensating control.
+   */
+  inspectWorkspace(workspaceId: string, reason: string, options?: AdminInspectOptions)
+      : Promise<RpcStub<AdminWorkspaceView>>;
+
+  /**
+   * One page of the deployment-wide admin audit log, newest first: access to workspaces and
+   * changes to settings, filtered as `options` says. Rejects a `limit` that is not a whole number
+   * from 1 to ADMIN_LIST_MAX_LIMIT, a filter over 1000 characters, and a malformed `cursor`.
+   */
+  listAdminAudit(options?: AdminAuditQuery): Promise<AdminAuditPage>;
+
+  /** Counts from the admin audit log over the last `days` UTC days, today included (7 by
+   * default). Throws unless `days` is a whole number from 1 to MAX_ADMIN_AUDIT_STATS_DAYS. */
+  getAdminAuditStats(options?: AdminAuditStatsQuery): Promise<AdminAuditStats>;
+
+  /**
+   * Set how much of a workspace inspectWorkspace() may show (see ADMIN_WORKSPACE_ACCESS_LEVELS),
+   * DEFAULT_ADMIN_WORKSPACE_ACCESS by default. Throws for a level above the deployment's maximum
+   * (AdminSettingsView.adminWorkspaceAccess.max), which only its ADMIN_WORKSPACE_ACCESS_MAX
+   * environment variable can raise. A view already minted runs at the lower of its own level and
+   * the new one from its next call once the setting reaches it, within about a minute.
+   */
+  setAdminWorkspaceAccess(access: AdminWorkspaceAccess): Promise<void>;
+
+  /**
+   * Set how many days the admin audit log keeps a record, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS by
+   * default. A record older than that is no longer listed or counted, and is deleted as the log is
+   * next used; the copy kept in its workspace goes when that workspace is next inspected. Throws
+   * unless `days` is a whole number from the deployment's minimum
+   * (AdminSettingsView.adminAuditRetentionDays.min, set by its ADMIN_AUDIT_RETENTION_MIN_DAYS
+   * environment variable) to MAX_ADMIN_AUDIT_RETENTION_DAYS.
+   */
+  setAdminAuditRetentionDays(days: number): Promise<void>;
+}
+
+/** A workspace as AdminWorkspaceView.describe() presents it. */
+export type AdminWorkspaceDescription = Pick<GadgetMetadata,
+    "id" | "title" | "totalCost" | "containsRestrictedData" | "ownerInvitesOnly" |
+    "defaultGadgetId"> & {
+  /** The owner's profile. */
+  owner: AiChatAuthorInfo;
+  /** Every workpiece summary a "build" session sees (see WorkpieceSummary): gadgets, pending ones
+   * included, and worktrees. Below "full" a gadget's `upstream` is left out: a blueprint id is a
+   * share link to code the view would otherwise withhold. */
+  workpieces: WorkpieceSummary[];
+  /** Everyone the workspace is shared with, as Overseer.listCollaborators() lists them. */
+  collaborators: CollaboratorInfo[];
+  /** The level this call ran at (see AdminWorkspaceView). */
+  access: AdminViewAccess;
+  /** When this view stops working. */
+  expiresAt: Date;
+};
+
+/** One connection (gatekeeper workpiece) of a workspace, as AdminWorkspaceView.listGatekeepers()
+ * lists it. */
+export type AdminGatekeeperInfo = {
+  /** Its workpiece id. */
+  id: WorkpieceId;
+  /** The connected resource's title, as the workspace records it. */
+  resourceTitle?: string;
+  /** The connected resource's URL, when known. */
+  resourceUrl?: string;
+  /** The vendor whose gatekeeper serves it. Absent for one with no vendor (a model, a spawner). */
+  vendorId?: string;
+  /** How it was created. Absent for one created before this was recorded. */
+  creationSpec?: GatekeeperCreationSpec;
+  /** The gadget bindings that point at it. `chatId` is present while one is pending in that chat. */
+  bindings: { gadgetId: WorkpieceId; name: string; chatId?: number }[];
+  /** The hooks it delivers, as Overseer.listHooks() lists them; below "full" each has an empty
+   * `description.description`. */
+  hooks: BoundHookInfo[];
+};
+
+/** The most records AdminWorkspaceDiagnostics.recentAdminAccess holds. */
+export const ADMIN_DIAGNOSTICS_ACCESS_LIMIT = 20;
+
+/** A workspace's operational state, as AdminWorkspaceView.getDiagnostics() reports it. None of it
+ * is content. */
+export type AdminWorkspaceDiagnostics = {
+  /** The version of the workspace's storage schema. */
+  storageVersion: number;
+  /** When the workspace's current Durable Object instance started. */
+  instanceStartedAt: Date;
+  /** The members' sessions open now, by kind ("owner", or a collaborator's role). Admin views are
+   * never counted. */
+  sessions: { owner: number; build: number; use: number };
+  /** The chats with an agent turn recorded as running. */
+  activeAgentChatIds: number[];
+  /** Calls to callable agents recorded but not yet in their chat. */
+  pendingAgentCalls: number;
+  /** Actions waiting for approval. */
+  pendingActions: number;
+  /** The workspace's chats. */
+  chats: number;
+  /** The workspace's hooks, and how many are enabled. */
+  hooks: { total: number; enabled: number };
+  /** Collaborators verified as observers (see docs/observers.md). */
+  observers: number;
+  /** When the workspace's alarm next fires. Absent while none is set. */
+  nextAlarm?: Date;
+  /** Whether an external message created the workspace before its owner's account recorded it. */
+  ownerRegistrationPending: boolean;
+  /** The workspace's most recent admin access records, newest first (this call's own first), at
+   * most ADMIN_DIAGNOSTICS_ACCESS_LIMIT, within the retention. */
+  recentAdminAccess: AdminAccessRecord[];
+};
+
+/**
+ * A deployment admin's read-only view of one workspace, minted by AdminApi.inspectWorkspace().
+ * Nothing it does changes the workspace or is seen by its members: it joins no presence and no
+ * session count, and starts no agent or connection.
+ *
+ * Each call first passes three checks, refused unrecorded with a code from
+ * ADMIN_ACCESS_ERROR_CODES: the view has not expired (`viewExpired`), its admin is still a
+ * deployment admin (`notAdmin`), and the workspace still exists (`workspaceNotFound`). They are
+ * checked again once the call has read the deployment's setting, so a call that the workspace's
+ * deletion overtakes writes nothing into it. It then runs at an access level: the view's own,
+ * fixed when it was minted, lowered to the deployment's current setting, so lowering the setting
+ * reaches live views (within about a minute) and raising it does not. The call is recorded as an
+ * AdminAccessRecord, in the workspace and in the deployment-wide log, and only then answered, or
+ * refused by its level: `accessOff` once the setting is "off", `contentWithheld` for getChat() or
+ * readFile() below "full". A call whose record cannot be written fails, having read nothing.
+ *
+ * A workspace restart (a revocation, a deletion, a redeploy) ends the view along with every other
+ * session on the workspace; inspect again.
+ */
+export interface AdminWorkspaceView extends RpcTarget {
+  /** The workspace's metadata, owner, workpieces and collaborators, with the level this call ran
+   * at and the view's expiry. */
+  describe(): Promise<AdminWorkspaceDescription>;
+
+  /** The workspace's chats, newest first, as Overseer.listChats() lists them; below "full", without
+   * `queuedSteers`, which hold message text. */
+  listChats(): Promise<AiChatMetadata[]>;
+
+  /** One page of a chat's messages, as Overseer.getChatHistory() pages them. Content: refused below
+   * "full". */
+  getChat(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage>;
+
+  /**
+   * One page of the workspace's action log, as Overseer.listActions() pages it. Admin access is
+   * never in it (see AdminAccessRecord). Below "full", every action, observation and hook entry has
+   * an empty `description.description` and no `description.fields`: titles, states, resources and
+   * times remain.
+   */
+  listActions(options?: { beforeId?: number; filter?: ActionHistoryFilter })
+      : Promise<ActionHistoryPage>;
+
+  /**
+   * The tree of a gadget's committed head, as Overseer.listTree() gives it, read only from the
+   * objects the workspace stores: it never pulls through a connection, and throws when an object
+   * is missing. Only a permanent gadget has a head to read: throws for a pending gadget, a
+   * worktree, or an id that names no gadget.
+   */
+  listFiles(gadgetId: WorkpieceId): Promise<TreeNode[]>;
+
+  /** One file of a gadget's committed head, as Overseer.readFilesAtCommit() reports it, read as
+   * listFiles() reads and refused as it is. Content: refused below "full". */
+  readFile(gadgetId: WorkpieceId, path: string): Promise<FileAtCommit>;
+
+  /** The workspace's connections, oldest first, with their bindings and hooks. */
+  listGatekeepers(): Promise<AdminGatekeeperInfo[]>;
+
+  /** The workspace's operational state, with its most recent admin access records. */
+  getDiagnostics(): Promise<AdminWorkspaceDiagnostics>;
 }
 
 /** A partial edit to one promoted format. Absent fields are left alone. */

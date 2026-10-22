@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -25,6 +25,7 @@ import {
   DEVICE_HANDOFF_LIFETIME_MS, isDeviceHandoffState, sealDeviceSessionHandoff,
   type DeviceSessionCredential, type DeviceSessionHandoff,
 } from "./auth/device-session-handoff.js";
+import { DIRECTORY_ACTIVITY_INTERVAL_MS, type UserDirectoryActivity } from "./user-directory.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -214,21 +215,35 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.vendors = buildGatekeeperVendorMap(env);
   }
 
-  // Mirrors the profile into the deployment-wide user directory. Best-effort
-  // and does not block the caller. The `syncUser` call opens this DO's input
-  // gate, so a rename can start a second sync while one is in flight, and the
-  // two can reach the directory in either order. Each sync carries its
-  // `profileRev` and the directory keeps the highest, so no ordering is needed
-  // here. The revision counter only increases, and a failed sync leaves it
-  // behind so the next authentication retries.
-  #syncDirectory(): void {
+  // Mirrors the profile into the deployment-wide user directory, with when the
+  // account was created and, when `session` says a session is starting, its
+  // start, at most once per DIRECTORY_ACTIVITY_INTERVAL_MS. Best-effort and
+  // does not block the caller. The `syncUser` call opens this DO's input gate,
+  // so a rename can start a second sync while one is in flight, and the two can
+  // reach the directory in either order. Each sync carries its `profileRev` and
+  // the directory keeps the highest, and it keeps the latest login time it is
+  // sent: the profile converges by revision and the login time by maximum, so
+  // neither needs ordering here. `directoryRev` and `directoryLoginAt` only
+  // advance, and a failed sync leaves both behind so the next session retries.
+  #syncDirectory(session: boolean): void {
     const rev = this.storage.profileRev.get();
-    if (rev === this.storage.directoryRev.get()) return;
+    const now = Date.now();
+    const reportLogin =
+        session && now - this.storage.directoryLoginAt.get() >= DIRECTORY_ACTIVITY_INTERVAL_MS;
+    if (rev === this.storage.directoryRev.get() && !reportLogin) return;
     const profile = this.storage.profile.get();
+    const createdAt = this.storage.createdAt.get();
+    const activity: UserDirectoryActivity = {
+      ...createdAt && { created: createdAt },
+      ...reportLogin && { lastLogin: new Date(now) },
+    };
     this.ctx.exports.UserDirectoryDurableObject.getByName("")
-        .syncUser({ id: profile.id, name: profile.name }, rev)
+        .syncUser({ id: profile.id, name: profile.name }, rev, activity)
         .then(() => {
           if (rev > this.storage.directoryRev.get()) this.storage.directoryRev.put(rev);
+          if (reportLogin && now > this.storage.directoryLoginAt.get()) {
+            this.storage.directoryLoginAt.put(now);
+          }
         }, (error: unknown) => {
           logger.warn("failed to sync user directory record", {
             event: "user.directory.sync.failed",
@@ -261,7 +276,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (session.pendingUntil) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
-    this.#syncDirectory();
+    this.#syncDirectory(true);
   }
 
   /**
@@ -277,13 +292,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
       // Create on first use.
       this.storage.created.put(true);
+      this.storage.createdAt.put(new Date());
       this.storage.profile.put({
         type: "user",
         name: email.split("@")[0],
         id: email,
       });
     }
-    this.#syncDirectory();
+    this.#syncDirectory(true);
     return isNew;
   }
 
@@ -416,6 +432,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     this.storage.created.put(true);
+    this.storage.createdAt.put(new Date());
     this.storage.profile.put({
       type: "user",
       name: displayName,
@@ -446,6 +463,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
+      this.storage.createdAt.put(new Date());
       this.storage.profile.put({
         type: "user",
         name: email.split("@")[0],
@@ -625,7 +643,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     profile.name = name;
     this.storage.profile.put(profile);
     this.storage.profileRev.put(this.storage.profileRev.get() + 1);
-    this.#syncDirectory();
+    this.#syncDirectory(false);
   }
 
   async setOwnCommitEmail(email: string | null): Promise<void> {
@@ -938,7 +956,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.gadgets.put(record);
   }
 
-  async getGadget(id: string): Promise<GadgetMetadata | null> {
+  /** The stored record of one of the user's workspaces, whose `created` the Overseer reads once to
+   * date a workspace older than the directory. */
+  async getGadget(id: string): Promise<GadgetRecord | null> {
     return this.storage.gadgets.get(id) || null;
   }
 

@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, ROUTER_TAG_PROBE_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute } from '@gadgets/workshop-shared/api';
+import { PublicApi, ROUTER_TAG_PROBE_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, AdminApiOptions, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -23,6 +23,8 @@ import { BlueprintKvRecord, listFeaturedBlueprintsFromKv, readBlueprintKvRecord 
 import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
+import { AdminAuditDurableObject } from "./admin-audit.js";
+import { isDeploymentAdmin } from "./admin-access.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
@@ -68,6 +70,9 @@ export { AdminSettings };
 // Re-export the deployment-wide user directory Durable Object.
 export { UserDirectoryDurableObject };
 
+// Re-export the deployment-wide admin audit log Durable Object.
+export { AdminAuditDurableObject };
+
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl };
 
@@ -100,12 +105,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
     this.#userId = userId;
     this.overseers = this.ctx.exports.OverseerDurableObject;
-    this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
   }
 
   private overseers: DurableObjectNamespace<OverseerDurableObject>;
-  private adminSettings: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
 
   #userId: DurableObjectId;
@@ -131,22 +134,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   #isAdmin(): boolean {
-    let name = this.#userId.name;
-    let admins = this.env.ADMINS;
-
-    if (!name || !admins) return false;
-
-    if (typeof admins === "string") {
-      // Admins should be a JSON binding of array type, but `.env` doesn't actually let you
-      // specify JSON bindings, so we also support a string that parses as JSON array.
-      admins = JSON.parse(admins);
-    }
-
-    if (!Array.isArray(admins)) {
-      throw new TypeError("ADMINS must be configured as an array of usernames.");
-    }
-
-    return admins.includes(name);
+    return isDeploymentAdmin(this.env, this.#userId.name);
   }
 
   whoami(): Promise<AiChatAuthorInfo> {
@@ -675,14 +663,14 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.#isAdmin();
   }
 
-  async getAdminApi(): Promise<RpcStub<AdminApi> | null> {
+  async getAdminApi(options?: AdminApiOptions): Promise<RpcStub<AdminApi> | null> {
     if (!this.#isAdmin()) return null;
     // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
     // resource catalog so RBAC-gated ones still surface for this admin.
     let adminUserId = this.#userId.name!;
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
-    return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId);
+    return new AdminApiImpl(this.ctx, this.env, adminUserId, options?.via ?? "api");
   }
 }
 

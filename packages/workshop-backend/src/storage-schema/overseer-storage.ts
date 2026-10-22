@@ -21,7 +21,7 @@ import type {
 import { createTypedStorage, collection, singleton, keyString } from "@gadgets/typed-storage";
 import {
   actionChangeTime,
-  type ActionState, type AgentSpawnerConfig, type AiChatAuthorInfo, type AiChatMessage,
+  type ActionState, type AdminAccessRecord, type AgentSpawnerConfig, type AiChatAuthorInfo, type AiChatMessage,
   type AlwaysAvailableResource,
   type AiChatMetadata, type BlueprintBindingAnnotation, type BlueprintMetadata,
   type BlueprintOutput, type ChatGadgetPinRecord, type CollaboratorRole, type GadgetUpstream,
@@ -1137,6 +1137,21 @@ export type BlueprintGadgetRecord = {
 };
 
 // =======================================================================================
+// Admin access
+
+/**
+ * One admin call into this workspace (see OverseerDurableObject.openForAdmin()), written before
+ * the call reads anything. Kept in its own collection rather than `actions`, so listActions(),
+ * subscribeToActions() and everything else that reads the action log can never show it to the
+ * workspace's members. One whose deployment-wide copy then failed records an attempt that read
+ * nothing. Pruned to the deployment's retention as new ones are written.
+ */
+export type AdminAccessLogRecord = Omit<AdminAccessRecord, "kind" | "workspaceId"> & {
+  /** Allocated from `nextAdminAccessId`, so id order is time order. */
+  id: number;
+};
+
+// =======================================================================================
 // Schema
 
 /**
@@ -1241,6 +1256,23 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // project-specific part of the agent's system prompt, so nobody without that prompt can
       // probe a shared prompt cache for it (see runAgentPass).
       promptCacheSalt: <string | undefined>undefined,
+
+      // When the workspace was initialised; unset for one initialised before this was recorded,
+      // until the directory feed backfills it from the owner's record (OverseerImpl.syncDirectory).
+      createdAt: <Date | undefined>undefined,
+
+      // The revision of the title the deployment directory is sent, bumped with every title
+      // write and at initialisation. Time-based (at least the epoch ms of the bump), so a
+      // workspace reinitialised under the same id outranks what its earlier life reported.
+      titleRev: 0,
+
+      // The highest titleRev the directory has acknowledged; -1 until it acknowledges one, and
+      // again once the workspace leaves the directory (OverseerImpl.removeFromDirectory), so
+      // that a deletion that fails leaves the workspace to be re-added at its next sync.
+      directoryRev: -1,
+
+      // Next id in `adminAccess`.
+      nextAdminAccessId: 0,
     },
 
     collections: {
@@ -1519,6 +1551,12 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
             return observer.observerId;
           }
         }
+      }),
+
+      // Admin calls into this workspace (see AdminAccessLogRecord): apart from `actions`, so that
+      // nothing a workspace member can read ever lists them.
+      adminAccess: collection<AdminAccessLogRecord>()({
+        primaryKey: "id",
       }),
     }
   });

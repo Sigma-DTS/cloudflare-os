@@ -21,6 +21,10 @@ through logs and errors, then everything else.
 - A large kernel change should be split by concern into separate PRs, and at minimum grouped into
   commits that let `workshop-backend`/`workshop-shared` be reviewed apart from UI. Flag PRs that
   bundle both.
+- Inside a Durable Object's `blockConcurrencyWhile()` callback, never await a promise whose I/O
+  started outside it. workerd delivers that completion only after the callback returns, so the
+  callback never finishes and the object is reset part-way; `deleteSelf()` leaves the workspace
+  directory before its critical section for this reason.
 
 ## Capability-based security
 
@@ -35,7 +39,23 @@ through logs and errors, then everything else.
   deliberately env-var driven in `auth/config.ts` and must **not** move into `AdminConfig`, so a
   compromised admin session cannot change it. Reject changes that relocate it.
 - `AdminSettings` is the only writer of the authoritative `AdminConfig`. Other code reads through
-  `readAdminConfig(env)`.
+  `readAdminConfig(env)`, except `AdminApiImpl`, which deliberately reads the authoritative config
+  in two places: `inspectWorkspace()`, so that a KV mirror still holding a higher access level never
+  mints a view at it, and the audit log's retention in `listAdminAudit()` and
+  `getAdminAuditStats()`.
+- `OverseerDurableObject.openForAdmin()` stays reachable only over the Durable Object binding, never
+  through a capability a user holds, and refuses an uninitialised workspace without writing. Every
+  `AdminWorkspaceView` method records its access before it reads, re-checking the view after its one
+  await; admin file reads never pull through a connection. Flag any path that reads workspace data
+  for an admin without these.
+- `ADMIN_WORKSPACE_ACCESS_MAX` and `ADMIN_AUDIT_RETENTION_MIN_DAYS` are env-driven, like auth
+  config, and the cap fails closed. Flag a read of `adminWorkspaceAccess` or
+  `adminAuditRetentionDays` that bypasses `adminAccessPolicy()`.
+- A new `AdminSettings` mutator takes an `AdminSettingActor` and records through
+  `#mutateAdminConfig()`, or records explicitly before any other write.
+- Text a user or workspace member controls (display names, titles) enters the directory or the
+  audit log only bounded: clamped to `MAX_DIRECTORY_TEXT_LENGTH`, or cut by `cutAdminAuditText()`.
+  Flag a new copy of such text into either store without a bound.
 - In `packages/mcp-shared/`, `tools.ts` is the trust boundary: nothing outside it may read a tool's
   annotations, a tool is an observation only when the server declares `readOnlyHint: true`, and
   auto-applying a write additionally requires a `vetted` endpoint. Every SDK OAuth operation must be

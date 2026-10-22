@@ -1,12 +1,12 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminModel, AdminResourceVendor, AdminSettingsView, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentUpdateStatus, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, ReasoningLevel, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { ADMIN_ACCESS_ERROR_CODES, AdminApi, AdminAuditPage, AdminAuditQuery, AdminAuditStats, AdminAuditStatsQuery, AdminFormat, AdminFormatPatch, AdminInspectOptions, AdminModel, AdminResourceVendor, AdminSettingChange, AdminSettingMethod, AdminSettingsView, AdminUserPage, AdminUserQuery, AdminVia, AdminWorkspaceAccess, AdminWorkspacePage, AdminWorkspaceQuery, AdminWorkspaceView, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentUpdateStatus, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ADMIN_AUDIT_ARG_LENGTH, MAX_ADMIN_AUDIT_RETENTION_DAYS, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, ReasoningLevel, SUGGESTED_MODELS, createAdminAccessError, getAdminAccessErrorCode, isAdminWorkspaceAccess, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
-import { RpcTarget } from 'capnweb';
+import { RpcTarget, type RpcStub } from 'capnweb';
 import { validateRpc } from 'capnweb-validate';
 import { createWorkshopLogger } from "./observability";
 import { sanitizeBlueprintOutput } from './blueprint-archive.js';
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
-import { MAX_AGENT_HINT, defaultOutputFormatId, isUpdateCheckInterval, isUpdateHours, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
+import { MAX_AGENT_HINT, defaultOutputFormatId, diffAdminConfig, isUpdateCheckInterval, isUpdateHours, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration } from './storage-schema/admin-settings-storage.js';
 import { getModelTokenLimits } from './agent-compaction.js';
 import { AiGatewayConfig, GatewayModels, assertGatewayProvider, gatewayModelConfig, gatewayRunConfig, getAiGatewayConfig, isCatalogModel } from './ai-gateway.js';
@@ -16,6 +16,10 @@ import { SITE_LOGO_R2_KEY, siteLogoImage, validateSiteLogo } from './site-logo.j
 import { ambientGatekeeperMode, DEFAULT_AMBIENT_GATEKEEPER_MODE } from './provisioning-policy.js';
 import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
+import type { UserDirectoryDurableObject } from './user-directory.js';
+import type { AdminAuditDurableObject } from './admin-audit.js';
+import type { OverseerDurableObject } from './overseer.js';
+import { type AdminSettingActor, type AdminViewTerms, adminAccessPolicy, adminAuditStatsDays, adminListLimit, adminSettingChange, adminViewLifetimeMs, cutAdminAuditText, deploymentAdmins, isDeploymentAdmin, lowerAdminWorkspaceAccess, maxAdminWorkspaceAccess, minAdminAuditRetentionDays, validateAdminAccessReason } from './admin-access.js';
 import { bundledBlueprintsManifestVersion, installBundledBlueprints } from './bundled-blueprints.js';
 import { BUNDLED_BLUEPRINTS } from './generated/bundled-blueprints.js';
 import { type DeployServiceInstall, NO_ANSWER, type VersionAnswer, deployServiceInstall, deploymentUpdateStatus, fetchLatestRelease, updateCheckDue } from './deployment-updates.js';
@@ -92,6 +96,8 @@ function testFailureMessage(text: string, apiToken: string | undefined): string 
 export class AdminSettings extends DurableObject<Cloudflare.Env> {
   private storage: AdminSettingsStorage;
   private users: DurableObjectNamespace<UserDurableObject>;
+  // The deployment-wide admin audit log, where every admin's change is recorded before it is made.
+  private audits: DurableObjectNamespace<AdminAuditDurableObject>;
   // Every bound gatekeeper, keyed by vendor id. Deployment-global (from env bindings), so admin
   // resource listing needs no user context.
   private vendors: Map<string, Service<GatekeeperVendor>>;
@@ -101,12 +107,17 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // R2 and config are separate stores. Serialize logo changes so reset/upload operations cannot
   // interleave while switching whether the fixed public object is enabled.
   private siteLogoMutationTail = Promise.resolve();
+  // Featuring reads the owner DO's bit to decide what to record, then writes it. Serialize the
+  // read/record/write so a concurrent call can never act on a bit another has since changed, which
+  // would make its change unrecorded.
+  private featuredMutationTail = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
 
     this.storage = makeAdminSettingsStorage(ctx.storage);
     this.users = this.ctx.exports.UserDurableObject;
+    this.audits = this.ctx.exports.AdminAuditDurableObject;
     this.vendors = buildGatekeeperVendorMap(env);
   }
 
@@ -184,8 +195,10 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
         .map(entry => ({blueprintId: entry.blueprintId, enabled: true}));
     // Always write, even when every pending format is already in DO storage. That is the retry
     // state after a prior KV mirror failure; stamping promotion without writing would strand the
-    // hot-path mirror on its old config forever.
-    await this.updateAdminConfig({formats: [...config.formats, ...added]});
+    // hot-path mirror on its old config forever. Offering the formats its release bundles is the
+    // deployment's own write, not an admin's, so it is not recorded.
+    await this.#mutateAdminConfig(null,
+        current => ({...current, formats: [...config.formats, ...added]}));
 
     for (let entry of pending) promoted.add(entry.blueprintId);
     this.storage.promotedFormatBlueprints.put([...promoted]);
@@ -269,14 +282,28 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     return featured;
   }
 
-  async setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
+  async setBlueprintFeatured(blueprintId: string, featured: boolean, actor: AdminSettingActor)
+      : Promise<void> {
     let { owner, publicInfo, featureable } = await this.#getOwnerBlueprint(blueprintId);
     if (!featureable || !owner) {
       throw new Error('Blueprint not featureable.');
     }
 
-    await owner.setBlueprintFeatured(blueprintId, featured);
-    await this.#syncFeaturedMirror(publicInfo, featured);
+    let previous = this.featuredMutationTail;
+    let release!: () => void;
+    this.featuredMutationTail = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try {
+      // The authoritative bit lives in the owner's DO, outside AdminConfig, so the change is
+      // recorded here rather than by #mutateAdminConfig().
+      let change = adminSettingChange("featured", blueprintId,
+          (await owner.isBlueprintFeatured(blueprintId)) ?? false, featured);
+      if (change) await this.#recordSetting(actor, [change], this.#config());
+      await owner.setBlueprintFeatured(blueprintId, featured);
+      await this.#syncFeaturedMirror(publicInfo, featured);
+    } finally {
+      release();
+    }
   }
 
   async syncFeaturedBlueprint(publicInfo: BlueprintPublicInfo): Promise<void> {
@@ -324,27 +351,29 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 
   /** Set whether the deployment checks for a newer release by itself. */
-  async setUpdateChecksEnabled(enabled: boolean): Promise<void> {
-    await this.updateAdminConfig({ updateChecksEnabled: enabled });
+  async setUpdateChecksEnabled(enabled: boolean, actor: AdminSettingActor): Promise<void> {
+    await this.updateAdminConfig({ updateChecksEnabled: enabled }, actor);
   }
 
   /** Set how many minutes a successful update check is relied on before the deployment asks again. */
-  async setUpdateCheckIntervalMinutes(minutes: number): Promise<void> {
+  async setUpdateCheckIntervalMinutes(minutes: number, actor: AdminSettingActor): Promise<void> {
     if (!isUpdateCheckInterval(minutes)) {
       throw new Error("The check interval must be a whole number of minutes from 1 to " +
           `${MAX_UPDATE_CHECK_INTERVAL_MINUTES}.`);
     }
-    await this.updateAdminConfig({ updateCheckIntervalMinutes: minutes });
+    await this.updateAdminConfig({ updateCheckIntervalMinutes: minutes }, actor);
   }
 
   /** Set how many hours a newer release must have been available before admins are notified. */
-  async setUpdateMinimumAgeHours(hours: number): Promise<void> {
-    await this.updateAdminConfig({ updateMinimumAgeHours: updateHours("minimum age", hours) });
+  async setUpdateMinimumAgeHours(hours: number, actor: AdminSettingActor): Promise<void> {
+    await this.updateAdminConfig(
+        { updateMinimumAgeHours: updateHours("minimum age", hours) }, actor);
   }
 
   /** Set how many hours a dismissed update notice stays hidden in the browser that dismissed it. */
-  async setUpdateNoticeSnoozeHours(hours: number): Promise<void> {
-    await this.updateAdminConfig({ updateNoticeSnoozeHours: updateHours("notice snooze", hours) });
+  async setUpdateNoticeSnoozeHours(hours: number, actor: AdminSettingActor): Promise<void> {
+    await this.updateAdminConfig(
+        { updateNoticeSnoozeHours: updateHours("notice snooze", hours) }, actor);
   }
 
   /** Record the version tag the router reported ("" for none); see ROUTER_VERSION_HEADER. */
@@ -449,7 +478,12 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     return this.#config();
   }
 
-  async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
+  // The one writer of the stored config. `actor` is the admin making the change, which is recorded
+  // in the audit log before anything is stored, so that a change whose record cannot be written is
+  // refused; null for a write that records nothing: the deployment's own, or one whose change its
+  // caller has already recorded.
+  async #mutateAdminConfig(actor: AdminSettingActor | null,
+                           mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
     let previousMutation = this.adminConfigMutationTail;
     let release!: () => void;
     this.adminConfigMutationTail = new Promise<void>(resolve => { release = resolve; });
@@ -457,10 +491,14 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     try {
       let current = this.#config();
       let next = mutate(current);
+      // A no-op records nothing, but is still written: it may be a retry repairing the KV mirror.
+      let changes = actor ? diffAdminConfig(current, next) : [];
+      if (actor && changes.length > 0) await this.#recordSetting(actor, changes, current);
       this.storage.adminConfig.put(next);
       try {
         await this.env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig(next));
       } catch (error) {
+        // The record stays: it records the attempt (see AdminSettingRecord).
         this.storage.adminConfig.put(current);
         throw error;
       }
@@ -469,17 +507,27 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  // Append `actor`'s change to the deployment-wide audit log, kept as long as `config` says.
+  // Throws when it cannot be appended, which refuses the change.
+  async #recordSetting(actor: AdminSettingActor, changes: AdminSettingChange[],
+                       config: AdminConfig): Promise<void> {
+    await this.audits.getByName("").append({ kind: "setting", at: new Date(), ...actor, changes },
+        adminAccessPolicy(config, this.env).retentionDays);
+  }
+
   /**
-   * Merge a partial update into the admin config and mirror it to KV. Callers (AdminApiImpl) validate
-   * scalar values; this just persists atomically.
+   * Merge a partial update into the admin config and mirror it to KV, recording the change `actor`
+   * makes. Callers (AdminApiImpl) validate scalar values; this just persists atomically.
    */
-  updateAdminConfig(patch: Partial<AdminConfig>): Promise<void> {
-    return this.#mutateAdminConfig(config => ({ ...config, ...patch }));
+  updateAdminConfig(patch: Partial<AdminConfig>, actor: AdminSettingActor): Promise<void> {
+    return this.#mutateAdminConfig(actor, config => ({ ...config, ...patch }));
   }
 
   /**
    * Read all admin-managed settings for the admin UI in one call: the stored config plus the live
-   * resource catalog (every bound gatekeeper's resource types annotated with their enabled state).
+   * resource catalog (every bound gatekeeper's resource types annotated with their enabled state),
+   * and the admin access level and audit retention as chosen, bounded by the environment and
+   * enforced.
    *
    * `adminUserId` is the requesting admin's user id (email/username), forwarded to each gatekeeper's
    * getSupportedResources(). Most gatekeepers ignore it, but RBAC-gated ones (e.g. the internal GTM
@@ -488,6 +536,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    */
   async getSettings(adminUserId: string): Promise<AdminSettingsView> {
     let config = this.#config();
+    let policy = adminAccessPolicy(config, this.env);
     return {
       signupsEnabled: config.signupsEnabled,
       userSearchEnabled: config.userSearchEnabled,
@@ -500,7 +549,47 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       resourceVendors: await this.#listResourceConfig(config, adminUserId),
       formats: await this.#listFormatConfig(config),
       gatewayModels: this.#listGatewayModels(config),
+      adminWorkspaceAccess: {
+        effective: policy.access,
+        chosen: config.adminWorkspaceAccess,
+        max: maxAdminWorkspaceAccess(this.env),
+      },
+      adminAuditRetentionDays: {
+        effective: policy.retentionDays,
+        chosen: config.adminAuditRetentionDays,
+        min: minAdminAuditRetentionDays(this.env),
+      },
     };
+  }
+
+  /**
+   * Set the access level admins choose for inspectWorkspace(), recording the change `actor` makes.
+   * Throws for a level above the one ADMIN_WORKSPACE_ACCESS_MAX allows, which a compromised admin
+   * session can never raise.
+   */
+  async setAdminWorkspaceAccess(access: AdminWorkspaceAccess, actor: AdminSettingActor)
+      : Promise<void> {
+    let max = maxAdminWorkspaceAccess(this.env);
+    if (lowerAdminWorkspaceAccess(access, max) !== access) {
+      throw new Error(`Admin access to workspaces can't be set above "${max}", the most this ` +
+          "deployment's ADMIN_WORKSPACE_ACCESS_MAX allows.");
+    }
+    await this.#mutateAdminConfig(actor, config => ({ ...config, adminWorkspaceAccess: access }));
+  }
+
+  /**
+   * Set how many days admins choose to keep audit records for, recording the change `actor` makes.
+   * Throws unless a whole number from the minimum ADMIN_AUDIT_RETENTION_MIN_DAYS sets to
+   * MAX_ADMIN_AUDIT_RETENTION_DAYS.
+   */
+  async setAdminAuditRetentionDays(days: number, actor: AdminSettingActor): Promise<void> {
+    let min = minAdminAuditRetentionDays(this.env);
+    if (!Number.isInteger(days) || days < min || days > MAX_ADMIN_AUDIT_RETENTION_DAYS) {
+      throw new Error(`The audit retention must be a whole number of days from ${min}, the ` +
+          `fewest this deployment's ADMIN_AUDIT_RETENTION_MIN_DAYS allows, to ` +
+          `${MAX_ADMIN_AUDIT_RETENTION_DAYS}.`);
+    }
+    await this.#mutateAdminConfig(actor, config => ({ ...config, adminAuditRetentionDays: days }));
   }
 
   // --- Standard output formats ---
@@ -529,9 +618,10 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   // Read-modify-write one format entry within the DO, so concurrent admin edits can't clobber each
   // other. `mutate` returns the replacement list, or null to leave the config untouched.
-  async #mutateFormats(mutate: (formats: FormatCuration[]) => FormatCuration[] | null)
+  async #mutateFormats(actor: AdminSettingActor,
+                       mutate: (formats: FormatCuration[]) => FormatCuration[] | null)
       : Promise<void> {
-    await this.#mutateAdminConfig(config => {
+    await this.#mutateAdminConfig(actor, config => {
       let next = mutate(config.formats);
       // A no-op may be a retry after the prior KV write failed but DO storage succeeded. Mirror the
       // current config again so idempotent retries repair that partial failure.
@@ -539,12 +629,12 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  async promoteFormat(blueprintId: string): Promise<void> {
+  async promoteFormat(blueprintId: string, actor: AdminSettingActor): Promise<void> {
     let record = await readBlueprintKvRecord(this.env, blueprintId);
     if (!record) {
       throw new Error("Blueprint not found.");
     }
-    await this.#mutateFormats(formats => {
+    await this.#mutateFormats(actor, formats => {
       // Idempotent so retrying after a KV mirror failure reaches #mutateFormats()'s repair write.
       if (formats.some(f => f.blueprintId === blueprintId)) return null;
       // A blueprint that declares no output still needs a stable grouping key before the admin can
@@ -559,7 +649,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  async removeFormat(blueprintId: string): Promise<void> {
+  async removeFormat(blueprintId: string, actor: AdminSettingActor): Promise<void> {
     // Enforced here, not just in the panel: this is an RPC an admin session can call directly.
     // Withdrawing a bundled entry is `enabled: false`, which keeps its overrides, hint and
     // position.
@@ -567,14 +657,15 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       throw new Error(
           "This format ships with the deployment, so it can't be removed. Turn it off instead.");
     }
-    await this.#mutateFormats(formats => {
+    await this.#mutateFormats(actor, formats => {
       let next = formats.filter(f => f.blueprintId !== blueprintId);
       return next.length === formats.length ? null : next;
     });
   }
 
-  async updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
-    await this.#mutateFormats(formats => formats.map(entry => {
+  async updateFormat(blueprintId: string, patch: AdminFormatPatch, actor: AdminSettingActor)
+      : Promise<void> {
+    await this.#mutateFormats(actor, formats => formats.map(entry => {
       if (entry.blueprintId !== blueprintId) return entry;
 
       let next: FormatCuration = {...entry};
@@ -598,8 +689,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     }));
   }
 
-  async setFormatOrder(blueprintIds: string[]): Promise<void> {
-    await this.#mutateFormats(formats => reorderFormats(formats, blueprintIds));
+  async setFormatOrder(blueprintIds: string[], actor: AdminSettingActor): Promise<void> {
+    await this.#mutateFormats(actor, formats => reorderFormats(formats, blueprintIds));
   }
 
   // --- AI Gateway models ---
@@ -652,8 +743,9 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    * Set how a gateway model is offered, atomically (read-modify-write within the DO). The model's
    * default mode is stored as absence, so setting it forgets the override.
    */
-  async setGatewayModelMode(modelId: string, mode: GatewayModelMode): Promise<void> {
-    await this.#mutateAdminConfig(config => {
+  async setGatewayModelMode(modelId: string, mode: GatewayModelMode, actor: AdminSettingActor)
+      : Promise<void> {
+    await this.#mutateAdminConfig(actor, config => {
       // Built from the config the mutation is handed, which is authoritative; the KV mirror the
       // user-facing paths read can trail it.
       let model = new GatewayModels(this.#requireGateway(), config).get(modelId);
@@ -669,8 +761,9 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    * reasoning level is not held to the model's own levels, since a request clamps it to them; the
    * compaction budget is held to the room the model's window leaves for a prompt.
    */
-  async setGatewayModelSettings(modelId: string, settings: GatewayModelSettings): Promise<void> {
-    await this.#mutateAdminConfig(config => {
+  async setGatewayModelSettings(modelId: string, settings: GatewayModelSettings,
+                                actor: AdminSettingActor): Promise<void> {
+    await this.#mutateAdminConfig(actor, config => {
       let model = new GatewayModels(this.#requireGateway(), config).get(modelId);
       if (!model) throw new Error(`No such model: ${modelId}`);
       let budget = settings.compactionInputBudget;
@@ -693,9 +786,10 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 
   /** Set the reasoning level of the gateway models whose settings give none, or null for none. */
-  async setDefaultReasoning(level: ReasoningLevel | null): Promise<void> {
+  async setDefaultReasoning(level: ReasoningLevel | null, actor: AdminSettingActor)
+      : Promise<void> {
     this.#requireGateway();
-    await this.updateAdminConfig({ defaultReasoning: level });
+    await this.updateAdminConfig({ defaultReasoning: level }, actor);
   }
 
   // The model `model` describes, as it is stored once added. Throws outside AI Gateway mode, and
@@ -730,8 +824,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    * Add a gateway model. Whether its ID is free is decided within the mutation, so that two
    * concurrent calls can't both add the same one.
    */
-  async addGatewayModel(model: GatewayModel): Promise<void> {
-    await this.#mutateAdminConfig(config => {
+  async addGatewayModel(model: GatewayModel, actor: AdminSettingActor): Promise<void> {
+    await this.#mutateAdminConfig(actor, config => {
       let added = this.#addableModel(model, config);
       // The ID was free, so a mode or settings stored under it belonged to a model that has since
       // left.
@@ -745,9 +839,9 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 
   /** Remove an added gateway model, and with it the mode and settings it was given. */
-  async removeGatewayModel(modelId: string): Promise<void> {
+  async removeGatewayModel(modelId: string, actor: AdminSettingActor): Promise<void> {
     this.#requireGateway();
-    await this.#mutateAdminConfig(config => {
+    await this.#mutateAdminConfig(actor, config => {
       let addedModels = config.addedModels.filter(model => model.id !== modelId);
       if (addedModels.length === config.addedModels.length) {
         throw new Error(`No such added model: ${modelId}`);
@@ -769,8 +863,9 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    * the modes and settings of the provider's models and the models added under it, all of which
    * return with it.
    */
-  async setGatewayProviderEnabled(provider: AiModelProvider, enabled: boolean): Promise<void> {
-    await this.#mutateAdminConfig(config => {
+  async setGatewayProviderEnabled(provider: AiModelProvider, enabled: boolean,
+                                  actor: AdminSettingActor): Promise<void> {
+    await this.#mutateAdminConfig(actor, config => {
       let gateway = this.#requireGateway();
       assertGatewayProvider(provider);
       if (gateway.providers.has(provider)) {
@@ -888,21 +983,22 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 
   /** Set whether users may add models of their own to the ones the gateway provides. */
-  async setUserModelsEnabled(enabled: boolean): Promise<void> {
+  async setUserModelsEnabled(enabled: boolean, actor: AdminSettingActor): Promise<void> {
     this.#requireGateway();
-    await this.updateAdminConfig({ userModelsEnabled: enabled });
+    await this.updateAdminConfig({ userModelsEnabled: enabled }, actor);
   }
 
   /** Set whether the admin UI may suggest models from models.dev while an admin adds one. */
-  async setModelsDevSuggestions(enabled: boolean): Promise<void> {
+  async setModelsDevSuggestions(enabled: boolean, actor: AdminSettingActor): Promise<void> {
     this.#requireGateway();
-    await this.updateAdminConfig({ modelsDevSuggestions: enabled });
+    await this.updateAdminConfig({ modelsDevSuggestions: enabled }, actor);
   }
 
   /** Enable/disable a single gatekeeper resource type atomically (read-modify-write within the DO). */
-  async setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
+  async setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean,
+                           actor: AdminSettingActor): Promise<void> {
     vendorId = vendorId.toLowerCase();
-    await this.#mutateAdminConfig(config => {
+    await this.#mutateAdminConfig(actor, config => {
       let map = { ...config.disabledResources };
       let disabled = new Set(map[vendorId] ?? []);
       if (enabled) disabled.delete(urlPattern); else disabled.add(urlPattern);
@@ -911,15 +1007,24 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  async setSiteLogo(data: Uint8Array | null): Promise<boolean> {
+  async setSiteLogo(data: Uint8Array | null, actor: AdminSettingActor): Promise<boolean> {
     let previous = this.siteLogoMutationTail;
     let release!: () => void;
     this.siteLogoMutationTail = new Promise<void>(resolve => { release = resolve; });
     await previous;
     try {
       let current = this.#config();
+      // Recorded before R2 or the config changes, so the config writes below record nothing more.
+      // A logo is recorded as its size and digest, never its bytes.
+      let change = adminSettingChange("siteLogo", undefined,
+          current.siteLogoConfigured ? "custom" : "default",
+          data === null ? "default" : {
+            bytes: data.byteLength,
+            sha256: new Uint8Array(await crypto.subtle.digest("SHA-256", data)).toHex(),
+          });
+      if (change) await this.#recordSetting(actor, [change], current);
       if (data === null) {
-        await this.updateAdminConfig({ siteLogoConfigured: false });
+        await this.#mutateAdminConfig(null, config => ({ ...config, siteLogoConfigured: false }));
         try {
           await this.env.BLUEPRINT_CONTENT.delete(SITE_LOGO_R2_KEY);
         } catch (error) {
@@ -934,7 +1039,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
         httpMetadata: { contentType: "image/png" },
       });
       if (!current.siteLogoConfigured) {
-        await this.updateAdminConfig({ siteLogoConfigured: true });
+        await this.#mutateAdminConfig(null, config => ({ ...config, siteLogoConfigured: true }));
       }
       return true;
     } finally {
@@ -948,12 +1053,13 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    * (default stored as absence); an ordinary gatekeeper stores a binary enabled/disabled in
    * disabledGatekeepers and rejects the ambient-only 'optional'.
    */
-  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode, actor: AdminSettingActor)
+      : Promise<void> {
     vendorId = vendorId.toLowerCase();
     let vendor = this.vendors.get(vendorId);
     let autoProvisions = !!vendor && (await vendor.describe()).autoProvisionsAccount === true;
     if (autoProvisions) {
-      await this.#mutateAdminConfig(config => {
+      await this.#mutateAdminConfig(actor, config => {
         let modes = { ...config.ambientGatekeeperModes };
         if (mode === DEFAULT_AMBIENT_GATEKEEPER_MODE) delete modes[vendorId]; else modes[vendorId] = mode;
         return { ...config, ambientGatekeeperModes: modes };
@@ -962,7 +1068,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       if (mode === "optional") {
         throw new Error(`"${vendorId}" is not an auto-provisioning gatekeeper; use 'enabled' or 'disabled'.`);
       }
-      await this.#mutateAdminConfig(config => {
+      await this.#mutateAdminConfig(actor, config => {
         let disabled = new Set(config.disabledGatekeepers);
         if (mode === "enabled") disabled.delete(vendorId); else disabled.add(vendorId);
         return { ...config, disabledGatekeepers: [...disabled] };
@@ -1031,22 +1137,45 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 }
 
-// Capability for managing deployment-wide admin settings, obtained via
-// AuthenticatedApi.getAdminApi() (which is null for non-admins). The admin access check happens once
-// when the capability is minted in server.ts, so these methods don't re-check. This is a thin
-// validation+forwarding facade over the AdminSettings DO — fully user-independent — so a disabled
-// gatekeeper/resource can't be re-enabled via a crafted request, and the client never receives a
-// stub to the DO's internal methods. Covers branding, agent instructions, signups, gatekeeper
-// connector/resource availability, AI Gateway models, and whether an update is available;
+// Capability for managing and investigating the deployment, obtained via
+// AuthenticatedApi.getAdminApi() (which is null for non-admins). The admin access check happens
+// once, when the capability is minted in server.ts, so its methods don't re-check, with one
+// exception: inspectWorkspace() re-checks, as openForAdmin() and every call on the view it mints
+// do, since a view is the one thing an admin holds that reads users' data. Setting by setting,
+// this is a thin validation+forwarding facade over the AdminSettings DO — fully user-independent —
+// so a disabled gatekeeper/resource can't be re-enabled via a crafted request, and the client
+// never receives a stub to the DO's internal methods. Every setter's change is recorded in the
+// deployment's audit log before it takes effect (see #mutateAdminConfig()). Covers branding, agent
+// instructions, signups, gatekeeper connector/resource availability, AI Gateway models, whether an
+// update is available, the user and workspace directory, and admin access to workspaces;
 // authentication config stays env-var driven.
 @validateRpc()
 export class AdminApiImpl extends RpcTarget implements AdminApi {
+  private admin: DurableObjectStub<AdminSettings>;
+  private directories: DurableObjectNamespace<UserDirectoryDurableObject>;
+  private audits: DurableObjectNamespace<AdminAuditDurableObject>;
+  private overseers: DurableObjectNamespace<OverseerDurableObject>;
+  #sessionId = crypto.randomUUID();
+
   /**
-   * `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
-   * resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
+   * `adminUserId` is the requesting admin's canonical id and `via` what their client said it is
+   * (AdminApiOptions.via). The capability's audit `sessionId` is minted here, so there is one per
+   * AuthenticatedApi.getAdminApi() call. Reaches the AdminSettings, UserDirectory, AdminAudit and
+   * Overseer namespaces through `ctx.exports`, and reads ADMINS and the admin access bounds from
+   * `env`.
    */
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
+  constructor(ctx: ExecutionContext, private env: Cloudflare.Env, private adminUserId: string,
+              private via: AdminVia) {
     super();
+    this.admin = ctx.exports.AdminSettings.getByName("");
+    this.directories = ctx.exports.UserDirectoryDurableObject;
+    this.audits = ctx.exports.AdminAuditDurableObject;
+    this.overseers = ctx.exports.OverseerDurableObject;
+  }
+
+  // Who makes a change through `method` of this capability, as its audit record says.
+  #actor(method: AdminSettingMethod): AdminSettingActor {
+    return { admin: this.adminUserId, sessionId: this.#sessionId, via: this.via, method };
   }
 
   getSettings(): Promise<AdminSettingsView> {
@@ -1054,48 +1183,52 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {
-    await this.admin.updateAdminConfig({ signupsEnabled: enabled });
+    await this.admin.updateAdminConfig(
+        { signupsEnabled: enabled }, this.#actor("setSignupsEnabled"));
   }
 
   async setUserSearchEnabled(enabled: boolean): Promise<void> {
-    await this.admin.updateAdminConfig({ userSearchEnabled: enabled });
+    await this.admin.updateAdminConfig(
+        { userSearchEnabled: enabled }, this.#actor("setUserSearchEnabled"));
   }
 
   async setSiteName(name: string): Promise<void> {
     if (name.length > MAX_SITE_NAME_LENGTH) {
       throw new Error(`Site name too long (max ${MAX_SITE_NAME_LENGTH} characters).`);
     }
-    await this.admin.updateAdminConfig({ siteName: name });
+    await this.admin.updateAdminConfig({ siteName: name }, this.#actor("setSiteName"));
   }
 
   async setSiteLogo(data: Uint8Array | null): Promise<AdminSettingsView['siteLogo']> {
     if (data !== null) validateSiteLogo(data);
-    return siteLogoImage(await this.admin.setSiteLogo(data));
+    return siteLogoImage(await this.admin.setSiteLogo(data, this.#actor("setSiteLogo")));
   }
 
   async setInstanceInstructions(text: string): Promise<void> {
     if (text.length > MAX_INSTANCE_INSTRUCTIONS_LENGTH) {
       throw new Error(`Instructions too long (max ${MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters).`);
     }
-    await this.admin.updateAdminConfig({ instanceInstructions: text });
+    await this.admin.updateAdminConfig(
+        { instanceInstructions: text }, this.#actor("setInstanceInstructions"));
   }
 
   setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
-    return this.admin.setResourceEnabled(vendorId, urlPattern, enabled);
+    return this.admin.setResourceEnabled(
+        vendorId, urlPattern, enabled, this.#actor("setResourceEnabled"));
   }
 
   setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
     if (!isAmbientGatekeeperMode(mode)) {
       throw new Error(`Invalid gatekeeper mode: ${mode}`);
     }
-    return this.admin.setGatekeeperMode(vendorId, mode);
+    return this.admin.setGatekeeperMode(vendorId, mode, this.#actor("setGatekeeperMode"));
   }
 
   async setAnnouncement(text: string): Promise<void> {
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
       throw new Error(`Announcement too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
     }
-    await this.admin.updateAdminConfig({ announcement: text });
+    await this.admin.updateAdminConfig({ announcement: text }, this.#actor("setAnnouncement"));
   }
 
   async setBanner(text: string, color: BannerColor): Promise<void> {
@@ -1105,14 +1238,14 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
     if (!isBannerColor(color)) {
       throw new Error(`Invalid banner color: ${color}`);
     }
-    await this.admin.updateAdminConfig({ banner: { text, color } });
+    await this.admin.updateAdminConfig({ banner: { text, color } }, this.#actor("setBanner"));
   }
 
   async setAccentColor(color: string): Promise<void> {
     if (color !== "" && !isHexColor(color)) {
       throw new Error(`Invalid accent color: ${color}`);
     }
-    await this.admin.updateAdminConfig({ accentColor: color });
+    await this.admin.updateAdminConfig({ accentColor: color }, this.#actor("setAccentColor"));
   }
 
   isBlueprintFeatured(blueprintId: string): Promise<boolean | null> {
@@ -1120,55 +1253,58 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
-    return this.admin.setBlueprintFeatured(blueprintId, featured);
+    return this.admin.setBlueprintFeatured(
+        blueprintId, featured, this.#actor("setBlueprintFeatured"));
   }
 
   promoteFormat(blueprintId: string): Promise<void> {
-    return this.admin.promoteFormat(blueprintId);
+    return this.admin.promoteFormat(blueprintId, this.#actor("promoteFormat"));
   }
 
   removeFormat(blueprintId: string): Promise<void> {
-    return this.admin.removeFormat(blueprintId);
+    return this.admin.removeFormat(blueprintId, this.#actor("removeFormat"));
   }
 
   updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
-    return this.admin.updateFormat(blueprintId, patch);
+    return this.admin.updateFormat(blueprintId, patch, this.#actor("updateFormat"));
   }
 
   setFormatOrder(blueprintIds: string[]): Promise<void> {
-    return this.admin.setFormatOrder(blueprintIds);
+    return this.admin.setFormatOrder(blueprintIds, this.#actor("setFormatOrder"));
   }
 
   setGatewayModelMode(modelId: string, mode: GatewayModelMode): Promise<void> {
-    return this.admin.setGatewayModelMode(modelId, mode);
+    return this.admin.setGatewayModelMode(modelId, mode, this.#actor("setGatewayModelMode"));
   }
 
   addGatewayModel(model: GatewayModel): Promise<void> {
-    return this.admin.addGatewayModel(model);
+    return this.admin.addGatewayModel(model, this.#actor("addGatewayModel"));
   }
 
   removeGatewayModel(modelId: string): Promise<void> {
-    return this.admin.removeGatewayModel(modelId);
+    return this.admin.removeGatewayModel(modelId, this.#actor("removeGatewayModel"));
   }
 
   setUserModelsEnabled(enabled: boolean): Promise<void> {
-    return this.admin.setUserModelsEnabled(enabled);
+    return this.admin.setUserModelsEnabled(enabled, this.#actor("setUserModelsEnabled"));
   }
 
   setModelsDevSuggestions(enabled: boolean): Promise<void> {
-    return this.admin.setModelsDevSuggestions(enabled);
+    return this.admin.setModelsDevSuggestions(enabled, this.#actor("setModelsDevSuggestions"));
   }
 
   setGatewayModelSettings(modelId: string, settings: GatewayModelSettings): Promise<void> {
-    return this.admin.setGatewayModelSettings(modelId, settings);
+    return this.admin.setGatewayModelSettings(
+        modelId, settings, this.#actor("setGatewayModelSettings"));
   }
 
   setDefaultReasoning(level: ReasoningLevel | null): Promise<void> {
-    return this.admin.setDefaultReasoning(level);
+    return this.admin.setDefaultReasoning(level, this.#actor("setDefaultReasoning"));
   }
 
   setGatewayProviderEnabled(provider: AiModelProvider, enabled: boolean): Promise<void> {
-    return this.admin.setGatewayProviderEnabled(provider, enabled);
+    return this.admin.setGatewayProviderEnabled(
+        provider, enabled, this.#actor("setGatewayProviderEnabled"));
   }
 
   testGatewayProvider(provider: AiModelProvider): Promise<GatewayModelTest> {
@@ -1192,18 +1328,139 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   setUpdateChecksEnabled(enabled: boolean): Promise<void> {
-    return this.admin.setUpdateChecksEnabled(enabled);
+    return this.admin.setUpdateChecksEnabled(enabled, this.#actor("setUpdateChecksEnabled"));
   }
 
   setUpdateCheckIntervalMinutes(minutes: number): Promise<void> {
-    return this.admin.setUpdateCheckIntervalMinutes(minutes);
+    return this.admin.setUpdateCheckIntervalMinutes(
+        minutes, this.#actor("setUpdateCheckIntervalMinutes"));
   }
 
   setUpdateMinimumAgeHours(hours: number): Promise<void> {
-    return this.admin.setUpdateMinimumAgeHours(hours);
+    return this.admin.setUpdateMinimumAgeHours(hours, this.#actor("setUpdateMinimumAgeHours"));
   }
 
   setUpdateNoticeSnoozeHours(hours: number): Promise<void> {
-    return this.admin.setUpdateNoticeSnoozeHours(hours);
+    return this.admin.setUpdateNoticeSnoozeHours(
+        hours, this.#actor("setUpdateNoticeSnoozeHours"));
+  }
+
+  // --- Users, workspaces and admin access ---
+
+  async listUsers(options: AdminUserQuery = {}): Promise<AdminUserPage> {
+    let limit = adminListLimit(options.limit);
+    // Built field by field, so that nothing else the client sent reaches the directory.
+    let { users, nextCursor } = await this.directories.getByName("").listUsers(
+        { query: options.query, cursor: options.cursor, limit });
+    let admins = deploymentAdmins(this.env);
+    let page = users.map(user => ({ ...user, isAdmin: admins.has(user.id) }));
+    return nextCursor === undefined ? { users: page } : { users: page, nextCursor };
+  }
+
+  async listWorkspaces(options: AdminWorkspaceQuery = {}): Promise<AdminWorkspacePage> {
+    let limit = adminListLimit(options.limit);
+    return await this.directories.getByName("").listWorkspaces(
+        { owner: options.owner, query: options.query, cursor: options.cursor, limit });
+  }
+
+  async inspectWorkspace(workspaceId: string, reason: string, options: AdminInspectOptions = {})
+      : Promise<RpcStub<AdminWorkspaceView>> {
+    reason = validateAdminAccessReason(reason);
+    let lifetimeMs = adminViewLifetimeMs(options.lifetimeSeconds);
+    if (!isDeploymentAdmin(this.env, this.adminUserId)) {
+      throw createAdminAccessError(ADMIN_ACCESS_ERROR_CODES.notAdmin);
+    }
+    let id: DurableObjectId;
+    try {
+      id = this.overseers.idFromString(workspaceId);
+    } catch {
+      throw createAdminAccessError(ADMIN_ACCESS_ERROR_CODES.workspaceNotFound);
+    }
+
+    // The authoritative config rather than readAdminConfig()'s KV mirror: a mirror still saying
+    // "full" after an admin lowered the level must not mint a view at the old one. The view's calls
+    // then read the mirror, which reaches them within about a minute.
+    let { access, retentionDays } =
+        adminAccessPolicy(await this.admin.getAdminConfig(), this.env);
+    let expiresAt = new Date(Date.now() + lifetimeMs);
+    if (access === "off") {
+      // Refused before any workspace is reached, so only the deployment-wide log records it.
+      let workspaceTitle = cutAdminAuditText(
+          await this.#directoryTitle(id.toString()), MAX_ADMIN_AUDIT_ARG_LENGTH);
+      await this.audits.getByName("").append({
+        kind: "workspace", at: new Date(), admin: this.adminUserId, sessionId: this.#sessionId,
+        via: this.via, workspaceId: id.toString(), workspaceTitle,
+        method: "inspectWorkspace", args: { expiresAt: expiresAt.toISOString() }, reason,
+        access: "off", refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
+      }, retentionDays);
+      throw createAdminAccessError(ADMIN_ACCESS_ERROR_CODES.accessOff);
+    }
+
+    // @ts-expect-error Cap'n Web RPC stubs and native RPC stubs are compatible but the type
+    //     system doesn't know this.
+    return this.#openForAdmin(id, reason, { via: this.via, access, expiresAt });
+  }
+
+  // Mint the view. A workspace that turns out not to exist leaves the directory, which lists it
+  // only until something finds it gone.
+  async #openForAdmin(id: DurableObjectId, reason: string, terms: AdminViewTerms) {
+    try {
+      return await this.overseers.get(id).openForAdmin(
+          this.adminUserId, reason, this.#sessionId, terms);
+    } catch (error) {
+      if (getAdminAccessErrorCode(error) === ADMIN_ACCESS_ERROR_CODES.workspaceNotFound) {
+        try {
+          await this.directories.getByName("").removeWorkspace(id.toString());
+        } catch (removal) {
+          logger.warn("failed to drop a missing workspace from the directory", {
+            event: "admin.directory.heal.failed", error: removal,
+          });
+        }
+      }
+      throw error;
+    }
+  }
+
+  // The title the directory lists for a workspace (clamped there to MAX_DIRECTORY_TEXT_LENGTH),
+  // for the record of an open refused before it reaches the workspace: "" when the directory lists
+  // none or cannot be asked, since the refusal is recorded either way.
+  async #directoryTitle(workspaceId: string): Promise<string> {
+    try {
+      return await this.directories.getByName("").workspaceTitle(workspaceId) ?? "";
+    } catch (error) {
+      logger.warn("failed to read a workspace's title from the directory", {
+        event: "admin.directory.title.failed", error,
+      });
+      return "";
+    }
+  }
+
+  async listAdminAudit(options: AdminAuditQuery = {}): Promise<AdminAuditPage> {
+    let limit = adminListLimit(options.limit);
+    let { kind, admin, workspace, since, cursor } = options;
+    return await this.audits.getByName("").list(
+        { kind, admin, workspace, since, cursor, limit }, await this.#retentionDays());
+  }
+
+  async getAdminAuditStats(options: AdminAuditStatsQuery = {}): Promise<AdminAuditStats> {
+    let days = adminAuditStatsDays(options.days);
+    return await this.audits.getByName("").stats(
+        { days, kind: options.kind }, await this.#retentionDays());
+  }
+
+  // The retention the authoritative config and the environment give now.
+  async #retentionDays(): Promise<number> {
+    return adminAccessPolicy(await this.admin.getAdminConfig(), this.env).retentionDays;
+  }
+
+  setAdminWorkspaceAccess(access: AdminWorkspaceAccess): Promise<void> {
+    if (!isAdminWorkspaceAccess(access)) {
+      throw new Error(`Invalid admin workspace access: ${access}`);
+    }
+    return this.admin.setAdminWorkspaceAccess(access, this.#actor("setAdminWorkspaceAccess"));
+  }
+
+  setAdminAuditRetentionDays(days: number): Promise<void> {
+    return this.admin.setAdminAuditRetentionDays(days, this.#actor("setAdminAuditRetentionDays"));
   }
 }
