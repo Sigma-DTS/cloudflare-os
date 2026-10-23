@@ -120,6 +120,8 @@ import {
   findUnresolvedConflicts, listConflictedFiles, type UnresolvedConflict,
 } from "./features/chat/mergeConflicts";
 import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDialog";
+import { GadgetUiBlockCard, GadgetUiBlockPending, type GadgetUiBlockCardProps } from "./features/chat/GadgetUiBlockCard";
+import { parseGadgetUiBlocks } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
 import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
 
@@ -1269,6 +1271,60 @@ export const MarkdownMessage = memo(function MarkdownMessage(
     </ReactMarkdown>
   );
 });
+
+// The mentions inside the answer's text from `start` to `end`, repositioned to that text.
+function mentionsWithin<T extends { position: number; length: number }>(
+  mentions: T[] | undefined, start: number, end: number,
+): T[] | undefined {
+  return mentions
+    ?.filter(mention => mention.position >= start && mention.position + mention.length <= end)
+    .map(mention => ({ ...mention, position: mention.position - start }));
+}
+
+// Shows text as code, in a fence longer than any backtick run inside it.
+function asCodeBlock(text: string): string {
+  const longestRun = Math.max(0, ...(text.match(/`+/g) ?? []).map(run => run.length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return `${fence}html\n${text}\n${fence}`;
+}
+
+type AnswerBlocks = Omit<GadgetUiBlockCardProps, "block">;
+
+/**
+ * An agent answer: Markdown prose, with each `<gadget-ui>` block drawn as a live view. Without
+ * `blocks` the answer is still streaming, so blocks show as placeholders.
+ */
+const AgentAnswer = (
+  { message, capsules, formats, blocks }: {
+    message: string;
+    capsules?: CapsuleSpecifier[];
+    formats?: MessageFormatRef[];
+    blocks?: AnswerBlocks;
+  },
+): ReactNode => {
+  // Stable per message, so the memoized MarkdownMessage parts don't re-tokenize on each render.
+  const parts = useMemo(() => parseGadgetUiBlocks(message).map(segment =>
+    segment.kind !== "text" ? segment : {
+      ...segment,
+      capsules: mentionsWithin(capsules, segment.start, segment.start + segment.text.length),
+      formats: mentionsWithin(formats, segment.start, segment.start + segment.text.length),
+    }), [message, capsules, formats]);
+
+  return parts.map((part, i) => {
+    switch (part.kind) {
+      case "text":
+        return <MarkdownMessage key={i} message={part.text} capsules={part.capsules} formats={part.formats} />;
+      case "block":
+        return blocks
+          ? <GadgetUiBlockCard key={i} {...blocks} block={part} />
+          : <GadgetUiBlockPending key={i} title={part.title} />;
+      case "open":
+        return blocks
+          ? <MarkdownMessage key={i} message={asCodeBlock(part.text)} />
+          : <GadgetUiBlockPending key={i} title={part.title} />;
+    }
+  });
+};
 
 // Build a temporary object URL for inlined attachment bytes, revoking it when no longer needed.
 function useAttachmentObjectUrl(content: Uint8Array | undefined, mimeType: string): string | null {
@@ -2981,6 +3037,11 @@ function ChatInterface({
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
   }, []);
+  // A view grows after it renders, once its frame reports its height, and a list that was at the
+  // bottom has to stay there.
+  const keepAtBottom = useCallback(() => {
+    if (isScrolledToBottomRef.current) scrollMessagesToBottom();
+  }, [scrollMessagesToBottom]);
 
   // Force a re-render when cache is updated
   const forceUpdate = () => setUpdateCounter((prev) => prev + 1);
@@ -3118,6 +3179,12 @@ function ChatInterface({
     ),
     [currentMessages],
   );
+  // While one of these is pending, neither the composer nor a view's Send can add a message.
+  const sendBlockedReason = hasPendingConnectionRequest
+    ? "Set up or deny the connection request above to continue."
+    : hasPendingAwaitedAction
+      ? "Approve or reject the pending action above to continue."
+      : undefined;
   // A gadget's stamped format, looked up by the id a finished createGadget call reports, so the
   // transcript can say "Created Doc" with the Doc icon.
   const resolveToolOutput = useCallback(
@@ -6074,11 +6141,20 @@ function ChatInterface({
 
                               {hasMessageText && (
                                 <div className={`text-[14px] leading-[22px] tracking-[-0.25px] text-kumo-default ${styles.markdownContent}`}>
-                                  <MarkdownMessage
-                                    message={msg.message}
-                                    capsules={msg.capsules}
-                                    formats={msg.formats}
-                                  />
+                                  {msg.author.type === "agent" && selectedChatId !== null ? (
+                                    <AgentAnswer
+                                      message={msg.message}
+                                      capsules={msg.capsules}
+                                      formats={msg.formats}
+                                      blocks={{ overseer, chatId: selectedChatId, sequence: msg.sequence, onSendMessage: handleSend, sendBlockedReason, onHeightChange: keepAtBottom, scrollRoot: messagesContainerRef }}
+                                    />
+                                  ) : (
+                                    <MarkdownMessage
+                                      message={msg.message}
+                                      capsules={msg.capsules}
+                                      formats={msg.formats}
+                                    />
+                                  )}
                                 </div>
                               )}
 
@@ -6439,7 +6515,7 @@ function ChatInterface({
 
                           {currentProvisionalState?.text && (
                             <div className={`text-[14px] leading-[22px] tracking-[-0.25px] text-kumo-default ${styles.markdownContent}`}>
-                              <MarkdownMessage message={currentProvisionalState.text} />
+                              <AgentAnswer message={currentProvisionalState.text} />
                             </div>
                           )}
 
@@ -6571,13 +6647,7 @@ function ChatInterface({
                           `workspace:${workspaceId}:chat:${selectedChatId}`,
                         )
                       : undefined}
-                    blockedReason={
-                      hasPendingConnectionRequest
-                        ? "Set up or deny the connection request above to continue."
-                        : hasPendingAwaitedAction
-                          ? "Approve or reject the pending action above to continue."
-                          : undefined
-                    }
+                    blockedReason={sendBlockedReason}
                     draftUpdateBanner={(() => {
                       if (!currentChatMetadata ||
                           !(chatHasProposedChanges(currentChatMetadata) ||
