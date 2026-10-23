@@ -1,19 +1,10 @@
 // `<gadget-ui>` blocks in an agent's answer: live views the Workshop draws in place of the block's
 // text (see plans/inline-gadget-ui.md). This module is the one parser of the syntax. The Workshop
-// lays out a message with it, and the kernel decides what a block can reach with it, so both sides
-// always agree on which block an index names.
-
-import { validateBindingName } from "./api.js";
+// lays out a message with it, and the kernel writes the text a chat gateway gets with it.
 
 /** One closed `<gadget-ui>` block of an agent answer. */
 export type GadgetUiBlock = {
   kind: "block";
-
-  /**
-   * Position among the answer's closed blocks, counting blocks that have an `error`. This is the
-   * `index` that `Overseer.connectToUiBlockGadget` takes.
-   */
-  index: number;
 
   /** The block's HTML: everything between its tags, trimmed. */
   html: string;
@@ -21,10 +12,7 @@ export type GadgetUiBlock = {
   /** The text of the block's `<title>` element, if it has one. */
   title?: string;
 
-  /** The chat binding named by the block's `gadget` attribute, if it has one. */
-  gadget?: string;
-
-  /** Why the block must not run, e.g. a `gadget` value that is not a binding name. */
+  /** Why the block must not run: it has nothing but a title. */
   error?: string;
 };
 
@@ -43,10 +31,7 @@ const CLOSE = "</gadget-ui>";
 
 // A tag counts only where it opens a line outside a code fence, so prose and examples that
 // mention the tag stay prose.
-const OPEN = /^[ \t]*<gadget-ui\b([^>]*)>/;
-
-// The `gadget` attribute itself (not `data-gadget`), with its value quoted or not, as HTML allows.
-const GADGET_ATTRIBUTE = /(?:^|\s)gadget\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/;
+const OPEN = /^[ \t]*<gadget-ui\b[^>]*>/;
 
 const TITLE = /<title>([\s\S]*?)<\/title>/i;
 
@@ -80,21 +65,11 @@ function titleOf(html: string): string | undefined {
   return title ? title : undefined;
 }
 
-function closedBlock(index: number, attributes: string, html: string): GadgetUiBlock {
-  let block: GadgetUiBlock = {kind: "block", index, html};
+function closedBlock(html: string): GadgetUiBlock {
+  let block: GadgetUiBlock = {kind: "block", html};
   let title = titleOf(html);
   if (title !== undefined) block.title = title;
-
-  let found = GADGET_ATTRIBUTE.exec(attributes);
-  let gadget = found?.[1] ?? found?.[2] ?? found?.[3];
-  if (gadget !== undefined) {
-    try {
-      validateBindingName(gadget);
-      block.gadget = gadget;
-    } catch (err) {
-      block.error = err instanceof Error ? err.message : String(err);
-    }
-  }
+  if (html.replace(TITLE, "").trim() === "") block.error = "This view has no content.";
   return block;
 }
 
@@ -104,7 +79,6 @@ export function parseGadgetUiBlocks(text: string): GadgetUiSegment[] {
   let prose = 0;
   let line = 0;
   let fence: Fence | null = null;
-  let index = 0;
 
   let lineEndAt = (start: number) => {
     let end = text.indexOf("\n", start);
@@ -130,7 +104,7 @@ export function parseGadgetUiBlocks(text: string): GadgetUiSegment[] {
       return segments;
     }
 
-    segments.push(closedBlock(index++, open[1] ?? "", text.slice(body, close).trim()));
+    segments.push(closedBlock(text.slice(body, close).trim()));
     prose = close + CLOSE.length;
     line = lineEndAt(prose) + 1;
   }

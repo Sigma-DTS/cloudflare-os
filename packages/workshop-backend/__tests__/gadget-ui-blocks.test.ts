@@ -7,7 +7,7 @@ describe("parseGadgetUiBlocks", () => {
   it("splits an answer into prose and blocks, in order, with each prose part's offset", () => {
     let answer = lines(
       "Food is up 18%.",
-      '<gadget-ui gadget="EXPENSES">',
+      "<gadget-ui>",
       "<title> Food, October </title>",
       "<div id=chart></div>",
       "</gadget-ui>",
@@ -15,30 +15,23 @@ describe("parseGadgetUiBlocks", () => {
     );
     expect(parseGadgetUiBlocks(answer)).toEqual([
       { kind: "text", text: "Food is up 18%.\n", start: 0 },
-      { kind: "block", index: 0, gadget: "EXPENSES", title: "Food, October",
+      { kind: "block", title: "Food, October",
         html: "<title> Food, October </title>\n<div id=chart></div>" },
       { kind: "text", text: "\nWant weekly totals?", start: answer.indexOf("\nWant") },
     ]);
   });
 
-  it("numbers every closed block, including one that must not run", () => {
+  it("refuses a block with nothing but a title, or nothing at all, whatever its attributes", () => {
     let segments = parseGadgetUiBlocks(lines(
-      "<gadget-ui>", "a", "</gadget-ui>",
-      "<gadget-ui gadget='no good'>", "b", "</gadget-ui>",
-      "\t <gadget-ui gadget='APP'>", "c", "</gadget-ui>",
+      "<gadget-ui></gadget-ui>",
+      "<gadget-ui>", "  <title>Plan</title>  ", "</gadget-ui>",
+      "\t <gadget-ui class='wide'>", "<title>Plan</title><p>Step one</p>", "</gadget-ui>",
     ));
-    expect(segments.flatMap(s => s.kind === "block" ? [[s.index, s.gadget, s.error !== undefined]] : []))
-        .toEqual([[0, undefined, false], [1, undefined, true], [2, "APP", false]]);
-  });
-
-  it("binds only the gadget attribute itself, quoted or not", () => {
-    let segments = parseGadgetUiBlocks(lines(
-      "<gadget-ui gadget=EXPENSES>", "a", "</gadget-ui>",
-      '<gadget-ui data-gadget="EXPENSES">', "b", "</gadget-ui>",
-      '<gadget-ui class="wide" gadget = "APP">', "c", "</gadget-ui>",
-    ));
-    expect(segments.flatMap(s => s.kind === "block" ? [s.gadget] : []))
-        .toEqual(["EXPENSES", undefined, "APP"]);
+    expect(segments.flatMap(s => s.kind === "block" ? [[s.title, s.error]] : [])).toEqual([
+      [undefined, "This view has no content."],
+      ["Plan", "This view has no content."],
+      ["Plan", undefined],
+    ]);
   });
 
   it("leaves a tag in a code fence or mid-line as prose", () => {

@@ -83,8 +83,8 @@ import { createWorkshopLogger, obsContext } from "./observability";
 import { traceAgentTurn, traceToolApproval } from "./agent-tracing";
 import { isLoopLimitError, retryOnDoReset, shouldRetryAfterReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
-import type { CreationApproval, GadgetExportFormat } from "@gadgets/workshop-shared/api";
-import { gadgetUiAnswerAsText, parseGadgetUiBlocks } from "@gadgets/workshop-shared/gadget-ui-blocks";
+import type { CreationApproval, GadgetExportFormat, ViewBinding } from "@gadgets/workshop-shared/api";
+import { gadgetUiAnswerAsText } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import {
   assertChatAttachmentSize,
   decodeChatAttachmentText,
@@ -5344,7 +5344,8 @@ class OverseerImpl implements AgentHooks {
     };
 
     this.storage.actions.put(record);
-    this.#associateAction(caller, actionId);
+    // A view reads on every mount, for every viewer, so its reads stay out of the chat.
+    if (caller.from !== "view") this.#associateAction(caller, actionId);
 
     if (sharing && baseline) {
       let affected = sharing.computeAffectedByOwnerInvitesOnly(baseline);
@@ -5907,6 +5908,10 @@ class OverseerImpl implements AgentHooks {
     if (description.pushedCommits !== undefined && description.pushedCommits.length > 0) {
       this.gitCache.verifyPushAncestry(gatekeeperId, description.pushedCommits);
     }
+
+    // A view's code runs again on every mount and for every viewer, so no rule may apply its
+    // actions. Storing that verdict keeps the card, the action log and the drainer in agreement.
+    if (caller.from === "view") description = {...description, autoApprovable: false};
 
     let actionId = this.storage.nextActionId.get();
     this.storage.nextActionId.put(actionId + 1);
@@ -7659,31 +7664,57 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // The gadget that block `index` of the agent answer at `sequence` names (see
-  // parseGadgetUiBlocks), resolved in the chat's binding scope. Throws unless that message is a
-  // stored agent answer with a valid block at `index` that names a gadget the chat binds.
-  uiBlockGadget(chatId: number, sequence: number, index: number): WorkpieceId {
-    let msg = this.storage.chats.get(chatKey(chatId, sequence));
-    if (msg?.type !== "message" || msg.author.type !== "agent") {
-      throw new Error(`Message ${sequence} of chat ${chatId} is not an agent answer.`);
+  // The chat binding `name` as a `<gadget-ui>` view reaches it (see Overseer.connectToChatBinding):
+  // a gadget's facet at the chat's version, or a session on a connection the user made, with the
+  // view as caller. `joinAs` counts what it returns toward the holder's session.
+  async openViewBinding(chatId: number, name: string, joinAs?: SessionKind): Promise<ViewBinding> {
+    let entry = this.resolveChatBinding(chatId, name);
+    if (entry === undefined) throw new Error(`"${name}" is not a binding in this chat.`);
+    let id = entry.type === "workpiece" ? entry.id : undefined;
+    if (id !== undefined && this.storage.gadgets.get(id)?.type === "gadget") {
+      // A gadget pane gets this from getUiBundle(); the worker loads only materialized changes.
+      this.checkChatExistsAndMaterializeChanges(chatId);
+      return {type: "gadget", rpc: await this.getGadgetFacet(id, chatId, joinAs)};
     }
-    for (let segment of parseGadgetUiBlocks(msg.message)) {
-      if (segment.kind !== "block" || segment.index !== index) continue;
-      if (segment.error !== undefined) throw new Error(segment.error);
-      if (segment.gadget === undefined) throw new Error("This block names no gadget.");
-      let gadgetId = this.resolveChatGadgetBinding(chatId, segment.gadget);
-      if (gadgetId === undefined) {
-        throw new Error(`"${segment.gadget}" is not a gadget in this chat.`);
-      }
-      return gadgetId;
+    // Only a connection the user made. A view never reaches a model, whose spend isn't recorded, a
+    // spawner, which starts agent turns, or an auto-provided service, which may spend credits or
+    // register lasting callbacks.
+    if (id !== undefined && this.storage.gatekeepers.get(id)?.creationSpec?.type === "gatekeeper") {
+      let session = await this.openGatekeeperSession(
+          id, await this.getGatekeeperFacet(id), {from: "view", chatId});
+      return {type: "connection", session: joinAs ? this.#leasedSession(session, joinAs) : session};
     }
-    throw new Error(`Message ${sequence} of chat ${chatId} has no block ${index}.`);
+    throw new Error(`"${name}" can't be used in a view.`);
   }
 
-  // The gadget `name` resolves to in the chat's binding scope, as the agent's `env` resolves it,
-  // or undefined if it resolves to no gadget. Reads only, unlike prepareChatBindings: the seed
-  // layer exists once the agent has run, which it has for any chat with an agent answer.
-  resolveChatGadgetBinding(chatId: number, name: string): WorkpieceId | undefined {
+  // `session`, counted toward `joinAs` until its holder disposes it. One proxy holds both, so a
+  // holder can't keep the session and drop the count (compare getGadgetFacet).
+  #leasedSession(session: RpcStub<any>, joinAs: SessionKind): RpcStub<any> {
+    let leaveSession = this.joinSession(joinAs);
+    let proxy = new Proxy(session, {
+      get(target, prop) {
+        if (prop === Symbol.dispose) {
+          return () => {
+            leaveSession();
+            target[Symbol.dispose]();
+          };
+        }
+        // `target` as the receiver, as in getGadgetFacet, where the proxy as receiver throws.
+        return Reflect.get(target, prop, target);
+      },
+      getPrototypeOf() {
+        return RpcTarget.prototype;
+      },
+    });
+    // As in getGadgetFacet: workerd doesn't detect a proxy RpcTarget that it serializes.
+    // @ts-expect-error NativeRpcStub still has infinite recursion problems, fixed in Cap'n Web.
+    return new NativeRpcStub(proxy) as RpcStub<any>;
+  }
+
+  // What `name` resolves to in the chat's binding scope, as the agent's `env` resolves it. Reads
+  // only, unlike prepareChatBindings: the seed layer exists once the agent has run, which it has
+  // for any chat with an agent answer.
+  resolveChatBinding(chatId: number, name: string): ChatBindingEntry | undefined {
     let checkpoint = this.getActiveChatCompaction(chatId);
     let seed = Object.entries(this.getChatAgentContext(chatId).bindings ?? {});
     let bindings = new Map<string, ChatBindingEntry>([
@@ -7694,9 +7725,7 @@ class OverseerImpl implements AgentHooks {
       prefix: chatKeyPrefix(chatId),
       start: chatKey(chatId, checkpoint?.compactedTo ?? 0),
     }), bindings);
-    let entry = bindings.get(name);
-    return entry?.type === "workpiece" && this.storage.gadgets.get(entry.id)?.type === "gadget"
-        ? entry.id : undefined;
+    return bindings.get(name);
   }
 
   getChatAgentContext(chatId: number): AiChatAgentContext {
@@ -12090,14 +12119,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return msg && this.#getChatMessageForClient(msg);
   }
 
-  async connectToUiBlockGadget(chatId: number, sequence: number, index: number)
-      : Promise<RpcStub<any>> {
-    let gadgetId = this.impl.uiBlockGadget(chatId, sequence, index);
-    // A gadget pane gets this from getUiBundle(); the worker loads only materialized changes.
-    this.impl.checkChatExistsAndMaterializeChanges(chatId);
-    // Counted toward the caller's session for as long as the stub lives, as
-    // GadgetClient.connectToGadget's stub is.
-    return this.impl.getGadgetFacet(gadgetId, chatId, this.#mintedCapabilityKind());
+  async connectToChatBinding(chatId: number, name: string): Promise<ViewBinding> {
+    // Counted toward the caller's session for as long as it lives, as the stub
+    // GadgetClient.connectToGadget returns is.
+    return this.impl.openViewBinding(chatId, name, this.#mintedCapabilityKind());
   }
 
   #getChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
@@ -12886,7 +12911,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async getChatMessage(_chatId: number, _sequence: number): Promise<AiChatMessage | undefined> { this.#deny(); }
-  async connectToUiBlockGadget(_chatId: number, _sequence: number, _index: number): Promise<RpcStub<any>> { this.#deny(); }
+  async connectToChatBinding(_chatId: number, _name: string): Promise<ViewBinding> { this.#deny(); }
   async listSlashCommands(): Promise<SlashCommandChoice[]> { this.#deny(); }
   async subscribeToChat(
       _subscriber: RpcStub<AiChatSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {
