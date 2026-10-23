@@ -1221,6 +1221,21 @@ function getMarkdownComponents(
         </a>
       );
     },
+    // The browser would fetch an image as soon as the message shows, sending its URL to the
+    // image's host with no click. The agent or a gatekeeper writes that URL, so it could carry
+    // workspace data out, even from a restricted workspace. Show a link instead.
+    img: ({ src, alt }) => {
+      const safeSrc = safeExternalUrl(typeof src === "string" ? src : undefined);
+      if (!safeSrc) {
+        return <>{alt}</>;
+      }
+
+      return (
+        <a href={safeSrc} target="_blank" rel="noopener noreferrer">
+          {alt || safeSrc}
+        </a>
+      );
+    },
   };
 }
 

