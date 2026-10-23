@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { type RefObject, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from 'react'
 import { Banner, Text } from '@cloudflare/kumo'
 import { CaretDownIcon, CaretRightIcon, PaperPlaneRightIcon } from '@phosphor-icons/react'
 import { newMessagePortRpcSession, type RpcStub } from 'capnweb'
@@ -15,8 +15,8 @@ import {
 
 const MIN_HEIGHT = 40
 const MAX_HEIGHT = 720
-// A view reloads when its gadget's server restarts, as it does on every code change. One that
-// keeps breaking within STABLE_CONNECTION_MS of connecting waits longer before each reload.
+// A view reloads when one of its bindings breaks, as a gadget's server does on every code change.
+// One that keeps breaking within STABLE_CONNECTION_MS of its handshake waits longer each time.
 const STABLE_CONNECTION_MS = 10_000
 const MAX_RELOAD_DELAY_MS = 30_000
 const reloadDelay = (quickBreaks: number) =>
@@ -25,14 +25,15 @@ const reloadDelay = (quickBreaks: number) =>
 export type GadgetUiBlockCardProps = {
   overseer: RpcStub<Overseer>
   chatId: number
-  /** The agent answer the block is part of. */
-  sequence: number
   block: GadgetUiBlock
   /** Sends a message as the viewer, as the composer does. Reports its own failures, then throws. */
   onSendMessage: (message: string) => Promise<void>
   /** Why the viewer cannot send now, e.g. the chat waits on an approval. */
   sendBlockedReason?: string
-  /** Runs after the card's height changes: its view reported a new height, or its chip came or went. */
+  /**
+   * Runs after the card's height may have changed: its view reported a new height, its chip came
+   * or went, or a binding's name joined its header.
+   */
   onHeightChange: () => void
   /** The chat's scrolling message list. It clips the card before the window does. */
   scrollRoot: RefObject<HTMLElement | null>
@@ -46,7 +47,7 @@ const clampHeight = (height: number) =>
 
 /** A live `<gadget-ui>` block of a stored agent answer, drawn in a sandboxed frame. */
 export const GadgetUiBlockCard = ({
-  overseer, chatId, sequence, block, onSendMessage, sendBlockedReason, onHeightChange, scrollRoot,
+  overseer, chatId, block, onSendMessage, sendBlockedReason, onHeightChange, scrollRoot,
 }: GadgetUiBlockCardProps) => {
   const { resolvedThemeMode } = useTheme()
   const cardRef = useRef<HTMLDivElement>(null)
@@ -61,20 +62,25 @@ export const GadgetUiBlockCard = ({
   const [codeError, setCodeError] = useState<string | null>(null)
   const [frameKey, setFrameKey] = useState(0)
   const [chip, setChip] = useState<Chip | null>(null)
+  // Names the view's code opened, in the order it opened them.
+  const [names, setNames] = useState<string[]>([])
   // The first document's theme avoids a flash; the handshake sends the current one.
-  const [srcDoc] = useState(() =>
-    createUiBlockHtml(block.html, block.gadget !== undefined, readUiBlockTheme()))
+  const [srcDoc] = useState(() => createUiBlockHtml(block.html, readUiBlockTheme()))
 
-  // Only a bound block's frame uses the Overseer connection. A frame hands over its port once per
-  // load, so a new connection (the Workshop reconnected) needs a new load, and a failure on the old
-  // connection no longer applies.
-  const gadgetOverseer = block.gadget === undefined ? null : overseer
-  const [frameOverseer, setFrameOverseer] = useState({ stub: gadgetOverseer })
-  if (frameOverseer.stub !== gadgetOverseer) {
-    setFrameOverseer({ stub: gadgetOverseer })
-    setError(block.error ?? null)
+  // The Overseer connection the current frame load asked for a binding on. Its stubs and lookups
+  // die with that connection, so a new one (the Workshop reconnected) needs a new load. A frame
+  // that never asked keeps running.
+  const [askedOn, setAskedOn] = useState<{ stub: RpcStub<Overseer> } | null>(null)
+  if (askedOn !== null && askedOn.stub !== overseer) {
+    setAskedOn(null)
     setFrameKey(key => key + 1)
   }
+
+  const openBinding = useEffectEvent((name: string) => {
+    // Marked before the lookup, so a lookup still in flight when the Workshop reconnects counts.
+    setAskedOn(current => current ?? { stub: overseer })
+    return overseer.connectToChatBinding(chatId, name)
+  })
 
   const live = nearViewport && !collapsed && error === null
 
@@ -94,16 +100,18 @@ export const GadgetUiBlockCard = ({
     if (!live) return
     let closed = false
     let handshakes = 0
+    let reloading = false
     const resources: Disposable[] = []
     const teardown = () => {
       frameRef.current = null
       // A request needs the frame that made it, and an error the document that threw it.
       setChip(null)
       setCodeError(null)
+      setAskedOn(null)
       for (const resource of resources.splice(0).toReversed()) resource[Symbol.dispose]()
     }
 
-    const handleMessage = async (event: MessageEvent) => {
+    const handleMessage = (event: MessageEvent) => {
       // Only our own frame, still at its opaque origin ("null" is the string the browser reports).
       if (event.source !== iframeRef.current?.contentWindow || event.origin !== 'null') return
       const port = event.ports[0]
@@ -115,33 +123,27 @@ export const GadgetUiBlockCard = ({
         setError('This view reloaded itself, so it was stopped.')
         return
       }
-      try {
-        const gadgetPromise = gadgetOverseer?.connectToUiBlockGadget(chatId, sequence, block.index)
-        if (gadgetPromise) resources.push(gadgetPromise)
-        const gadget = await gadgetPromise
-        if (closed) return
-        const openedAt = Date.now()
-        gadget?.onRpcBroken(() => {
-          if (closed) return
+      const openedAt = Date.now()
+      const host = new UiBlockHostImpl({
+        openBinding: name => openBinding(name),
+        onBinding: name => setNames(current => current.includes(name) ? current : [...current, name]),
+        onBindingBroken: () => {
+          // Disposing a stub can report it broken, and the stubs of one load often break together.
+          if (closed || reloading) return
+          reloading = true
           if (Date.now() - openedAt > STABLE_CONNECTION_MS) quickBreaksRef.current = 0
           const timer = setTimeout(() => setFrameKey(key => key + 1), reloadDelay(quickBreaksRef.current++))
           resources.push({ [Symbol.dispose]: () => clearTimeout(timer) })
-        })
-        const host = new UiBlockHostImpl(
-          gadget,
-          message => setChip({ message, sending: false }),
-          reported => setHeight(clampHeight(reported)),
-          setCodeError,
-        )
-        resources.push(host)
-        const frame = newMessagePortRpcSession<UiBlockFrame>(port, host)
-        resources.push(frame)
-        frameRef.current = frame
-        void frame.setTheme(readUiBlockTheme())
-      } catch (caught) {
-        port.close()
-        if (!closed) setError(caught instanceof Error ? caught.message : String(caught))
-      }
+        },
+        onMessageRequest: message => setChip({ message, sending: false }),
+        onResize: reported => setHeight(clampHeight(reported)),
+        onError: setCodeError,
+      })
+      resources.push(host)
+      const frame = newMessagePortRpcSession<UiBlockFrame>(port, host)
+      resources.push(frame)
+      frameRef.current = frame
+      void frame.setTheme(readUiBlockTheme())
     }
 
     window.addEventListener('message', handleMessage)
@@ -150,14 +152,14 @@ export const GadgetUiBlockCard = ({
       window.removeEventListener('message', handleMessage)
       teardown()
     }
-  }, [live, frameKey, gadgetOverseer, chatId, sequence, block.index])
+  }, [live, frameKey])
 
   useEffect(() => {
     // ThemeProvider applies a mode to the document before it publishes it.
     void frameRef.current?.setTheme(readUiBlockTheme())
   }, [resolvedThemeMode])
 
-  useLayoutEffect(() => onHeightChange(), [height, chip, onHeightChange])
+  useLayoutEffect(() => onHeightChange(), [height, chip, names, onHeightChange])
 
   const send = async () => {
     if (!chip || chip.sending || sendBlockedReason !== undefined) return
@@ -181,7 +183,7 @@ export const GadgetUiBlockCard = ({
   const title = block.title ?? 'View'
   return (
     <div ref={cardRef} className="my-2 overflow-hidden rounded-lg border border-kumo-line bg-kumo-base">
-      <div className="flex items-center gap-2 px-2 py-1.5">
+      <div className="flex flex-wrap items-center gap-2 px-2 py-1.5">
         <WorkshopIconButton
           aria-label={collapsed ? `Show ${title}` : `Hide ${title}`}
           aria-expanded={!collapsed}
@@ -191,11 +193,11 @@ export const GadgetUiBlockCard = ({
           {collapsed ? <CaretRightIcon size={14} /> : <CaretDownIcon size={14} />}
         </WorkshopIconButton>
         <Text size="sm" bold>{title}</Text>
-        {block.gadget !== undefined && (
-          <span className="rounded bg-kumo-tint px-1.5 font-mono text-[11px] leading-5 text-kumo-subtle">
-            {block.gadget}
+        {names.map(name => (
+          <span key={name} className="rounded bg-kumo-tint px-1.5 font-mono text-[11px] leading-5 text-kumo-subtle">
+            {name}
           </span>
-        )}
+        ))}
       </div>
       {!collapsed && (error !== null ? (
         <div className="px-3 pb-3">

@@ -6146,7 +6146,7 @@ function ChatInterface({
                                       message={msg.message}
                                       capsules={msg.capsules}
                                       formats={msg.formats}
-                                      blocks={{ overseer, chatId: selectedChatId, sequence: msg.sequence, onSendMessage: handleSend, sendBlockedReason, onHeightChange: keepAtBottom, scrollRoot: messagesContainerRef }}
+                                      blocks={{ overseer, chatId: selectedChatId, onSendMessage: handleSend, sendBlockedReason, onHeightChange: keepAtBottom, scrollRoot: messagesContainerRef }}
                                     />
                                   ) : (
                                     <MarkdownMessage

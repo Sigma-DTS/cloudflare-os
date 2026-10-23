@@ -43,29 +43,71 @@ class VisibleIntersectionObserver {
   disconnect() {}
 }
 
+// Real dates, so each break counts as soon after the handshake; fake timers skip the reload waits.
+async function withFakeTimers(test: () => Promise<void>) {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    await test()
+  } finally {
+    vi.useRealTimers()
+  }
+}
+
+// Lets port messages arrive without moving the fake clock, as vi.waitFor would: each turn waits
+// for a message on a port of its own, a task the fake timers leave alone.
+const nextTask = () => new Promise<void>(resolve => {
+  const { port1, port2 } = new MessageChannel()
+  port1.addEventListener('message', () => {
+    port1.close()
+    resolve()
+  }, { once: true })
+  port1.start()
+  port2.postMessage(null)
+})
+const settle = () => act(async () => {
+  for (let turn = 0; turn < 10; turn++) await nextTask()
+})
+
 class FakeGadget extends RpcTarget {
   disposed = false
   read() { return 'gadget data' }
   [Symbol.dispose]() { this.disposed = true }
 }
 
+class FakeSession extends RpcTarget {
+  disposed = false
+  listIssues() { return ['#12'] }
+  [Symbol.dispose]() { this.disposed = true }
+}
+
+// GITHUB is a connection, MODEL a binding a view may not use, and every other name a gadget. A
+// lookup for SLOW waits for finishSlow().
 class FakeOverseer extends RpcTarget {
-  connects: unknown[][] = []
-  gadgets: FakeGadget[] = []
-  // The server end of each gadget connection, which a test closes to restart that server.
+  lookups: unknown[][] = []
+  served: (FakeGadget | FakeSession)[] = []
+  // The server end of each binding, which a test closes to restart that server.
   servers: MessagePort[] = []
-  connectToUiBlockGadget(...args: unknown[]) {
-    this.connects.push(args)
-    const gadget = new FakeGadget()
-    this.gadgets.push(gadget)
-    const { port1, port2 } = new MessageChannel()
-    newMessagePortRpcSession(port1, gadget)
-    this.servers.push(port1)
-    return newMessagePortRpcSession<FakeGadget>(port2)
+  finishSlow = () => {}
+
+  async connectToChatBinding(chatId: number, name: string) {
+    this.lookups.push([chatId, name])
+    if (name === 'MODEL') throw new Error(`"MODEL" can't be used in a view.`)
+    if (name === 'SLOW') await new Promise<void>(resolve => { this.finishSlow = resolve })
+    if (name === 'GITHUB') return { type: 'connection', session: this.#serve(new FakeSession()) }
+    return { type: 'gadget', rpc: this.#serve(new FakeGadget()) }
   }
-  restart(connection: number) {
+
+  #serve<T extends FakeGadget | FakeSession>(target: T) {
+    this.served.push(target)
+    const { port1, port2 } = new MessageChannel()
+    newMessagePortRpcSession(port1, target)
+    this.servers.push(port1)
+    return newMessagePortRpcSession<T>(port2)
+  }
+
+  restart(server: number) {
     // Cap'n Web's signal that the peer closed the port.
-    this.servers[connection]?.postMessage(null)
+    this.servers[server]?.postMessage(null)
   }
 }
 
@@ -73,11 +115,12 @@ class FakeFrame extends RpcTarget implements UiBlockFrame {
   setTheme() {}
 }
 
-// The host as a bound block's frame sees it, with a FakeGadget as its gadget.
-type TestHost = Omit<UiBlockHost, 'gadget'> & { gadget: FakeGadget }
+// The host as the block's frame sees it. A name that is not a string is what block code can send.
+type TestHost = Omit<UiBlockHost, 'binding'> & {
+  binding(name: string | number): Promise<{ rpc: FakeGadget } & FakeSession>
+}
 
-const BOUND: GadgetUiBlock = { kind: 'block', index: 2, html: '<p>hi</p>', title: 'Spending', gadget: 'EXPENSES' }
-const UNBOUND: GadgetUiBlock = { ...BOUND, gadget: undefined }
+const BLOCK: GadgetUiBlock = { kind: 'block', html: '<p>hi</p>', title: 'Spending' }
 
 describe('GadgetUiBlockCard', () => {
   let container: HTMLDivElement
@@ -108,12 +151,12 @@ describe('GadgetUiBlockCard', () => {
   const scrollRoot = { current: null }
   const onHeightChange = () => {}
   const card = (fake: FakeOverseer, block: GadgetUiBlock, sendBlockedReason?: string) => (
-    <GadgetUiBlockCard overseer={new RpcStub(fake) as unknown as RpcStub<Overseer>} chatId={1} sequence={7}
+    <GadgetUiBlockCard overseer={new RpcStub(fake) as unknown as RpcStub<Overseer>} chatId={1}
       block={block} scrollRoot={scrollRoot} sendBlockedReason={sendBlockedReason} onHeightChange={onHeightChange}
       onSendMessage={message => { sent.push(message); return reply() }} />
   )
 
-  async function renderCard(block = BOUND, sendBlockedReason?: string) {
+  async function renderCard(block = BLOCK, sendBlockedReason?: string) {
     await act(async () => root.render(card(overseer, block, sendBlockedReason)))
     await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
     return container.querySelector('iframe')!
@@ -137,7 +180,7 @@ describe('GadgetUiBlockCard', () => {
     [...container.querySelectorAll('button')].find(button => button.textContent === name)
 
   it("sends the view's message as the viewer's only when they click Send", async () => {
-    const host = await handshake(await renderCard(UNBOUND))
+    const host = await handshake(await renderCard())
     for (let i = 0; i < 5; i++) await host.requestMessage(`Show me week ${i}.`)
 
     await vi.waitFor(() => expect(container.textContent).toContain('Show me week 4.'))
@@ -147,12 +190,12 @@ describe('GadgetUiBlockCard', () => {
     await act(async () => buttonNamed('Send')!.click())
     await vi.waitFor(() => expect(sent).toEqual(['Show me week 4.']))
     await vi.waitFor(() => expect(buttonNamed('Send')).toBeUndefined())
-    // An unbound view never reaches for a gadget.
-    expect(overseer.connects).toEqual([])
+    // A view that never reads `env` never reaches the kernel.
+    expect(overseer.lookups).toEqual([])
   })
 
   it('drops a message the viewer dismisses', async () => {
-    const host = await handshake(await renderCard(UNBOUND))
+    const host = await handshake(await renderCard())
     await host.requestMessage('Pick Aero.')
     await vi.waitFor(() => expect(buttonNamed('Dismiss')).toBeDefined())
 
@@ -162,7 +205,7 @@ describe('GadgetUiBlockCard', () => {
   })
 
   it('holds Send while the chat waits on the viewer', async () => {
-    const host = await handshake(await renderCard(UNBOUND, 'Approve the pending action above.'))
+    const host = await handshake(await renderCard(BLOCK, 'Approve the pending action above.'))
     await host.requestMessage('Pick Aero.')
     await vi.waitFor(() => expect(buttonNamed('Send')).toBeDefined())
 
@@ -171,7 +214,7 @@ describe('GadgetUiBlockCard', () => {
   })
 
   it('keeps the message for another try when a Send fails', async () => {
-    const host = await handshake(await renderCard(UNBOUND))
+    const host = await handshake(await renderCard())
     await host.requestMessage('Pick Aero.')
     await vi.waitFor(() => expect(buttonNamed('Send')).toBeDefined())
     reply = () => Promise.reject(new Error('offline'))
@@ -183,7 +226,7 @@ describe('GadgetUiBlockCard', () => {
   })
 
   it('keeps a newer message when an earlier Send finishes', async () => {
-    const host = await handshake(await renderCard(UNBOUND))
+    const host = await handshake(await renderCard())
     await host.requestMessage('Pick Aero.')
     await vi.waitFor(() => expect(buttonNamed('Send')).toBeDefined())
     let finish = () => {}
@@ -201,37 +244,89 @@ describe('GadgetUiBlockCard', () => {
     expect(buttonNamed('Send')).toBeDefined()
   })
 
-  it("gives a bound view the server of the gadget its block names", async () => {
+  it("gives the view a gadget's server and a connection's session, each opened once", async () => {
     const host = await handshake(await renderCard())
-    await expect(host.gadget.read()).resolves.toBe('gadget data')
-    expect(overseer.connects).toEqual([[1, 7, 2]])
+    await expect(host.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
+    await expect(host.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
+    await expect(host.binding('GITHUB').listIssues()).resolves.toEqual(['#12'])
+
+    expect(overseer.lookups).toEqual([[1, 'EXPENSES'], [1, 'GITHUB']])
+    await vi.waitFor(() => expect(container.textContent).toContain('EXPENSESGITHUB'))
   })
 
-  it("reloads a bound view each time its gadget's server restarts, however often", async () => {
-    // Real dates, so each break counts as soon after connecting; fake timers skip the reload waits.
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      let iframe = await renderCard()
-      for (let restart = 0; restart < 5; restart++) {
-        await (await handshake(iframe)).gadget.read()
-        overseer.restart(restart)
-        await vi.waitFor(() => {
-          vi.runOnlyPendingTimers()
-          expect(container.querySelector('iframe')).not.toBe(iframe)
-        })
-        iframe = container.querySelector('iframe')!
-      }
-      await expect((await handshake(iframe)).gadget.read()).resolves.toBe('gadget data')
-      expect(overseer.connects).toHaveLength(6)
-      expect(buttonNamed('Reload')).toBeUndefined()
-    } finally {
-      vi.useRealTimers()
-    }
+  it('rejects a lookup that fails, and the view keeps running', async () => {
+    const host = await handshake(await renderCard())
+    await expect(host.binding('MODEL')).rejects.toThrow(`"MODEL" can't be used in a view.`)
+    await expect(host.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
+
+    // The header names only what the view could open.
+    await vi.waitFor(() => expect(container.textContent).toContain('EXPENSES'))
+    expect(container.textContent).not.toContain('MODEL')
+    expect(buttonNamed('Reload')).toBeUndefined()
   })
+
+  it('refuses a name that is not a string, and a 33rd name', async () => {
+    const host = await handshake(await renderCard())
+    await expect(host.binding(42)).rejects.toThrow('A binding name is a string.')
+    for (let i = 0; i < 32; i++) await host.binding(`G${i}`).rpc.read()
+
+    await expect(host.binding('G32')).rejects.toThrow('at most 32 bindings')
+    await expect(host.binding('G0').rpc.read()).resolves.toBe('gadget data')
+    expect(overseer.lookups).toHaveLength(32)
+  })
+
+  it('disposes a binding that arrives after the view unmounted', async () => {
+    const host = await handshake(await renderCard())
+    host.binding('SLOW').catch(() => {})
+    await vi.waitFor(() => expect(overseer.lookups).toEqual([[1, 'SLOW']]))
+
+    await act(async () => root.render(<></>))
+    overseer.finishSlow()
+    await vi.waitFor(() => expect(overseer.served[0]?.disposed).toBe(true))
+  })
+
+  it("reloads a view each time a binding's server restarts, however often", () => withFakeTimers(async () => {
+    let iframe = await renderCard()
+    for (let restart = 0; restart < 5; restart++) {
+      await (await handshake(iframe)).binding('EXPENSES').rpc.read()
+      overseer.restart(restart)
+      await vi.waitFor(() => {
+        vi.runOnlyPendingTimers()
+        expect(container.querySelector('iframe')).not.toBe(iframe)
+      })
+      iframe = container.querySelector('iframe')!
+    }
+    await expect((await handshake(iframe)).binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
+    expect(overseer.lookups).toHaveLength(6)
+    expect(buttonNamed('Reload')).toBeUndefined()
+  }))
+
+  it('counts bindings that break together as one restart', () => withFakeTimers(async () => {
+    const first = await renderCard()
+    const host = await handshake(first)
+    await host.binding('EXPENSES').rpc.read()
+    await host.binding('GITHUB').listIssues()
+    overseer.restart(0)
+    overseer.restart(1)
+    await settle()
+    expect(vi.getTimerCount()).toBe(1)
+    await act(async () => { vi.advanceTimersByTime(0) })
+    expect(container.querySelector('iframe')).not.toBe(first)
+
+    // The next quick restart waits 1 second, as after a single break, not 2.
+    const second = container.querySelector('iframe')!
+    await (await handshake(second)).binding('EXPENSES').rpc.read()
+    overseer.restart(2)
+    await settle()
+    await act(async () => { vi.advanceTimersByTime(999) })
+    expect(container.querySelector('iframe')).toBe(second)
+    await act(async () => { vi.advanceTimersByTime(1) })
+    expect(container.querySelector('iframe')).not.toBe(second)
+  }))
 
   it('stops a view whose document loaded again', async () => {
     const iframe = await renderCard()
-    await (await handshake(iframe)).gadget.read()
+    await (await handshake(iframe)).binding('EXPENSES').rpc.read()
     const { port2 } = new MessageChannel()
     await act(async () => {
       window.dispatchEvent(new MessageEvent('message', {
@@ -240,32 +335,56 @@ describe('GadgetUiBlockCard', () => {
     })
 
     await vi.waitFor(() => expect(container.textContent).toContain('reloaded itself'))
-    await vi.waitFor(() => expect(overseer.gadgets[0]!.disposed).toBe(true))
+    await vi.waitFor(() => expect(overseer.served[0]!.disposed).toBe(true))
     expect(container.querySelector('iframe')).toBeNull()
     expect(buttonNamed('Reload')).toBeDefined()
   })
 
-  it('reloads a bound view on a new connection to the Workshop', async () => {
+  it('reloads a view that asked for a binding on a new connection to the Workshop', async () => {
     const first = await renderCard()
-    await (await handshake(first)).gadget.read()
+    await (await handshake(first)).binding('EXPENSES').rpc.read()
     const reconnected = new FakeOverseer()
-    await act(async () => root.render(card(reconnected, BOUND)))
+    await act(async () => root.render(card(reconnected, BLOCK)))
     await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBe(first))
 
     const host = await handshake(container.querySelector('iframe')!)
-    await expect(host.gadget.read()).resolves.toBe('gadget data')
-    await vi.waitFor(() => expect(overseer.gadgets[0]!.disposed).toBe(true))
+    await expect(host.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
+    expect(reconnected.lookups).toEqual([[1, 'EXPENSES']])
+    await vi.waitFor(() => expect(overseer.served[0]!.disposed).toBe(true))
   })
 
-  it("disposes its gadget's server when it unmounts", async () => {
-    await (await handshake(await renderCard())).gadget.read()
+  it('reloads a view whose lookup is in flight when the Workshop reconnects', async () => {
+    const first = await renderCard()
+    ;(await handshake(first)).binding('SLOW').catch(() => {})
+    await vi.waitFor(() => expect(overseer.lookups).toEqual([[1, 'SLOW']]))
+
+    await act(async () => root.render(card(new FakeOverseer(), BLOCK)))
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBe(first))
+  })
+
+  it('keeps a view that never asked for a binding running, and looks up on the new connection', async () => {
+    const first = await renderCard()
+    const host = await handshake(first)
+    const reconnected = new FakeOverseer()
+    await act(async () => root.render(card(reconnected, BLOCK)))
+
+    expect(container.querySelector('iframe')).toBe(first)
+    await expect(host.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
+    expect(reconnected.lookups).toEqual([[1, 'EXPENSES']])
+    expect(overseer.lookups).toEqual([])
+  })
+
+  it('disposes every binding when it unmounts', async () => {
+    const host = await handshake(await renderCard())
+    await host.binding('EXPENSES').rpc.read()
+    await host.binding('GITHUB').listIssues()
     await act(async () => root.render(<></>))
-    await vi.waitFor(() => expect(overseer.gadgets[0]!.disposed).toBe(true))
+    await vi.waitFor(() => expect(overseer.served.map(target => target.disposed)).toEqual([true, true]))
   })
 
   it('runs nothing for a block that must not run', async () => {
-    await act(async () => root.render(card(overseer, { ...UNBOUND, error: 'Not a binding name.' })))
-    expect(container.textContent).toContain('Not a binding name.')
+    await act(async () => root.render(card(overseer, { ...BLOCK, error: 'This view has no content.' })))
+    expect(container.textContent).toContain('This view has no content.')
     expect(container.querySelector('iframe')).toBeNull()
     expect(buttonNamed('Reload')).toBeUndefined()
   })
