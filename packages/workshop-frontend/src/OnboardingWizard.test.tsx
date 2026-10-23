@@ -5,6 +5,7 @@ import { act } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type * as Kumo from '@cloudflare/kumo'
 import type { GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
+import { INSTANCE_ADMIN_VENDOR_ID } from '@gadgets/workshop-shared/instance-admin'
 
 const addToast = vi.hoisted(() => vi.fn<(options: unknown) => void>())
 
@@ -89,6 +90,22 @@ describe('OnboardingWizard built-in tools', () => {
     await click(/Let.s build/)
 
     expect(api.provisionAmbientAccount.mock.calls).toEqual([['scheduler']])
+    expect(api.completeOnboarding).toHaveBeenCalledOnce()
+  })
+
+  it('neither offers nor turns on deployment admin access, and still turns on the rest', async () => {
+    const api = fakeApi()
+    await openConnectionsStep()
+    await api.discovery.resolve([...tools, tool(INSTANCE_ADMIN_VENDOR_ID, 'Deployment Admin')])
+
+    expect(document.querySelector('[role="switch"][aria-label="Deployment Admin"]')).toBeNull()
+    expect(document.querySelector('[role="switch"][aria-label="Web Search"]')).not.toBeNull()
+    expect(document.body.textContent).not.toContain('Deployment Admin')
+
+    await click(/^Next$/)
+    await click(/Let.s build/)
+
+    expect(api.provisionAmbientAccount.mock.calls).toEqual([['scheduler'], ['websearch']])
     expect(api.completeOnboarding).toHaveBeenCalledOnce()
   })
 

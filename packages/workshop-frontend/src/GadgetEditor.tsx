@@ -2062,6 +2062,7 @@ export default function GadgetEditor() {
                 <Activity
                   overseer={overseer.stub}
                   restricted={metadata?.containsRestrictedData === true}
+                  deploymentAdminAccess={metadata?.deploymentAdminAccess}
                   view={activityView}
                   onViewChange={setActivityView}
                   onAutoApproveChange={() => setAutoApproveReloadTrigger(t => t + 1)}

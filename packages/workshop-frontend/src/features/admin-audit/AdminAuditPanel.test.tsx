@@ -313,6 +313,41 @@ describe('AdminAuditPanel', () => {
       expect(setting.textContent).toContain('siteNameOld name→ changed to New name')
     })
 
+    describe('a call an admin’s agent made', () => {
+      it('labels it as made via the agent, with the workspace and chat it came from', async () => {
+        const admin = fakeAdmin()
+        admin.listAdminAudit.mockResolvedValue(testPage([accessRecord({
+          via: 'gatekeeper', origin: { workspaceId: 'ws-admin', chatId: 7 },
+        })]))
+
+        await render(settingsWith(), admin)
+
+        const [access] = recentItems()
+        expect(access.textContent).toContain(`${formatFullTimestamp(ACCESS_AT)} · admin via agent`)
+        expect(access.textContent).toContain('From workspace ws-admin, chat 7')
+        expect(access.textContent).not.toContain('approved as action')
+      })
+
+      it('names the action an approved call ran as', async () => {
+        const admin = fakeAdmin()
+        admin.listAdminAudit.mockResolvedValue(testPage([settingRecord({
+          via: 'gatekeeper', origin: { workspaceId: 'ws-admin', chatId: 7, actionId: 12 },
+        })]))
+
+        await render(settingsWith(), admin)
+
+        const [setting] = recentItems()
+        expect(setting.textContent).toContain('second-admin via agent')
+        expect(setting.textContent).toContain('From workspace ws-admin, chat 7, approved as action 12')
+      })
+
+      it('says nothing of an origin for a call made through the API or the CLI', async () => {
+        await render()
+
+        for (const item of recentItems()) expect(item.textContent).not.toContain('From workspace')
+      })
+    })
+
     it('names an entry by its key, shows an absent side as — (announced as none), and labels a keyless formats change as the order', async () => {
       const admin = fakeAdmin()
       admin.listAdminAudit.mockResolvedValue(testPage([settingRecord({

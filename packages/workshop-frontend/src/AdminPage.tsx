@@ -14,6 +14,8 @@ import { AdminModelsPanel } from './features/ai-models/AdminModelsPanel'
 import { AdminUpdatesPanel } from './features/deployment-updates/AdminUpdatesPanel'
 import { AdminAuditPanel } from './features/admin-audit/AdminAuditPanel'
 import { auditSettingsOf, type AuditSettings } from './features/admin-audit/auditSettings'
+import { INSTANCE_ADMIN_MODE_HINTS, InstanceAdminModeNote } from './features/instance-admin/InstanceAdminModeNote'
+import { INSTANCE_ADMIN_VENDOR_ID } from '@gadgets/workshop-shared/instance-admin'
 import { latestReads } from './features/deployment-updates/latestReads'
 import { probeRouterTag } from './features/deployment-updates/probeRouterTag'
 import { isAdminTab, resolveAdminTab } from './adminTab'
@@ -954,11 +956,19 @@ export default function AdminPage() {
 
               // Auto-provisioned ("ambient") gatekeepers use a three-state mode and have no resources.
               if (vendor.autoProvisions) {
-                const mode = vendor.ambientMode ?? 'optional'
+                // The instance admin Gatekeeper is off unless an admin turns it on, and only admins are
+                // offered it, so it falls back to its own default and has its own hints.
+                const instanceAdmin = vendor.vendorId === INSTANCE_ADMIN_VENDOR_ID
+                const mode = vendor.ambientMode ?? (instanceAdmin ? 'disabled' : 'optional')
+                const hints: Record<AmbientGatekeeperMode, string> = instanceAdmin ? INSTANCE_ADMIN_MODE_HINTS : {
+                  disabled: 'Off for everyone',
+                  optional: 'Users can add it themselves',
+                  enabled: 'On for everyone automatically',
+                }
                 const options: { value: AmbientGatekeeperMode; label: string; hint: string }[] = [
-                  { value: 'disabled', label: 'Disabled', hint: 'Off for everyone' },
-                  { value: 'optional', label: 'Optional', hint: 'Users can add it themselves' },
-                  { value: 'enabled', label: 'Enabled', hint: 'On for everyone automatically' },
+                  { value: 'disabled', label: 'Disabled', hint: hints.disabled },
+                  { value: 'optional', label: 'Optional', hint: hints.optional },
+                  { value: 'enabled', label: 'Enabled', hint: hints.enabled },
                 ]
                 return (
                   <div key={vendor.vendorId}>
@@ -995,6 +1005,11 @@ export default function AdminPage() {
                         </button>
                       ))}
                     </div>
+                    {instanceAdmin && (
+                      <div className="px-3 pt-2">
+                        <InstanceAdminModeNote />
+                      </div>
+                    )}
                   </div>
                 )
               }

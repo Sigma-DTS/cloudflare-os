@@ -1301,6 +1301,32 @@ describe('ShareModal', () => {
     expect(rendered.textContent).toContain('People with access')
   })
 
+  it('offers no way to share a workspace that ever had deployment admin access', async () => {
+    for (const deploymentAdminAccess of ['on', 'off'] as const) {
+      const adminMetadata = {
+        ...METADATA, containsRestrictedData: true, deploymentAdminAccess,
+      } as GadgetMetadata
+      const rendered = await render(fakeOverseer({
+        requirements: { use: [CRM_REQUIREMENT], build: [CRM_REQUIREMENT] },
+      }), fakeAuthenticatedApi(), adminMetadata)
+
+      expect(rendered.textContent).toContain(
+        'Deployment admin access has been on in this workspace, so only you can open it. It can’t be shared.')
+      expect(rendered.textContent).toContain(
+        'Other deployment admins can still inspect it, as they can any workspace; their inspections ' +
+        'are recorded in the admin audit log.')
+      // It replaces the restricted-data notice, whose invitees could never be added here.
+      expect(rendered.textContent).not.toContain('This workspace has read sensitive data')
+      expect(rendered.textContent).toContain('Manage access.')
+      expect(rendered.querySelector('input[aria-label="Search people"]')).toBeNull()
+      expect(rendered.textContent).not.toContain('Create a share link')
+      expect(rendered.textContent).not.toContain('Recipient verification')
+
+      act(() => root?.unmount())
+      container?.remove()
+    }
+  })
+
   it('releases the results scroll lock when a live ownerInvitesOnly update stops a collaborator inviting', async () => {
     const collaboratorMetadata = {
       ...METADATA,

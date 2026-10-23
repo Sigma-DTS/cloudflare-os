@@ -12,6 +12,7 @@ import type {
   AdminApi,
   AdminAuditRecord,
   AdminAuditStats,
+  AdminGatekeeperOrigin,
   AdminSettingChange,
   AdminSettingRecord,
   AdminVia,
@@ -45,7 +46,7 @@ const ACCESS_LEVEL_NAMES: Record<AdminWorkspaceAccess, string> = {
   full: 'Full',
 }
 
-const VIA_NAMES: Record<AdminVia, string> = { api: 'API', cli: 'CLI' }
+const VIA_NAMES: Record<AdminVia, string> = { api: 'API', cli: 'CLI', gatekeeper: 'agent' }
 
 const REFUSAL_NAMES: Record<NonNullable<AdminAccessRecord['refused']>, string> = {
   [ADMIN_ACCESS_ERROR_CODES.contentWithheld]: 'Content withheld',
@@ -151,6 +152,19 @@ const WorkspaceAccess = ({ record }: { record: AdminAccessRecord }) => (
   </div>
 )
 
+const OriginId = ({ children }: { children: string | number }) => (
+  <span className="font-mono break-all">{children}</span>
+)
+
+// Where an admin's agent made a via-"gatekeeper" call: the admin's own workspace and chat, and the
+// action they approved for it, if the call waited for one.
+const OriginLine = ({ origin }: { origin: AdminGatekeeperOrigin }) => (
+  <p className="mt-1 text-xs text-kumo-subtle break-words">
+    From workspace <OriginId>{origin.workspaceId}</OriginId>, chat <OriginId>{origin.chatId}</OriginId>
+    {origin.actionId !== undefined && <>, approved as action <OriginId>{origin.actionId}</OriginId></>}
+  </p>
+)
+
 const RecentRecord = ({ record }: { record: AdminAuditRecord }) => (
   <li className="py-3 first:pt-0 last:pb-0">
     <p className="text-xs text-kumo-subtle">
@@ -165,6 +179,7 @@ const RecentRecord = ({ record }: { record: AdminAuditRecord }) => (
           <SettingChanges record={record} />
         </>
       )}
+    {record.origin && <OriginLine origin={record.origin} />}
   </li>
 )
 

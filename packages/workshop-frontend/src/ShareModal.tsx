@@ -336,8 +336,11 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
   const containsRestrictedData = metadata.containsRestrictedData === true
   // The server refuses share links and non-owner invites once this is set; hide those controls.
   const ownerInvitesOnly = metadata.ownerInvitesOnly === true
-  const canInvite = !ownerInvitesOnly || isOwner
-  const canUseShareLinks = !ownerInvitesOnly
+  // A workspace that ever had deployment admin access is its owner's alone for good: the server
+  // refuses every invite and share link.
+  const adminOnly = metadata.deploymentAdminAccess !== undefined
+  const canInvite = !adminOnly && (!ownerInvitesOnly || isOwner)
+  const canUseShareLinks = !adminOnly && !ownerInvitesOnly
   const directoryQuery = addUsername.trim()
   // Everyone already on the workspace: the caller, the owner (absent from listCollaborators()
   // when the caller is a collaborator), and every collaborator -- plus everyone already staged.
@@ -1014,12 +1017,18 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
           className={`chat-panel min-h-0 flex-1 overscroll-contain px-4 pb-6 sm:px-6 ${directoryOpen ? 'overflow-hidden' : 'overflow-y-auto'}`}
           onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}
         >
-          {(containsRestrictedData || ownerInvitesOnly) && (
+          {(adminOnly || containsRestrictedData || ownerInvitesOnly) && (
             <div className="mb-3 flex items-start gap-2.5 rounded-2xl bg-kumo-warning-tint px-3 py-2.5">
               <div className="grid h-6 w-6 shrink-0 place-items-center text-kumo-warning">
                 <ShieldWarning size={18} weight="duotone" />
               </div>
-              {ownerInvitesOnly ? (
+              {adminOnly ? (
+                <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
+                  Deployment admin access has been on in this workspace, so only you can open it. It
+                  can’t be shared. Other deployment admins can still inspect it, as they can any
+                  workspace; their inspections are recorded in the admin audit log.
+                </p>
+              ) : ownerInvitesOnly ? (
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
                   This workspace has read data from a connection that doesn’t allow share links, so
                   only the owner can add people. People the owner invites are asked to verify their

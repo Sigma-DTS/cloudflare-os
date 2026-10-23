@@ -22,6 +22,7 @@ import AutoApproveConfirmDialog from './components/AutoApproveConfirmDialog'
 import { IncompleteDescriptionNotice, isDescriptionIncomplete } from './components/IncompleteDescriptionNotice'
 import { ActionFields, entryFields, fieldCountLabel } from './components/ActionFields'
 import { RestrictedApprovalNotice } from './components/RestrictedApprovalNotice'
+import { DeploymentAdminAccessNotice } from './features/instance-admin/DeploymentAdminAccessNotice'
 
 export type ActivityView = 'review' | 'history' | 'auto'
 
@@ -33,6 +34,9 @@ interface ActivityProps {
   // Latched actions are never auto-approved, so the always-approve affordance is hidden and
   // existing rules are shown as suspended but stay revocable.
   restricted?: boolean
+  // GadgetMetadata.deploymentAdminAccess: whether the workspace's agent can use the deployment's
+  // Admin API as its owner, absent if it never could.
+  deploymentAdminAccess?: 'on' | 'off'
   view: ActivityView
   onViewChange: (view: ActivityView) => void
   onAutoApproveChange?: () => void
@@ -160,6 +164,7 @@ function ActivityNotice({ icon, title, description, children }: {
 export default function Activity({
   overseer,
   restricted,
+  deploymentAdminAccess,
   view,
   onViewChange,
   onAutoApproveChange,
@@ -447,6 +452,9 @@ export default function Activity({
 
   return (
     <div className="flex h-full flex-col bg-kumo-base">
+      {deploymentAdminAccess && (
+        <DeploymentAdminAccessNotice overseer={overseer} access={deploymentAdminAccess} />
+      )}
       {renderActivityContent()}
 
       {/* The workspace latched: the affordance is gone and confirming could only error. */}

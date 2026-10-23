@@ -10,6 +10,7 @@ import {
 import {
   VendorDescription,
 } from '@gadgets/workshop-shared/gatekeeper'
+import { INSTANCE_ADMIN_VENDOR_ID } from '@gadgets/workshop-shared/instance-admin'
 import {
   Camera,
   ArrowRight,
@@ -237,7 +238,9 @@ export default function OnboardingWizard({
     authenticatedApi
       .listAddableGatekeepers()
       .then((list) => {
-        if (!cancelled) setAmbientVendors(list)
+        // Deployment admin access is something an admin adds deliberately, from Connectors, knowing
+        // what it exposes; it is never one of the tools a new workspace starts with.
+        if (!cancelled) setAmbientVendors(list.filter((vendor) => vendor.id !== INSTANCE_ADMIN_VENDOR_ID))
       })
       .catch((err) => logRpcFailure('Failed to load addable gatekeepers:', err))
       .finally(() => {
