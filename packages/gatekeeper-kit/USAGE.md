@@ -914,3 +914,13 @@ simulated diff and a provider diff read alike.
 - Every callback the kit invokes must throw display-safe errors. `discardMint`, the rejection heal,
   and the expiry notification all log what they catch, so a thrown token, header, or response body
   lands in the deployment's logs.
+
+## Managed central OAuth transport
+
+For `./central-oauth`, set both `CENTRAL_GATEKEEPER_ACCESS_CLIENT_ID` and
+`CENTRAL_GATEKEEPER_ACCESS_CLIENT_SECRET` as Worker secrets to authenticate to an Access-protected
+`CENTRAL_GATEKEEPER_URL`. The pair is sent only in headers on signed `/begin`, `/redeem`,
+`/refresh` and `/revoke` requests. Incomplete pairs fail before network access; redirects are never
+followed. Omitting both preserves use with brokers that do not require this transport. Access
+authentication supplements the installation signature and never selects a tenant or grant.
+Keep these credentials separate from any credentials used to reach an upstream provider.

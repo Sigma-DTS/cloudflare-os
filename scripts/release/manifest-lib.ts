@@ -179,6 +179,10 @@ export interface WorkerEntry {
   preinstall?: true;
   /** Installable at most once per instance. */
   singleton?: true;
+  /** Supports installer-owned central OAuth without provider application secrets. */
+  centralOAuth?: true;
+  /** Runtime can authenticate to an Access-protected central broker. */
+  centralOAuthAccess?: true;
   /** Name of the ESM entry module within `modules`. */
   mainModule: string;
   /** Every uploadable module, content-addressed. */
@@ -520,6 +524,7 @@ export function buildWorkerEntry(
     installable,
     ...(PREINSTALL.has(pkgName) ? { preinstall: true } : {}),
     ...(SINGLETON.has(pkgName) ? { singleton: true } : {}),
+    ...(["gatekeeper-gitlab", "gatekeeper-slack"].includes(pkgName) ? { centralOAuth: true as const, centralOAuthAccess: true as const } : {}),
     mainModule,
     modules: modules.map(({ name, type, sha256, size }) => ({
       name, type, sha256, size, r2Key: moduleR2Key(sha256),
