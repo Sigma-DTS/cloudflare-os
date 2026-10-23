@@ -80,6 +80,13 @@ export interface NonUniqueIndex<T, Key, PK extends string | number = string | nu
    */
   get(key: Key, options?: ListOptions<PK>): Iterable<T>;
   list(options?: ListOptions<Key>): Iterable<T>;
+
+  /**
+   * List the distinct keys at least one record is indexed under, in key order, without reading
+   * the records: string keys verbatim, integer keys as keyString() encodes them. `options` ranges
+   * and pages over the keys; `dedupe` does not apply.
+   */
+  listKeys(options?: ListOptions<Key>): Iterable<string>;
   delete(key: Key): number;
 
   /**
@@ -683,6 +690,9 @@ function createCollection<
             }
           }
         }
+      },
+      listKeys(options: ListOptions<Key> = {}): Iterable<string> {
+        return idxKv.listKeys(options);
       },
       delete(key: Key): number {
         let id = idxKv.get(key);
