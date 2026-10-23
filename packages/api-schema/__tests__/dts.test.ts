@@ -750,13 +750,16 @@ describe("tags", () => {
         { ...method("other", { kind: "stub", service: "Other" }) },
         { ...method("save", { kind: "void" }, [], "Saves."), mutates: true },
         { ...method("tagged", { kind: "void" }, [], "Writes.\n\n@mutates"), mutates: true },
+        { ...method("bill", { kind: "void" }, [], "Bills."), confirmation: "Sends a paid request." },
+        { ...method("charged", { kind: "void" }, [], "Charges.\n@confirmation Costs."), confirmation: "Costs." },
+        { ...method("ping", { kind: "void" }), confirmation: "" },
       ],
     },
     Other: { doc: "Kept.\n@deprecated", deprecated: "" },
   });
   const { full } = emitDeclarations(schema, { root: "Api" });
 
-  test("`@deprecated` and `@mutates` are in the JSDoc once, from the field when the doc lacks them", () => {
+  test("`@deprecated`, `@mutates` and `@confirmation` are in the JSDoc once, from the field when the doc lacks them", () => {
     expect(full).toMatch(/^\/\*\* @deprecated \*\/\nexport interface Api \{/);
     expect(full).toContain("  /**\n   * @param x The x.\n   * @deprecated\n   * @mutates\n   */\n  both(");
     expect(full).toContain("  /** @deprecated Removed soon. */\n  gone(");
@@ -765,6 +768,10 @@ describe("tags", () => {
     expect(full).toContain("  /**\n   * Saves.\n   * @mutates\n   */\n  save(");
     expect(full).toContain("  /**\n   * Writes.\n   *\n   * @mutates\n   */\n  tagged(");
     expect(full).toContain("/**\n * Kept.\n * @deprecated\n */\nexport interface Other {");
+    expect(full).toContain("  /**\n   * Bills.\n   * @confirmation Sends a paid request.\n   */\n  bill(");
+    expect(full).toContain("  /**\n   * Charges.\n   * @confirmation Costs.\n   */\n  charged(");
+    expect(full).toContain("  /** @confirmation */\n  ping(");
+    expect(full.match(/@confirmation\b/g)).toHaveLength(3);
   });
 });
 
@@ -776,10 +783,16 @@ test("the extractor's fixture: every tag once, and declarations that type-check"
   const members = services.flatMap((service) => [...service.methods, ...service.properties ?? []]);
   const deprecated = [...services, ...members].filter((item) => item.deprecated !== undefined).length;
   const mutates = services.flatMap((service) => service.methods).filter((m) => m.mutates).length;
+  const confirmation = services.flatMap((service) => service.methods)
+    .filter((m) => m.confirmation !== undefined).length;
   expect(deprecated).toBeGreaterThan(0);
   expect(mutates).toBeGreaterThan(0);
+  expect(confirmation).toBe(2);
   expect(full.match(/@deprecated\b/g)).toHaveLength(deprecated);
   expect(full.match(/@mutates\b/g)).toHaveLength(mutates);
+  expect(full.match(/@confirmation\b/g)).toHaveLength(confirmation);
+  expect(full).toContain("   * @confirmation Sends a paid request.\n   */\n  publish(");
+  expect(full).toContain("   * @confirmation\n   */\n  print(");
   expect(diagnose({ "api.d.ts": full })).toEqual([]);
 });
 

@@ -2,9 +2,11 @@
 
 A deployment's admins (the canonical user ids its backend Worker's `ADMINS` variable lists) need to
 operate, debug and investigate the instance: find a user or a workspace, look inside a workspace
-that misbehaves, and know afterwards who looked at what and who changed which setting. This
-document is the design record for that surface. The API itself is documented on `AdminApi` and
-`AdminWorkspaceView` in `packages/workshop-shared/src/api.ts`; the pieces are:
+that misbehaves, and know afterwards who looked at what and who changed which setting. An admin
+can also let their own agent do some of this as them, through the instance admin Gatekeeper (see
+[Through an agent](#through-an-agent)). This document is the design record for that surface. The
+API itself is documented on `AdminApi` and `AdminWorkspaceView` in
+`packages/workshop-shared/src/api.ts`; the pieces are:
 
 | Concern | Location |
 | --- | --- |
@@ -16,12 +18,22 @@ document is the design record for that surface. The API itself is documented on 
 | Inspection (`openForAdmin`, `AdminWorkspaceViewImpl`) and the workspace's directory feed | `packages/workshop-backend/src/overseer.ts` |
 | Reads that never pull (`readLocalCommitTree`, `readLocalFileAtCommit`) | `packages/workshop-backend/src/git-cache.ts` |
 | The admin panel's Audit tab | `packages/workshop-frontend/src/features/admin-audit/` |
+| The instance admin Gatekeeper, which serves an admin's agent the Admin API and decides nothing | `packages/gatekeeper-instanceadmin` (its README is its design record) |
+| Its contract with the Workshop (`InstanceAdminGrant`, `InstanceAdminGatekeeper`, the approval window and the run limit) | `packages/workshop-shared/src/instance-admin.ts` |
+| What the agent may do with each `AdminApi` method (`ADMIN_AGENT_ACCESS`) | `packages/workshop-shared/src/api.ts` |
+| The grant, the deployment admin actions the Workshop holds, activation and turning off, and where the capsule may live | `packages/workshop-backend/src/overseer.ts` |
+| The rules and texts: canonical calls, approval cards, observations, which turns qualify | `packages/workshop-backend/src/instance-admin.ts` |
+| Offering it to admins only, disabled by default | `packages/workshop-backend/src/user.ts`, `packages/workshop-backend/src/provisioning-policy.ts` |
+| The agent's types and the schema the Gatekeeper bundles (`admin-api.agent.d.ts`, `admin-api.schema.json`, `admin-api.fragments.json`) | `packages/api-schema/generated/` |
 
 ## Entry points
 
-Everything goes through `AuthenticatedApi.getAdminApi({ via })`, which returns null unless the
-caller is an admin. The admin check runs once, when the capability is minted, for every `AdminApi`
-method except workspace inspection, which checks again (see [Inspection](#inspection)).
+A client gets the `AdminApi` capability from `AuthenticatedApi.getAdminApi({ via })`, which returns
+null unless the caller is an admin. The admin check runs once, when the capability is minted, for
+every `AdminApi` method except workspace inspection, which checks again (see
+[Inspection](#inspection)). An admin's own agent reaches the same methods only through the
+instance admin Gatekeeper, whose calls the Workshop makes itself and which re-checks admin status on
+every call (see [Through an agent](#through-an-agent)).
 
 - **Settings**: the setters (signups, user search, site name and logo, instructions,
   resource and gatekeeper availability, models, update checks, ...), plus
@@ -32,10 +44,17 @@ method except workspace inspection, which checks again (see [Inspection](#inspec
   the deployment's.
 - **The audit log**: `listAdminAudit()` and `getAdminAuditStats()`.
 
-`via` is `"api"` (the default, the Workshop's admin panel included) or `"cli"` for a command-line
-client. It is stated by the client and unverified: it labels records and grants nothing. Each
-capability mints a random `sessionId`, so every record made through one `getAdminApi()` call,
-settings and inspections alike, shares its `via` and `sessionId` and can be read as one session.
+`via` says how an admin's calls reached the deployment (`AdminVia`). A client states `"api"` (the
+default, the Workshop's admin panel included) or `"cli"` for a command-line client; that is
+unverified, and labels records without granting anything. The third value, `"gatekeeper"`, no
+client can state (`AdminApiOptions.via` takes only `AdminClientVia`): the Workshop alone records it,
+for a call the admin's agent made through the instance admin Gatekeeper, and always with an
+`origin` (`AdminGatekeeperOrigin`: the admin's workspace, the chat whose agent made the call, and
+for an approved call the approving action's id). Each capability mints a random `sessionId`, so
+every record made through one `getAdminApi()` call, settings and inspections alike, shares its
+`via` and `sessionId` and can be read as one session. For `"gatekeeper"` the session is one agent
+code run: every record its calls make shares a `sessionId`, the changes it queued included, which
+are recorded when the admin approves them.
 
 ## The directory
 
@@ -292,8 +311,12 @@ typed, so type the number of days you want kept, even the minimum.
   `admin`, `sessionId`, `via`, `method`, and `changes`, each naming a setting, an entry `key` for a
   map or list setting, and its value `before` and `after`.
 
-`listAdminAudit()` filters by kind, admin, workspace, what a call exposed (`exposed`) and time;
-`getAdminAuditStats()` by kind.
+Both carry `origin` exactly when `via` is `"gatekeeper"`: where the admin's agent made the call
+(see [Entry points](#entry-points)). An access record's `origin.workspaceId` is the admin's own
+workspace, not the inspected one its `workspaceId` names.
+
+`listAdminAudit()` filters by kind, admin, workspace, `via`, what a call exposed (`exposed`) and
+time; `getAdminAuditStats()` by kind.
 
 ### What a call exposed
 
@@ -374,7 +397,8 @@ chokepoint records `diffAdminConfig(current, next)` before `storage.adminConfig.
 
 Not recorded: reads (`getSettings`, `isBlueprintFeatured`, `getUpdateStatus`, the listings and the
 audit log itself), the gateway tests, `checkForUpdates`, and the deployment's own promotion of its
-bundled formats, which no admin made.
+bundled formats, which no admin made. When an admin's agent makes those reads or gateway tests, the
+admin's own workspace records them instead (see [Through an agent](#the-audit-of-an-agents-calls)).
 
 ### Text bounds
 
@@ -415,6 +439,296 @@ the workspace and content-read lists are empty. A window reaching past the reten
 The Audit tab shows the week's content reads, marks each content read in its recent activity, shows
 the level an inspection asked for where its view got less, and can list content reads alone.
 
+## Through an agent
+
+The instance admin Gatekeeper (`packages/gatekeeper-instanceadmin`, vendor id `instanceadmin`) lets
+a deployment admin's own agent use the Admin API as them, in a workspace they turn it on in. Its
+README is the Gatekeeper's design record; this section is the deployment's side.
+
+The Gatekeeper holds no power of its own. For each session the Workshop lends it an
+`InstanceAdminGrant` through the facet's `startAdminSession()`, and the session forwards every
+`AdminApi` call to the grant's `callAdminApi(method, args)`, which the Overseer answers
+(`callInstanceAdmin`). The Workshop decides everything about a call: whether it runs, waits for
+the admin's approval or is refused, what its approval card says, and what is recorded. It never
+calls `startSession()`, `applyAction()` or `rejectAction()` on this facet, which has no
+`ApprovalQueue` and submits no actions. The only via-`"gatekeeper"` `AdminApiImpl` is built in
+`OverseerImpl.adminApiForAgent()`, for one run's calls or one approved change, and never leaves the
+Overseer.
+
+### Availability
+
+- **Disabled by default.** `defaultAmbientGatekeeperMode()` gives it mode **Disabled** until an
+  admin chooses one in the admin Gatekeepers panel; every other auto-provisioning gatekeeper starts
+  **Optional**. The panel shows, beside its mode, what it lends, the prompt-injection risk and the
+  advice to use a dedicated workspace (see [Risks](#risks)).
+- **Admins only.** The user DO offers, provisions, lists and lends the account only to a user who
+  is a deployment admin now, in every mode, **Enabled** included. Admin status comes from
+  `ADMINS`, so it is checked on every use rather than stored.
+- **Dormant after demotion or disabling.** Once the user is no longer an admin, or the deployment
+  disables the vendor, the account is hidden and `getSingletonGatekeeperClass()` refuses it, and
+  `ensureAmbientCapsules()` removes the capsule from each of their workspaces at its next open. The
+  account and the workspaces stay, so promoting the admin again restores them (see
+  [Risks](#risks)).
+- **No resources.** The vendor offers no URL-addressed resources, so an agent is never offered it
+  through `createExternalResource`, and no non-ambient record of it can be minted.
+
+### The workspace
+
+- **The capsule lives only where nobody else can get in.** The capsule (the ambient record that
+  binds the Gatekeeper into the workspace) exists only in a workspace that is latched (below), or
+  that nobody but its owner can open: no collaborator with a role, every share link revoked, and no
+  collaborator session live. `ensureAmbientCapsules()` checks before adding it, `addGatekeeper()`
+  checks again right before publishing it, and sharing drops it: the sharing manager's `onShared`
+  hook removes it synchronously with the first grant or link written to a workspace that is not
+  latched.
+- **Turning access on is an approval.** Access starts off in every workspace. The agent's first
+  call queues an activation card the Workshop words itself, saying what the agent may then do, what
+  becomes permanent, and the prompt-injection warning (see [Risks](#risks)). Only the owner, while
+  a deployment admin, can approve it, and only by hand, with the vendor enabled. Asking and
+  approving are both refused (R9) unless nobody else can open the workspace (no collaborators, no
+  links, and nobody else with it open), and refused (A5) while a reply to an external message is
+  still to be delivered.
+- **The latch is permanent.** Approving sets `instanceAdminLatched`, `instanceAdminActive` and
+  `containsRestrictedData` in one transaction, and nothing clears the latch. From then on:
+  - only the owner can open the workspace: nobody else has a role, and every grant, link and
+    redemption is refused (S1; see [sharing.md](sharing.md#deployment-admin-access-owner-only-for-good));
+  - it takes no external messages (X2), including one already on its way when access was turned
+    on: `registerExternalMessageResponseTarget()` refuses inside the prompt's transaction, which
+    rolls back;
+  - it is restricted: no public web fetches or git pushes, and no auto-approval.
+
+  `GadgetMetadata.deploymentAdminAccess` reads `"on"` or `"off"` from then on, and the Activity
+  panel and the Share modal say why the workspace stays its owner's alone. The latch keeps out
+  collaborators and links, not admins: other deployment admins can still inspect the workspace, as
+  they can any workspace, and their inspections are recorded in the admin audit log.
+- **Turning access off is immediate.** The owner turns it off from the Activity panel
+  (`Overseer.turnOffDeploymentAdminAccess()`). Only the owner can (T1), and they can whether or not
+  they are still an admin and whatever the vendor's mode. Synchronously, it clears
+  `instanceAdminActive`, drops every approved one-call allowance, rejects every pending deployment
+  admin action (requests to turn access on included), and restarts the capsule's facet, ending its
+  sessions. From then on a grant's call asks to turn access back on, and a view's is refused (A3).
+  An approved change already being made when it is turned off completes, and is recorded
+  approved. In a workspace where access was never on, it only rejects pending requests to turn it
+  on.
+- **Turning it back on takes approval again.** After a turn-off the agent's next call asks to turn
+  access back on, with the reactivation card, approved as the first one was.
+
+### Who it serves
+
+- **The owner's own turns.** A grant serves a turn only when its initiator is the owner and it
+  answers a message the owner wrote themselves (`turnAnswersOwner()`), in a chat that is neither
+  spawned (R15) nor a blueprint update's review (R15). Any other turn, a gadget's callback among
+  them, is refused (R3).
+- **Not a connection's slash command.** A connection's slash command (a Context Library skill, the
+  only kind today) expands to text its provider wrote, which the chat logs as the owner's message
+  (it carries `generatedBySlashCommandSequence`). The turn it starts therefore can't use the
+  binding: it fails closed, and the owner sends a message of their own to go on. The expansion stays
+  in the chat's history, where, like anything else the agent read, it can still steer that later
+  turn.
+- **The owner's `/compact` is theirs.** The built-in `/compact` is the owner's command, not a
+  connection's, and never fails a turn closed. It holds no task text and its turn runs no tools, so a
+  retry after it continues the task before it: compacting a callback's or a slash command's task
+  doesn't make it the owner's.
+- **Retries and resumptions keep their origin.** A retry, an approval's resumption, a steer or a
+  legacy adoption continues the task before it and qualifies exactly when that task did, so a
+  callback's, a slash command's or a blueprint's task never qualifies.
+- **The live part of one executeCode call.** A grant works only during the executeCode call the
+  binding was handed to: until its code settles (R2), until the owner stops the turn (R16; Stop
+  doesn't stop running code, so the Workshop marks the run stopped), and for at most its first
+  `INSTANCE_ADMIN_RUN_LIMIT_SECONDS`, 10 minutes (R17). Only the capsule's loopbacks carry the
+  run's `executionId`, so a loopback kept from an earlier call resolves against nothing.
+- **Forwarding.** A loopback or view the agent hands to a gadget, a callback or another binding
+  during a live call acts as the owner until the call ends: the Workshop can't tell those callers
+  apart. The capsule itself can't be bound into a gadget or an agent spawner (X1), and never
+  reaches a spawned chat.
+- **While the owner is an admin and the vendor enabled.** Every mint, grant call and view call
+  re-checks admin status (R4), and every approval checks it of the approver (A2). Each of them, the
+  approval included, also reads the deployment config, and refuses once the vendor is disabled
+  (R7).
+
+### What each call does
+
+`ADMIN_AGENT_ACCESS` gives every `AdminApi` method a kind, and the grant dispatches on it alone. It
+is typed to cover `AdminApi` exactly, so a method added without a kind does not compile.
+
+| Kind | Methods | What a call does |
+| --- | --- | --- |
+| `read` | `getSettings`, `isBlueprintFeatured`, `getUpdateStatus`, `checkForUpdates`, `listUsers`, `listWorkspaces`, `listAdminAudit`, `getAdminAuditStats` | Runs at once, and is recorded in the admin's workspace before it answers. |
+| `change` | the setters (`ADMIN_SETTING_METHODS`, tagged `@mutates`) but the three withheld | Changes nothing yet: it is queued as an action with a card showing the method and every argument exactly. On approval the Workshop makes exactly the stored call, once. |
+| `confirm` | the three gateway tests, tagged `@confirmation`: they change no setting, but send requests the providers bill | The first call asks for approval of that one call. Once approved, the agent's next identical call in the same chat within `INSTANCE_ADMIN_APPROVAL_LIFETIME_SECONDS` (15 minutes) runs once. |
+| `inspect` | `inspectWorkspace` | A `read` at `"metadata"` (the default); a `confirm` at `"full"`. The view opens at the level the Workshop classified, and gets no more than the deployment's level allows. |
+| `withheld` | `setSiteLogo`, `setAdminWorkspaceAccess`, `setAdminAuditRetentionDays` | Left out of the agent's types (`ADMIN_OMIT`) and refused (R10). The admin sets them in the admin panel. |
+
+- **A request already made is reused.** An identical request the same turn already made
+  (`existing`) names that action instead of making a new card, so the turn waits on it; the same
+  request from a later turn, or another chat, makes a new card. Each approval allows one call: the
+  allowance is consumed before the call, even if the call then fails.
+- **An approval that ran nothing resumes the agent with a nudge.** Approving the activation or a
+  one-call approval runs nothing, so the resumed agent is told to make the call again
+  (`instanceAdminApprovedNudge()`). An approved change keeps the ordinary "approved and applied"
+  sentence.
+- **Arguments are JSON, and bounded.** A queued call's arguments are kept as canonical JSON (keys
+  sorted), which the card shows and the apply passes. Anything else (a function, a stub, a date, a
+  cycle...) is refused (R12), and so is a call whose JSON and card together pass
+  `MAX_INSTANCE_ADMIN_ACTION_CHARS` (R13), since its record would not fit a Durable Object value.
+  Ordinary text of the longest length a setter keeps (8,000 characters) fits.
+- **Only an inspection returns a capability.** Every other answer, and every view call's, must be
+  plain data (R14). An inspection's view reaches the agent only wrapped (`InstanceAdminViewImpl`):
+  every call on it goes through `callInstanceAdminView`, re-checks the run, and is recorded, and the
+  view stops working with the executeCode call that opened it.
+- **While access is off,** every call naming an available method with well-formed arguments asks to
+  turn it on instead, and nothing runs.
+- **The binding** is `INSTANCE_ADMIN`, or `INSTANCE_ADMIN_2` in an older chat that had the binding
+  before the capsule was dropped and added again. The agent's preamble and the refusals don't rely
+  on the name.
+
+### The audit of an agent's calls
+
+- **In the admin's workspace.** Every read, every view call and every call that ran on a one-call
+  approval is an observation in the workspace whose agent made it, restricted
+  (`containsRestrictedData`), with its arguments; every change and every approval request is an
+  action there. Reads are recorded only once their answer has passed the plain-data check, and
+  before it is returned.
+- **Deployment-wide, for inspections and changes only.** Inspections (the open and every view call)
+  and setting changes are recorded in the deployment's admin audit log with `via` `"gatekeeper"`,
+  an `origin` and the run's `sessionId`. As for any admin, an inspection's record follows its read
+  and precedes the answer, and a setting's record precedes the change. Directory, settings,
+  audit-log and update reads, and the gateway tests, add nothing deployment-wide: the admin's
+  workspace records them.
+- **A one-call approval is recorded however it ends.** A call approved one at a time (a gateway
+  test, a full inspection) is recorded in the admin's workspace as soon as it has run, with what it
+  returned or threw and the approving action, before the checks that decide whether to answer. So a
+  call whose answer a Stop, a turn-off or a demotion withholds still leaves its record, and the AI
+  Gateway's own logs are the other trace of a gateway test.
+- **Logs name ids.** The kernel's logs on these paths carry the event name and the action and chat
+  ids, and the method, as `operation`, only once `ADMIN_AGENT_ACCESS` has classified it. They never
+  carry arguments, results, reasons, titles, or an Admin API error's message, which can quote an
+  argument.
+
+### Refusals
+
+The kernel's messages on these paths (`overseer.ts`, `instance-admin.ts`, `user.ts`,
+`sharing.ts`), by the labels the code's comments use for them; "..." marks a message cut here.
+
+| | Message | When |
+| --- | --- | --- |
+| R1 | The instance admin binding works only in its owner's own agent turns, from executeCode. | A session not opened from the agent's executeCode (a user's own `openSession`, for one). |
+| R2 | This instance admin binding belongs to an executeCode call that has ended. ... | The grant's run has settled, or another run took its place. |
+| R3 | The instance admin binding works only in a turn that answers a message this workspace's owner wrote in this chat, ... | The turn is not the owner's own (see [Who it serves](#who-it-serves)). |
+| R4 | The instance admin binding works only while this workspace's owner is a deployment admin. | The owner is not in `ADMINS`. |
+| R5 | The instance admin connection has been removed from this workspace. | The capsule is gone or replaced. At approval: the capsule the action was queued through is gone; a capsule dropped and added again has a new id, so the old one's cards can't be approved, and stay until rejected or turned off. |
+| R6 | The instance admin binding doesn't work in a turn whose reply goes out through an external message. | The chat has a reply to an external message still to deliver. |
+| R7 | The instance admin gatekeeper is turned off on this deployment. | The deployment disabled the vendor (read at every mint, grant call, view call and apply). |
+| R8 | This instance admin account is no longer available to you. | The user DO, in `getSingletonGatekeeperClass()` and in the account check each run makes: the user is not an admin now, or the account is not their auto-provisioned instance admin account. |
+| R8g | The "&lt;vendor&gt;" gatekeeper is disabled on this deployment by an administrator. | `getSingletonGatekeeperClass()` or the account check, for a vendor the deployment disabled. |
+| R9 | Deployment admin access works only in a workspace nobody else can open: ... | Asking for or approving activation while anyone else can open the workspace. |
+| R10 | AdminApi.&lt;m&gt; isn't available through the instance admin binding. | A withheld method. At approval: a held change, confirm or inspect action whose method `ADMIN_AGENT_ACCESS` no longer gives that kind, after a deploy withheld or reclassified it; the action stays pending. |
+| R11 | AdminApi has no method &lt;m&gt;. (`TypeError`) | A name that is not an `AdminApi` method. |
+| R12 | &lt;path&gt;: &lt;what&gt; can't be queued for approval; only JSON values can. (`TypeError`) | A queued call's argument that is not a JSON value. |
+| R13 | This call's arguments are too large for an approval card: ... at most 40,000 characters. | The call and its card pass `MAX_INSTANCE_ADMIN_ACTION_CHARS`. |
+| R14 | &lt;label&gt; returned a capability, which the instance admin binding passes on only from AdminApi.inspectWorkspace(). | A read's, a confirm's or a view call's answer holds a capability. An answer nested deeper than 64 levels is refused too, with a `TypeError` naming it. |
+| R15 | The instance admin binding doesn't work in a chat an agent spawner started or in one that reviews a blueprint update, ... | A spawned chat, or a blueprint update's review. |
+| R16 | This turn was stopped, so its instance admin binding no longer works. | The owner stopped the turn. |
+| R17 | This executeCode call started more than 10 minutes ago, ... | The run passed `INSTANCE_ADMIN_RUN_LIMIT_SECONDS`. |
+| A1 | Deployment admin actions are approved only by hand. | An auto-approval. |
+| A2 | Only this workspace's owner, while a deployment admin, can approve deployment admin actions. | Anyone else approving. |
+| A3 | Deployment admin access is off in this workspace. | Approving a change or a one-call approval, a view call, or a call's answer, while access is off. |
+| A4 | This action is already being applied. | Approving or rejecting an action whose call is being made. |
+| A5 | Deployment admin access can't be turned on while a reply to an external message is still to be delivered. | Asking for or approving activation with such a reply pending. |
+| T1 | Only this workspace's owner can turn off deployment admin access. | Anyone else turning it off. |
+| X1 | The instance admin binding can't be bound into a gadget or an agent spawner: ... | `setGadgetBinding`, or an agent spawner's env naming the capsule. |
+| X2 | This workspace takes no external messages. | The owner messaging a latched workspace from outside. |
+| S1 | Deployment admin access has been on in this workspace, so only its owner can ever open it: it can't be shared. | Adding a collaborator or making a share link in a latched workspace; a redemption there is refused with the `shareLinksDisabled` open error. |
+
+X2 reaches only the owner, and is neutral on purpose: it doesn't say why. Every other sender to a
+latched workspace gets the refusal any workspace they can't use gives (the sign-up prompt without
+an account, the access refusal with one, since nobody else has a role there), so an external sender
+learns nothing about the owner's admin status, which only admins can see. The owner's own texts
+(the activation card, the Share modal and the Activity panel) say why.
+
+### Risks
+
+These are accepted. The activation card, the admin panel and the Gatekeeper's README also state the
+prompt-injection risk and the advice to use a dedicated workspace, and the activation card says that
+other admins can still inspect the workspace; the rest are stated here.
+
+- **Prompt injection can leak what the agent reads.** Restricted mode stops public web fetches and
+  git pushes and suspends auto-approval; it doesn't keep data in. What the agent reads goes into the
+  chat, to the chat's AI model provider, and into the deployment's AI Gateway logs, which keep
+  prompts and responses on the deployment's Cloudflare account for whoever can read them. Steered,
+  the agent can send it out through web search queries, MCP servers and other gatekeepers' reads,
+  actions on other connections the owner approves, gadgets and exports, blueprints published from
+  the workspace, hook or callback turns in the same chat, and push-notification chat titles.
+- **The injection can come from anywhere the agent reads:** a user's name, a workspace title, a
+  chat, a file, an audit reason, a web page, MCP output, and the inputs every agent's system prompt
+  carries: the deployment's instance instructions (any admin sets them, and this agent can queue a
+  change to them) and the standard formats' names and hints (blueprint authors and admins write
+  them).
+- **So use a dedicated workspace, and connect nothing else to it.** That advice has a limit:
+  connections every workspace of the owner gets, such as Web Search, are in the dedicated one too,
+  unless the owner removes an optional one from Connectors (which removes it from all their
+  workspaces) or an admin disables it; and a search query can carry data out without any approval.
+- **Approval fatigue.** A change's card is complete, but only as safe as the owner's reading of it.
+- **Forwarded bindings** act as the owner until the call ends (see
+  [Who it serves](#who-it-serves)).
+- **A compromised instance admin Worker** can, during a live owner run with the vendor enabled,
+  read what the admin can read (recorded), open metadata views and queue cards. It can't change a
+  setting, spend, or read a workspace's content without the owner approving that exact call.
+- **Propagation.** Disabling the vendor reaches every grant within the KV mirror's propagation,
+  about a minute. Demotion needs a redeploy, as `ADMINS` is an environment variable.
+- **Data left behind.** Admin data stays in a latched workspace after turn-off or demotion, until
+  the workspace is deleted, and may include content read from other workspaces. Other admins can
+  inspect it there (recorded).
+- **Re-application after a crash.** A crash between an approved change and its record can let a
+  retry make it again. The setters are idempotent, and the audit log shows both.
+- **Outbound update checks.** `getUpdateStatus` and `checkForUpdates` run as reads, without
+  approval.
+- **Re-promotion** restores a latched workspace's last on or off state without asking again.
+
+### The binding's name confers admin power
+
+The Workshop derives the vendor id from the `GATEKEEPER_INSTANCEADMIN` binding, and lends deployment
+admin power to whatever Worker answers to it, so the binding is trusted as the backend's own
+configuration is. The release build reserves the slug: `releaseShortName()` in
+`scripts/release/manifest-lib.ts` refuses any other package whose install slug folds to
+`instanceadmin`. The package name has no inner hyphen because the dev server and a release fold one
+differently, and the vendor id must be the same in both.
+
+### Tests of the agent path
+
+Unit suites, in `packages/workshop-backend/__tests__/`:
+
+- `admin-agent-access.test.ts`: `ADMIN_AGENT_ACCESS` covers exactly `AdminApiImpl`'s methods,
+  matches the `@mutates` and `@confirmation` tags and the Gatekeeper's generated surface, and only
+  `inspectWorkspace()` returns a capability (walking the generated schema).
+- `instance-admin.test.ts`: the pure rules: canonical calls and their bounds, cards, string fields,
+  observations, the nudge, the plain-result walk, which turns answer the owner, blueprint reviews
+  and the run limit.
+- `instance-admin-grants.test.ts`: against a real Overseer, which sessions get a grant, how long it
+  works, each kind of call, a call's one await, applying, rejecting and turning off (and the races
+  between them), one-call approvals, views, activation, the latch's effect on sharing and external
+  messages, and every refusal.
+- `instance-admin-turns.test.ts`: which turns qualify: callbacks, slash commands, retries, steers,
+  `/compact`, spawned chats, blueprint reviews and Stop.
+- `instance-admin-provisioning.test.ts` and `provisioning-policy.test.ts`: offered to admins only,
+  dormant after demotion or disabling, and disabled by default.
+- `admin-access.test.ts`, `admin-api-impl.test.ts`, `admin-audit.test.ts`,
+  `admin-settings-audit.test.ts` and `admin-workspace-view.test.ts`: `via` `"gatekeeper"` only with
+  a well-formed origin, and the origin and session on both kinds of record.
+- `sharing.test.ts`: the `ownerOnly` and `onShared` hooks, and `isPrivate()`.
+
+Integration suites, in `packages/integration-tests/__tests__/` (see
+[integration-testing.md](integration-testing.md#the-real-instance-admin-gatekeeper)):
+
+- `instance-admin-gatekeeper.test.ts`: who is offered it, turning access on, where the capsule may
+  live, changes and their approval, inspections, the turns it serves, the withheld methods, turning
+  access off, and the deployment disabling it.
+- `instance-admin-gateway.test.ts`: a gateway test sends nothing until its one call is approved,
+  then exactly one request; a rejected one never sends.
+- `instance-admin-demotion.test.ts`: a redeploy that drops the owner from `ADMINS`.
+
+The Gatekeeper's own suites are listed in its README.
+
 ## Error codes
 
 Expected refusals carry a code from `ADMIN_ACCESS_ERROR_CODES` (read with
@@ -430,6 +744,9 @@ Expected refusals carry a code from `ADMIN_ACCESS_ERROR_CODES` (read with
 
 ## Tests
 
+The instance admin Gatekeeper's suites are listed under
+[Tests of the agent path](#tests-of-the-agent-path).
+
 Unit suites, in `packages/workshop-backend/__tests__/`:
 
 - `admin-access.test.ts`: admin status, the bounds' parsing (failing closed), the policy, validation,
@@ -437,8 +754,8 @@ Unit suites, in `packages/workshop-backend/__tests__/`:
   holds content (each predicate, empty values included).
 - `admin-config.test.ts` (`diffAdminConfig`) and `admin-settings-audit.test.ts`: what each setter
   records, before which write, and the setters' bounds.
-- `admin-audit.test.ts`: the deployment-wide log's listing, filters (`exposed` alone and with the
-  others), cursors, schema (the `exposed` column and the CHECK tying it to access records),
+- `admin-audit.test.ts`: the deployment-wide log's listing, filters (`exposed` and `via`, each
+  alone and with the others), cursors, schema (the `exposed` column and the CHECK tying it to access records),
   retention, stats (content reads, their rankings and titles, by kind), and multi-MiB titles.
 - `admin-api-impl.test.ts`: `AdminApiImpl`'s inspection path, the level asked for (the lower of it
   and the deployment's, and the validator's `TypeError` for any other level), refused opens,

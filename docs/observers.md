@@ -119,6 +119,22 @@ visible at `"metadata"`, and can echo content. The compensating controls are:
   record cannot be written fails, returning nothing;
 - `ADMIN_AUDIT_RETENTION_MIN_DAYS` sets a floor on how long those records are kept.
 
+An inspection an admin's own agent makes through the instance admin Gatekeeper is the same
+exception, under the same controls, and is recorded with `via` `"gatekeeper"` and an `origin` naming
+the admin's workspace and chat.
+
+That Gatekeeper's capsule, which binds it into the admin's workspace, never meets the observer
+machinery, so `#inScopeGatekeepers` keeps no exemption for it:
+
+- it exists only in a workspace nobody but its owner can open, and the first grant or link written
+  to a workspace that holds it drops it;
+- once deployment admin access has been on, the workspace can never be shared, so nobody is ever
+  verified against it;
+- its facet's `addObserver()` refuses everyone, should anything ask.
+
+`listObserverRequirements()` leaves it out of the preview the Share modal shows, since sharing
+drops it.
+
 [admin-access.md](admin-access.md) is the design record.
 
 ---

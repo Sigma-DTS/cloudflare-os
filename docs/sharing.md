@@ -156,6 +156,8 @@ A share-key redemption goes through the same gate. The redeeming open() then ver
 
 Deployment admins can inspect a workspace outside the sharing graph: `AdminApi.inspectWorkspace()` mints a read-only `AdminWorkspaceView` through `openForAdmin()`, which never consults the permission graph, adds no collaborator and joins no session. It is a deliberate exception, bounded by an environment-set access cap and an audit recorded before anything an admin reads leaves the server; see [admin-access.md](admin-access.md).
 
+Two flags narrow the graph further, both supplied by the Overseer as hooks and checked right before each grant's write: `ownerInvitesOnly` counts only the owner's direct grants (below), and deployment admin access, once it has been on, leaves nobody but the owner a role at all (see "Deployment admin access: owner-only for good").
+
 ### `ownerInvitesOnly`
 
 A gatekeeper whose data source requires each recipient to be granted access individually can mark an observation `ownerInvitesOnly` (`ObservationDescription` in `packages/workshop-shared/src/gatekeeper.ts`, typically alongside `containsRestrictedData`). Once any such observation is authorized, the Overseer permanently sets the `ownerInvitesOnly` storage flag (in `authorizeObservation`, after the exclusion gate, so a refused observation sets nothing). From then on, **only direct grants from the owner count**: `computeEffectiveRoles` skips every share-link edge (even for a link the owner created) and every `user` edge from anyone but the owner. Because every access decision derives from that computation, `open()`, `listCollaborators`, and the removal previews agree without further checks.
@@ -173,6 +175,18 @@ The owner can still list, rename, and revoke links (which no longer grant anythi
 The policy lives in the Overseer, which passes it into `SharingManager` as a hook. Each grant checks it after its last await, right before the storage write, so an observation that sets the flag mid-call cannot slip a grant through.
 
 **Residual:** the observation that sets the flag is delivered to the gatekeeper's caller before the restart lands (~100ms later), so a session held by someone who is about to lose access stays live for that window.
+
+### Deployment admin access: owner-only for good
+
+A workspace where its owner, a deployment admin, ever turned on deployment admin access (the instance admin Gatekeeper; see [admin-access.md](admin-access.md#through-an-agent)) holds deployment admin data its agent read, so from then on nobody but its owner may ever open it. The Overseer tells `SharingManager` so through `SharingAccessHooks`:
+
+- **`ownerOnly`** reads the Overseer's permanent `instanceAdminLatched` flag. While it holds, `computeEffectiveRoles` gives nobody but the owner a role, whatever the graph holds, so `open()`, `listCollaborators` and the removal previews agree without further checks. Turning access on is refused unless nobody else can open the workspace already, so the latch strands nobody.
+- **Every grant, link and redemption is refused**, checked right before its write as `ownerInvitesOnly` is, so access turned on mid-call cannot slip one through. `addCollaborator` (the owner's included), `createShareLink` and `newShareLinkKey` throw "Deployment admin access has been on in this workspace, so only its owner can ever open it: it can't be shared." Redeeming a link is refused with the `shareLinksDisabled` open error for anyone but the owner, whom it lets through, writing nothing.
+- **No external messages.** The workspace refuses them, including one already on its way when access was turned on (see [admin-access.md](admin-access.md#the-workspace)).
+- **`GadgetMetadata.deploymentAdminAccess`** reports `"on"` or `"off"` once access has been on, and stays present when it is turned off. The Share modal then hides the invite box and the link controls and says why: only the owner can open the workspace, and other deployment admins can still inspect it, as they can any workspace, with their inspections recorded in the admin audit log.
+- **`onShared`** is called synchronously right after any write that lets someone else open the workspace (a collaborator edge, a share link or a copy of one, a redemption that adds an edge, a `keepUsers` re-root). The Overseer drops the instance admin capsule then, so sharing a workspace that has the capsule but was never turned on takes the Admin API out of it at once.
+
+Unlike `ownerInvitesOnly`, the latch also keeps out the people the owner adds directly.
 
 ### Terminating live sessions on revocation or scope growth
 

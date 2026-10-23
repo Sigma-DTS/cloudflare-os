@@ -30,8 +30,15 @@ Beyond names, types and docs, the schema records:
 - a service's `properties`, its non-method members, which a stub reads by pipelining
   (`stub.foo.bar()`);
 - a stream's `element`, what a `ReadableStream<T>` or `WritableStream<T>` carries;
-- `deprecated`, from a `@deprecated` tag, on a service, method or property, and `mutates: true`
-  on a method whose doc has a `@mutates` tag, so a Gatekeeper can route it through approval.
+- `deprecated`, from a `@deprecated` tag, on a service, method or property;
+- `mutates: true` on a method whose doc has a `@mutates` tag, so a Gatekeeper can route it through
+  approval;
+- `confirmation` on a method whose doc has a `@confirmation` tag: the tag's text (`""` when bare),
+  the sentence a host shows before a call that costs or commits something even though it changes
+  no state, so a Gatekeeper can route that through approval too.
+
+In the Workshop API, `AdminApi`'s setters carry `@mutates` and its gateway tests, which send
+requests the deployment's AI providers bill, `@confirmation`.
 
 Each of these but `direction` is omitted when absent, and none changes what an existing field
 means, so a reader that predates them can ignore them.
@@ -40,14 +47,20 @@ means, so a reader that predates them can ignore them.
 
 `generated/` is committed. Nothing in it is edited by hand.
 
-Nothing reads these files yet; the last column is who each is written for.
+The instance admin Gatekeeper reads `admin-api.schema.json`, and the Workshop's and the
+Gatekeeper's tests check the Admin API's tags and the admin subset against
+`workshop-api.schema.json`; nothing reads the other files yet, and the last column is who each is
+written for.
 
 | File | What it is | Meant for |
 | --- | --- | --- |
-| `workshop-api.schema.json` | The capnweb-schema of everything reachable from `PublicApi`. | The starter's `cf-os api` ([cloudflare-os-starter](https://github.com/cloudflare/cloudflare-os-starter)), which extracts its own schema today and is to render its command table from this file instead. The starter's extractor predates `format`, `direction`, properties, stream elements, `deprecated` and `mutates`, so the two files are no longer byte-identical; its command table reads only the fields they share. |
+| `workshop-api.schema.json` | The capnweb-schema of everything reachable from `PublicApi`. | The starter's `cf-os api` ([cloudflare-os-starter](https://github.com/cloudflare/cloudflare-os-starter)), which extracts its own schema today and is to render its command table from this file instead. The starter's extractor predates `format`, `direction`, properties, stream elements, `deprecated`, `mutates` and `confirmation`, so the two files are no longer byte-identical; its command table reads only the fields they share. |
 | `workshop-api.agent.d.ts` | One self-contained declaration file of what a holder of an `AuthenticatedApi` stub can call, without the credential methods (`authenticate`, `login`, `changePassword`, ...). | Gatekeepers and code-mode agents, to write code against. The agent's `describeBinding` still writes its own description. |
 | `workshop-api.fragments.json` | The same declarations split per service, each fragment readable on its own, other services referred to by name. | Agents that fetch one service at a time instead of the whole surface. Shaped like the answer a live introspection method would give ([capnweb#177](https://github.com/cloudflare/capnweb/issues/177)), but rendered from `AuthenticatedApi`'s point of view, so a shape's name or position can differ from what one stub alone would report, and without the credential methods, which such a method would list unless it left them out too. |
-| `workshop-api.tools.json` | **Experimental.** One tool per method callable from `AuthenticatedApi`, each with a JSON Schema for its arguments and result, `continuesOn` where the result is a capability, and the method's `deprecated` and `mutates` where it has them. | A base for MCP and tool search; its shape may change. |
+| `workshop-api.tools.json` | **Experimental.** One tool per method callable from `AuthenticatedApi`, each with a JSON Schema for its arguments and result, `continuesOn` where the result is a capability, and the method's `deprecated`, `mutates` and `confirmation` where it has them. | A base for MCP and tool search; its shape may change. |
+| `admin-api.schema.json` | The capnweb-schema of what a holder of an `AdminApi` stub reaches (`subsetSchema`), without the methods the instance admin Gatekeeper withholds (`ADMIN_OMIT`): `AdminApi` and the `AdminWorkspaceView` it opens. | `packages/gatekeeper-instanceadmin`, which bundles it, renders its agent's declarations from it with the same emitter, and checks each call's arguments against it with `checkArguments`. |
+| `admin-api.agent.d.ts` | That schema's declarations, rooted at `AdminApi`: what the Gatekeeper's `getTypeScriptTypes()` renders, under its own header. | Reviewers: the Gatekeeper's agent-facing types, read as another Gatekeeper's `types.d.ts` is. |
+| `admin-api.fragments.json` | The same declarations split per service. | As `workshop-api.fragments.json`. |
 
 The declarations use the web platform's globals (`ReadableStream`), as a Worker has them, and
 `Symbol.dispose` (TypeScript's `esnext.disposable` lib): every stub the agent holds can be disposed,
@@ -57,7 +70,7 @@ A value parameter is `Awaitable<T>`, the value or a promise of it, so one call's
 to the next without awaiting it (`gadget.setTitle(other.getTitle())`), and a subscriber's methods
 return `Awaitable<T>`, so an implementation may return its result as is or be `async`. A
 service's property is a `readonly` member, which a holder reads as it would a method's result,
-and `@deprecated` and `@mutates` appear in the JSDoc.
+and `@deprecated`, `@mutates` and `@confirmation` appear in the JSDoc.
 
 ## Regenerating
 
@@ -89,7 +102,18 @@ and CI, writes nothing and fails naming any file that is out of date. Both print
   which a forge plugin has no input for yet, and hand them a `Schema`: a forge plugin reads
   forge's IR, not capnweb-schema, so either an adapter rebuilds the schema from the IR or forge
   passes the document through to plugins (the RFC's §6).
+- `src/subset.ts` and `src/check.ts` are pure in the same way. `subsetSchema` cuts a schema down to
+  what a holder of one service's stub reaches, less the methods omitted: emitting declarations from
+  it gives what emitting them from the whole schema with the same omissions gives. `checkArguments`
+  says what is wrong with one call's arguments, one line per problem
+  (`options.limit: expected number`), checking values only: a capability, function or stream is
+  always a problem. Both are for a host that serves one capability from its schema alone, as the
+  instance admin Gatekeeper does: `scripts/generate.ts` cuts the admin schema with `subsetSchema`,
+  and the Gatekeeper bundles `src/check.ts`, with `src/schema.ts` and `src/emit/dts.ts`, into its
+  Worker.
 
 `scripts/generate.ts` is the only product-specific file: it names `api.ts` and its tsconfig, the
 entry `PublicApi`, the constant `SERVICE_SALT`, the agent root `AuthenticatedApi` and the
-credential methods an agent never calls, and it is the only part that writes to disk.
+credential methods an agent never calls, the instance admin Gatekeeper's root `ADMIN_ROOT`
+(`AdminApi`) and the methods it withholds, `ADMIN_OMIT`, and it is the only part that writes to
+disk.

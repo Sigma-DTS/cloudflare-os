@@ -50,15 +50,20 @@ extracted at the time of writing:
 
 | Measure | Value |
 | --- | --- |
-| Services (capability interfaces reachable from `PublicApi`) | 16 |
-| Methods | 219 |
-| Named shapes | 123 |
-| `workshop-api.schema.json` | 362,441 bytes |
-| `workshop-api.agent.d.ts` (rooted at `AuthenticatedApi`) | 123,432 bytes, 3,089 lines, ~30.9k tokens |
-| Largest per-service fragment (`Overseer`) | 55,927 bytes, ~14.0k tokens |
-| Tools callable from `AuthenticatedApi` | 187, across 5 services |
+| Services (capability interfaces reachable from `PublicApi`) | 17 |
+| Methods | 235 |
+| Named shapes | 147 |
+| `workshop-api.schema.json` | 409,608 bytes |
+| `workshop-api.agent.d.ts` (rooted at `AuthenticatedApi`) | 140,020 bytes, 3,509 lines, ~35.0k tokens |
+| Largest per-service fragment (`Overseer`) | 56,726 bytes, ~14.2k tokens |
+| Tools callable from `AuthenticatedApi` | 203, across 6 services |
+| Declarations rooted at `AdminApi` | 51,316 bytes, 1,639 lines |
+| `admin-api.agent.d.ts` (rooted at `AdminApi`, without its three withheld methods) | 49,711 bytes, 1,613 lines, ~12.4k tokens, before its header |
 
-Token counts are estimated at four bytes per token.
+Token counts are estimated at four bytes per token. The `AdminApi` declarations are what the
+instance admin Gatekeeper gives its agent, whole. Before `AdminApi`'s methods were tagged
+(`@mutates`, `@confirmation`) and documented for it, they were 49,671 bytes and 1,581 lines, and
+48,108 bytes and 1,558 lines without the withheld methods.
 
 We already have a working extractor and CLI. The extractor reads `api.ts` with the TypeScript
 compiler; the starter's `cf-os api` is generated from its output: every method a client can call
@@ -123,7 +128,7 @@ interface Schema {
     direction: "server" | "client" | "both";  // the side that implements it
     methods: {
       name: string; doc: string; params: { name; type; optional; doc }[]; returns;
-      deprecated?: string; mutates?: true;
+      deprecated?: string; mutates?: true; confirmation?: string;
     }[];
     properties?: { name: string; doc: string; type; optional: boolean; deprecated?: string }[];
     deprecated?: string;
@@ -161,18 +166,19 @@ The additions for the first versioned release, and where each stands in this pac
 | Addition | Why | Status |
 | --- | --- | --- |
 | A top-level `format: "capnweb-schema/0"` | So a reader can refuse a format it does not know. | Implemented: the schema's first field. |
-| Per service, `direction: "server" \| "client" \| "both"` | A subscriber or callback (`ObserverConfigCallback`) is implemented by the client; without it a consumer infers that from where the service appears. | Implemented. The entry is the server's; a capability in a service's results or property values is its implementer's, one in its parameters the other side's, a function and a `WritableStream`'s element swapping sides the same way; `"both"` is a service reached each way. The Workshop API has 8 server and 8 client services, none both. |
+| Per service, `direction: "server" \| "client" \| "both"` | A subscriber or callback (`ObserverConfigCallback`) is implemented by the client; without it a consumer infers that from where the service appears. | Implemented. The entry is the server's; a capability in a service's results or property values is its implementer's, one in its parameters the other side's, a function and a `WritableStream`'s element swapping sides the same way; `"both"` is a service reached each way. The Workshop API has 9 server and 8 client services, none both. |
 | Stream element types | `ReadableStream<T>` and `WritableStream<T>` carry `T`, which a stream's kind alone does not say. | Implemented: a stream's `element`, absent when undeclared or `any`. The Workshop API's three streams are `ReadableStream<Uint8Array>`, `element: {kind: "bytes"}`. |
 | `deprecated` and availability, from `@deprecated` and a tag | As forge's methods have them (`deprecated`, `availability`). | `deprecated` implemented, on services, methods and properties: the tag's text, `""` when bare (`doc` keeps the tag too). One Workshop method has it (`ActionsSubscriber.ready`). Availability is not: no tag is chosen for it yet. |
 | Property members | Cap'n Web pipelines property access (`stub.foo.bar()`), and capnweb-validate already models getters (`isGetter`). | Implemented: a service's non-method members, as `properties` with each one's type and whether it is optional. The Workshop API has none. |
 | Handle disposal semantics | Every stub must be disposed; the schema should say which results are stubs the caller owns and must dispose. | Proposed; see below. |
-| A `@mutates` tag | Which methods change state, so a Gatekeeper can route those through user approval and let reads through. It plays the part of MCP's `readOnlyHint` and forge's `x-forge-require-confirmation`. | Implemented: `mutates: true` on a method whose doc has the tag; absent means undeclared, not read-only. No Workshop method has it yet (§9 step 2). |
+| A `@mutates` tag | Which methods change state, so a Gatekeeper can route those through user approval and let reads through. It plays the part of MCP's `readOnlyHint` and forge's `x-forge-require-confirmation`. | Implemented: `mutates: true` on a method whose doc has the tag; absent means undeclared, not read-only. `AdminApi`'s 29 setters have it. |
+| A `@confirmation` tag | Which methods cost or commit something even though they change no state (a request someone pays for), with the sentence to show before calling one, so a Gatekeeper can route those through approval too. It is forge's `x-forge-require-confirmation`. | Implemented: `confirmation` on a method whose doc has the tag, the tag's text (`""` when bare); `doc` keeps the tag too. `AdminApi`'s 3 gateway tests have it, each saying what it sends and who bills it. |
 
 The emitters carry the additions through: the `.d.ts` declares a stream's element type and a
-property as a `readonly` member, and keeps `@deprecated` and `@mutates` in the JSDoc; the tool
-catalog skips client services, follows capabilities a property holds as it does those a method
-returns, gives a stream's element as `x-capnweb-element`, and copies a method's `deprecated` and
-`mutates` onto its tool.
+property as a `readonly` member, and keeps `@deprecated`, `@mutates` and `@confirmation` in the
+JSDoc; the tool catalog skips client services, follows capabilities a property holds as it does
+those a method returns, gives a stream's element as `x-capnweb-element`, and copies a method's
+`deprecated`, `mutates` and `confirmation` onto its tool.
 
 **Handle disposal stays a proposal.** Every Cap'n Web stub is disposable, and every stub a caller
 receives is its own to dispose, so "this result is a stub the caller must dispose" is already said
@@ -198,8 +204,8 @@ The reference implementation is `packages/api-schema/src/extract.ts` in Cloudfla
 the entry file under its tsconfig with the TypeScript compiler API, refuses a program that does not
 type-check (an unresolved type silently becomes `any`, turning capabilities into values), walks the
 capability graph from the entry interface with capnweb-validate's classification rules, keeps
-names, JSDoc and the `@deprecated` and `@mutates` tags, and marks which side implements each
-service. It imports nothing but the compiler and `node:path`, and takes its inputs as
+names, JSDoc and the `@deprecated`, `@mutates` and `@confirmation` tags, and marks which side
+implements each service. It imports nothing but the compiler and `node:path`, and takes its inputs as
 options:
 
 ```ts
@@ -233,10 +239,11 @@ Relative to `forge:plugin@0.3.0`, the next version of the WIT would need:
   returns }` names the method's service, its parameters in order, and its result type.
 - **Method metadata.** The rest of `method-info` is transport-neutral and stays. A schema
   method's `deprecated` sets its `deprecated: bool`; the tag's text stays in the description,
-  where the schema's `doc` already keeps it. `mutates` becomes a new `mutates: bool` beside
-  `confirmation`: `confirmation` is the sentence to show before a call
-  (`x-forge-require-confirmation`), which `@mutates` does not supply; `mutates` only says the
-  method changes state, which a host may route through approval.
+  where the schema's `doc` already keeps it. A schema method's `confirmation`, from its
+  `@confirmation` tag, maps to `method-info`'s `confirmation`, the sentence to show before a call
+  (`x-forge-require-confirmation`). `mutates` becomes a new `mutates: bool` beside it, since
+  `@mutates` supplies no sentence: it only says the method changes state, which a host may route
+  through approval.
 - **New types.** `type-info` gains `capability(option<service-id>)` (none for an untyped stub),
   `function { params, returns }` and `stream { element: option<type-id>, direction }`, the
   element none when the schema has none and `direction` readable or writable. A map today is an
@@ -321,6 +328,16 @@ as it keeps extensions as `json` today; or the emitter rewritten against the IR,
    can build on it, as cf's `cf tools` and `cf cli search` build on its command metadata.
 4. **Docs.** Not written yet: a page per service from the same schema.
 
+Two more functions of the schema serve a host that hands an agent one capability and forwards its
+calls, as the instance admin Gatekeeper does with `AdminApi`. Neither writes files, so neither is a
+plugin, but both stay generic. `subsetSchema` (`src/subset.ts`) cuts a schema down to what a holder
+of one service reaches, less the methods omitted, so the host bundles that instead of the whole API,
+and the `.d.ts` emitter renders the same declarations from it as from the whole schema with the
+same omissions. `checkArguments` (`src/check.ts`) checks one call's arguments against the shapes the
+schema records and says what is wrong in lines a caller can act on (`options.limit: expected
+number`), so the host refuses a malformed call before forwarding it; it accepts values only, never a
+capability, function or stream.
+
 ## 7. Alignment with capnweb#177
 
 #177 asks for a runtime method that tells an agent holding an unknown stub what it can call. The
@@ -391,10 +408,15 @@ Security:
 1. **This package**: the format, the extractor, the committed schema of the Workshop API, and the
    generic `.d.ts` and tool-catalog emitters. The starter's `cf-os api` reads
    `workshop-api.schema.json` from the pin instead of extracting it itself.
-2. **An audited Admin API**: `@mutates`, which the schema records (§3), on every Admin API
-   method that changes state.
-3. **An admin Gatekeeper**: an agent's access to the Admin API, proxied, with mutating calls routed
-   through approval.
+2. **An audited Admin API** (done): `@mutates`, which the schema records (§3), on every Admin API
+   method that changes state, and `@confirmation` on the ones a provider bills.
+3. **An admin Gatekeeper** (built, `packages/gatekeeper-instanceadmin`): an agent's access to the
+   Admin API, as its admin. The Workshop decides what each Admin API method may do through it
+   (`ADMIN_AGENT_ACCESS` in `api.ts`: run a read at once, queue a change for the admin's approval,
+   run a billed call once after approval, open a workspace for inspection, its metadata at once and
+   its full content only after approval, or withhold the method) and records it. The Gatekeeper is
+   a proxy that only forwards: built from `admin-api.schema.json` (§6's subset), it checks each
+   call's arguments and passes the call to the Workshop.
 4. **forge IR**: the changes of §5.
 5. **The emitters ported to forge TypeScript plugins**, reading the schema through an adapter
    from the IR or as the document forge passes through (§6).
@@ -413,6 +435,7 @@ Long-term homes:
 `src/extract.ts` move to capnweb unchanged, and `src/emit/dts.ts` and `src/emit/tools.ts` to
 forge, inside a plugin wrapper that names the files, supplies the options and hands them a
 `Schema`, rebuilt from the IR or passed through as the frontend's document (§6): none of them
-imports anything from Cloudflare OS or names its API. `scripts/generate.ts`, the one
-file that names `api.ts`, `PublicApi`, `SERVICE_SALT` and `AuthenticatedApi`, stays, with the
-committed `generated/` files it writes.
+imports anything from Cloudflare OS or names its API; nor do `src/subset.ts` and `src/check.ts`,
+which go with the format. `scripts/generate.ts`, the one file that names `api.ts`, `PublicApi`,
+`SERVICE_SALT`, `AuthenticatedApi` and `AdminApi`, stays, with the committed `generated/` files it
+writes.

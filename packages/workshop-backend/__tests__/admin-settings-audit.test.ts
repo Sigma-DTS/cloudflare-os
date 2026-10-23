@@ -305,6 +305,80 @@ describe("AdminSettings records each admin's change before making it", () => {
   });
 });
 
+describe("AdminSettings records an agent's change as made through the gatekeeper", () => {
+  it("keeps the change's origin and its run's session on the record", async () => {
+    const { inDo, records } = adminSettings();
+    const origin = { workspaceId: "w-admin", chatId: 3, actionId: 9 };
+    await inDo(admin => admin.updateAdminConfig({ siteName: "Acme" },
+        { ...ACTOR, sessionId: "agent-run-1", via: "gatekeeper", origin }));
+    expect(records()).toHaveLength(1);
+    expect(records()[0]).toMatchObject({
+      kind: "setting", admin: "admin@example.test", sessionId: "agent-run-1", via: "gatekeeper",
+      origin, method: "setSiteName", changes: [{ setting: "siteName", before: "", after: "Acme" }],
+    });
+  });
+});
+
+// A bound ambient vendor: buildGatekeeperVendorMap() finds it by binding name, and
+// setGatekeeperMode() takes the ambient branch for a vendor whose describe() auto-provisions.
+function ambientVendor(displayName: string) {
+  return {
+    describe: async () => ({ displayName, autoProvisionsAccount: true }),
+    getSupportedResources: async () => [],
+  };
+}
+
+describe("AdminSettings.setGatekeeperMode", () => {
+  const VENDORS = {
+    GATEKEEPER_INSTANCEADMIN: ambientVendor("Instance admin"),
+    GATEKEEPER_WEBSEARCH: ambientVendor("Web Search"),
+  };
+  const MODE_ACTOR: AdminSettingActor = { ...ACTOR, method: "setGatekeeperMode" };
+
+  it("stores each ambient vendor's own default as absence", async () => {
+    const { inDo, config } = adminSettings();
+    const set = (vendorId: string, mode: "disabled" | "optional" | "enabled") =>
+        inDo(admin => admin.setGatekeeperMode(vendorId, mode, MODE_ACTOR), { more: VENDORS });
+
+    await set("instanceadmin", "optional");
+    await set("websearch", "disabled");
+    expect((await config()).ambientGatekeeperModes)
+        .toStrictEqual({ instanceadmin: "optional", websearch: "disabled" });
+
+    await set("instanceadmin", "disabled");
+    await set("websearch", "optional");
+    expect((await config()).ambientGatekeeperModes).toStrictEqual({});
+
+    await set("InstanceAdmin", "enabled");
+    await set("websearch", "enabled");
+    expect((await config()).ambientGatekeeperModes)
+        .toStrictEqual({ instanceadmin: "enabled", websearch: "enabled" });
+    expect((await config()).disabledGatekeepers).toEqual([]);
+  });
+
+  it("reports the instance admin gatekeeper disabled until an admin sets a mode", async () => {
+    const { inDo } = adminSettings();
+    const modes = async () => Object.fromEntries(
+        (await inDo(admin => admin.getSettings("admin@example.test"), { more: VENDORS }))
+            .resourceVendors.map(vendor =>
+                [vendor.vendorId, vendor.autoProvisions ? vendor.ambientMode : undefined]));
+    expect(await modes()).toEqual({ instanceadmin: "disabled", websearch: "optional" });
+    await inDo(admin => admin.setGatekeeperMode("instanceadmin", "optional", MODE_ACTOR),
+        { more: VENDORS });
+    expect(await modes()).toEqual({ instanceadmin: "optional", websearch: "optional" });
+  });
+
+  it("leaves a vendor that does not auto-provision on the binary setting", async () => {
+    const { inDo, config } = adminSettings();
+    await inDo(admin => admin.setGatekeeperMode("github", "disabled", MODE_ACTOR),
+        { more: VENDORS });
+    expect((await config()).disabledGatekeepers).toEqual(["github"]);
+    expect((await config()).ambientGatekeeperModes).toStrictEqual({});
+    await expect(inDo(admin => admin.setGatekeeperMode("github", "optional", MODE_ACTOR),
+        { more: VENDORS })).rejects.toThrow("is not an auto-provisioning gatekeeper");
+  });
+});
+
 describe("AdminSettings admin access bounds", () => {
   it("refuses an access level above ADMIN_WORKSPACE_ACCESS_MAX", async () => {
     const { inDo, appended, config, records } = adminSettings();

@@ -96,6 +96,8 @@ const stashedTickets = new Map<string, string>();
  */
 export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   name: string; failRevoke?: boolean; failDescribe?: boolean; providesUi?: boolean;
+  /** Declares an agent singleton of this TypeScript type, as an ambient account does. */
+  singleton?: string;
 }> {
   #record(call: string) {
     const calls = accountCalls.get(this.ctx.props.name) ?? [];
@@ -110,7 +112,19 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
       displayName: this.ctx.props.name,
       uniqueName: this.ctx.props.name,
       ...(this.ctx.props.providesUi ? { providesUi: { title: this.ctx.props.name } } : {}),
+      ...(this.ctx.props.singleton ? { singleton: { tsType: this.ctx.props.singleton } } : {}),
     };
+  }
+
+  /** No resources, as an ambient account has; not recorded, since listing accounts asks it. */
+  async getSupportedResources(): Promise<[]> {
+    return [];
+  }
+
+  /** Records the call; no suite opens the session, so there is no class to return. */
+  async getSingletonGatekeeperClass(): Promise<null> {
+    this.#record("getSingletonGatekeeperClass");
+    return null;
   }
 
   async revoke(): Promise<void> {

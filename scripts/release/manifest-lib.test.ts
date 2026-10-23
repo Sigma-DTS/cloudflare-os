@@ -177,6 +177,14 @@ test("worker entries carry the deploy contract", () => {
   assert.equal(websearch.singleton, true);
   assert.deepEqual(websearch.inputs, []);
   assert.deepEqual(websearch.bindings, [{ type: "ai", name: "AI" }]);
+  // Instance admin is ambient and preinstalled too, and takes nothing from the wizard: the
+  // Workshop keeps it disabled until an admin chooses its mode.
+  const instanceAdmin = workers["gatekeeper-instanceadmin"];
+  assert.equal(instanceAdmin.shortName, "instanceadmin");
+  assert.equal(instanceAdmin.preinstall, true);
+  assert.equal(instanceAdmin.singleton, true);
+  assert.deepEqual(instanceAdmin.inputs, []);
+  assert.deepEqual(instanceAdmin.bindings, []);
   for (const [name, entry] of Object.entries(workers)) {
     if (entry.preinstall) {
       assert.ok(entry.installable, `${name}: preinstall requires installable`);
@@ -262,6 +270,17 @@ test("releaseShortName rejects names that don't fold to a legal slug", () => {
   }
   // The cap itself is inclusive.
   assert.equal(releaseShortName(`gatekeeper-${"a".repeat(20)}`), "a".repeat(20));
+});
+
+// The Workshop lends deployment admin power to whatever is bound as GATEKEEPER_INSTANCEADMIN, so
+// no package but gatekeeper-instanceadmin may fold to its slug, however it is spelled.
+test("releaseShortName reserves instanceadmin for gatekeeper-instanceadmin", () => {
+  assert.equal(releaseShortName("gatekeeper-instanceadmin"), "instanceadmin");
+  for (const pkgName of ["gatekeeper-instance-admin", "gatekeeper-instance_admin"]) {
+    assert.throws(() => releaseShortName(pkgName),
+        /folds to "instanceadmin", which is reserved for gatekeeper-instanceadmin/,
+        `expected ${pkgName} to be rejected`);
+  }
 });
 
 test("every gatekeeper shortName is unique", () => {

@@ -101,7 +101,8 @@ export interface AuthenticatedApi {
    * Returns a capability for managing and investigating the deployment as an admin, or null when
    * the caller is not one. The access check happens here, once, for every AdminApi method but
    * workspace inspection: AdminApi.inspectWorkspace() and each call on the view it mints check
-   * again (see AdminWorkspaceView). `options.via` labels every audit record the capability makes.
+   * again (see AdminWorkspaceView). `options.via` labels every audit record the capability makes,
+   * "api" or "cli" as the client states it.
    * (Authentication config — sign-in providers, password login — is intentionally not managed
    * here; it stays env-var driven.)
    */
@@ -429,6 +430,13 @@ export interface ActionsSubscriber {
  * user and workspace directory, and admin access to workspaces — NOT authentication config (that's
  * env-var driven). Each setter throws on invalid input, and records the change it makes in the
  * deployment's audit log before making it (see AdminSettingRecord).
+ *
+ * A deployment admin's own agent can call these methods as them through the instance admin
+ * Gatekeeper (packages/gatekeeper-instanceadmin), in a workspace they turned deployment admin access
+ * on in. The Workshop decides what each call may do from ADMIN_AGENT_ACCESS: a read runs at once, a
+ * method tagged `@mutates` runs only as an action the admin approves, one tagged `@confirmation` (and
+ * an inspection asking for "full") only once they approve that one call, and the rest are withheld.
+ * Its audit records say `via` "gatekeeper", with an AdminGatekeeperOrigin.
  */
 export interface AdminApi {
   /**
@@ -439,6 +447,7 @@ export interface AdminApi {
    * added model already has its ID, if the model runtime does not know its `behavesLike` under
    * its provider, or if what its context window reserves for the response (its output limit, or
    * WORKERS_AI_OUTPUT_LIMIT for a Cloudflare model that gives none) leaves a prompt no room.
+   * @mutates
    */
   addGatewayModel(model: Awaitable<GatewayModel>): Promise<void>;
   /**
@@ -512,6 +521,7 @@ export interface AdminApi {
    * Offer a blueprint as a standard format, appended last in menu order. Throws if the blueprint
    * doesn't exist. Promoting one that already is leaves its curation and menu position alone, so
    * that retrying a promotion whose mirror write failed repairs it rather than being refused.
+   * @mutates
    */
   promoteFormat(blueprintId: Awaitable<string>): Promise<void>;
   /**
@@ -521,6 +531,7 @@ export interface AdminApi {
    * Refused for a bundled blueprint (see `AdminFormat.bundled`), which the deployment installed
    * and will reinstall: `enabled: false` withdraws it without discarding the admin's overrides,
    * hint and menu position.
+   * @mutates
    */
   removeFormat(blueprintId: Awaitable<string>): Promise<void>;
   /**
@@ -532,11 +543,13 @@ export interface AdminApi {
    * minted for it carries its own provider and model, so while users may add their own models
    * (see setUserModelsEnabled) it runs once the model is removed, even if the model was disabled.
    * To shut a model off, disable it instead.
+   * @mutates
    */
   removeGatewayModel(modelId: Awaitable<string>): Promise<void>;
   /**
    * Set the deployment accent color (hex, e.g. "#3b82f6"). Pass "" to reset to the default theme.
    * Rejects an invalid hex color.
+   * @mutates
    */
   setAccentColor(color: Awaitable<string>): Promise<void>;
   /**
@@ -546,6 +559,7 @@ export interface AdminApi {
    * unless `days` is a whole number from the deployment's minimum
    * (AdminSettingsView.adminAuditRetentionDays.min, set by its ADMIN_AUDIT_RETENTION_MIN_DAYS
    * environment variable) to MAX_ADMIN_AUDIT_RETENTION_DAYS.
+   * @mutates
    */
   setAdminAuditRetentionDays(days: Awaitable<number>): Promise<void>;
   /**
@@ -554,26 +568,36 @@ export interface AdminApi {
    * (AdminSettingsView.adminWorkspaceAccess.max), which only its ADMIN_WORKSPACE_ACCESS_MAX
    * environment variable can raise. A view already minted runs at the lower of its own level and
    * the new one from its next call once the setting reaches it, within about a minute.
+   * @mutates
    */
   setAdminWorkspaceAccess(access: Awaitable<"full" | "metadata" | "off">): Promise<void>;
   /**
    * Set the top-bar notice (centered text in the top navigation bar). Pass "" to clear. Rejects over
    * MAX_ANNOUNCEMENT_LENGTH.
+   * @mutates
    */
   setAnnouncement(text: Awaitable<string>): Promise<void>;
   /**
    * Set the full-width banner. Pass an empty text to hide it. Rejects over MAX_ANNOUNCEMENT_LENGTH or
    * an invalid color.
+   * @mutates
    */
   setBanner(text: Awaitable<string>, color: Awaitable<BannerColor>): Promise<void>;
-  /** Mark or unmark a blueprint as featured on the deployment. */
+  /**
+   * Mark or unmark a blueprint as featured on the deployment.
+   * @mutates
+   */
   setBlueprintFeatured(blueprintId: Awaitable<string>, featured: Awaitable<boolean>): Promise<void>;
   /**
    * Set the reasoning level of every gateway model that has none of its own, or null for each
    * model's built-in behaviour. It never applies to a model a user added.
+   * @mutates
    */
   setDefaultReasoning(level: Awaitable<"high" | "low" | "max" | "medium" | "minimal" | "off" | "xhigh" | null>): Promise<void>;
-  /** Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids. */
+  /**
+   * Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids.
+   * @mutates
+   */
   setFormatOrder(blueprintIds: Awaitable<string[]>): Promise<void>;
   /**
    * Set a gatekeeper's availability. For an auto-provisioning ("ambient") gatekeeper, `mode` is the
@@ -581,6 +605,7 @@ export interface AdminApi {
    * 'enabled' are valid ('optional' is rejected). Soft enforcement: it doesn't revoke a capability a
    * gadget already holds, and 'disabled' leaves an ambient account's data dormant rather than deleting
    * it.
+   * @mutates
    */
   setGatekeeperMode(vendorId: Awaitable<string>, mode: Awaitable<"disabled" | "enabled" | "optional">): Promise<void>;
   /**
@@ -590,6 +615,7 @@ export interface AdminApi {
    *
    * 'disabled' revokes nothing that is stored: the chats, spawners, preferences and gadget model
    * bindings that name the model keep naming it, and stop resolving for as long as it is disabled.
+   * @mutates
    */
   setGatewayModelMode(modelId: Awaitable<string>, mode: Awaitable<"disabled" | "enabled" | "hidden">): Promise<void>;
   /**
@@ -601,6 +627,7 @@ export interface AdminApi {
    *
    * The reasoning level may be one the model lacks, since it is fitted to the model when a
    * request is made (see ReasoningLevel).
+   * @mutates
    */
   setGatewayModelSettings(modelId: Awaitable<string>, settings: Awaitable<GatewayModelSettings>): Promise<void>;
   /**
@@ -614,9 +641,14 @@ export interface AdminApi {
    * settings, and the models added under the provider, are kept for when it is back on. It stops
    * neither a model a user already added under the provider nor a gadget model binding already
    * minted for one of its models, which setUserModelsEnabled(false) does.
+   * @mutates
    */
   setGatewayProviderEnabled(provider: Awaitable<AiModelProvider>, enabled: Awaitable<boolean>): Promise<void>;
-  /** Replace the agent system-prompt instructions. Pass "" to clear. Rejects over MAX_INSTANCE_INSTRUCTIONS_LENGTH. */
+  /**
+   * Replace the agent system-prompt instructions. Pass "" to clear. Rejects over
+   * MAX_INSTANCE_INSTRUCTIONS_LENGTH.
+   * @mutates
+   */
   setInstanceInstructions(text: Awaitable<string>): Promise<void>;
   /**
    * Set whether the admin UI may suggest models from models.dev while an admin adds one. Off by
@@ -626,25 +658,33 @@ export interface AdminApi {
    * list while an admin adds a model, to fill in the add-model form. It changes nothing the server
    * does: the server never contacts models.dev, and addGatewayModel() validates a suggested model
    * like any other.
+   * @mutates
    */
   setModelsDevSuggestions(enabled: Awaitable<boolean>): Promise<void>;
   /**
    * Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.
    * Soft enforcement: disabling hides the resource from the connect UI, the resource picker, and the
    * agent; it doesn't revoke a capability a gadget already holds.
+   * @mutates
    */
   setResourceEnabled(vendorId: Awaitable<string>, urlPattern: Awaitable<string>, enabled: Awaitable<boolean>): Promise<void>;
-  /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
+  /**
+   * Enable or disable new account signups. Existing users can still log in while signups are
+   * closed.
+   * @mutates
+   */
   setSignupsEnabled(enabled: Awaitable<boolean>): Promise<void>;
   /**
    * Set the deployment logo from browser-rasterized PNG bytes and return its canonical public
    * image, or undefined after reset. Pass null to restore the default Cloudflare OS mark. The
    * caller must supply decodable PNG data; the server enforces its header, size, and dimensions.
+   * @mutates
    */
   setSiteLogo(data: Awaitable<Uint8Array | null>): Promise<AvatarImage | undefined>;
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.
    * Rejects over MAX_SITE_NAME_LENGTH.
+   * @mutates
    */
   setSiteName(name: Awaitable<string>): Promise<void>;
   /**
@@ -653,12 +693,14 @@ export interface AdminApi {
    * or 15 minutes, whichever is shorter. The deployment asks only while an admin is using it
    * (getUpdateStatus() makes the check when one is due), never on a schedule of its own. Throws
    * unless `minutes` is a whole number from 1 to MAX_UPDATE_CHECK_INTERVAL_MINUTES.
+   * @mutates
    */
   setUpdateCheckIntervalMinutes(minutes: Awaitable<number>): Promise<void>;
   /**
    * Set whether the deployment checks for updates by itself. On by default. When off,
    * getUpdateStatus() makes no outbound call and admins are never notified; checkForUpdates()
    * still asks.
+   * @mutates
    */
   setUpdateChecksEnabled(enabled: Awaitable<boolean>): Promise<void>;
   /**
@@ -666,12 +708,14 @@ export interface AdminApi {
    * it, DEFAULT_UPDATE_MINIMUM_AGE_HOURS by default. It delays the notice only: an update always
    * installs the newest release. 0 notifies as soon as a check reports an update. Throws unless
    * `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
+   * @mutates
    */
   setUpdateMinimumAgeHours(hours: Awaitable<number>): Promise<void>;
   /**
    * Set how many hours a dismissed update notice stays hidden in the browser that dismissed it,
    * DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS by default. 0 means a closed notice comes back on the next
    * visit to Home. Throws unless `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
+   * @mutates
    */
   setUpdateNoticeSnoozeHours(hours: Awaitable<number>): Promise<void>;
   /**
@@ -682,11 +726,13 @@ export interface AdminApi {
    * models users added are neither listed nor resolved. A gadget model binding stops at its next
    * call unless a gateway model has its provider and model. Nothing stored is deleted, so the
    * models users added work again once this is back on.
+   * @mutates
    */
   setUserModelsEnabled(enabled: Awaitable<boolean>): Promise<void>;
   /**
    * Enable or disable user directory search. The directory itself is maintained
    * either way, and this switch just controls user access.
+   * @mutates
    */
   setUserSearchEnabled(enabled: Awaitable<boolean>): Promise<void>;
   /**
@@ -702,6 +748,7 @@ export interface AdminApi {
    *
    * A pass says that the model answered that one request. It costs more than
    * testGatewayProvider(), whose quick request is capped at a few tokens.
+   * @confirmation Sends a request of up to 2,048 response tokens through the deployment's AI Gateway, which its provider bills.
    */
   testGatewayModel(modelId: Awaitable<string>): Promise<GatewayModelTest>;
   /**
@@ -715,6 +762,7 @@ export interface AdminApi {
    * gateway lacks from a CF_AI_GATEWAY_API_TOKEN that may not run models. The request is a
    * quick one that takes none of a model's settings: testGatewayModel() sends a model the
    * request its chats would.
+   * @confirmation Sends a request through the deployment's AI Gateway, which its provider bills.
    */
   testGatewayProvider(provider: Awaitable<AiModelProvider>): Promise<GatewayModelTest>;
   /**
@@ -729,11 +777,13 @@ export interface AdminApi {
    *
    * A pass says that the model answered that one request. A model that lists every level is sent
    * eight requests, each of which may use the whole response cap.
+   * @confirmation Sends up to eight requests of up to 2,048 response tokens each through the deployment's AI Gateway, which their provider bills.
    */
   testNewGatewayModel(model: Awaitable<GatewayModel>): Promise<GatewayModelLevelTest[]>;
   /**
    * Update one promoted format. Only the provided fields change. `agentHint: ""` clears the hint;
    * an `overrides` field set to null reverts that field to the blueprint's own declaration.
+   * @mutates
    */
   updateFormat(blueprintId: Awaitable<string>, patch: Awaitable<AdminFormatPatch>): Promise<void>;
   /** Disposes of this stub, releasing the capability it holds. */
@@ -1666,6 +1716,16 @@ export interface Overseer {
    */
   subscribeToWorkpieces(subscriber: WorkpiecesSubscriber): Pipelined<Empty>;
   /**
+   * Turn off deployment admin access in this workspace (GadgetMetadata.deploymentAdminAccess). Every
+   * pending deployment admin action is rejected, requests to turn access on included, and approved
+   * calls not yet made are dropped; a change already being made when this is called completes. From now
+   * on the agent's calls through the instance admin Gatekeeper ask to turn access on, which takes the
+   * owner's approval again. If access was on, it reads "off" from now on and the workspace stays its
+   * owner's alone, restricted and closed to external messages; if it never was, nothing else changes.
+   * Only the owner may call it, whether or not they are still a deployment admin.
+   */
+  turnOffDeploymentAdminAccess(): Promise<void>;
+  /**
    * Update an existing blueprint. Any combination of metadata and code can be updated
    * atomically in a single call with one propagation pass.
    *
@@ -1896,6 +1956,7 @@ export type AdminAccessRecord = {
   exposed: AdminAccessExposure;
   kind: "workspace";
   method: "describe" | "getChat" | "getDiagnostics" | "inspectWorkspace" | "listActions" | "listChats" | "listFiles" | "listGatekeepers" | "readFile";
+  origin?: AdminGatekeeperOrigin;
   reason: string;
   refused?: "ADMIN_CONTENT_WITHHELD" | "ADMIN_WORKSPACE_ACCESS_OFF";
   requested: AdminViewAccess;
@@ -1906,7 +1967,7 @@ export type AdminAccessRecord = {
 };
 
 export type AdminApiOptions = {
-  via?: AdminVia;
+  via?: AdminClientVia;
 };
 
 export type AdminAuditPage = {
@@ -1921,6 +1982,7 @@ export type AdminAuditQuery = {
   kind?: "setting" | "workspace";
   limit?: number;
   since?: Date;
+  via?: AdminVia;
   workspace?: string;
 };
 
@@ -1958,6 +2020,8 @@ export type AdminAuditStatsQuery = {
   days?: number;
   kind?: "setting" | "workspace";
 };
+
+export type AdminClientVia = "api" | "cli";
 
 export type AdminFormat = {
   agentHint: string;
@@ -2000,6 +2064,12 @@ export type AdminGatekeeperInfo = {
   resourceTitle?: string;
   resourceUrl?: string;
   vendorId?: string;
+};
+
+export type AdminGatekeeperOrigin = {
+  actionId?: number;
+  chatId: number;
+  workspaceId: string;
 };
 
 export type AdminGatewayProvider = {
@@ -2074,6 +2144,7 @@ export type AdminSettingRecord = {
   changes: AdminSettingChange[];
   kind: "setting";
   method: "addGatewayModel" | "promoteFormat" | "removeFormat" | "removeGatewayModel" | "setAccentColor" | "setAdminAuditRetentionDays" | "setAdminWorkspaceAccess" | "setAnnouncement" | "setBanner" | "setBlueprintFeatured" | "setDefaultReasoning" | "setFormatOrder" | "setGatekeeperMode" | "setGatewayModelMode" | "setGatewayModelSettings" | "setGatewayProviderEnabled" | "setInstanceInstructions" | "setModelsDevSuggestions" | "setResourceEnabled" | "setSignupsEnabled" | "setSiteLogo" | "setSiteName" | "setUpdateCheckIntervalMinutes" | "setUpdateChecksEnabled" | "setUpdateMinimumAgeHours" | "setUpdateNoticeSnoozeHours" | "setUserModelsEnabled" | "setUserSearchEnabled" | "updateFormat";
+  origin?: AdminGatekeeperOrigin;
   sessionId: string;
   via: AdminVia;
 };
@@ -2128,7 +2199,7 @@ export type AdminUserRecord = {
   name: string;
 };
 
-export type AdminVia = "api" | "cli";
+export type AdminVia = "api" | "cli" | "gatekeeper";
 
 export type AdminViewAccess = "full" | "metadata";
 
@@ -2137,6 +2208,7 @@ export type AdminWorkspaceDescription = {
   collaborators: CollaboratorInfo[];
   containsRestrictedData?: boolean;
   defaultGadgetId?: number;
+  deploymentAdminAccess?: "off" | "on";
   expiresAt: Date;
   id: string;
   owner: AiChatAuthorInfo;
@@ -3042,6 +3114,7 @@ export type GadgetExportFormat = {
 export type GadgetMetadata = {
   containsRestrictedData?: boolean;
   defaultGadgetId?: number;
+  deploymentAdminAccess?: "off" | "on";
   id: string;
   notificationMute?: NotificationMute;
   owner?: AiChatAuthorInfo;
@@ -3056,6 +3129,7 @@ export type GadgetMetadataWithTimestamps = {
   containsRestrictedData?: boolean;
   created: Date;
   defaultGadgetId?: number;
+  deploymentAdminAccess?: "off" | "on";
   id: string;
   lastActive: Date;
   notificationMute?: NotificationMute;

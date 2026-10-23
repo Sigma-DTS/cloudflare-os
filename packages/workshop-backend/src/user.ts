@@ -1,7 +1,10 @@
 import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
-import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
+import {
+  shouldAutoProvisionAccount, ambientGatekeeperMode, isGatekeeperDisabled,
+} from "./provisioning-policy.js";
+import { INSTANCE_ADMIN_VENDOR_ID } from "@gadgets/workshop-shared/instance-admin";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
@@ -19,6 +22,8 @@ import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { isDeploymentAdmin } from "./admin-access.js";
+import type { AdminConfig } from "./storage-schema/admin-settings-storage.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
 import { deliver, registerDevice } from "./notification-service.js";
 import {
@@ -77,6 +82,18 @@ function areCredentialsValid(record: ConnectedAccountRecord): boolean {
  * Gateway billing flow is Cloudflare-specific, so several places key off this literal.
  */
 export const CLOUDFLARE_VENDOR_ID = "cloudflare";
+
+/** Throws unless the deployment offers gatekeeper `vendorId` (see isGatekeeperDisabled()). */
+function assertGatekeeperEnabled(config: AdminConfig, vendorId: string): void {
+  if (isGatekeeperDisabled(config, vendorId)) {
+    throw new Error(
+        `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+  }
+}
+
+/** Why an instance admin account can't be used: the user is no longer a deployment admin, or the
+ * account is not one the Workshop provisioned for them. */
+const INSTANCE_ADMIN_ACCOUNT_UNAVAILABLE = "This instance admin account is no longer available to you.";
 
 const withholdSecret = (secret: string) => secret === "" ? "" : null;
 
@@ -1408,14 +1425,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The ambient gatekeepers the user can opt into now: mode "optional" and not yet added. Backs the
+   * The ambient gatekeepers the user can opt into now: mode "optional", not yet added and, for the
+   * instance admin Gatekeeper, only for a deployment admin now (see #offersVendor). Backs the
    * Connectors "Available" section. ("enabled" ones are already provisioned; "disabled" ones aren't
    * offered.)
    */
   async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
     let config = await readAdminConfig(this.env);
     return (await this.#ambientVendors())
-        .filter(({vendorId}) =>
+        .filter(({vendorId}) => this.#offersVendor(vendorId) &&
             ambientGatekeeperMode(config, vendorId) === "optional" && !this.#hasAccountForVendor(vendorId))
         // Same shape as listGatekeeperVendors; ambient gatekeepers expose no resources.
         .map(({vendorId, description}) => ({id: vendorId, description, supportedResources: []}));
@@ -1427,7 +1445,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * Opt into an ambient gatekeeper on demand: mint its connected account for this user (no OAuth).
-   * Only when the vendor's mode isn't "disabled" and the user has no account yet. Idempotent.
+   * Only when the vendor's mode isn't "disabled" and the user has no account yet and, for the
+   * instance admin Gatekeeper, only for a deployment admin now (see #offersVendor). Idempotent.
    */
   provisionAmbientAccount(vendorId: string): Promise<void> {
     vendorId = vendorId.toLowerCase();
@@ -1443,6 +1462,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let vendor = this.vendors.get(vendorId);
     if (!vendor) throw new Error("No such service: " + vendorId);
 
+    if (!this.#offersVendor(vendorId)) {
+      throw new Error("Only deployment admins can add the instance admin gatekeeper.");
+    }
     if (ambientGatekeeperMode(await readAdminConfig(this.env), vendorId) === "disabled") {
       throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
     }
@@ -1500,7 +1522,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     let config = await readAdminConfig(this.env);
     for (let {vendorId, vendor} of await this.#ambientVendors()) {
-      if (provisioned.has(vendorId)) continue;
+      if (provisioned.has(vendorId) || !this.#offersVendor(vendorId)) continue;
       // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
       // added on demand by the user (provisionAmbientAccount); "disabled" ones never.
       if (!shouldAutoProvisionAccount(config, vendorId)) continue;
@@ -1528,9 +1550,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let result: ProvidedAccountInfo[] = [];
     for (let rec of this.#connectedAccountRecords()) {
       if (!rec.description.singleton && !rec.description.providesUi) continue;
-      // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
-      // or management UI. (Its data is preserved, so re-enabling restores it.)
-      if (rec.autoProvisioned && ambientGatekeeperMode(config, rec.vendorId) === "disabled") continue;
+      // A disabled ambient gatekeeper's account stays dormant: don't surface its singleton capsule
+      // or management UI. (Its data is preserved, so re-enabling restores it.) A non-ambient
+      // vendor's management UI stays listed whatever disabledGatekeepers says.
+      if (rec.autoProvisioned && isGatekeeperDisabled(config, rec.vendorId)) continue;
+      // Likewise a demoted admin's instance admin account, until they are an admin again.
+      if (!this.#offersVendor(rec.vendorId)) continue;
       result.push({ accountId: rec.id, vendorId: rec.vendorId, description: rec.description });
     }
     return result;
@@ -1541,6 +1566,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * this gatekeeper into the owner's gadgets (as a Facet) like any other gatekeeper, so the session
    * and catalog run gadget-side in the gatekeeper's own worker — no further round-trips through this
    * DO. The account capability stays encapsulated here; only the class reference crosses out.
+   * Throws, without asking the account, for an instance admin account while the user is not a
+   * deployment admin, and for an account of a gatekeeper the deployment disabled.
    */
   async getSingletonGatekeeperClass(accountId: number)
       : Promise<DurableObjectClass<Gatekeeper<any>> | null> {
@@ -1548,7 +1575,34 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // Present only when description.singleton is set; gate on that, then call through the derived
     // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
+    if (!this.#offersVendor(record.vendorId)) throw new Error(INSTANCE_ADMIN_ACCOUNT_UNAVAILABLE);
+    assertGatekeeperEnabled(await readAdminConfig(this.env), record.vendorId);
     return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
+  }
+
+  /**
+   * Throws that the account is no longer available unless this user has account `accountId`, of
+   * INSTANCE_ADMIN_VENDOR_ID and auto-provisioned, and is a deployment admin now; throws that the
+   * gatekeeper is disabled when the deployment disabled the vendor. The Overseer checks the instance
+   * admin capsule's account with it once per code run.
+   */
+  async assertInstanceAdminAccount(accountId: number): Promise<void> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (record?.vendorId !== INSTANCE_ADMIN_VENDOR_ID || !record.autoProvisioned ||
+        !this.#offersVendor(INSTANCE_ADMIN_VENDOR_ID)) {
+      throw new Error(INSTANCE_ADMIN_ACCOUNT_UNAVAILABLE);
+    }
+    assertGatekeeperEnabled(await readAdminConfig(this.env), INSTANCE_ADMIN_VENDOR_ID);
+  }
+
+  // Whether this user may have an account of `vendorId` at all: every vendor but the instance admin
+  // Gatekeeper, whose accounts lend an agent deployment admin power and so go only to a user who is
+  // a deployment admin now. Admin status comes from the environment, so it is checked on every use
+  // rather than stored: a demoted admin's account stays, hidden and refused, until they are
+  // promoted again. A user not yet created has only the placeholder profile, so none.
+  #offersVendor(vendorId: string): boolean {
+    return vendorId !== INSTANCE_ADMIN_VENDOR_ID ||
+        (this.storage.created.get() && isDeploymentAdmin(this.env, this.storage.profile.get().id));
   }
 
   /**
@@ -1684,8 +1738,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // re-subscribes (e.g. on reconnect), matching other deployment config.
     let config = await readAdminConfig(this.env);
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    let instanceAdminOffered = this.#offersVendor(INSTANCE_ADMIN_VENDOR_ID);
 
     async function notifyAdd(record: ConnectedAccountRecord) {
+      if (record.vendorId === INSTANCE_ADMIN_VENDOR_ID && !instanceAdminOffered) return;
       // Ambient (auto-provisioned) accounts only appear in the Connectors list when their vendor is
       // "optional" — i.e. the user opted in and can manage/remove it. "enabled" (forced) accounts have
       // nothing to manage, and "disabled" ones are dormant, so both are hidden.
@@ -2221,11 +2277,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async #assertResourceEnabled(vendorId: string, resource: SupportedResource) {
     let config = await readAdminConfig(this.env);
     let normalized = vendorId.toLowerCase();
-    if (config.disabledGatekeepers.includes(normalized) ||
-        ambientGatekeeperMode(config, normalized) === "disabled") {
-      throw new Error(
-          `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
-    }
+    assertGatekeeperEnabled(config, vendorId);
     if (isResourceDisabled(config, normalized, resource.urlPattern)) {
       throw new Error(
           `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
@@ -2262,6 +2314,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async #eligibleGatekeeperAccounts(vendorId: string): Promise<ConnectedAccountRecord[]> {
     if (!this.storage.created.get()) return [];
     vendorId = vendorId.toLowerCase();
+    if (!this.#offersVendor(vendorId)) return [];
 
     let config = await readAdminConfig(this.env);
     if (config.disabledGatekeepers.includes(vendorId)) return [];

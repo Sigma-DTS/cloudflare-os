@@ -13,10 +13,10 @@ import {
   DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS, MAX_ADMIN_ACCESS_REASON_LENGTH, MAX_ADMIN_AUDIT_ARG_LENGTH,
   MAX_ADMIN_AUDIT_RETENTION_DAYS, MAX_ADMIN_AUDIT_STATS_DAYS, MAX_ADMIN_AUDIT_VALUE_LENGTH,
   MAX_ADMIN_VIEW_LIFETIME_SECONDS, createAdminAccessError, isAdminWorkspaceAccess,
-  type ActionLogEntry, type AdminAccessRecord, type AdminSettingChange, type AdminSettingRecord,
-  type AdminViewAccess, type AdminVia, type AdminWorkspaceAccess, type AdminWorkspaceMethod,
-  type AiChatHistoryPage, type AiChatMetadata, type BoundHookInfo, type FileAtCommit,
-  type WorkpieceSummary,
+  type ActionLogEntry, type AdminAccessRecord, type AdminGatekeeperOrigin, type AdminSettingChange,
+  type AdminSettingRecord, type AdminViewAccess, type AdminVia, type AdminWorkspaceAccess,
+  type AdminWorkspaceMethod, type AiChatHistoryPage, type AiChatMetadata, type BoundHookInfo,
+  type FileAtCommit, type WorkpieceSummary,
 } from "@gadgets/workshop-shared/api";
 import type { AdminConfig } from "./storage-schema/admin-settings-storage.js";
 import { createWorkshopLogger } from "./observability";
@@ -140,7 +140,13 @@ export function adminAccessPolicy(
 /** Who changes a setting, and through which AdminApi method: what an AdminSettingRecord records of
  * the call besides its time and changes. AdminApiImpl passes one with every AdminSettings
  * mutation. */
-export type AdminSettingActor = Pick<AdminSettingRecord, "admin" | "sessionId" | "via" | "method">;
+export type AdminSettingActor =
+    Pick<AdminSettingRecord, "admin" | "sessionId" | "via" | "method" | "origin">;
+
+/** What a via-"gatekeeper" AdminApiImpl records on every record it makes. Only
+ * OverseerImpl.adminApiForAgent() makes one: per agent code run for its reads and one-call runs, per
+ * approved action for a change. */
+export type AdminGatekeeperCall = { origin: AdminGatekeeperOrigin; sessionId: string };
 
 /** What an AdminWorkspaceView is minted with (see OverseerDurableObject.openForAdmin()), fixed for
  * the view's life. */
@@ -155,6 +161,8 @@ export type AdminViewTerms = {
   access: AdminViewAccess;
   /** When the view stops working. */
   expiresAt: Date;
+  /** Present exactly when `via` is "gatekeeper" (AdminAccessRecord.origin). */
+  origin?: AdminGatekeeperOrigin;
 };
 
 /** The view methods that read content, refused below "full": getChat and readFile. */
@@ -175,6 +183,34 @@ export function validateAdminAccessReason(reason: string): string {
         `A reason is required, and must be at most ${MAX_ADMIN_ACCESS_REASON_LENGTH} characters.`);
   }
   return trimmed;
+}
+
+// The longest workspace id an AdminGatekeeperOrigin may carry, as the audit log bounds its filters;
+// workspace ids are 64 characters.
+const MAX_ORIGIN_WORKSPACE_ID_LENGTH = 1000;
+
+/** Throws a TypeError unless `terms.via` is "api" or "cli" without an origin, or "gatekeeper" with a
+ * well-formed one (a non-empty workspace id of at most 1000 characters, a whole non-negative chatId,
+ * a whole non-negative actionId when present). openForAdmin() calls it, since Durable Object RPC
+ * validates nothing. */
+export function assertAdminViewVia(terms: Pick<AdminViewTerms, "via" | "origin">): void {
+  let { via, origin } = terms;
+  let wellFormed = (via === "api" || via === "cli") ? origin === undefined
+      : via === "gatekeeper" && isAdminGatekeeperOrigin(origin);
+  if (!wellFormed) {
+    throw new TypeError(
+        "An admin view's via must be \"api\" or \"cli\", or \"gatekeeper\" with its origin.");
+  }
+}
+
+function isAdminGatekeeperOrigin(origin: unknown): origin is AdminGatekeeperOrigin {
+  if (origin === null || typeof origin !== "object") return false;
+  let { workspaceId, chatId, actionId } = origin as Record<string, unknown>;
+  return typeof workspaceId === "string" && workspaceId.length > 0 &&
+      workspaceId.length <= MAX_ORIGIN_WORKSPACE_ID_LENGTH &&
+      typeof chatId === "number" && isWholeNumberIn(chatId, 0, Number.MAX_SAFE_INTEGER) &&
+      (actionId === undefined ||
+          typeof actionId === "number" && isWholeNumberIn(actionId, 0, Number.MAX_SAFE_INTEGER));
 }
 
 /** The lifetime `lifetimeSeconds` asks for, in ms; throws unless absent

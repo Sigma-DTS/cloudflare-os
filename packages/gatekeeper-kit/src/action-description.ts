@@ -13,6 +13,7 @@
 import type {
   ActionDescription, ActionField, ActionFieldSyntax,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { ACTION_FIELD_INVISIBLE_CHARS, actionFieldJson } from "@gadgets/workshop-shared/gatekeeper";
 
 /**
  * Longest description the builder renders, in UTF-8 bytes of prose and fields together. The
@@ -40,17 +41,14 @@ export type FileDescription = Omit<Extract<ActionField, { kind: "file" }>, "labe
 const FIELD_OVERHEAD = 128;
 const ITEM_OVERHEAD = 3;
 
-// Characters a surface cannot show: NUL and the other C0 and C1 controls render as nothing or as a
-// replacement glyph, except tab and line feed, which display as themselves. Default-ignorable code
-// points (zero-width spaces, word joiners, the byte order mark, the bidirectional formatting
-// characters and the like) render as nothing too, so `admin\u200B@x.com` reads as `admin@x.com`,
-// and the bidi controls can reorder the text around them so it reads as something else.
-const CONTROL_CHARS = "\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F-\\u009F";
-const INVISIBLE_CHARS = `${CONTROL_CHARS}\\p{Default_Ignorable_Code_Point}`;
-// Short values (`inline`, `list`, file names) and JSON strings escape or reroute every invisible
-// character, so an identifier or address shows its exact code points.
-const INVISIBLE = new RegExp(`[${INVISIBLE_CHARS}]`, "u");
-const INVISIBLE_GLOBAL = new RegExp(`[${INVISIBLE_CHARS}]`, "gu");
+// Characters a surface cannot show (ACTION_FIELD_INVISIBLE_CHARS): NUL and the other C0 and C1
+// controls render as nothing or as a replacement glyph, except tab and line feed, which display as
+// themselves. Default-ignorable code points (zero-width spaces, word joiners, the byte order mark,
+// the bidirectional formatting characters and the like) render as nothing too, so
+// `admin\u200B@x.com` reads as `admin@x.com`, and the bidi controls can reorder the text around them
+// so it reads as something else. Short values (`inline`, `list`, file names) and JSON strings escape
+// or reroute every invisible character, so an identifier or address shows its exact code points.
+const INVISIBLE = new RegExp(`[${ACTION_FIELD_INVISIBLE_CHARS}]`, "u");
 // Text keeps only the invisibles that belong to an emoji, since those render as part of a visible
 // glyph: a zero-width joiner between two emoji, a presentation selector right after one, a keycap's
 // selector, and the tag characters of the three RGI subdivision flags (England, Scotland, Wales).
@@ -101,18 +99,9 @@ export function truncateToBytes(text: string, maxBytes: number):
 }
 
 // JSON text for `value`, with every invisible character escaped so the text displays and decodes
-// to exactly the value, or `undefined` for a value JSON cannot represent. `JSON.stringify` escapes
-// C0 controls but not DEL, C1 or the default-ignorables; those can only occur inside strings, where
-// a `\u` escape decodes to the same character. An astral match (a tag character) is escaped as its
-// surrogate pair.
+// to exactly the value, or `undefined` for a value JSON cannot represent.
 function toJson(value: unknown): string | undefined {
-  try {
-    return JSON.stringify(value, null, 2)?.replace(INVISIBLE_GLOBAL, c =>
-      Array.from({ length: c.length }, (_, i) =>
-        `\\u${c.charCodeAt(i).toString(16).padStart(4, "0")}`).join(""));
-  } catch {
-    return undefined;
-  }
+  return actionFieldJson(value);
 }
 
 // A value shown on one line reproduces exactly: no line break, no edge whitespace or tab or run of

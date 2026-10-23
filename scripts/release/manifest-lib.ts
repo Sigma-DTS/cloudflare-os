@@ -272,6 +272,7 @@ const ARTIFACTS_CUT_ALLOWED = new Set(["gatekeeper-context"]);
 const NO_DEFAULT_CRED_INPUTS = new Set([
   "gatekeeper-context",       // no third-party service; uses its own storage
   "gatekeeper-homeassistant", // users connect their own Home Assistant URL + token in-app
+  "gatekeeper-instanceadmin", // auto-provisioned; no third-party service
   "gatekeeper-scheduler",     // auto-provisioned; no third-party OAuth app
   "gatekeeper-websearch",     // auto-provisioned; searches through the account's own AI Gateway
   "gatekeeper-mcp",           // MCP OAuth uses dynamic client registration, not a static app
@@ -284,16 +285,20 @@ const NOT_INSTALLABLE = new Set(["gatekeeper-email"]);
 
 // Ambient gatekeepers the deploy service installs on every fresh core deploy, server-side with
 // no user interaction. Members must take no inputs of any kind (enforced below): a preinstall
-// has nobody to ask.
-const PREINSTALL = new Set(["gatekeeper-context", "gatekeeper-scheduler", "gatekeeper-websearch"]);
+// has nobody to ask. Preinstalled is not offered: gatekeeper-instanceadmin stays disabled until
+// an admin chooses its mode in the admin panel.
+const PREINSTALL = new Set([
+  "gatekeeper-context", "gatekeeper-instanceadmin", "gatekeeper-scheduler", "gatekeeper-websearch",
+]);
 
 // Gatekeepers that may be installed at most once per instance; the deploy service enforces this
 // at install time. Two independent reasons to be here:
 //
 //  1. The account declares an agent singleton (`AccountDescription.singleton` — context's
-//     `ContextLibrary`, scheduler's `ScheduleSession`, websearch's `WebSearchSession`). The
-//     Workshop auto-provisions those accounts and folds the singleton into every workspace as an
-//     ambient gatekeeper, so a second install would hand every user a duplicate ambient capsule.
+//     `ContextLibrary`, instanceadmin's `AdminApi`, scheduler's `ScheduleSession`, websearch's
+//     `WebSearchSession`). The Workshop auto-provisions those accounts and folds the singleton
+//     into every workspace as an ambient gatekeeper, so a second install would hand every user a
+//     duplicate ambient capsule.
 //  2. Nothing could distinguish two installs. A gatekeeper taking no inputs (see
 //     NO_DEFAULT_CRED_INPUTS and the absence of a deploy-inputs.json) is configured identically on
 //     every install, so a second one is a byte-identical worker — it adds no capability, and it
@@ -303,10 +308,11 @@ const PREINSTALL = new Set(["gatekeeper-context", "gatekeeper-scheduler", "gatek
 //
 // Reason 2 turns on inputs, not on the vendor: google/github/slack take per-install
 // CLIENT_ID/CLIENT_SECRET, so two installs can front two different OAuth apps and must stay
-// multi-install. Independent of PREINSTALL in principle; the ambient three coincide with it today
+// multi-install. Independent of PREINSTALL in principle; the ambient four coincide with it today
 // only because every ambient gatekeeper we ship is also preinstalled.
 const SINGLETON = new Set([
   "gatekeeper-context",       // (1) ambient ContextLibrary
+  "gatekeeper-instanceadmin", // (1) ambient AdminApi
   "gatekeeper-scheduler",     // (1) ambient ScheduleSession
   "gatekeeper-websearch",     // (1) ambient WebSearchSession
   "gatekeeper-homeassistant", // (2) no inputs; users connect their own URL + token in-app
@@ -369,6 +375,13 @@ const SLUG_RE = /^[a-z][a-z0-9]*$/;
 const MAX_SLUG_LEN = 20;
 
 /**
+ * Install slugs only one package may fold to, by slug. The Workshop lends deployment admin power
+ * to whatever Worker is bound as GATEKEEPER_INSTANCEADMIN (workshop-shared's
+ * INSTANCE_ADMIN_VENDOR_ID), so no other gatekeeper may take that binding.
+ */
+const RESERVED_SLUGS = new Map([["instanceadmin", "gatekeeper-instanceadmin"]]);
+
+/**
  * The release manifest's shortName. Deployed instances bind gatekeepers as GATEKEEPER_<SLUG> and
  * the router recovers the path from that binding name, so a slug must survive `toUpperCase()` and
  * back — the deploy wizard restricts it to SLUG_RE and sends the manifest shortName as the install
@@ -384,6 +397,12 @@ const MAX_SLUG_LEN = 20;
  */
 export function releaseShortName(pkgName: string): string {
   const shortName = gatekeeperShortName(pkgName).replace(/[^a-z0-9]/g, "");
+  const owner = RESERVED_SLUGS.get(shortName);
+  if (owner !== undefined && owner !== pkgName) {
+    throw new Error(`${pkgName} folds to "${shortName}", which is reserved for ${owner}: the ` +
+        `Workshop lends deployment admin power to whatever is bound as ` +
+        `GATEKEEPER_${shortName.toUpperCase()}. Rename the package.`);
+  }
   if (!SLUG_RE.test(shortName) || shortName.length > MAX_SLUG_LEN) {
     throw new Error(`${pkgName} folds to "${shortName}", which is not a legal install slug: ` +
         `it must be 1-${MAX_SLUG_LEN} lowercase letters and digits starting with a letter ` +

@@ -1,7 +1,7 @@
 import {
   MAX_ADMIN_AUDIT_ARG_LENGTH,
   type AdminAuditPage, type AdminAuditQuery, type AdminAuditRecord, type AdminAuditStats,
-  type AdminAuditStatsQuery,
+  type AdminAuditStatsQuery, type AdminVia,
 } from "@gadgets/workshop-shared/api";
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -16,6 +16,9 @@ const PRUNE_BATCH = 1000;
 // The longest admin or workspace filter list() takes; workspace ids are 64 characters.
 const MAX_FILTER_LENGTH = 1000;
 const TOP_LIMIT = 10;
+// Every AdminVia, which list()'s via filter takes; typed to cover AdminVia exactly.
+const ADMIN_VIAS: ReadonlySet<string> = new Set(Object.keys(
+    { api: true, cli: true, gatekeeper: true } satisfies Record<AdminVia, true>));
 
 type AuditRow = {
   seq: number;
@@ -110,8 +113,9 @@ export class AdminAuditDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /** One page, newest first (see AdminApi.listAdminAudit()), each record rebuilt from its columns
-   * and JSON; `limit` is validated by the caller. Throws for a malformed cursor or a filter over
-   * 1000 characters. */
+   * and JSON; `limit` is validated by the caller. Throws for a malformed cursor, a filter over 1000
+   * characters, or a `via` other than "api", "cli" or "gatekeeper" (Durable Object RPC validates
+   * nothing). */
   list(query: Omit<AdminAuditQuery, "limit"> & { limit: number }, retentionDays: number)
       : AdminAuditPage {
     let limit = adminListLimit(query.limit);
@@ -120,6 +124,9 @@ export class AdminAuditDurableObject extends DurableObject<Cloudflare.Env> {
       if (filter !== undefined && filter.length > MAX_FILTER_LENGTH) {
         throw new TypeError(`Audit filters must be at most ${MAX_FILTER_LENGTH} characters.`);
       }
+    }
+    if (query.via !== undefined && !ADMIN_VIAS.has(query.via)) {
+      throw new TypeError("The via filter must be \"api\", \"cli\" or \"gatekeeper\".");
     }
 
     let where = ["at >= ?"];
@@ -139,6 +146,11 @@ export class AdminAuditDurableObject extends DurableObject<Cloudflare.Env> {
     if (query.exposed !== undefined) {
       where.push("exposed = ?");
       params.push(query.exposed);
+    }
+    if (query.via !== undefined) {
+      // `via` lives in the JSON column (as does `origin`), read by SQLite's JSON functions.
+      where.push("json_extract(record, '$.via') = ?");
+      params.push(query.via);
     }
     if (query.since !== undefined) {
       let since = query.since.getTime();

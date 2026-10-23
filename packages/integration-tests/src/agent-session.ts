@@ -32,6 +32,12 @@ export type AgentSessionOptions = {
   userModel?: UserModel;
   ambientVendorIds?: readonly string[];
   usernamePrefix?: string;
+  /**
+   * Sign up exactly this username, instead of one nextUsernames() allocates from `usernamePrefix`,
+   * for a suite that configures the account by name (say, in `ADMINS`). The account must still be
+   * a fresh one: signing up a taken name fails.
+   */
+  username?: string;
   turnTimeoutMs?: number;
   costAccountingTimeoutMs?: number;
 };
@@ -98,6 +104,10 @@ export type ProvisionalGadget = { client: RpcStub<GadgetClient>; chatId: number 
  */
 export interface WorkshopAgentSession extends AsyncDisposable {
   readonly username: string;
+  /** The session's workspace, for opening it over another connection. */
+  readonly workspaceId: string;
+  /** The session's one chat, once its first turn has created it. */
+  readonly chatId: number | undefined;
   /** How many times the connection to the Workshop has dropped since the session opened. */
   readonly connectionDrops: number;
   runTurn(prompt: string, options?: AgentTurnOptions): Promise<AgentTurnResult>;
@@ -492,6 +502,14 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
 
   get connectionDrops(): number {
     return this.#connectionDrops;
+  }
+
+  get workspaceId(): string {
+    return this.#workspaceId;
+  }
+
+  get chatId(): number | undefined {
+    return this.#chatId;
   }
 
   async initialize(): Promise<void> {
@@ -1044,7 +1062,7 @@ export async function openAgentSession(
   let workspace: RpcStub<Overseer> | undefined;
   let session: WorkshopAgentSessionImpl | undefined;
   try {
-    const username = nextUsernames(options.usernamePrefix ?? "agent").at(0);
+    const username = options.username ?? nextUsernames(options.usernamePrefix ?? "agent").at(0);
     if (username === undefined) throw new Error("Failed to allocate an agent-session username");
     const authenticated = authenticatedApi = await signUp(publicApi, username);
     if (options.userModel !== undefined) {

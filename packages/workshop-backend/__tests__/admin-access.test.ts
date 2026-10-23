@@ -9,7 +9,7 @@ import {
 import {
   ADMIN_AUDIT_EXCERPT_CONTEXT, actionHoldsContent, adminAccessPolicy, adminAuditStatsDays,
   adminAuditValue, adminListLimit, adminSettingChange, adminViewCallAccess, adminViewLifetimeMs,
-  assertAdminViewLive, chatHoldsContent, chatPageHoldsContent, cutAdminAuditText,
+  assertAdminViewLive, assertAdminViewVia, chatHoldsContent, chatPageHoldsContent, cutAdminAuditText,
   deploymentAdmins, fileHoldsContent, hookHoldsContent, isDeploymentAdmin,
   lowerAdminWorkspaceAccess, maxAdminWorkspaceAccess, minAdminAuditRetentionDays,
   redactAdminAuditArgs, validateAdminAccessReason, withholdActionContent, withholdChatContent,
@@ -184,6 +184,49 @@ describe("view calls", () => {
         .toEqual({ access: "full" });
     expect(adminViewCallAccess(terms(), "describe", { access: "off", retentionDays: 90 }))
         .toEqual({ access: "off", refused: ADMIN_ACCESS_ERROR_CODES.accessOff });
+  });
+});
+
+describe("assertAdminViewVia", () => {
+  const origin = { workspaceId: "w".repeat(64), chatId: 3 };
+
+  it("takes a client's via without an origin, and an agent's with a well-formed one", () => {
+    for (let via of ["api", "cli"] as const) expect(() => assertAdminViewVia({ via })).not.toThrow();
+    for (let good of [
+      origin, { ...origin, actionId: 0 }, { ...origin, chatId: 0, actionId: 12 },
+      { workspaceId: "w".repeat(1000), chatId: Number.MAX_SAFE_INTEGER },
+    ]) {
+      expect(() => assertAdminViewVia({ via: "gatekeeper", origin: good })).not.toThrow();
+    }
+  });
+
+  it("refuses an origin on a client's via, and an agent's via without one", () => {
+    for (let via of ["api", "cli"] as const) {
+      expect(() => assertAdminViewVia({ via, origin })).toThrow(TypeError);
+    }
+    expect(() => assertAdminViewVia({ via: "gatekeeper" })).toThrow(TypeError);
+  });
+
+  it("refuses a via that is not an AdminVia", () => {
+    for (let via of ["", "API", "agent", undefined, null, 1]) {
+      expect(() => assertAdminViewVia({ via: via as never })).toThrow(
+          "An admin view's via must be \"api\" or \"cli\", or \"gatekeeper\" with its origin.");
+    }
+  });
+
+  it("refuses a malformed origin", () => {
+    for (let bad of [
+      null, "w1", [], {},
+      { ...origin, workspaceId: "" }, { ...origin, workspaceId: "w".repeat(1001) },
+      { ...origin, workspaceId: 7 }, { workspaceId: "w1" },
+      { ...origin, chatId: -1 }, { ...origin, chatId: 1.5 }, { ...origin, chatId: "3" },
+      { ...origin, chatId: NaN }, { ...origin, chatId: Infinity },
+      { ...origin, actionId: -1 }, { ...origin, actionId: 0.5 }, { ...origin, actionId: "1" },
+      { ...origin, actionId: null },
+    ]) {
+      expect(() => assertAdminViewVia({ via: "gatekeeper", origin: bad as never }), String(bad))
+          .toThrow(TypeError);
+    }
   });
 });
 

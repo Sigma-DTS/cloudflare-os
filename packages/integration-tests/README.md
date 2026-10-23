@@ -80,6 +80,30 @@ Google is `__tests__/google-fake.ts`. `vp run -F @gadgets/integration-tests buil
 The new one comes from `vp run -F @gadgets/google-gatekeeper build:integration-worker`. The `test`
 task and `test:prebuild` build both first.
 
+## The instance admin Gatekeeper
+
+Three suites drive the real Workshop and the real `gatekeeper-instanceadmin` as an admin's agent
+would, scripting its `executeCode` calls, and boot the Gatekeeper with `INSTANCE_ADMIN_GATEKEEPER`
+from `src/harness.ts`, from the tree `vp run -F @gadgets/gatekeeper-instanceadmin
+build:integration-worker` validates (the `test` task and `test:prebuild` build it first):
+
+- `instance-admin-gatekeeper.test.ts`: who is offered it, turning access on, where the capsule may
+  live, changes and their approval, inspections, the turns it serves (a callback's, a direct session,
+  a gadget binding, Stop), the withheld methods, turning access off and the deployment disabling it.
+- `instance-admin-gateway.test.ts`: in AI Gateway mode, a gateway test sends nothing until its one
+  call is approved, then exactly one request, and a rejected one never sends.
+- `instance-admin-demotion.test.ts`: a redeploy that drops the owner from `ADMINS`.
+
+Each runs serially on a harness of its own: admin settings and the audit log are deployment-wide,
+and the cases build on one workspace turned on once. The Gatekeeper is disabled until an admin picks
+a mode, so each suite's setup sets it to `optional` through its admin's `AdminApi`. Every agent
+session is an admin account of its own, signed up by exact name (`AgentSessionOptions.username`) and
+added to `ADMINS` in the suite's `patchWorkshop`: a session's turns route to its own script by the
+Workers AI account id of the model it added, and an account can add only one model under
+`SCRIPTED_MODEL_PROFILE`'s id. A suite reaches the session's workspace over its own connection,
+from `session.workspaceId` and `session.chatId`. Slash-command turns are left to
+workshop-backend's unit suites, since this harness boots no slash-command provider.
+
 ## Further reading
 
 [`docs/integration-testing.md`](../../docs/integration-testing.md) covers the reasoning behind the

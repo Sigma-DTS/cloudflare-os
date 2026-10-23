@@ -127,7 +127,7 @@ describe("the fixture", () => {
     });
   });
 
-  test("records properties, @deprecated and @mutates, and omits them when absent", () => {
+  test("records properties, @deprecated, @mutates and @confirmation, and omits them when absent", () => {
     const { services } = extractSchema(FIXTURE);
     const method = (service: string, name: string) => services[service]!.methods.find((m) => m.name === name)!;
     expect(services.FixturePublicApi!.properties).toEqual([
@@ -148,6 +148,11 @@ describe("the fixture", () => {
 
     expect(method("Notebook", "file").mutates).toBe(true);
     expect("mutates" in method("Notebook", "upload")).toBe(false);
+
+    expect(method("Notebook", "publish").confirmation).toBe("Sends a paid request.");
+    expect(method("Notebook", "publish").doc).toBe("Publishes the notebook.\n@confirmation Sends a paid request.");
+    expect(method("Notebook", "print").confirmation).toBe("");
+    expect("confirmation" in method("Notebook", "file")).toBe(false);
   });
 
   test("is deterministic across separate programs", () => {
@@ -255,6 +260,26 @@ export interface Api { a(): void; b?(): void; readonly c: string; d?: Sub | null
 `).services.Api!.methods[0]!;
     expect(method).toEqual({ name: "save", doc: "Saves.\n@deprecated Use\nsaveAll.\n@mutates", params: [],
       returns: { kind: "void" }, deprecated: "Use\nsaveAll.", mutates: true });
+  });
+
+  test("@confirmation, read from the tag wherever it is in the comment", () => {
+    const methods = extract(`export interface Api {
+  /**
+   * Charges.
+   * @confirmation Bills the
+   * card.
+   * @mutates
+   */
+  charge(): void;
+  /** @confirmation */
+  ping(): void;
+}
+`).services.Api!.methods;
+    expect(methods).toEqual([
+      { name: "charge", doc: "Charges.\n@confirmation Bills the\ncard.\n@mutates", params: [],
+        returns: { kind: "void" }, mutates: true, confirmation: "Bills the\ncard." },
+      { name: "ping", doc: "@confirmation", params: [], returns: { kind: "void" }, confirmation: "" },
+    ]);
   });
 });
 

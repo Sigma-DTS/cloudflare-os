@@ -149,6 +149,52 @@ describe("AdminAuditDurableObject.list", () => {
     expect(await list({ kind: "setting", exposed: "content" })).toEqual([]);
   });
 
+  it("filters on how the calls reached the deployment, alone and with the other filters",
+      async () => {
+    let log = auditLog();
+    let origin = { workspaceId: "w9", chatId: 2 };
+    let records: AdminAuditRecord[] = [
+      access({ admin: "ada", via: "gatekeeper", origin, at: daysAgo(3) }),
+      access({ admin: "ada", via: "gatekeeper", origin, exposed: "content", at: daysAgo(1) }),
+      access({ admin: "grace", via: "api", at: daysAgo(1) }),
+      setting({ admin: "ada", via: "gatekeeper", origin: { ...origin, actionId: 5 },
+                at: daysAgo(1) }),
+      setting({ admin: "ada", via: "cli", at: daysAgo(1) }),
+    ];
+    for (let record of records) await log.append(record, RETENTION);
+
+    let list = async (query: object) =>
+        (await log.list({ limit: 50, ...query }, RETENTION)).records;
+    expect(await list({ via: "gatekeeper" })).toEqual([records[3], records[1], records[0]]);
+    expect(await list({ via: "api" })).toEqual([records[2]]);
+    expect(await list({ via: "cli" })).toEqual([records[4]]);
+    expect(await list({ via: "gatekeeper", kind: "setting" })).toEqual([records[3]]);
+    expect(await list({ via: "gatekeeper", kind: "workspace", exposed: "content" }))
+        .toEqual([records[1]]);
+    expect(await list({ via: "gatekeeper", workspace: "w1", since: daysAgo(2) }))
+        .toEqual([records[1]]);
+    expect(await list({ via: "gatekeeper", admin: "grace" })).toEqual([]);
+  });
+
+  it("returns an agent's origin as appended, for both kinds of record", async () => {
+    let log = auditLog();
+    let opened = access({ via: "gatekeeper", origin: { workspaceId: "w9", chatId: 0 } });
+    let changed = setting({
+      via: "gatekeeper", sessionId: "run-1", origin: { workspaceId: "w9", chatId: 4, actionId: 17 },
+    });
+    await log.append(opened, RETENTION);
+    await log.append(changed, RETENTION);
+    expect((await log.list({ limit: 10 }, RETENTION)).records).toEqual([changed, opened]);
+  });
+
+  it("refuses a via filter that is not an AdminVia", async () => {
+    let log = auditLog();
+    for (let via of ["", "API", "agent", "gatekeeper' OR 1=1 --"]) {
+      await expectRejection(log.list({ limit: 2, via: via as never }, RETENTION),
+          "The via filter must be \"api\", \"cli\" or \"gatekeeper\".");
+    }
+  });
+
   it("pages with a cursor, and rejects a malformed cursor or an over-long filter", async () => {
     let log = auditLog();
     let records = Array.from({ length: 5 }, (_, i) => access({ args: { i } }));

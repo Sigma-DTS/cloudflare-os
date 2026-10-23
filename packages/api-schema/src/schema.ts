@@ -74,6 +74,13 @@ export interface SchemaMethod {
    * through approval. Absent means not declared, not read-only.
    */
   mutates?: true;
+  /**
+   * The `@confirmation` tag's text (`""` when bare), when its doc has one: the sentence a host shows
+   * before making the call, because the call costs or commits something even if it changes no state
+   * (forge's `x-forge-require-confirmation`). A Gatekeeper can route such a call through approval.
+   * Absent means none declared. `doc` keeps the tag too.
+   */
+  confirmation?: string;
 }
 
 /** One non-method member of a capability interface. */

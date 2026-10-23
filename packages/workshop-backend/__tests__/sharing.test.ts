@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
-import { SharingManager, SharingStorage } from "../src/sharing.js";
+import { SharingAccessHooks, SharingManager, SharingStorage } from "../src/sharing.js";
 import type { CollaboratorRecord, ShareKeyRecord } from "../src/storage-schema/overseer-storage.js";
 import {
   AiChatAuthorInfo, PermissionEdge, CollaboratorRole, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES,
@@ -25,10 +25,10 @@ function makeStorage(): SharingStorage {
 
 const OWNER = "owner@example.com";
 
-function makeManager(ownerInvitesOnly: () => boolean = () => false)
+function makeManager(ownerInvitesOnly: () => boolean = () => false, access?: SharingAccessHooks)
     : { storage: SharingStorage; mgr: SharingManager } {
   let storage = makeStorage();
-  return { storage, mgr: new SharingManager(storage, OWNER, ownerInvitesOnly) };
+  return { storage, mgr: new SharingManager(storage, OWNER, ownerInvitesOnly, access) };
 }
 
 // A manager whose `ownerInvitesOnly` flag the test can flip at any point.
@@ -824,5 +824,235 @@ describe("ownerInvitesOnly", () => {
 
     mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
     expect(mgr.getEffectiveRole("b")).toBe("use");
+  });
+});
+
+// A manager with deployment admin access hooks: `access.ownerOnly` can be flipped at any point, and
+// `shared` counts onShared's calls.
+function makeManagerWithAccess() {
+  let access = { ownerOnly: false, shared: 0 };
+  let made = makeManager(() => false, {
+    ownerOnly: () => access.ownerOnly,
+    onShared: () => { access.shared++; },
+  });
+  return { access, ...made };
+}
+
+const S1 = "Deployment admin access has been on in this workspace, so only its owner can ever " +
+    "open it: it can't be shared.";
+
+describe("deployment admin access hooks", () => {
+  it("leave every role out while ownerOnly holds", () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    seedLink(storage, "k1", OWNER);
+    seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
+    seedCollaborator(storage, "b", [keyEdge("k1", "use")]);
+    access.ownerOnly = true;
+
+    expect(mgr.computeEffectiveRoles()).toEqual(new Map());
+    expect(mgr.getEffectiveRole("a")).toBeUndefined();
+    expect(mgr.getEffectiveRole("b")).toBeUndefined();
+    expect(mgr.getEffectiveRole(OWNER)).toBe("build");
+    expect(mgr.listCollaborators()).toEqual([]);
+
+    access.ownerOnly = false;
+    expect(mgr.getEffectiveRole("a")).toBe("build");
+  });
+
+  it("refuse adding a collaborator, even for the owner", () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
+    access.ownerOnly = true;
+
+    expect(() => mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" }))
+        .toThrow(S1);
+    expect(() => mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" }))
+        .toThrow(S1);
+    expect(storage.collaborators.get("a")!.addedBy)
+        .toEqual([expect.objectContaining({ type: "user", sharer: OWNER, role: "use" })]);
+    expect(storage.collaborators.get("b")).toBeUndefined();
+    expect(access.shared).toBe(0);
+  });
+
+  it("refuse creating or copying a link, as an uncoded error", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    seedLink(storage, "k1", OWNER);
+    access.ownerOnly = true;
+
+    let error = await mgr.createShareLink({ caller: owner, role: "use" }).catch(e => e);
+    expect(error).toMatchObject({ message: S1 });
+    expect(getOpenGadgetErrorCode(error)).toBeUndefined();
+    await expect(mgr.newShareLinkKey({ caller: owner, linkId: "k1" })).rejects.toThrow(S1);
+    expect([...storage.shareKeys.list()].map(r => r.id)).toEqual(["k1"]);
+    expect(access.shared).toBe(0);
+  });
+
+  it("persist no link when ownerOnly flips while a key is being minted", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    seedLink(storage, "k1", OWNER);
+
+    // Both calls park in #mintKey's await, and ask ownerOnly only once it resolves.
+    let created = mgr.createShareLink({ caller: owner, role: "use" });
+    let copied = mgr.newShareLinkKey({ caller: owner, linkId: "k1" });
+    access.ownerOnly = true;
+
+    await expect(created).rejects.toThrow(S1);
+    await expect(copied).rejects.toThrow(S1);
+    expect([...storage.shareKeys.list()].map(r => r.id)).toEqual(["k1"]);
+    expect(access.shared).toBe(0);
+  });
+
+  it("refuse a non-owner redeeming a link, before any write", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
+    seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
+    access.ownerOnly = true;
+    access.shared = 0;
+
+    let fetched = 0;
+    for (let profileId of ["newbie", "a"]) {
+      await expect(mgr.redeemShareKey({
+        rawKey: key, profileId,
+        fetchProfile: async () => { fetched++; return profile(profileId); },
+      })).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
+    }
+
+    expect(fetched).toBe(0);
+    expect(storage.collaborators.get("newbie")).toBeUndefined();
+    expect(storage.collaborators.get("a")!.addedBy).toHaveLength(1);
+    expect(access.shared).toBe(0);
+  });
+
+  it("persist no collaborator when ownerOnly flips during the profile fetch", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
+    access.shared = 0;
+
+    await expect(mgr.redeemShareKey({
+      rawKey: key, profileId: "newbie",
+      fetchProfile: async () => { access.ownerOnly = true; return profile("newbie"); },
+    })).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
+    expect(storage.collaborators.get("newbie")).toBeUndefined();
+    expect(access.shared).toBe(0);
+  });
+
+  it("let the owner's redemption pass, writing nothing", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
+    access.shared = 0;
+
+    access.ownerOnly = true;
+    await mgr.redeemShareKey({
+      rawKey: key, profileId: OWNER, fetchProfile: async () => profile(OWNER),
+    });
+
+    // And when the flag flips during the fetch.
+    access.ownerOnly = false;
+    await mgr.redeemShareKey({
+      rawKey: key, profileId: OWNER,
+      fetchProfile: async () => { access.ownerOnly = true; return profile(OWNER); },
+    });
+
+    expect([...storage.collaborators.list()]).toEqual([]);
+    expect(access.shared).toBe(0);
+  });
+
+  it("call onShared once after each write that grants access", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+
+    // A new collaborator, a second sharer's edge, and an upgrade of an existing edge.
+    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
+    expect(access.shared).toBe(1);
+    mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "use" });
+    expect(access.shared).toBe(2);
+    mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
+    expect(access.shared).toBe(3);
+    mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "build" });
+    expect(access.shared).toBe(4);
+
+    let { key, linkId } = await mgr.createShareLink({ caller: owner, role: "use" });
+    expect(access.shared).toBe(5);
+    let { key: copy } = await mgr.newShareLinkKey({ caller: owner, linkId });
+    expect(access.shared).toBe(6);
+
+    // A redemption that creates a collaborator, and one that adds an edge to an existing one.
+    await mgr.redeemShareKey({ rawKey: key, profileId: "c", fetchProfile: async () => profile("c") });
+    expect(access.shared).toBe(7);
+    await mgr.redeemShareKey({ rawKey: copy, profileId: "a", fetchProfile: async () => profile("a") });
+    expect(access.shared).toBe(8);
+
+    // A re-root writes one edge per kept user who would lose access.
+    seedCollaborator(storage, "d", [userEdge("b", "use")]);
+    seedCollaborator(storage, "e", [userEdge("b", "use")]);
+    mgr.removeCollaborator(owner, "b", ["d", "e"]);
+    expect(access.shared).toBe(10);
+    expect(mgr.getEffectiveRole("d")).toBe("use");
+    expect(mgr.getEffectiveRole("e")).toBe("use");
+  });
+
+  it("never call onShared for writes that grant nothing", async () => {
+    let { storage, access, mgr } = makeManagerWithAccess();
+    seedLink(storage, "k1", OWNER);
+    seedLink(storage, "k2", OWNER);
+    seedCollaborator(storage, "a", [userEdge(OWNER, "build"), keyEdge("k1")]);
+    seedCollaborator(storage, "b", [userEdge("a", "use")]);
+
+    // Redeeming a link the user already has an edge for, or an unknown or revoked key.
+    let { key: copy } = await mgr.newShareLinkKey({ caller: owner, linkId: "k1" });
+    access.shared = 0;
+    await mgr.redeemShareKey({ rawKey: copy, profileId: "a", fetchProfile: async () => profile("a") });
+    await mgr.redeemShareKey({
+      rawKey: "00".repeat(16), profileId: "x", fetchProfile: async () => profile("x"),
+    });
+
+    mgr.updateShareLink(owner, "k1", "note");
+    mgr.revokeShareLink(owner, "k2", []);
+    mgr.revokeShareLink(owner, "k1", []);
+    await mgr.redeemShareKey({
+      rawKey: copy, profileId: "y", fetchProfile: async () => profile("y"),
+    });
+
+    // A removal with no kept users, and one whose kept user keeps access without a new edge.
+    seedCollaborator(storage, "c", [userEdge(OWNER, "use"), userEdge("a", "use")]);
+    mgr.removeCollaborator(collab("a"), "c", ["c"]);
+    mgr.removeCollaborator(owner, "a", []);
+
+    expect(access.shared).toBe(0);
+    expect(storage.collaborators.get("y")).toBeUndefined();
+  });
+
+  it("isPrivate holds only while nobody has a role and every link is revoked", async () => {
+    let { access, mgr } = makeManagerWithAccess();
+    expect(mgr.isPrivate()).toBe(true);
+
+    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
+    expect(mgr.isPrivate()).toBe(false);
+    mgr.removeCollaborator(owner, "a", []);
+    expect(mgr.isPrivate()).toBe(true);
+
+    // An unredeemed link already lets someone in.
+    let { linkId } = await mgr.createShareLink({ caller: owner, role: "use" });
+    expect(mgr.isPrivate()).toBe(false);
+    mgr.revokeShareLink(owner, linkId, []);
+    expect(mgr.isPrivate()).toBe(true);
+
+    // A removed collaborator lingers in storage, unreachable, and the workspace is still private.
+    expect(mgr.isCollaborator("a")).toBe(true);
+
+    // While ownerOnly holds, nobody has a role whatever the graph holds.
+    mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
+    expect(mgr.isPrivate()).toBe(false);
+    access.ownerOnly = true;
+    expect(mgr.isPrivate()).toBe(true);
+  });
+
+  it("isPrivate counts a link that ownerInvitesOnly keeps from granting anything", async () => {
+    let flags = { ownerInvitesOnly: false };
+    let { mgr } = makeManager(() => flags.ownerInvitesOnly);
+    let { linkId } = await mgr.createShareLink({ caller: owner, role: "use" });
+    flags.ownerInvitesOnly = true;
+    expect(mgr.isPrivate()).toBe(false);
+    mgr.revokeShareLink(owner, linkId, []);
+    expect(mgr.isPrivate()).toBe(true);
   });
 });

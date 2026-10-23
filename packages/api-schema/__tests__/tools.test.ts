@@ -182,15 +182,21 @@ describe("maps each shape to JSON Schema", () => {
     expect(tool.returns).toEqual({ type: "null", "x-capnweb-kind": "undefined" });
   });
 
-  test("deprecated and mutates, as the method has them", () => {
+  test("deprecated, mutates and confirmation, as the method has them", () => {
     const catalog = emitToolCatalog(schemaOf({
       Api: service(
         { ...method("bare", []), deprecated: "" },
         { ...method("old", []), deprecated: "Use plain." },
         { ...method("write", []), mutates: true },
+        { ...method("bill", []), confirmation: "Sends a paid request." },
+        { ...method("ping", []), confirmation: "" },
         method("plain", []),
       ),
     }), { root: "Api" });
+    expect(toolOf(catalog, "Api.bill").confirmation).toBe("Sends a paid request.");
+    expect(toolOf(catalog, "Api.ping").confirmation).toBe("");
+    expect(toolOf(catalog, "Api.write")).not.toHaveProperty("confirmation");
+    expect(toolOf(catalog, "Api.plain")).not.toHaveProperty("confirmation");
     expect(toolOf(catalog, "Api.bare").deprecated).toBe("");
     expect(toolOf(catalog, "Api.old").deprecated).toBe("Use plain.");
     expect(toolOf(catalog, "Api.old")).not.toHaveProperty("mutates");
@@ -379,12 +385,15 @@ test("the extractor's fixture, from its authenticated API", () => {
     "FixtureAdmin.setBanner", "FixtureAuthedApi.findNotes", "FixtureAuthedApi.getAdmin",
     "FixtureAuthedApi.importArchive", "FixtureAuthedApi.openNotebook", "FixtureAuthedApi.setMood",
     "FixtureAuthedApi.setNickname", "Notebook.connect", "Notebook.file", "Notebook.lock", "Notebook.move",
-    "Notebook.outline", "Notebook.subscribe", "Notebook.upload", "Notebook.watchTitle",
+    "Notebook.outline", "Notebook.print", "Notebook.publish", "Notebook.subscribe", "Notebook.upload",
+    "Notebook.watchTitle",
   ]);
   expect(toolOf(catalog, "FixtureAuthedApi.getAdmin").continuesOn).toBe("FixtureAdmin");
   expect(toolOf(catalog, "FixtureAuthedApi.openNotebook").inputSchema.properties.id)
     .toEqual({ type: "string", description: "The notebook's ID." });
   expect(toolOf(catalog, "Notebook.file").mutates).toBe(true);
+  expect(toolOf(catalog, "Notebook.publish").confirmation).toBe("Sends a paid request.");
+  expect(toolOf(catalog, "Notebook.print").confirmation).toBe("");
   expect(toolOf(catalog, "FixtureAuthedApi.importArchive").inputSchema.properties.archive).toEqual({
     "x-capnweb-kind": "stream",
     "x-capnweb-stream": "readable",

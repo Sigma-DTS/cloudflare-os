@@ -17,6 +17,7 @@ export default {
         dependsOn: [
           '@gadgets/workshop-backend#build:integration-worker',
           '@gadgets/gatekeeper-context#build:integration-worker',
+          '@gadgets/gatekeeper-instanceadmin#build:integration-worker',
         ],
       },
       /**
@@ -57,6 +58,7 @@ export default {
           '@gadgets/github-gatekeeper#build:integration-worker',
           '@gadgets/google-gatekeeper#build:integration-worker',
           '@gadgets/gatekeeper-context#build:integration-worker',
+          '@gadgets/gatekeeper-instanceadmin#build:integration-worker',
         ],
       },
     },

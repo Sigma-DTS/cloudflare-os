@@ -7,7 +7,7 @@
       "id": "AdminApi.addGatewayModel",
       "service": "AdminApi",
       "method": "addGatewayModel",
-      "description": "Add a model to the ones the deployment provides, listed after its provider's suggested models\nand 'enabled' by default. Throws if the model is malformed (an empty or over-long ID or name,\nan over-long `behavesLike`, a token limit that isn't a positive integer), if the gateway does\nnot serve and enable its provider (see AdminSettingsView.gatewayModels), if a suggested or\nadded model already has its ID, if the model runtime does not know its `behavesLike` under\nits provider, or if what its context window reserves for the response (its output limit, or\nWORKERS_AI_OUTPUT_LIMIT for a Cloudflare model that gives none) leaves a prompt no room.",
+      "description": "Add a model to the ones the deployment provides, listed after its provider's suggested models\nand 'enabled' by default. Throws if the model is malformed (an empty or over-long ID or name,\nan over-long `behavesLike`, a token limit that isn't a positive integer), if the gateway does\nnot serve and enable its provider (see AdminSettingsView.gatewayModels), if a suggested or\nadded model already has its ID, if the model runtime does not know its `behavesLike` under\nits provider, or if what its context window reserves for the response (its output limit, or\nWORKERS_AI_OUTPUT_LIMIT for a Cloudflare model that gives none) leaves a prompt no room.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -90,7 +90,8 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.checkForUpdates",
@@ -1198,11 +1199,21 @@
                 "format": "date-time",
                 "x-capnweb-kind": "date"
               },
+              "via": {
+                "$ref": "#/$defs/AdminVia"
+              },
               "workspace": {
                 "type": "string"
               }
             },
             "additionalProperties": false
+          },
+          "AdminVia": {
+            "enum": [
+              "api",
+              "cli",
+              "gatekeeper"
+            ]
           }
         }
       },
@@ -1265,6 +1276,9 @@
                   "listGatekeepers",
                   "readFile"
                 ]
+              },
+              "origin": {
+                "$ref": "#/$defs/AdminGatekeeperOrigin"
               },
               "reason": {
                 "type": "string"
@@ -1335,6 +1349,25 @@
                 "$ref": "#/$defs/AdminSettingRecord"
               }
             ]
+          },
+          "AdminGatekeeperOrigin": {
+            "type": "object",
+            "properties": {
+              "actionId": {
+                "type": "number"
+              },
+              "chatId": {
+                "type": "number"
+              },
+              "workspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "chatId",
+              "workspaceId"
+            ],
+            "additionalProperties": false
           },
           "AdminSettingChange": {
             "type": "object",
@@ -1428,6 +1461,9 @@
                   "updateFormat"
                 ]
               },
+              "origin": {
+                "$ref": "#/$defs/AdminGatekeeperOrigin"
+              },
               "sessionId": {
                 "type": "string"
               },
@@ -1449,7 +1485,8 @@
           "AdminVia": {
             "enum": [
               "api",
-              "cli"
+              "cli",
+              "gatekeeper"
             ]
           },
           "AdminViewAccess": {
@@ -1656,7 +1693,7 @@
       "id": "AdminApi.promoteFormat",
       "service": "AdminApi",
       "method": "promoteFormat",
-      "description": "Offer a blueprint as a standard format, appended last in menu order. Throws if the blueprint\ndoesn't exist. Promoting one that already is leaves its curation and menu position alone, so\nthat retrying a promotion whose mirror write failed repairs it rather than being refused.",
+      "description": "Offer a blueprint as a standard format, appended last in menu order. Throws if the blueprint\ndoesn't exist. Promoting one that already is leaves its curation and menu position alone, so\nthat retrying a promotion whose mirror write failed repairs it rather than being refused.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1672,13 +1709,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.removeFormat",
       "service": "AdminApi",
       "method": "removeFormat",
-      "description": "Stop offering a blueprint as a standard format, and forget the deployment's curation of it.\nThe blueprint itself is untouched.\n\nRefused for a bundled blueprint (see `AdminFormat.bundled`), which the deployment installed\nand will reinstall: `enabled: false` withdraws it without discarding the admin's overrides,\nhint and menu position.",
+      "description": "Stop offering a blueprint as a standard format, and forget the deployment's curation of it.\nThe blueprint itself is untouched.\n\nRefused for a bundled blueprint (see `AdminFormat.bundled`), which the deployment installed\nand will reinstall: `enabled: false` withdraws it without discarding the admin's overrides,\nhint and menu position.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1694,13 +1732,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.removeGatewayModel",
       "service": "AdminApi",
       "method": "removeGatewayModel",
-      "description": "Remove a model added with addGatewayModel(), along with its mode and settings. Throws if no\nadded model has this ID; a suggested model can't be removed, only disabled.\n\nRemoving frees the ID rather than reserving it. The chats, spawners and preferences that name\nthe model resolve again if a model is later added under the same ID. A gadget model binding\nminted for it carries its own provider and model, so while users may add their own models\n(see setUserModelsEnabled) it runs once the model is removed, even if the model was disabled.\nTo shut a model off, disable it instead.",
+      "description": "Remove a model added with addGatewayModel(), along with its mode and settings. Throws if no\nadded model has this ID; a suggested model can't be removed, only disabled.\n\nRemoving frees the ID rather than reserving it. The chats, spawners and preferences that name\nthe model resolve again if a model is later added under the same ID. A gadget model binding\nminted for it carries its own provider and model, so while users may add their own models\n(see setUserModelsEnabled) it runs once the model is removed, even if the model was disabled.\nTo shut a model off, disable it instead.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1716,13 +1755,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setAccentColor",
       "service": "AdminApi",
       "method": "setAccentColor",
-      "description": "Set the deployment accent color (hex, e.g. \"#3b82f6\"). Pass \"\" to reset to the default theme.\nRejects an invalid hex color.",
+      "description": "Set the deployment accent color (hex, e.g. \"#3b82f6\"). Pass \"\" to reset to the default theme.\nRejects an invalid hex color.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1738,13 +1778,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setAdminAuditRetentionDays",
       "service": "AdminApi",
       "method": "setAdminAuditRetentionDays",
-      "description": "Set how many days the admin audit log keeps a record, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS by\ndefault. A record older than that is no longer listed or counted, and is deleted as the log is\nnext used; the copy kept in its workspace goes when that workspace is next inspected. Throws\nunless `days` is a whole number from the deployment's minimum\n(AdminSettingsView.adminAuditRetentionDays.min, set by its ADMIN_AUDIT_RETENTION_MIN_DAYS\nenvironment variable) to MAX_ADMIN_AUDIT_RETENTION_DAYS.",
+      "description": "Set how many days the admin audit log keeps a record, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS by\ndefault. A record older than that is no longer listed or counted, and is deleted as the log is\nnext used; the copy kept in its workspace goes when that workspace is next inspected. Throws\nunless `days` is a whole number from the deployment's minimum\n(AdminSettingsView.adminAuditRetentionDays.min, set by its ADMIN_AUDIT_RETENTION_MIN_DAYS\nenvironment variable) to MAX_ADMIN_AUDIT_RETENTION_DAYS.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1760,13 +1801,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setAdminWorkspaceAccess",
       "service": "AdminApi",
       "method": "setAdminWorkspaceAccess",
-      "description": "Set how much of a workspace inspectWorkspace() may show (see ADMIN_WORKSPACE_ACCESS_LEVELS),\nDEFAULT_ADMIN_WORKSPACE_ACCESS by default. Throws for a level above the deployment's maximum\n(AdminSettingsView.adminWorkspaceAccess.max), which only its ADMIN_WORKSPACE_ACCESS_MAX\nenvironment variable can raise. A view already minted runs at the lower of its own level and\nthe new one from its next call once the setting reaches it, within about a minute.",
+      "description": "Set how much of a workspace inspectWorkspace() may show (see ADMIN_WORKSPACE_ACCESS_LEVELS),\nDEFAULT_ADMIN_WORKSPACE_ACCESS by default. Throws for a level above the deployment's maximum\n(AdminSettingsView.adminWorkspaceAccess.max), which only its ADMIN_WORKSPACE_ACCESS_MAX\nenvironment variable can raise. A view already minted runs at the lower of its own level and\nthe new one from its next call once the setting reaches it, within about a minute.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1786,13 +1828,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setAnnouncement",
       "service": "AdminApi",
       "method": "setAnnouncement",
-      "description": "Set the top-bar notice (centered text in the top navigation bar). Pass \"\" to clear. Rejects over\nMAX_ANNOUNCEMENT_LENGTH.",
+      "description": "Set the top-bar notice (centered text in the top navigation bar). Pass \"\" to clear. Rejects over\nMAX_ANNOUNCEMENT_LENGTH.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1808,13 +1851,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setBanner",
       "service": "AdminApi",
       "method": "setBanner",
-      "description": "Set the full-width banner. Pass an empty text to hide it. Rejects over MAX_ANNOUNCEMENT_LENGTH or\nan invalid color.",
+      "description": "Set the full-width banner. Pass an empty text to hide it. Rejects over MAX_ANNOUNCEMENT_LENGTH or\nan invalid color.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1846,13 +1890,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setBlueprintFeatured",
       "service": "AdminApi",
       "method": "setBlueprintFeatured",
-      "description": "Mark or unmark a blueprint as featured on the deployment.",
+      "description": "Mark or unmark a blueprint as featured on the deployment.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1872,13 +1917,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setDefaultReasoning",
       "service": "AdminApi",
       "method": "setDefaultReasoning",
-      "description": "Set the reasoning level of every gateway model that has none of its own, or null for each\nmodel's built-in behaviour. It never applies to a model a user added.",
+      "description": "Set the reasoning level of every gateway model that has none of its own, or null for each\nmodel's built-in behaviour. It never applies to a model a user added.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1919,13 +1965,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setFormatOrder",
       "service": "AdminApi",
       "method": "setFormatOrder",
-      "description": "Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids.",
+      "description": "Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1944,13 +1991,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setGatekeeperMode",
       "service": "AdminApi",
       "method": "setGatekeeperMode",
-      "description": "Set a gatekeeper's availability. For an auto-provisioning (\"ambient\") gatekeeper, `mode` is the\nfull three-state (disabled / optional / enabled); for an ordinary gatekeeper only 'disabled' /\n'enabled' are valid ('optional' is rejected). Soft enforcement: it doesn't revoke a capability a\ngadget already holds, and 'disabled' leaves an ambient account's data dormant rather than deleting\nit.",
+      "description": "Set a gatekeeper's availability. For an auto-provisioning (\"ambient\") gatekeeper, `mode` is the\nfull three-state (disabled / optional / enabled); for an ordinary gatekeeper only 'disabled' /\n'enabled' are valid ('optional' is rejected). Soft enforcement: it doesn't revoke a capability a\ngadget already holds, and 'disabled' leaves an ambient account's data dormant rather than deleting\nit.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1974,13 +2022,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setGatewayModelMode",
       "service": "AdminApi",
       "method": "setGatewayModelMode",
-      "description": "Set how the deployment offers one of its gateway models (see GatewayModelMode). Setting the\nmodel's default mode forgets the override, so the model follows its default from then on.\nThrows if `modelId` is not one of the deployment's gateway models.\n\n'disabled' revokes nothing that is stored: the chats, spawners, preferences and gadget model\nbindings that name the model keep naming it, and stop resolving for as long as it is disabled.",
+      "description": "Set how the deployment offers one of its gateway models (see GatewayModelMode). Setting the\nmodel's default mode forgets the override, so the model follows its default from then on.\nThrows if `modelId` is not one of the deployment's gateway models.\n\n'disabled' revokes nothing that is stored: the chats, spawners, preferences and gadget model\nbindings that name the model keep naming it, and stop resolving for as long as it is disabled.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2004,13 +2053,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setGatewayModelSettings",
       "service": "AdminApi",
       "method": "setGatewayModelSettings",
-      "description": "Replace what the deployment sets for one of its gateway models (see GatewayModelSettings):\na field left out of `settings` is unset, and an empty `settings` unsets everything. Throws\nif `modelId` is not one of the deployment's gateway models, or if the compaction budget is\nnot a positive whole number within the model's maximum (see\nAdminModelView.maxCompactionInputBudget).\n\nThe reasoning level may be one the model lacks, since it is fitted to the model when a\nrequest is made (see ReasoningLevel).",
+      "description": "Replace what the deployment sets for one of its gateway models (see GatewayModelSettings):\na field left out of `settings` is unset, and an empty `settings` unsets everything. Throws\nif `modelId` is not one of the deployment's gateway models, or if the compaction budget is\nnot a positive whole number within the model's maximum (see\nAdminModelView.maxCompactionInputBudget).\n\nThe reasoning level may be one the model lacks, since it is fitted to the model when a\nrequest is made (see ReasoningLevel).\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2052,13 +2102,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setGatewayProviderEnabled",
       "service": "AdminApi",
       "method": "setGatewayProviderEnabled",
-      "description": "Turn a provider on or off beside the ones CF_AI_GATEWAY_PROVIDERS lists. On is the same as\nlisting it there: its suggested models appear in their default modes, models can be added\nunder it, and so can users' own while those are allowed. Throws for a provider the gateway\ndoes not serve, and when turning off one that the variable lists: it is a floor, which an\nadmin adds to.\n\nOff takes the provider's models out of the deployment's and deletes nothing: their modes and\nsettings, and the models added under the provider, are kept for when it is back on. It stops\nneither a model a user already added under the provider nor a gadget model binding already\nminted for one of its models, which setUserModelsEnabled(false) does.",
+      "description": "Turn a provider on or off beside the ones CF_AI_GATEWAY_PROVIDERS lists. On is the same as\nlisting it there: its suggested models appear in their default modes, models can be added\nunder it, and so can users' own while those are allowed. Throws for a provider the gateway\ndoes not serve, and when turning off one that the variable lists: it is a floor, which an\nadmin adds to.\n\nOff takes the provider's models out of the deployment's and deletes nothing: their modes and\nsettings, and the models added under the provider, are kept for when it is back on. It stops\nneither a model a user already added under the provider nor a gadget model binding already\nminted for one of its models, which setUserModelsEnabled(false) does.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2089,13 +2140,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setInstanceInstructions",
       "service": "AdminApi",
       "method": "setInstanceInstructions",
-      "description": "Replace the agent system-prompt instructions. Pass \"\" to clear. Rejects over MAX_INSTANCE_INSTRUCTIONS_LENGTH.",
+      "description": "Replace the agent system-prompt instructions. Pass \"\" to clear. Rejects over\nMAX_INSTANCE_INSTRUCTIONS_LENGTH.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2111,13 +2163,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setModelsDevSuggestions",
       "service": "AdminApi",
       "method": "setModelsDevSuggestions",
-      "description": "Set whether the admin UI may suggest models from models.dev while an admin adds one. Off by\ndefault.\n\nThe admin's browser reads the setting and, with it on, downloads models.dev's public model\nlist while an admin adds a model, to fill in the add-model form. It changes nothing the server\ndoes: the server never contacts models.dev, and addGatewayModel() validates a suggested model\nlike any other.",
+      "description": "Set whether the admin UI may suggest models from models.dev while an admin adds one. Off by\ndefault.\n\nThe admin's browser reads the setting and, with it on, downloads models.dev's public model\nlist while an admin adds a model, to fill in the add-model form. It changes nothing the server\ndoes: the server never contacts models.dev, and addGatewayModel() validates a suggested model\nlike any other.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2133,13 +2186,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setResourceEnabled",
       "service": "AdminApi",
       "method": "setResourceEnabled",
-      "description": "Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.\nSoft enforcement: disabling hides the resource from the connect UI, the resource picker, and the\nagent; it doesn't revoke a capability a gadget already holds.",
+      "description": "Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.\nSoft enforcement: disabling hides the resource from the connect UI, the resource picker, and the\nagent; it doesn't revoke a capability a gadget already holds.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2163,13 +2217,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setSignupsEnabled",
       "service": "AdminApi",
       "method": "setSignupsEnabled",
-      "description": "Enable or disable new account signups. Existing users can still log in while signups are closed.",
+      "description": "Enable or disable new account signups. Existing users can still log in while signups are\nclosed.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2185,13 +2240,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setSiteLogo",
       "service": "AdminApi",
       "method": "setSiteLogo",
-      "description": "Set the deployment logo from browser-rasterized PNG bytes and return its canonical public\nimage, or undefined after reset. Pass null to restore the default Cloudflare OS mark. The\ncaller must supply decodable PNG data; the server enforces its header, size, and dimensions.",
+      "description": "Set the deployment logo from browser-rasterized PNG bytes and return its canonical public\nimage, or undefined after reset. Pass null to restore the default Cloudflare OS mark. The\ncaller must supply decodable PNG data; the server enforces its header, size, and dimensions.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2237,13 +2293,14 @@
             "additionalProperties": false
           }
         }
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setSiteName",
       "service": "AdminApi",
       "method": "setSiteName",
-      "description": "Set the site name shown next to the top-bar logo. Pass \"\" to reset to DEFAULT_SITE_NAME.\nRejects over MAX_SITE_NAME_LENGTH.",
+      "description": "Set the site name shown next to the top-bar logo. Pass \"\" to reset to DEFAULT_SITE_NAME.\nRejects over MAX_SITE_NAME_LENGTH.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2259,13 +2316,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setUpdateCheckIntervalMinutes",
       "service": "AdminApi",
       "method": "setUpdateCheckIntervalMinutes",
-      "description": "Set how many minutes a successful update check is relied on before the deployment asks again,\nDEFAULT_UPDATE_CHECK_INTERVAL_MINUTES by default. A failed check is retried after the interval\nor 15 minutes, whichever is shorter. The deployment asks only while an admin is using it\n(getUpdateStatus() makes the check when one is due), never on a schedule of its own. Throws\nunless `minutes` is a whole number from 1 to MAX_UPDATE_CHECK_INTERVAL_MINUTES.",
+      "description": "Set how many minutes a successful update check is relied on before the deployment asks again,\nDEFAULT_UPDATE_CHECK_INTERVAL_MINUTES by default. A failed check is retried after the interval\nor 15 minutes, whichever is shorter. The deployment asks only while an admin is using it\n(getUpdateStatus() makes the check when one is due), never on a schedule of its own. Throws\nunless `minutes` is a whole number from 1 to MAX_UPDATE_CHECK_INTERVAL_MINUTES.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2281,13 +2339,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setUpdateChecksEnabled",
       "service": "AdminApi",
       "method": "setUpdateChecksEnabled",
-      "description": "Set whether the deployment checks for updates by itself. On by default. When off,\ngetUpdateStatus() makes no outbound call and admins are never notified; checkForUpdates()\nstill asks.",
+      "description": "Set whether the deployment checks for updates by itself. On by default. When off,\ngetUpdateStatus() makes no outbound call and admins are never notified; checkForUpdates()\nstill asks.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2303,13 +2362,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setUpdateMinimumAgeHours",
       "service": "AdminApi",
       "method": "setUpdateMinimumAgeHours",
-      "description": "Set how many hours a newer release must have been available before admins are notified of\nit, DEFAULT_UPDATE_MINIMUM_AGE_HOURS by default. It delays the notice only: an update always\ninstalls the newest release. 0 notifies as soon as a check reports an update. Throws unless\n`hours` is a whole number from 0 to MAX_UPDATE_HOURS.",
+      "description": "Set how many hours a newer release must have been available before admins are notified of\nit, DEFAULT_UPDATE_MINIMUM_AGE_HOURS by default. It delays the notice only: an update always\ninstalls the newest release. 0 notifies as soon as a check reports an update. Throws unless\n`hours` is a whole number from 0 to MAX_UPDATE_HOURS.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2325,13 +2385,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setUpdateNoticeSnoozeHours",
       "service": "AdminApi",
       "method": "setUpdateNoticeSnoozeHours",
-      "description": "Set how many hours a dismissed update notice stays hidden in the browser that dismissed it,\nDEFAULT_UPDATE_NOTICE_SNOOZE_HOURS by default. 0 means a closed notice comes back on the next\nvisit to Home. Throws unless `hours` is a whole number from 0 to MAX_UPDATE_HOURS.",
+      "description": "Set how many hours a dismissed update notice stays hidden in the browser that dismissed it,\nDEFAULT_UPDATE_NOTICE_SNOOZE_HOURS by default. 0 means a closed notice comes back on the next\nvisit to Home. Throws unless `hours` is a whole number from 0 to MAX_UPDATE_HOURS.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2347,13 +2408,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setUserModelsEnabled",
       "service": "AdminApi",
       "method": "setUserModelsEnabled",
-      "description": "Set whether users may add models of their own, which run through the deployment's gateway\nlike the models it provides. On by default.\n\nOff makes the deployment's models the only ones: a user can't add or edit a model, and the\nmodels users added are neither listed nor resolved. A gadget model binding stops at its next\ncall unless a gateway model has its provider and model. Nothing stored is deleted, so the\nmodels users added work again once this is back on.",
+      "description": "Set whether users may add models of their own, which run through the deployment's gateway\nlike the models it provides. On by default.\n\nOff makes the deployment's models the only ones: a user can't add or edit a model, and the\nmodels users added are neither listed nor resolved. A gadget model binding stops at its next\ncall unless a gateway model has its provider and model. Nothing stored is deleted, so the\nmodels users added work again once this is back on.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2369,13 +2431,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.setUserSearchEnabled",
       "service": "AdminApi",
       "method": "setUserSearchEnabled",
-      "description": "Enable or disable user directory search. The directory itself is maintained\neither way, and this switch just controls user access.",
+      "description": "Enable or disable user directory search. The directory itself is maintained\neither way, and this switch just controls user access.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2391,13 +2454,14 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminApi.testGatewayModel",
       "service": "AdminApi",
       "method": "testGatewayModel",
-      "description": "Send one request to a gateway model the way a chat turn would, through the gateway, as the\nadmin, and report what happened within 30 seconds. The request asks for the reasoning level\nin effect for the model (its own, else the deployment's default, else what BuiltInReasoning\ndescribes), with the capabilities stated for it and the flags of the model it behaves like,\nunder a response cap of at most 2,048 tokens. A level that a model takes as a token budget\ncomes out of that cap, so it is cut to the room the cap leaves and is smaller than a chat's.\nIt works on a model in any mode, hidden and disabled included, and changes nothing. Throws\noutside AI Gateway mode and for an ID that names no gateway model; a request that fails is a\nresult (see GatewayModelTest).\n\nA pass says that the model answered that one request. It costs more than\ntestGatewayProvider(), whose quick request is capped at a few tokens.",
+      "description": "Send one request to a gateway model the way a chat turn would, through the gateway, as the\nadmin, and report what happened within 30 seconds. The request asks for the reasoning level\nin effect for the model (its own, else the deployment's default, else what BuiltInReasoning\ndescribes), with the capabilities stated for it and the flags of the model it behaves like,\nunder a response cap of at most 2,048 tokens. A level that a model takes as a token budget\ncomes out of that cap, so it is cut to the room the cap leaves and is smaller than a chat's.\nIt works on a model in any mode, hidden and disabled included, and changes nothing. Throws\noutside AI Gateway mode and for an ID that names no gateway model; a request that fails is a\nresult (see GatewayModelTest).\n\nA pass says that the model answered that one request. It costs more than\ntestGatewayProvider(), whose quick request is capped at a few tokens.\n@confirmation Sends a request of up to 2,048 response tokens through the deployment's AI Gateway, which its provider bills.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2457,13 +2521,14 @@
             ]
           }
         }
-      }
+      },
+      "confirmation": "Sends a request of up to 2,048 response tokens through the deployment's AI Gateway, which its provider bills."
     },
     {
       "id": "AdminApi.testGatewayProvider",
       "service": "AdminApi",
       "method": "testGatewayProvider",
-      "description": "Send one small request to the first of a provider's SUGGESTED_MODELS through the gateway, as\nthe admin, and report what happened within 15 seconds: the Workshop can't see which provider\nkeys the gateway holds. It works on a provider that is off, and changes nothing. Throws for\na provider the gateway does not serve; a request that fails is a result (see\nGatewayModelTest).\n\nA pass says that one model answered once. A 401 or 403 does not tell a provider key the\ngateway lacks from a CF_AI_GATEWAY_API_TOKEN that may not run models. The request is a\nquick one that takes none of a model's settings: testGatewayModel() sends a model the\nrequest its chats would.",
+      "description": "Send one small request to the first of a provider's SUGGESTED_MODELS through the gateway, as\nthe admin, and report what happened within 15 seconds: the Workshop can't see which provider\nkeys the gateway holds. It works on a provider that is off, and changes nothing. Throws for\na provider the gateway does not serve; a request that fails is a result (see\nGatewayModelTest).\n\nA pass says that one model answered once. A 401 or 403 does not tell a provider key the\ngateway lacks from a CF_AI_GATEWAY_API_TOKEN that may not run models. The request is a\nquick one that takes none of a model's settings: testGatewayModel() sends a model the\nrequest its chats would.\n@confirmation Sends a request through the deployment's AI Gateway, which its provider bills.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2534,13 +2599,14 @@
             ]
           }
         }
-      }
+      },
+      "confirmation": "Sends a request through the deployment's AI Gateway, which its provider bills."
     },
     {
       "id": "AdminApi.testNewGatewayModel",
       "service": "AdminApi",
       "method": "testNewGatewayModel",
-      "description": "Test a model as described, without adding it. It sends one request the way a chat turn would\nwith no reasoning level set (so asking for what BuiltInReasoning describes, whatever the\ndeployment's default level is), and one at each reasoning level the model would list once\nadded (see AdminModelView.reasoningLevels). The requests are sent together, through the\ngateway, as the admin, each under testGatewayModel()'s response cap and time limit. The\nresults come with the request that set no level first, then the levels from least to most.\nIt stores nothing. Throws outside AI Gateway mode and for a model addGatewayModel() would\nrefuse, for the same reason; a request that fails is a result (see GatewayModelLevelTest).\n\nA pass says that the model answered that one request. A model that lists every level is sent\neight requests, each of which may use the whole response cap.",
+      "description": "Test a model as described, without adding it. It sends one request the way a chat turn would\nwith no reasoning level set (so asking for what BuiltInReasoning describes, whatever the\ndeployment's default level is), and one at each reasoning level the model would list once\nadded (see AdminModelView.reasoningLevels). The requests are sent together, through the\ngateway, as the admin, each under testGatewayModel()'s response cap and time limit. The\nresults come with the request that set no level first, then the levels from least to most.\nIt stores nothing. Throws outside AI Gateway mode and for a model addGatewayModel() would\nrefuse, for the same reason; a request that fails is a result (see GatewayModelLevelTest).\n\nA pass says that the model answered that one request. A model that lists every level is sent\neight requests, each of which may use the whole response cap.\n@confirmation Sends up to eight requests of up to 2,048 response tokens each through the deployment's AI Gateway, which their provider bills.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2728,13 +2794,14 @@
             ]
           }
         }
-      }
+      },
+      "confirmation": "Sends up to eight requests of up to 2,048 response tokens each through the deployment's AI Gateway, which their provider bills."
     },
     {
       "id": "AdminApi.updateFormat",
       "service": "AdminApi",
       "method": "updateFormat",
-      "description": "Update one promoted format. Only the provided fields change. `agentHint: \"\"` clears the hint;\nan `overrides` field set to null reverts that field to the blueprint's own declaration.",
+      "description": "Update one promoted format. Only the provided fields change. `agentHint: \"\"` clears the hint;\nan `overrides` field set to null reverts that field to the blueprint's own declaration.\n@mutates",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2841,7 +2908,8 @@
       "returns": {
         "type": "null",
         "x-capnweb-kind": "undefined"
-      }
+      },
+      "mutates": true
     },
     {
       "id": "AdminWorkspaceView.describe",
@@ -2880,6 +2948,12 @@
               },
               "defaultGadgetId": {
                 "type": "number"
+              },
+              "deploymentAdminAccess": {
+                "enum": [
+                  "off",
+                  "on"
+                ]
               },
               "expiresAt": {
                 "type": "string",
@@ -5957,6 +6031,9 @@
                   "readFile"
                 ]
               },
+              "origin": {
+                "$ref": "#/$defs/AdminGatekeeperOrigin"
+              },
               "reason": {
                 "type": "string"
               },
@@ -5999,10 +6076,30 @@
             ],
             "additionalProperties": false
           },
+          "AdminGatekeeperOrigin": {
+            "type": "object",
+            "properties": {
+              "actionId": {
+                "type": "number"
+              },
+              "chatId": {
+                "type": "number"
+              },
+              "workspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "chatId",
+              "workspaceId"
+            ],
+            "additionalProperties": false
+          },
           "AdminVia": {
             "enum": [
               "api",
-              "cli"
+              "cli",
+              "gatekeeper"
             ]
           },
           "AdminViewAccess": {
@@ -7769,7 +7866,7 @@
       "id": "AuthenticatedApi.getAdminApi",
       "service": "AuthenticatedApi",
       "method": "getAdminApi",
-      "description": "Returns a capability for managing and investigating the deployment as an admin, or null when\nthe caller is not one. The access check happens here, once, for every AdminApi method but\nworkspace inspection: AdminApi.inspectWorkspace() and each call on the view it mints check\nagain (see AdminWorkspaceView). `options.via` labels every audit record the capability makes.\n(Authentication config — sign-in providers, password login — is intentionally not managed\nhere; it stays env-var driven.)",
+      "description": "Returns a capability for managing and investigating the deployment as an admin, or null when\nthe caller is not one. The access check happens here, once, for every AdminApi method but\nworkspace inspection: AdminApi.inspectWorkspace() and each call on the view it mints check\nagain (see AdminWorkspaceView). `options.via` labels every audit record the capability makes,\n\"api\" or \"cli\" as the client states it.\n(Authentication config — sign-in providers, password login — is intentionally not managed\nhere; it stays env-var driven.)",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -7784,12 +7881,12 @@
             "type": "object",
             "properties": {
               "via": {
-                "$ref": "#/$defs/AdminVia"
+                "$ref": "#/$defs/AdminClientVia"
               }
             },
             "additionalProperties": false
           },
-          "AdminVia": {
+          "AdminClientVia": {
             "enum": [
               "api",
               "cli"
@@ -9010,6 +9107,12 @@
               },
               "defaultGadgetId": {
                 "type": "number"
+              },
+              "deploymentAdminAccess": {
+                "enum": [
+                  "off",
+                  "on"
+                ]
               },
               "id": {
                 "type": "string"
@@ -17996,6 +18099,12 @@
               "defaultGadgetId": {
                 "type": "number"
               },
+              "deploymentAdminAccess": {
+                "enum": [
+                  "off",
+                  "on"
+                ]
+              },
               "id": {
                 "type": "string"
               },
@@ -21576,6 +21685,22 @@
       "returns": {
         "x-capnweb-kind": "capability",
         "x-capnweb-service": "{}"
+      }
+    },
+    {
+      "id": "Overseer.turnOffDeploymentAdminAccess",
+      "service": "Overseer",
+      "method": "turnOffDeploymentAdminAccess",
+      "description": "Turn off deployment admin access in this workspace (GadgetMetadata.deploymentAdminAccess). Every\npending deployment admin action is rejected, requests to turn access on included, and approved\ncalls not yet made are dropped; a change already being made when this is called completes. From now\non the agent's calls through the instance admin Gatekeeper ask to turn access on, which takes the\nowner's approval again. If access was on, it reads \"off\" from now on and the workspace stays its\nowner's alone, restricted and closed to external messages; if it never was, nothing else changes.\nOnly the owner may call it, whether or not they are still a deployment admin.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "returns": {
+        "type": "null",
+        "x-capnweb-kind": "undefined"
       }
     },
     {

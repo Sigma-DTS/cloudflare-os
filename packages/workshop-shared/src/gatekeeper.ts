@@ -1534,6 +1534,36 @@ export type ActionField = {
 );
 
 /**
+ * The characters an ActionField value cannot show as itself, as the body of a regular-expression
+ * character class (use with the "u" flag): the C0 and C1 controls but tab and line feed, and the
+ * default-ignorable code points (zero-width spaces and joiners, the byte order mark, the bidirectional
+ * controls...), which render as nothing or reorder the text around them. Fields escape them
+ * (actionFieldJson()) or carry the value in a field that does.
+ */
+export const ACTION_FIELD_INVISIBLE_CHARS =
+  "\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F-\\u009F\\p{Default_Ignorable_Code_Point}";
+
+const ACTION_FIELD_INVISIBLE_GLOBAL = new RegExp(`[${ACTION_FIELD_INVISIBLE_CHARS}]`, "gu");
+
+/**
+ * Pretty-printed JSON for a `json` ActionField: JSON.stringify(value, null, 2) with every
+ * ACTION_FIELD_INVISIBLE_CHARS character escaped as \uXXXX, so the text displays, and decodes, to
+ * exactly the value. Undefined for a value JSON cannot represent.
+ */
+export function actionFieldJson(value: unknown): string | undefined {
+  // JSON.stringify escapes C0 controls but not DEL, C1 or the default-ignorables; those can only
+  // occur inside strings, where a `\u` escape decodes to the same character. An astral match (a tag
+  // character) is escaped as its surrogate pair.
+  try {
+    return JSON.stringify(value, null, 2)?.replace(ACTION_FIELD_INVISIBLE_GLOBAL, c =>
+      Array.from({ length: c.length }, (_, i) =>
+        `\\u${c.charCodeAt(i).toString(16).padStart(4, "0")}`).join(""));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * A stable, machine-readable tag for an action paired with its human-readable display name; the two
  * always travel together. Policy decisions key on `tag` (auto-approval rules group on it today, and
  * the future policy / danger-level engine will too -- treat it as a stable enum; multiple action

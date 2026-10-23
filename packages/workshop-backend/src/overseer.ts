@@ -3,11 +3,16 @@ import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, modelKind } from '@gadgets/workshop-shared/api'
 import {
   ADMIN_ACCESS_ERROR_CODES, ADMIN_DIAGNOSTICS_ACCESS_LIMIT, MAX_ADMIN_AUDIT_ARG_LENGTH,
-  MAX_ADMIN_VIEW_LIFETIME_SECONDS, createAdminAccessError,
-  type AdminAccessExposure, type AdminAccessRecord, type AdminGatekeeperInfo, type AdminViewAccess,
-  type AdminWorkspaceAccess, type AdminWorkspaceDescription, type AdminWorkspaceDiagnostics,
-  type AdminWorkspaceMethod, type AdminWorkspaceView,
+  MAX_ADMIN_VIEW_LIFETIME_SECONDS, adminAgentAccess, createAdminAccessError,
+  type AdminAccessExposure, type AdminAccessRecord, type AdminApi, type AdminGatekeeperInfo,
+  type AdminViewAccess, type AdminWorkspaceAccess, type AdminWorkspaceDescription,
+  type AdminWorkspaceDiagnostics, type AdminWorkspaceMethod, type AdminWorkspaceView,
 } from "@gadgets/workshop-shared/api";
+import {
+  INSTANCE_ADMIN_APPROVAL_LIFETIME_SECONDS, INSTANCE_ADMIN_RUN_LIMIT_SECONDS,
+  INSTANCE_ADMIN_VENDOR_ID, type InstanceAdminCallResult, type InstanceAdminGatekeeper,
+  type InstanceAdminGrant,
+} from "@gadgets/workshop-shared/instance-admin";
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
   MAX_CODE_CHANGE_SIZE, transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   requireTextFiles, type FileContent, type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -28,6 +33,7 @@ import {
   type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
   type StoredAssistantMessage, type StoredChatMessage, type StoredChatMetadata,
   type WorkpieceRecord, type WorktreeRecord, type AdminAccessLogRecord,
+  type InstanceAdminActionRecord, type InstanceAdminAllowanceRecord,
 } from "./storage-schema/overseer-storage";
 import type { UserAiModelRecord, WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import {
@@ -61,15 +67,22 @@ import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import {
   actionHoldsContent, adminAccessPolicy, adminViewCallAccess, assertAdminViewLive,
-  chatHoldsContent, chatPageHoldsContent, cutAdminAuditText, fileHoldsContent, hookHoldsContent,
-  lowerAdminWorkspaceAccess, redactAdminAuditArgs, validateAdminAccessReason,
-  withholdActionContent, withholdChatContent, withholdHookContent, workpieceHoldsContent,
-  type AdminAccessPolicy, type AdminViewTerms,
+  assertAdminViewVia, chatHoldsContent, chatPageHoldsContent, cutAdminAuditText, fileHoldsContent,
+  hookHoldsContent, isDeploymentAdmin, lowerAdminWorkspaceAccess, redactAdminAuditArgs,
+  validateAdminAccessReason, withholdActionContent, withholdChatContent, withholdHookContent,
+  workpieceHoldsContent, type AdminAccessPolicy, type AdminGatekeeperCall, type AdminViewTerms,
 } from "./admin-access";
+import { AdminApiImpl } from "./admin-settings";
+import {
+  assertInstanceAdminActionFits, assertPlainAdminResult, canonicalAdminCall,
+  instanceAdminActivationCard, instanceAdminApprovedNudge, instanceAdminCallCard,
+  instanceAdminReadObservation, instanceAdminRunExpired, instanceAdminViewObservation,
+  isBlueprintProposal, isInstanceAdminCapsule, turnAnswersOwner, type CanonicalAdminCall,
+} from "./instance-admin";
 import type { AdminAuditDurableObject } from "./admin-audit";
 import { DIRECTORY_ACTIVITY_INTERVAL_MS, type UserDirectoryDurableObject } from "./user-directory";
 import { chatChangeStatuses, foldCompactedCode, isTurnPrompt } from "./agent-compaction";
-import { ambientGatekeeperMode } from "./provisioning-policy";
+import { isGatekeeperDisabled } from "./provisioning-policy";
 import {
   blueprintContentKey, deleteBlueprintContent, readBlueprintRelease, sanitizeBlueprintOutput,
 } from "./blueprint-archive";
@@ -273,6 +286,99 @@ type PreparedScratchWorktree = {
 // shape to call it — same optional-method-on-a-stub pattern as user.ts's SingletonAccountStub.
 type CatalogGatekeeperFacet =
     Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "getAgentCatalog">>>;
+
+// The instance admin Gatekeeper's facet, viewed through its Workshop-only contract once its record
+// has been seen to be of INSTANCE_ADMIN_VENDOR_ID (see openGatekeeperSession).
+type InstanceAdminFacet = Fetcher<InstanceAdminGatekeeper<any>>;
+
+// The executeCode run in progress in each chat, registered by executeCodeMode for that run (one
+// turn per chat; its executeCode calls are sequential). Loopbacks minted for the run carry its
+// executionId, so only they resolve against it.
+type ActiveCodeRun = {
+  executionId: string;
+  initiator: AiChatAuthorInfo;
+  /** The turn's worktree state, when executeCodeMode was given one (the worktree binding). */
+  worktree?: WorktreeTurnAccess;
+  /** True from registration until run() settles. The code reaches its env only inside run()
+   * (disallow_importable_env; verify() is empty), so this covers every moment the binding can be
+   * called. */
+  running: boolean;
+  /** Set when the turn is stopped or its chat torn down (cancelAgent, destroyLiveChat), and at
+   * registration when the turn's cancel signal has already fired. */
+  stopped: boolean;
+  /** Date.now() at registration, for INSTANCE_ADMIN_RUN_LIMIT_SECONDS. */
+  startedAt: number;
+  /** The audit session the run's instance admin calls, and the changes it queues, share. */
+  adminSessionId: string;
+  /** The instance admin capsule's account check, made once per run. */
+  instanceAdminAccount?: Promise<void>;
+  /** What the run's turn is, classified at its first instance admin mint, once ownerProfileId is
+   * known. "owner": its initiator is the owner and it answers a message they wrote. "spawned" /
+   * "blueprint": a chat an agent spawner started, or one applyBlueprint created. "notOwner":
+   * anything else. */
+  instanceAdminTurn?: "owner" | "notOwner" | "spawned" | "blueprint";
+};
+
+// Who an instance admin grant serves: the agent run of chat `caller.chatId` whose executionId is
+// `executionId`, through capsule `capsuleId` on account `accountId`.
+type InstanceAdminTerms = {
+  capsuleId: WorkpieceId;
+  caller: {from: "agent"; chatId: number};
+  executionId: string;
+  accountId: number;
+};
+
+// The refusals on the instance admin Gatekeeper's paths (see docs/admin-access.md).
+const INSTANCE_ADMIN_NOT_AGENT =
+    "The instance admin binding works only in its owner's own agent turns, from executeCode.";
+const INSTANCE_ADMIN_RUN_ENDED = "This instance admin binding belongs to an executeCode call " +
+    "that has ended. Use the instance admin binding from the current call's env.";
+const INSTANCE_ADMIN_NOT_OWNER_TURN = "The instance admin binding works only in a turn that " +
+    "answers a message this workspace's owner wrote in this chat, not in one a callback, a " +
+    "gadget or a connection's slash command started.";
+const INSTANCE_ADMIN_NOT_ADMIN =
+    "The instance admin binding works only while this workspace's owner is a deployment admin.";
+const INSTANCE_ADMIN_REMOVED =
+    "The instance admin connection has been removed from this workspace.";
+const INSTANCE_ADMIN_EXTERNAL_REPLY = "The instance admin binding doesn't work in a turn whose " +
+    "reply goes out through an external message.";
+const INSTANCE_ADMIN_DISABLED = "The instance admin gatekeeper is turned off on this deployment.";
+const INSTANCE_ADMIN_NOT_PRIVATE = "Deployment admin access works only in a workspace nobody " +
+    "else can open: remove its collaborators, revoke its share links and wait until nobody else " +
+    "has it open, or use a new workspace.";
+const INSTANCE_ADMIN_SPAWNED_CHAT = "The instance admin binding doesn't work in a chat an agent " +
+    "spawner started or in one that reviews a blueprint update, only in the workspace's other " +
+    "chats.";
+const INSTANCE_ADMIN_STOPPED =
+    "This turn was stopped, so its instance admin binding no longer works.";
+const INSTANCE_ADMIN_RUN_MINUTES = INSTANCE_ADMIN_RUN_LIMIT_SECONDS / 60;
+const INSTANCE_ADMIN_RUN_EXPIRED = `This executeCode call started more than ` +
+    `${INSTANCE_ADMIN_RUN_MINUTES} minutes ago, and the instance admin binding works only for ` +
+    `the first ${INSTANCE_ADMIN_RUN_MINUTES} minutes of a call. Make further calls from a new ` +
+    "executeCode call.";
+const INSTANCE_ADMIN_MANUAL_ONLY = "Deployment admin actions are approved only by hand.";
+const INSTANCE_ADMIN_OWNER_APPROVES =
+    "Only this workspace's owner, while a deployment admin, can approve deployment admin actions.";
+const INSTANCE_ADMIN_OFF = "Deployment admin access is off in this workspace.";
+const INSTANCE_ADMIN_APPLYING = "This action is already being applied.";
+const INSTANCE_ADMIN_REPLY_PENDING = "Deployment admin access can't be turned on while a reply " +
+    "to an external message is still to be delivered.";
+const INSTANCE_ADMIN_OWNER_TURNS_OFF =
+    "Only this workspace's owner can turn off deployment admin access.";
+const INSTANCE_ADMIN_NOT_BINDABLE = "The instance admin binding can't be bound into a gadget or " +
+    "an agent spawner: it works only in its owner's own agent turns.";
+// Neutral on purpose: an external sender must not learn that the owner is or was a deployment
+// admin, which only admins can see. The owner's own texts say why.
+const NO_EXTERNAL_MESSAGES = "This workspace takes no external messages.";
+
+function instanceAdminWithheld(method: string): string {
+  return `AdminApi.${method} isn't available through the instance admin binding.`;
+}
+
+// What GadgetMetadata.deploymentAdminAccess reports for the two singletons.
+function deploymentAdminAccessOf(latched: boolean, active: boolean): "on" | "off" | undefined {
+  return latched ? (active ? "on" : "off") : undefined;
+}
 
 function defaultBlueprintBindingTitle(record: GatekeeperRecord, bindingName?: string): string {
   return record.resourceTitle || bindingName || "Connection";
@@ -991,6 +1097,7 @@ class OverseerImpl implements AgentHooks {
   // (Undelivered calls to the agent live in storage -- `pendingAgentCalls` -- not here; deleteChat
   // removes them itself.)
   destroyLiveChat(chatId: number) {
+    this.#stopCodeRun(chatId);
     this.#resumeErrors.delete(chatId);
     this.#unregisterRunningAgent(chatId);
     let meta = this.storage.chatMeta.get(chatId);
@@ -1773,6 +1880,9 @@ class OverseerImpl implements AgentHooks {
         throw new Error(`Gadget-to-gadget bindings are not supported yet.`);
       }
       throw new Error(`No such gatekeeper: ${target}`);
+    }
+    if (gatekeeperVendorId(targetRecord) === INSTANCE_ADMIN_VENDOR_ID) {
+      throw new Error(INSTANCE_ADMIN_NOT_BINDABLE);
     }
     // A permanent edge can put an account-requiring connection into every "use" collaborator's
     // verification scope, since the gadget UI they drive can now invoke it. Snapshot the scope
@@ -2641,7 +2751,8 @@ class OverseerImpl implements AgentHooks {
   // arguments.
   // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
   // behavior elsewhere. `executionId` is the calling executeCodeMode run, minted into worktree
-  // loopbacks so they are usable only from within that execution.
+  // loopbacks and the instance admin capsule's loopback so they are usable only from within that
+  // execution.
   getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>,
                  executionId: string): object {
     let caller: GatekeeperCaller = {from: "agent", chatId};
@@ -2680,8 +2791,14 @@ class OverseerImpl implements AgentHooks {
             // executeCode run (see startGatekeeperSession's "worktree" case).
             env[name] = this.makeBindingLoopback(
                 {type: "worktree", id: entry.id, executionId}, caller);
-          } else if (this.storage.gatekeepers.get(entry.id)) {
-            env[name] = this.makeBindingLoopback({type: "gatekeeper", id: entry.id}, caller);
+          } else {
+            let gatekeeper = this.storage.gatekeepers.get(entry.id);
+            if (gatekeeper) {
+              env[name] = this.makeBindingLoopback({
+                type: "gatekeeper", id: entry.id,
+                ...(isInstanceAdminCapsule(gatekeeper) ? {executionId} : {}),
+              }, caller);
+            }
           }
           break;
         }
@@ -4967,6 +5084,9 @@ class OverseerImpl implements AgentHooks {
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
                            creation?: {creator: Fetcher<GatekeeperUserVerifier>,
                                        configuration: string | null}): Promise<void> {
+    if (record.instanceAdmin) {
+      return this.#applyInstanceAdminAction(record, record.instanceAdmin, resolvedBy, autoApproved);
+    }
     let id = record.gatekeeperId;
     // A created resource exists only once its creation applies, and that stays pending until then.
     if (record.action !== "create" && this.#creationPending(id)) {
@@ -5013,11 +5133,7 @@ class OverseerImpl implements AgentHooks {
       this.storage.actions.put(record);
       if (gatekeeperRecord) this.storage.gatekeepers.put(gatekeeperRecord);
     });
-    // No await between the decision write and the durable execution claim. This also covers
-    // auto-approval, rather than relying on a client's continuation after this promise resolves.
-    if (record.caller.from === "agent" && record.description.awaitDecision) {
-      this.resumeAgentAfterDecision(record.caller.chatId, record.id);
-    }
+    this.#announceApproval(record);
     if (gatekeeperRecord) {
       // Restart the facet on the new class before anything else reaches it.
       this.ctx.facets.abort(`gatekeeper${id}`,
@@ -5027,6 +5143,16 @@ class OverseerImpl implements AgentHooks {
       if (this.#restartIfSessionsAffected("Gadget restarted because a resource was created.")) {
         this.#gatekeepersPendingRestart.add(id);
       }
+    }
+  }
+
+  // Follows the durable write of `record`'s approval, with no await between them: resumes the agent
+  // turn waiting on it and traces the approval.
+  #announceApproval(record: ActionRecord & {type: "action"}): void {
+    // No await between the decision write and the durable execution claim. This also covers
+    // auto-approval, rather than relying on a client's continuation after this promise resolves.
+    if (record.caller.from === "agent" && record.description.awaitDecision) {
+      this.resumeAgentAfterDecision(record.caller.chatId, record.id);
     }
     // Also when a rule applies it: a user's "always approve" answers a pending request that way.
     this.traceAgentActionApproval(record, "approved");
@@ -5089,9 +5215,11 @@ class OverseerImpl implements AgentHooks {
   // `joinAs` counts the returned client toward #hasCollaboratorSession for its lifetime; passed by
   // the collaborator-facing mints, omitted for the owner's and for internal callers (see
   // GadgetClientImpl). `actorUserId` is who the returned client acts for, for analytics only.
+  // `beforePublish` runs synchronously right before the record is published; a throw tears the
+  // connection down instead.
   async addGatekeeper(
       cls: GatekeeperClass, creationSpec: GatekeeperCreationSpec, actorUserId: string,
-      joinAs?: SessionKind)
+      joinAs?: SessionKind, beforePublish?: () => void)
       : Promise<GatekeeperClient<any>> {
     let id = this.allocateWorkpieceId();
     let gatekeeperRecord: GatekeeperRecord = {
@@ -5113,6 +5241,7 @@ class OverseerImpl implements AgentHooks {
       gatekeeperRecord.resourceTitle = description.title;
       gatekeeperRecord.resourceUrl = description.url;
       gatekeeperRecord.hasSlashCommands = description.hasSlashCommands;
+      beforePublish?.();
       this.storage.gatekeepers.put(gatekeeperRecord);
     } catch (error) {
       // Still the right teardown with nothing published: it deletes the facet we just created, and
@@ -5211,7 +5340,8 @@ class OverseerImpl implements AgentHooks {
 
       case "gatekeeper":
         return this.getGatekeeperFacet(target.id)
-            .then(facet => this.openGatekeeperSession(target.id, facet, caller));
+            .then(facet =>
+                this.openGatekeeperSession(target.id, facet, caller, target.executionId));
 
       case "worktree": {
         // The programmatic Worktree binding (worktree-session.ts). A worktree's uncommitted
@@ -5228,8 +5358,10 @@ class OverseerImpl implements AgentHooks {
         if (record.chatId !== caller.chatId) {
           throw new Error(`No such worktree: ${target.id}`);
         }
-        let turn = this.#activeWorktreeTurns.get(caller.chatId);
-        if (turn === undefined || turn.executionId !== target.executionId) {
+        let run = this.#activeCodeRuns.get(caller.chatId);
+        let worktree = run?.worktree;
+        if (run === undefined || worktree === undefined ||
+            run.executionId !== target.executionId) {
           throw new Error(
               "This worktree binding is no longer live; worktree bindings are usable only " +
               "while the executeCode call they were provided to is running.");
@@ -5237,9 +5369,9 @@ class OverseerImpl implements AgentHooks {
         // Commits go to the turn's initiator: in a collaborative chat, a collaborator's work is
         // attributed to the collaborator, matching how accepted commits use the acting user's
         // profile.
-        let initiator = turn.initiator;
+        let initiator = run.initiator;
         return Promise.resolve(
-            new WorktreeSessionImpl(this, target.id, turn.access, async () => initiator));
+            new WorktreeSessionImpl(this, target.id, worktree, async () => initiator));
       }
 
       case "exports":
@@ -5266,8 +5398,8 @@ class OverseerImpl implements AgentHooks {
   // the owner standing in for a spawner's creator. Resolved at commit time, so read-only use
   // of env.GIT never waits on the owner's DO.
   async #gitAuthorFor(caller: GatekeeperCaller): Promise<AiChatAuthorInfo> {
-    let turn = caller.from === "agent" ? this.#activeWorktreeTurns.get(caller.chatId) : undefined;
-    if (turn !== undefined) return turn.initiator;
+    let run = caller.from === "agent" ? this.#activeCodeRuns.get(caller.chatId) : undefined;
+    if (run !== undefined) return run.initiator;
     return this.gadgetAuthorFor(await retryOnDoReset(() => this.ownerUserDo().whoami(), this.logger));
   }
 
@@ -5283,12 +5415,19 @@ class OverseerImpl implements AgentHooks {
     };
   }
 
-  // The worktree turn state registered by a running executeCode, keyed by chat (one turn per
-  // chat, and executeCode calls within it are sequential). `executionId` names the registering
-  // execution: worktree loopbacks are minted with it and verified against it, so only stubs from
-  // the currently-running execution resolve. See executeCodeMode.
-  #activeWorktreeTurns = new Map<number,
-      {access: WorktreeTurnAccess, initiator: AiChatAuthorInfo, executionId: string}>();
+  // The executeCode run in progress in each chat (see ActiveCodeRun), registered by
+  // executeCodeMode. Worktree loopbacks and the instance admin capsule's loopback are minted with
+  // its executionId and verified against it, so only stubs from the currently-running execution
+  // resolve.
+  #activeCodeRuns = new Map<number, ActiveCodeRun>();
+
+  // Marks the chat's run stopped. The executeCode tool doesn't forward the turn's cancel signal and
+  // the agent loop waits for the tool, so a stopped turn's code keeps running until it settles:
+  // this is what makes its instance admin binding stop working at once.
+  #stopCodeRun(chatId: number): void {
+    let run = this.#activeCodeRuns.get(chatId);
+    if (run !== undefined) run.stopped = true;
+  }
 
   // Maps chat ID to action numbers recently performed by that chat's agent. These are drained into
   // the chat log after the tool returns. `awaitDecision` is true if any captured action needs it.
@@ -5938,7 +6077,7 @@ class OverseerImpl implements AgentHooks {
     let actionId = this.storage.nextActionId.get();
     this.storage.nextActionId.put(actionId + 1);
 
-    let record: ActionRecord = {
+    let record: ActionRecord & {type: "action"} = {
       id: actionId,
       gatekeeperId,
       caller,
@@ -5954,10 +6093,21 @@ class OverseerImpl implements AgentHooks {
     // The marking walk stamps the verified push closure "pending push" -- the read grant that
     // lets the gatekeeper simulate the queued push -- in the same transaction that persists the
     // action record, so the marks and the action can never disagree.
-    this.storage.transaction(() => {
+    this.#queuePendingAction(record, () => {
       if (description.pushedCommits !== undefined && description.pushedCommits.length > 0) {
         this.gitCache.markPushClosure(gatekeeperId, actionId, description.pushedCommits);
       }
+    });
+  }
+
+  // Persists `record`, a new pending action, in one transaction with `write`'s writes, and
+  // announces it: in the chat it came from, to tracing, and to an agent turn that waits on it, or
+  // to the auto-approval drain. Shared by submitAction and the actions the Workshop queues for the
+  // instance admin Gatekeeper, which never auto-approve.
+  #queuePendingAction(record: ActionRecord & {type: "action"}, write = () => {}): void {
+    let {id: actionId, gatekeeperId, caller, description} = record;
+    this.storage.transaction(() => {
+      write();
       this.storage.actions.put(record);
     });
     this.#associateAction(caller, actionId);
@@ -6481,13 +6631,576 @@ class OverseerImpl implements AgentHooks {
 
   // Every gatekeeper session -- GatekeeperClientImpl.openSession and binding loopbacks via
   // startGatekeeperSession alike -- passes through here, so this is where a connection still
-  // blocked pending a scope-widening restart is refused (see #gatekeepersPendingRestart).
+  // blocked pending a scope-widening restart is refused (see #gatekeepersPendingRestart). A
+  // connection of the instance admin Gatekeeper, and anything a loopback minted with an
+  // `executionId` (only the instance admin capsule's is) reaches, is opened by
+  // #openInstanceAdminSession instead.
   openGatekeeperSession<Session extends RpcCompatible<Session>>(
-      id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller)
+      id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller,
+      executionId?: string)
       : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
+    let record = this.storage.gatekeepers.get(id);
+    if (executionId !== undefined || gatekeeperVendorId(record) === INSTANCE_ADMIN_VENDOR_ID) {
+      return this.#openInstanceAdminSession(
+          id, record, facet as unknown as InstanceAdminFacet, caller, executionId);
+    }
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
     return facet.startSession(new ApprovalQueueImpl(this, id, caller));
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // The instance admin Gatekeeper (packages/gatekeeper-instanceadmin; docs/admin-access.md)
+  //
+  // The one Gatekeeper that serves its owner's agent the deployment's Admin API. It holds no power
+  // of its own: each session gets an InstanceAdminGrantImpl, which calls back into
+  // callInstanceAdmin, and every decision (whether a call runs, waits for the owner's approval or
+  // is refused; what is recorded) is made here. Every check runs synchronously with the write,
+  // mint or answer it guards, and again after any await.
+
+  /** Ids of approved instance admin actions whose call is being made, from the apply's last check
+   * to its final write. Reject refuses them and turn-off skips them. */
+  #instanceAdminApplying = new Set<number>();
+
+  /** The via-"gatekeeper" Admin API of the workspace's owner, for one run's calls or one approved
+   * action: the only place one is constructed, and callInstanceAdmin and #applyInstanceAdminAction
+   * are its only callers, which never hand it out. A method, as users and adminAudits are fields,
+   * so tests can replace it. */
+  adminApiForAgent(call: AdminGatekeeperCall): AdminApiImpl {
+    if (this.ownerProfileId === undefined) {
+      throw new Error("The workspace owner's profile is not loaded.");
+    }
+    return new AdminApiImpl(this.ctx, this.env, this.ownerProfileId, "gatekeeper", call);
+  }
+
+  // Whether deployment admin access is on (GadgetMetadata.deploymentAdminAccess).
+  #instanceAdminOn(): boolean {
+    return this.storage.instanceAdminLatched.get() && this.storage.instanceAdminActive.get();
+  }
+
+  /** Whether the capsule may exist and access may be turned on now: latched, or nobody else can
+   * open the workspace (sharing.isPrivate() and no collaborator session is live). Queueing an
+   * activation, applying one and placing the capsule all ask it. */
+  #instanceAdminCapsuleAllowed(sharing: SharingManager): boolean {
+    return this.storage.instanceAdminLatched.get() ||
+        (sharing.isPrivate() && !this.#hasCollaboratorSession());
+  }
+
+  // Whether a reply to an external message is still to be delivered in any chat.
+  #hasUndeliveredExternalReply(): boolean {
+    return [...this.storage.gadgetResponseDeliveries.undeliveredByChatId.list({limit: 1})]
+        .length > 0;
+  }
+
+  // Removes every instance admin capsule, unless the workspace is latched (it is then its owner's
+  // alone, so the capsule may stay). The sharing manager calls it right after a write that lets
+  // someone else open the workspace. Never throws.
+  #dropInstanceAdminCapsule(): void {
+    if (this.storage.instanceAdminLatched.get()) return;
+    try {
+      // A snapshot: removeGatekeeper() deletes from the collection being walked.
+      for (let record of Array.from(this.storage.gatekeepers.list())) {
+        if (isInstanceAdminCapsule(record)) this.removeGatekeeper(record.id);
+      }
+    } catch (error) {
+      this.logger.error("failed to drop the instance admin capsule", {
+        event: "instance.admin.capsule.drop.failed", error,
+      });
+    }
+  }
+
+  // What the run's turn is (ActiveCodeRun.instanceAdminTurn), classified on first use and cached on
+  // the run. Undefined, caching nothing, while ownerProfileId is unknown: the mint loads it first.
+  // The class can't change during the run: a chat's spawnerConfig and first record are fixed, and
+  // no prompt is logged while a turn runs.
+  #instanceAdminTurn(chatId: number, run: ActiveCodeRun): ActiveCodeRun["instanceAdminTurn"] {
+    if (run.instanceAdminTurn !== undefined) return run.instanceAdminTurn;
+    let ownerProfileId = this.ownerProfileId;
+    if (ownerProfileId === undefined) return undefined;
+    let prefix = chatKeyPrefix(chatId);
+    let [first] = this.storage.chats.list({prefix, limit: 1});
+    run.instanceAdminTurn = this.getChatAgentContext(chatId).spawnerConfig ? "spawned"
+        : isBlueprintProposal(first) ? "blueprint"
+        : run.initiator.type === "user" && run.initiator.id === ownerProfileId &&
+          turnAnswersOwner(this.storage.chats.list({prefix, reverse: true}), ownerProfileId)
+        ? "owner" : "notOwner";
+    return run.instanceAdminTurn;
+  }
+
+  // The live run `terms` serves, or the refusal saying why there is none: the run is registered,
+  // running, not stopped and within INSTANCE_ADMIN_RUN_LIMIT_SECONDS; its turn is the owner's own,
+  // in a chat that is neither spawned nor a blueprint update's review; the owner is a deployment
+  // admin; the capsule is intact; and no external reply is undelivered in the chat. Synchronous, so
+  // it holds for whatever its caller does next without awaiting.
+  #instanceAdminRun(terms: InstanceAdminTerms): ActiveCodeRun {
+    let chatId = terms.caller.chatId;
+    let run = this.#activeCodeRuns.get(chatId);
+    if (run === undefined || run.executionId !== terms.executionId || !run.running) {
+      throw new Error(INSTANCE_ADMIN_RUN_ENDED);
+    }
+    if (run.stopped) throw new Error(INSTANCE_ADMIN_STOPPED);
+    if (instanceAdminRunExpired(run.startedAt, Date.now())) {
+      throw new Error(INSTANCE_ADMIN_RUN_EXPIRED);
+    }
+    let turn = this.#instanceAdminTurn(chatId, run);
+    if (turn === "spawned" || turn === "blueprint") throw new Error(INSTANCE_ADMIN_SPAWNED_CHAT);
+    if (turn !== "owner") throw new Error(INSTANCE_ADMIN_NOT_OWNER_TURN);
+    if (!isDeploymentAdmin(this.env, this.ownerProfileId)) {
+      throw new Error(INSTANCE_ADMIN_NOT_ADMIN);
+    }
+    let capsule = this.storage.gatekeepers.get(terms.capsuleId)?.creationSpec;
+    if (capsule?.type !== "ambient" || capsule.vendorId !== INSTANCE_ADMIN_VENDOR_ID ||
+        capsule.accountId !== terms.accountId) {
+      throw new Error(INSTANCE_ADMIN_REMOVED);
+    }
+    if (this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId)) {
+      throw new Error(INSTANCE_ADMIN_EXTERNAL_REPLY);
+    }
+    return run;
+  }
+
+  // #instanceAdminRun, plus access being on: what every answer, and every view call, needs.
+  #instanceAdminLiveRun(terms: InstanceAdminTerms): ActiveCodeRun {
+    let run = this.#instanceAdminRun(terms);
+    if (!this.#instanceAdminOn()) throw new Error(INSTANCE_ADMIN_OFF);
+    return run;
+  }
+
+  // Opens a session of the instance admin capsule `id` (`record`) for the agent run its loopback
+  // was minted for (`executionId`), handing the facet a grant for that run.
+  async #openInstanceAdminSession(
+      id: WorkpieceId, record: GatekeeperRecord | undefined, facet: InstanceAdminFacet,
+      caller: GatekeeperCaller, executionId: string | undefined): Promise<any> {
+    if (caller.from !== "agent" || executionId === undefined) {
+      throw new Error(INSTANCE_ADMIN_NOT_AGENT);
+    }
+    let spec = record?.creationSpec;
+    if (spec?.type !== "ambient" || spec.vendorId !== INSTANCE_ADMIN_VENDOR_ID) {
+      throw new Error(INSTANCE_ADMIN_REMOVED);
+    }
+    let terms: InstanceAdminTerms = {
+      capsuleId: id, caller: {from: "agent", chatId: caller.chatId}, executionId,
+      accountId: spec.accountId,
+    };
+    // The sharing manager loads ownerProfileId, which the owner checks need.
+    let [, config] = await Promise.all([this.getSharingManager(), readAdminConfig(this.env)]);
+    let run = this.#instanceAdminRun(terms);
+    // Before the account check, so that a disabled vendor reads as such.
+    if (isGatekeeperDisabled(config, INSTANCE_ADMIN_VENDOR_ID)) {
+      throw new Error(INSTANCE_ADMIN_DISABLED);
+    }
+    await (run.instanceAdminAccount ??=
+        this.ownerUserDo().assertInstanceAdminAccount(spec.accountId));
+    this.#instanceAdminRun(terms);
+    // Nothing is awaited from the check to the mint.
+    return facet.startAdminSession(new InstanceAdminGrantImpl(this, terms));
+  }
+
+  /** The directory's title for workspace `id`, for a full inspection's card: "" when the
+   * directory lists none, `id` is not a string, or the directory can't be asked (logged by event
+   * name only). */
+  async #directoryTitle(id: unknown): Promise<string> {
+    if (typeof id !== "string") return "";
+    try {
+      return await this.directories.getByName("").workspaceTitle(id) ?? "";
+    } catch {
+      this.logger.warn("failed to read a workspace's title for an inspection card", {
+        event: "instance.admin.title.failed",
+      });
+      return "";
+    }
+  }
+
+  /**
+   * One call to AdminApi `method` from the agent run `terms` serves (InstanceAdminGrant
+   * .callAdminApi()), dispatched by ADMIN_AGENT_ACCESS: a read runs and is observed; a change is
+   * queued; a call needing approval one at a time runs if an approval allows it, or asks for one;
+   * an inspection at "metadata" opens a view the run's checks keep. While access is off, a call
+   * that names an available method with well-formed arguments asks to turn it on instead.
+   */
+  async callInstanceAdmin(terms: InstanceAdminTerms, method: string, args: unknown[])
+      : Promise<InstanceAdminCallResult> {
+    let kind = adminAgentAccess(method);
+    if (kind === undefined) throw new TypeError(`AdminApi has no method ${method}.`);
+    let name = method as keyof AdminApi;
+    if (kind === "withheld") throw new Error(instanceAdminWithheld(name));
+
+    // What the arguments alone decide, before anything is read.
+    let call: CanonicalAdminCall | undefined;
+    let callArgs = args;
+    if (kind === "change" || kind === "confirm") call = canonicalAdminCall(args);
+    if (kind === "inspect") {
+      let options = args[2];
+      if (options !== undefined &&
+          (typeof options !== "object" || options === null || Array.isArray(options))) {
+        throw new TypeError("inspectWorkspace's options must be an object.");
+      }
+      let requested = (options as {access?: unknown} | undefined)?.access ?? "metadata";
+      if (requested !== "metadata" && requested !== "full") {
+        throw new TypeError("inspectWorkspace's access must be \"metadata\" or \"full\".");
+      }
+      // The view opens at the level classified here, whatever AdminApiImpl's own default.
+      callArgs = [args[0], args[1], {...options, access: requested}];
+      if (requested === "full") call = canonicalAdminCall(callArgs);
+    }
+    this.#instanceAdminRun(terms);
+
+    // Everything the call decides on, read in one await, so that a turn-off, Stop, demotion,
+    // capsule removal or vendor disable during it is seen at the check after it.
+    let [sharing, config, title] = await Promise.all([
+      this.getSharingManager(), readAdminConfig(this.env),
+      kind === "inspect" && call !== undefined ? this.#directoryTitle(args[0]) : undefined,
+    ]);
+    let run = this.#instanceAdminRun(terms);
+    if (isGatekeeperDisabled(config, INSTANCE_ADMIN_VENDOR_ID)) {
+      throw new Error(INSTANCE_ADMIN_DISABLED);
+    }
+    // From here nothing is awaited until the Admin API call starts or the action is queued, so of
+    // two identical calls only the first to get here queues a card.
+    if (!this.#instanceAdminOn()) return this.#requestInstanceAdminActivation(terms, sharing);
+
+    // A change, or a call approved one at a time: a "confirm", or an inspection at "full".
+    if (call !== undefined) {
+      if (kind === "change") {
+        let card = instanceAdminCallCard("change", name, call);
+        assertInstanceAdminActionFits(call, card);
+        let actionId = this.#queueInstanceAdminAction(terms, card, {
+          kind: "change", method: name, args: call.json, sessionId: run.adminSessionId,
+        });
+        return {outcome: "queued", actionId};
+      }
+      return this.#oneCallInstanceAdmin(
+          run, terms, kind === "confirm" ? "confirm" : "inspect", name, call, title);
+    }
+
+    // A read, or an inspection at "metadata".
+    let impl = this.adminApiForAgent({
+      origin: {workspaceId: this.ctx.id.toString(), chatId: terms.caller.chatId},
+      sessionId: run.adminSessionId,
+    });
+    let value: unknown = await Reflect.apply(impl[name], impl, callArgs);
+    if (kind === "inspect") return this.#answerInstanceAdminView(terms, value, callArgs, true);
+    this.#instanceAdminLiveRun(terms);
+    assertPlainAdminResult(`AdminApi.${name}`, value);
+    await this.authorizeObservation(
+        terms.capsuleId, instanceAdminReadObservation(name, callArgs, {value}), terms.caller);
+    return {outcome: "answered", value};
+  }
+
+  // Answers an inspection with `value`, the AdminWorkspaceView it opened, wrapped so that the run's
+  // checks keep it: once the run still holds, the open is observed (with `observeOpen`; a full
+  // inspection's open was observed as soon as it ran) and the wrapper returned. A refusal disposes
+  // the view; the open stays recorded in the deployment's admin audit log.
+  async #answerInstanceAdminView(terms: InstanceAdminTerms, value: unknown, inspectArgs: unknown[],
+      observeOpen: boolean): Promise<InstanceAdminCallResult> {
+    let view = value as RpcStub<AdminWorkspaceView>;
+    try {
+      this.#instanceAdminLiveRun(terms);
+    } catch (error) {
+      view[Symbol.dispose]();
+      throw error;
+    }
+    let description = {workspaceId: String(inspectArgs[0]), reason: String(inspectArgs[1])};
+    let wrapper = new InstanceAdminViewImpl(this, terms, view, description);
+    if (observeOpen) {
+      await this.authorizeObservation(terms.capsuleId, instanceAdminReadObservation(
+          "inspectWorkspace", inspectArgs, {value: undefined}), terms.caller);
+    }
+    return {outcome: "answered", value: wrapper};
+  }
+
+  // The id of a pending instance admin action this chat's agent queued in its current step that
+  // `matches`, if any: a request the turn already made, which it waits on.
+  #capturedInstanceAdminRequest(chatId: number,
+      matches: (held: InstanceAdminActionRecord) => boolean): number | undefined {
+    for (let id of this.#capturedActions.get(chatId)?.actions ?? []) {
+      let record = this.storage.actions.get(id);
+      if (record?.type === "action" && record.state === "pending" && record.instanceAdmin &&
+          matches(record.instanceAdmin)) {
+        return id;
+      }
+    }
+    return undefined;
+  }
+
+  // A call that runs only once the owner approves it ("confirm", or "inspect" at "full"): run it if
+  // an unexpired allowance for exactly this call in this chat is left, consuming it, or else ask
+  // for one. Synchronous up to the call it makes.
+  async #oneCallInstanceAdmin(run: ActiveCodeRun, terms: InstanceAdminTerms,
+      kind: "confirm" | "inspect", method: keyof AdminApi, call: CanonicalAdminCall,
+      title: string | undefined): Promise<InstanceAdminCallResult> {
+    let chatId = terms.caller.chatId;
+    let now = Date.now();
+    let allowance: InstanceAdminAllowanceRecord | undefined;
+    // A snapshot, since deleting during the listing would end typed-storage's KV cursor.
+    for (let held of Array.from(this.storage.instanceAdminAllowances.list())) {
+      if (held.expiresAt.getTime() <= now) {
+        this.storage.instanceAdminAllowances.deleteRecord(held);
+      } else if (allowance === undefined && held.chatId === chatId && held.method === method &&
+                 held.args === call.json) {
+        allowance = held;
+      }
+    }
+    if (allowance === undefined) {
+      let existing = this.#capturedInstanceAdminRequest(chatId, held =>
+          held.kind === kind && held.method === method && held.args === call.json);
+      if (existing !== undefined) {
+        return {outcome: "needsApproval", actionId: existing, existing: true, reason: kind};
+      }
+      let card = instanceAdminCallCard(kind, method, call, title);
+      assertInstanceAdminActionFits(call, card);
+      let actionId = this.#queueInstanceAdminAction(terms, card, {
+        kind, method, args: call.json, sessionId: run.adminSessionId,
+      });
+      return {outcome: "needsApproval", actionId, existing: false, reason: kind};
+    }
+
+    // Consumed before the call, and not restored if it fails: each approval allows one call.
+    this.storage.instanceAdminAllowances.deleteRecord(allowance);
+    let actionId = allowance.actionId;
+    let impl = this.adminApiForAgent({
+      origin: {workspaceId: this.ctx.id.toString(), chatId, actionId},
+      sessionId: run.adminSessionId,
+    });
+    let outcome: {value: unknown} | {error: unknown};
+    try {
+      outcome = {value: await Reflect.apply(impl[method], impl, call.args)};
+      if (kind === "confirm") assertPlainAdminResult(`AdminApi.${method}`, outcome.value);
+    } catch (error) {
+      outcome = {error};
+    }
+    // Recorded as soon as the call settles, before the checks that decide whether to answer: a
+    // paid call that a Stop, turn-off or demotion withholds still ran.
+    await this.authorizeObservation(terms.capsuleId, instanceAdminReadObservation(method, call.args,
+        "error" in outcome || kind === "confirm" ? outcome : {value: undefined}, actionId),
+        terms.caller);
+    if ("error" in outcome) {
+      this.#instanceAdminLiveRun(terms);
+      throw outcome.error;
+    }
+    if (kind === "inspect") {
+      return this.#answerInstanceAdminView(terms, outcome.value, call.args, false);
+    }
+    this.#instanceAdminLiveRun(terms);
+    return {outcome: "answered", value: outcome.value};
+  }
+
+  // Asks the owner to turn deployment admin access on (again, once latched), or names the request
+  // this turn already made. Synchronous.
+  #requestInstanceAdminActivation(terms: InstanceAdminTerms, sharing: SharingManager)
+      : InstanceAdminCallResult {
+    if (!this.#instanceAdminCapsuleAllowed(sharing)) throw new Error(INSTANCE_ADMIN_NOT_PRIVATE);
+    if (this.#hasUndeliveredExternalReply()) throw new Error(INSTANCE_ADMIN_REPLY_PENDING);
+    let existing = this.#capturedInstanceAdminRequest(
+        terms.caller.chatId, held => held.kind === "activate");
+    if (existing !== undefined) {
+      return {outcome: "needsApproval", actionId: existing, existing: true, reason: "activate"};
+    }
+    // Fixed text, so it always fits.
+    let card = instanceAdminActivationCard(this.storage.instanceAdminLatched.get());
+    let actionId = this.#queueInstanceAdminAction(terms, card, {kind: "activate"});
+    return {outcome: "needsApproval", actionId, existing: false, reason: "activate"};
+  }
+
+  // Queues an instance admin action, pending, through the capsule `terms` names, with `card` (which
+  // assertInstanceAdminActionFits has passed) and `instanceAdmin`, what approving it does. Its
+  // `action` is its own id. Returns that id.
+  #queueInstanceAdminAction(terms: InstanceAdminTerms, card: ActionDescription,
+      instanceAdmin: InstanceAdminActionRecord): number {
+    let capsule = this.storage.gatekeepers.get(terms.capsuleId);
+    let id = this.storage.nextActionId.get();
+    this.storage.nextActionId.put(id + 1);
+    this.#queuePendingAction({
+      id, gatekeeperId: terms.capsuleId, caller: terms.caller,
+      resourceTitle: capsule?.resourceTitle, resourceUrl: capsule?.resourceUrl,
+      action: id, createdAt: new Date(), state: "pending", type: "action", description: card,
+      instanceAdmin,
+    });
+    return id;
+  }
+
+  /** One call on an admin view an inspection returned to the agent run `terms` serves: checked as
+   * every instance admin call is, before and after the deployment config's read and after the
+   * answer, and observed before it is answered. */
+  async callInstanceAdminView<T>(terms: InstanceAdminTerms,
+      method: Exclude<AdminWorkspaceMethod, "inspectWorkspace">, args: unknown[],
+      call: () => Promise<T>, view: {workspaceId: string; reason: string}): Promise<T> {
+    this.#instanceAdminLiveRun(terms);
+    let config = await readAdminConfig(this.env);
+    this.#instanceAdminLiveRun(terms);
+    if (isGatekeeperDisabled(config, INSTANCE_ADMIN_VENDOR_ID)) {
+      throw new Error(INSTANCE_ADMIN_DISABLED);
+    }
+    let value = await call();
+    this.#instanceAdminLiveRun(terms);
+    assertPlainAdminResult(`AdminWorkspaceView.${method}`, value);
+    await this.authorizeObservation(
+        terms.capsuleId, instanceAdminViewObservation(view, method, args), terms.caller);
+    return value;
+  }
+
+  // Applies approved instance admin action `record` (applyPendingAction delegates it here): makes
+  // its call, writes its allowance, or turns access on, and marks it approved, never asking the
+  // facet. Refuses an auto-approval, and re-checks right before the commit point everything the
+  // approval depends on; a reject or turn-off that lands before then wins, and one after it is
+  // refused (A4) or skipped, so the action log never contradicts what ran.
+  async #applyInstanceAdminAction(record: ActionRecord & {type: "action"},
+      held: InstanceAdminActionRecord, resolvedBy: AiChatAuthorInfo, autoApproved: boolean)
+      : Promise<void> {
+    if (autoApproved) throw new Error(INSTANCE_ADMIN_MANUAL_ONLY);
+    let {id, caller} = record;
+    // Only the agent's calls queue instance admin actions.
+    if (caller.from !== "agent") throw new Error(`Not a deployment admin action: ${id}`);
+    let chatId = caller.chatId;
+    let sharing = await this.getSharingManager();
+    let check = () => {
+      let current = this.storage.actions.get(id);
+      if (current?.type !== "action" || current.state !== "pending") {
+        throw new Error(`Action is not pending: ${id}`);
+      }
+      if (resolvedBy.type !== "user" || resolvedBy.id !== this.ownerProfileId ||
+          !isDeploymentAdmin(this.env, resolvedBy.id)) {
+        throw new Error(INSTANCE_ADMIN_OWNER_APPROVES);
+      }
+      // The kind was decided when the action was queued; a deploy may since have withheld or
+      // reclassified the method.
+      if (held.kind !== "activate" && adminAgentAccess(held.method) !== held.kind) {
+        throw new Error(instanceAdminWithheld(held.method));
+      }
+      // The capsule it was queued through: a capsule dropped and added again has a new id.
+      if (!isInstanceAdminCapsule(this.storage.gatekeepers.get(record.gatekeeperId))) {
+        throw new Error(INSTANCE_ADMIN_REMOVED);
+      }
+      if (held.kind === "activate") {
+        if (!this.#instanceAdminCapsuleAllowed(sharing)) {
+          throw new Error(INSTANCE_ADMIN_NOT_PRIVATE);
+        }
+        if (this.#hasUndeliveredExternalReply()) throw new Error(INSTANCE_ADMIN_REPLY_PENDING);
+      } else if (!this.#instanceAdminOn()) {
+        throw new Error(INSTANCE_ADMIN_OFF);
+      }
+    };
+    check();
+    let config = await readAdminConfig(this.env);
+    check();
+    if (isGatekeeperDisabled(config, INSTANCE_ADMIN_VENDOR_ID)) {
+      throw new Error(INSTANCE_ADMIN_DISABLED);
+    }
+
+    // The commit point, synchronous with the last check.
+    if (this.#instanceAdminApplying.has(id)) throw new Error(INSTANCE_ADMIN_APPLYING);
+    this.#instanceAdminApplying.add(id);
+    let writes: (() => void) | undefined;
+    try {
+      if (held.kind === "change") {
+        let impl = this.adminApiForAgent({
+          origin: {workspaceId: this.ctx.id.toString(), chatId, actionId: id},
+          sessionId: held.sessionId,
+        });
+        try {
+          await Reflect.apply(impl[held.method], impl, JSON.parse(held.args));
+        } catch (error) {
+          // Not the error itself: the Admin API's message can quote an argument.
+          this.logger.warn("an approved deployment admin change failed", {
+            event: "instance.admin.apply.failed", actionId: id, chatId, operation: held.method,
+          });
+          throw error;
+        }
+      } else if (held.kind === "activate") {
+        // Active before latched, so that a metadata subscriber reads "on" without passing "off".
+        writes = () => {
+          this.storage.instanceAdminActive.put(true);
+          this.storage.instanceAdminLatched.put(true);
+          this.storage.containsRestrictedData.put(true);
+        };
+      } else {
+        let allowance: InstanceAdminAllowanceRecord = {
+          actionId: id, chatId, method: held.method, args: held.args,
+          expiresAt: new Date(Date.now() + INSTANCE_ADMIN_APPROVAL_LIFETIME_SECONDS * 1000),
+        };
+        writes = () => this.storage.instanceAdminAllowances.put(allowance);
+      }
+    } finally {
+      this.#instanceAdminApplying.delete(id);
+    }
+
+    let approved: (ActionRecord & {type: "action"}) | undefined;
+    this.storage.transaction(() => {
+      let current = this.storage.actions.get(id);
+      if (current?.type !== "action" || current.state !== "pending") return;
+      current.state = "approved";
+      current.appliedAt = new Date();
+      current.resolvedBy = resolvedBy;
+      current.autoApproved = false;
+      this.storage.actions.put(current);
+      writes?.();
+      approved = current;
+    });
+    if (approved === undefined) {
+      // Unreachable while reject and turn-off skip the actions being applied.
+      this.logger.error("an approved deployment admin action was resolved while it applied", {
+        event: "instance.admin.apply.raced", actionId: id,
+        ...(held.kind === "activate" ? {} : {operation: held.method}),
+      });
+      return;
+    }
+    this.#announceApproval(approved);
+  }
+
+  /** Rejects pending instance admin action `id` on behalf of `resolvedBy`, deciding on the record
+   * as it is: refuses one no longer pending, or one being applied (A4). */
+  rejectInstanceAdminAction(id: number, resolvedBy: AiChatAuthorInfo): void {
+    let record = this.storage.actions.get(id);
+    if (record?.type !== "action" || record.state !== "pending") {
+      throw new Error(`Action is not pending: ${id}`);
+    }
+    if (this.#instanceAdminApplying.has(id)) throw new Error(INSTANCE_ADMIN_APPLYING);
+    record.state = "rejected";
+    record.appliedAt = new Date();
+    record.resolvedBy = resolvedBy;
+    this.storage.actions.put(record);
+    this.traceAgentActionApproval(record, "denied");
+    if (record.caller.from === "agent") {
+      this.resumeAgentAfterDecision(record.caller.chatId, record.id);
+    }
+  }
+
+  /** Turns deployment admin access off (Overseer.turnOffDeploymentAdminAccess()), whatever the
+   * owner's admin status and the vendor's mode: clears `instanceAdminActive` when latched, drops
+   * every allowance, rejects every pending instance admin action but those being applied, and
+   * restarts the capsule's facet. Synchronous. */
+  turnOffInstanceAdmin(resolvedBy: AiChatAuthorInfo): void {
+    if (this.storage.instanceAdminLatched.get()) this.storage.instanceAdminActive.put(false);
+    // Snapshots before each walk: a write, or the listings a reject's resume makes, would end
+    // typed-storage's KV cursor.
+    for (let allowance of Array.from(this.storage.instanceAdminAllowances.list())) {
+      this.storage.instanceAdminAllowances.deleteRecord(allowance);
+    }
+    let pending = Array.from(this.storage.actions.byHistoryFilter.get("pending"));
+    for (let record of pending) {
+      if (record.type !== "action" || !record.instanceAdmin ||
+          this.#instanceAdminApplying.has(record.id)) {
+        continue;
+      }
+      this.rejectInstanceAdminAction(record.id, resolvedBy);
+    }
+    for (let record of Array.from(this.storage.gatekeepers.list())) {
+      if (!isInstanceAdminCapsule(record)) continue;
+      try {
+        this.ctx.facets.abort(`gatekeeper${record.id}`,
+            new Error("Connection restarted because deployment admin access was turned off."));
+      } catch (error) {
+        this.logger.warn("failed to restart the instance admin capsule", {
+          event: "instance.admin.capsule.abort.failed", gatekeeperId: record.id, error,
+        });
+      }
+    }
+  }
+
+  /** GadgetMetadata.deploymentAdminAccess. */
+  deploymentAdminAccess(): "on" | "off" | undefined {
+    return deploymentAdminAccessOf(
+        this.storage.instanceAdminLatched.get(), this.storage.instanceAdminActive.get());
   }
 
   // Sessions are authorized and verified only at open(), so widening what a live session's holder
@@ -6980,6 +7693,9 @@ class OverseerImpl implements AgentHooks {
     promptSequence: number,
     chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>,
   ): void {
+    // Inside the caller's transaction, so a message parked across the activation that latched the
+    // workspace writes nothing (receiveExternalMessage maps this to its refusal).
+    if (this.storage.instanceAdminLatched.get()) throw new Error(NO_EXTERNAL_MESSAGES);
     if (this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId)) {
       throw new Error("This chat already has an undelivered workspace response target.");
     }
@@ -7101,6 +7817,7 @@ class OverseerImpl implements AgentHooks {
   // Stops the chat's running agent. Its queued steers are dropped: the client that stops puts them
   // in its draft (see Overseer.stopAgent).
   cancelAgent(chatId: number) {
+    this.#stopCodeRun(chatId);
     let meta = this.storage.chatMeta.get(chatId);
     if (meta?.queuedSteers) {
       delete meta.queuedSteers;
@@ -7814,6 +8531,10 @@ class OverseerImpl implements AgentHooks {
     // single round trip both provisions them and reads them back before we wire up capsules.
     let accounts = (await ownerDo.listProvidedAccounts())
         .filter(account => account.description.singleton?.tsType);
+    // The instance admin capsule exists only where #instanceAdminCapsuleAllowed() says it may.
+    let sharing = await this.getSharingManager();
+    let allowed = (vendorId: string) =>
+        vendorId !== INSTANCE_ADMIN_VENDOR_ID || this.#instanceAdminCapsuleAllowed(sharing);
 
     // Reconcile existing ambient capsule records against the owner's current singleton accounts. Each
     // record is keyed to a specific accountId; if that account is gone (disconnected) or was replaced
@@ -7825,13 +8546,15 @@ class OverseerImpl implements AgentHooks {
     let existingGatekeepers = Array.from(this.storage.gatekeepers.list());
     for (let gk of existingGatekeepers) {
       if (gk.creationSpec?.type !== "ambient") continue;
-      if (currentAccountId.get(gk.creationSpec.vendorId) === gk.creationSpec.accountId) {
+      if (currentAccountId.get(gk.creationSpec.vendorId) === gk.creationSpec.accountId &&
+          allowed(gk.creationSpec.vendorId)) {
         bound.add(gk.creationSpec.vendorId);
       } else {
         this.removeGatekeeper(gk.id);
       }
     }
-    let toAdd = accounts.filter(account => !bound.has(account.vendorId));
+    let toAdd = accounts.filter(
+        account => !bound.has(account.vendorId) && allowed(account.vendorId));
     if (toAdd.length === 0) return;
 
     // Each singleton account provides a normal Gatekeeper class (imbued via ctx.props with whatever
@@ -7851,10 +8574,14 @@ class OverseerImpl implements AgentHooks {
         // Provision as an unnamed record: it reaches the agent through each chat's env (named from
         // the gatekeeper's suggested binding name when the chat takes it in; see
         // prepareChatBindings), not as any gadget's binding.
+        // Asked again right before the record is published: the workspace may have been shared
+        // while the class and the facet's description were fetched.
         await this.addGatekeeper(
             cls,
             {type: "ambient", vendorId: account.vendorId, accountId: account.accountId},
-            ownerId);
+            ownerId, undefined, () => {
+              if (!allowed(account.vendorId)) throw new Error(INSTANCE_ADMIN_NOT_PRIVATE);
+            });
       } catch (err) {
         this.logger.error("failed to provision ambient capsule", {
           event: "ambient.capsule.provision.failed",
@@ -9101,13 +9828,18 @@ class OverseerImpl implements AgentHooks {
     crypto.getRandomValues(bytes);
     let executionId: string = bytes.toBase64();
 
-    // Register the turn's worktree state for the worktree binding loopbacks (see
-    // startGatekeeperSession's "worktree" case), for exactly this execution's duration -- the
-    // executionId is minted into the loopbacks below, so stubs from other executions never
-    // resolve against this registration.
-    if (worktreeTurn !== undefined) {
-      this.#activeWorktreeTurns.set(chatId, {access: worktreeTurn, initiator, executionId});
-    }
+    // Register the run for exactly this execution's duration (see ActiveCodeRun), synchronously,
+    // before getEnvForAgent below mints its executionId into the worktree and instance admin
+    // loopbacks, so stubs from other executions never resolve against this registration. It is
+    // running from here on: the code reaches its env only inside run() (disallow_importable_env;
+    // the harness's verify() is empty). A run whose turn was already stopped starts stopped.
+    let run: ActiveCodeRun = {
+      executionId, initiator, running: true,
+      stopped: this.#liveChats.get(chatId)?.cancelController.signal.aborted === true,
+      startedAt: Date.now(), adminSessionId: crypto.randomUUID(),
+      ...(worktreeTurn !== undefined ? {worktree: worktreeTurn} : {}),
+    };
+    this.#activeCodeRuns.set(chatId, run);
 
     if (onOutputText) {
       this.#codeModeOutputSubscribers.set(executionId, onOutputText);
@@ -9170,6 +9902,9 @@ class OverseerImpl implements AgentHooks {
           error = `${err}`;
         }
         onOutputText?.(`\n\nUncaught exception: ${error}`);
+      } finally {
+        // The code can no longer reach its env, so neither can anything it passed its bindings to.
+        run.running = false;
       }
 
       let timeout = scheduler.wait(5000).then(() => { return null; })
@@ -9196,8 +9931,8 @@ class OverseerImpl implements AgentHooks {
       return log;
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
-      if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {
-        this.#activeWorktreeTurns.delete(chatId);
+      if (this.#activeCodeRuns.get(chatId)?.executionId === executionId) {
+        this.#activeCodeRuns.delete(chatId);
       }
       this.#codeModeOutputSubscribers.delete(executionId);
       this.#codeModeResolvers.delete(executionId);
@@ -9250,6 +9985,8 @@ class OverseerImpl implements AgentHooks {
     let actionIds: number[] = [];
     let requestIds: string[] = [];
     let titles: string[] = [];
+    // Approved instance admin requests run nothing themselves (see resumeAgentAfterDecision).
+    let oneCallTitles: string[] = [];
     let pending = false;
     let denied = false;
     let steered = false;
@@ -9278,14 +10015,16 @@ class OverseerImpl implements AgentHooks {
         if (record?.type === "action" && record.caller.from === "agent" &&
             record.description.awaitDecision) {
           actionIds.push(record.id);
-          titles.push(record.description.title);
+          (record.instanceAdmin && record.instanceAdmin.kind !== "change" ? oneCallTitles : titles)
+              .push(record.description.title);
           pending ||= record.state === "pending";
           denied ||= record.state === "rejected";
         }
       }
     }
     return agent && (actionIds.length || requestIds.length)
-        ? {agent, actionIds, requestIds, titles: titles.toReversed(), pending, denied}
+        ? {agent, actionIds, requestIds, titles: titles.toReversed(),
+           oneCallTitles: oneCallTitles.toReversed(), pending, denied}
         : undefined;
   }
 
@@ -9314,8 +10053,16 @@ class OverseerImpl implements AgentHooks {
       return;
     }
     if (wait.pending || this.isPreparingChatMessage(chatId)) return;
-    let text = wait.titles.length
-        ? `The changes you submitted have been approved and applied: ${wait.titles.map(t => `"${t}"`).join(", ")}. Reads now reflect them.`
+    // An approval that ran nothing (turning access on, a one-call approval) asks the agent to make
+    // the call again; a change's approval keeps the sentence it always had.
+    let decided = [
+      ...wait.titles.length
+          ? [`The changes you submitted have been approved and applied: ${wait.titles.map(t => `"${t}"`).join(", ")}. Reads now reflect them.`]
+          : [],
+      ...wait.oneCallTitles.length ? [instanceAdminApprovedNudge(wait.oneCallTitles)] : [],
+    ];
+    let text = decided.length
+        ? decided.join(" ")
         : "The requested connections have been accepted. Continue using the connected resources.";
     this.addChatMessages(chatId, record.initiator, [{type: "agentNudge", text}]);
     meta.activeAgent = wait.agent;
@@ -9834,8 +10581,11 @@ class OverseerImpl implements AgentHooks {
     return result.filter(gk => !this.#creationPending(gk.id));
   }
 
+  // Omits the instance admin capsule: sharing drops it, and this is only a preview of what opening
+  // will verify (#inScopeGatekeepers still enforces it).
   listObserverRequirements(role: CollaboratorRole): ObserverBindingNeed[] {
-    return this.#inScopeGatekeepers(role).map(observerBindingNeed);
+    return this.#inScopeGatekeepers(role).filter(record => !isInstanceAdminCapsule(record))
+        .map(observerBindingNeed);
   }
 
   // Tail of the in-flight addObserver/removeObserver chain per `${observerId}/${gatekeeperId}`
@@ -10239,7 +10989,10 @@ class OverseerImpl implements AgentHooks {
   async getSharingManager(): Promise<SharingManager> {
     if (!this.#sharingManager) {
       this.#sharingManager = new SharingManager(
-          this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get());
+          this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get(), {
+            ownerOnly: () => this.storage.instanceAdminLatched.get(),
+            onShared: () => this.#dropInstanceAdminCapsule(),
+          });
     }
     return this.#sharingManager;
   }
@@ -10608,9 +11361,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let trimmedReason = validateAdminAccessReason(reason);
-    if (terms.via !== "api" && terms.via !== "cli") {
-      throw new TypeError("An admin view's via must be \"api\" or \"cli\".");
-    }
+    assertAdminViewVia(terms);
     if (terms.access !== "metadata" && terms.access !== "full") {
       throw new TypeError("An admin view's access must be \"metadata\" or \"full\".");
     }
@@ -10678,6 +11429,13 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         user_id: callerId,
         source: "external_message",
       });
+    }
+
+    // A workspace where deployment admin access was ever on takes no external messages. Only its
+    // owner is told so: anyone else is refused below as by any workspace they can't use (nobody
+    // else has a role in it), so a sender learns nothing of the owner's admin status.
+    if (ownerId === callerId && this.impl.storage.instanceAdminLatched.get()) {
+      return { accepted: false, message: NO_EXTERNAL_MESSAGES };
     }
 
     // A non-owner caller counts as a live "build" session from the moment they are authorized
@@ -10771,27 +11529,36 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       chatGatewayRpcTarget: input.chatGatewayRpcTarget,
     };
     let chatId: number;
-    if (externalChat) {
-      await this.impl.sendChatMessage(
-        caller,
-        userContext,
-        externalChat.chatId,
-        input.prompt,
-        undefined,
-        undefined,
-        responseTargetRegistration,
-      );
-      chatId = externalChat.chatId;
-    } else {
-      chatId = await this.impl.newChat(
-        caller,
-        userContext,
-        input.prompt,
-        undefined,
-        undefined,
-        responseTargetRegistration,
-        input.externalChatKey,
-      );
+    try {
+      if (externalChat) {
+        await this.impl.sendChatMessage(
+          caller,
+          userContext,
+          externalChat.chatId,
+          input.prompt,
+          undefined,
+          undefined,
+          responseTargetRegistration,
+        );
+        chatId = externalChat.chatId;
+      } else {
+        chatId = await this.impl.newChat(
+          caller,
+          userContext,
+          input.prompt,
+          undefined,
+          undefined,
+          responseTargetRegistration,
+          input.externalChatKey,
+        );
+      }
+    } catch (error) {
+      // Latched while the message was parked: registerExternalMessageResponseTarget refused it
+      // inside the prompt's transaction, which wrote nothing.
+      if (this.impl.storage.instanceAdminLatched.get()) {
+        return { accepted: false, message: NO_EXTERNAL_MESSAGES };
+      }
+      throw error;
     }
 
     return { accepted: true, chatPath: `/workspace/${this.ctx.id.toString()}?chat=${chatId}` };
@@ -10900,8 +11667,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (!vendorId) throw new Error("Hook vendor is unavailable.");
 
     let config = await readAdminConfig(this.env);
-    if (config.disabledGatekeepers.includes(vendorId) ||
-        ambientGatekeeperMode(config, vendorId) === "disabled") {
+    if (isGatekeeperDisabled(config, vendorId)) {
       throw new Error("Gatekeeper is disabled.");
     }
 
@@ -11051,14 +11817,20 @@ type GatekeeperLoopbackProps = {
 };
 
 type BindingLoopbackTarget = {
-  type: "gadget" | "gatekeeper";
+  type: "gadget";
   id: WorkpieceId;
+} | {
+  type: "gatekeeper";
+  id: WorkpieceId;
+
+  /** Set only on the instance admin capsule's agent-env loopback: the run it was minted for. */
+  executionId?: string;
 } | {
   type: "worktree";
   id: WorkpieceId;
 
   // The executeCodeMode execution this loopback was minted for. A worktree binding resolves
-  // against the turn state registered for exactly that execution (see #activeWorktreeTurns), so
+  // against the run registered for exactly that execution (see #activeCodeRuns), so
   // a stub retained past it -- say, stored in a gadget the agent called -- fails closed instead
   // of coming back to life against a later execution's turn.
   executionId: string;
@@ -11486,6 +12258,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       role: "build",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
+    let adminAccess = this.impl.deploymentAdminAccess();
+    if (adminAccess !== undefined) result.deploymentAdminAccess = adminAccess;
     if (!this.isOwner) {
       result.owner = await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
     }
@@ -11512,6 +12286,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       defaultGadgetId: this.impl.defaultGadgetId,
     };
     if (owner) metadata.owner = owner;
+    // A singleton's subscriber runs before its new value lands, so each keeps the value it is given.
+    let adminAccessLatched = this.impl.storage.instanceAdminLatched.get();
+    let adminAccessActive = this.impl.storage.instanceAdminActive.get();
+    let setAdminAccess = () => {
+      let adminAccess = deploymentAdminAccessOf(adminAccessLatched, adminAccessActive);
+      if (adminAccess === undefined) delete metadata.deploymentAdminAccess;
+      else metadata.deploymentAdminAccess = adminAccess;
+    };
+    setAdminAccess();
 
     let titleSubscriber = {
       update(value: string) {
@@ -11537,12 +12320,28 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         callback(metadata).catch(unsubscribe);
       }
     };
+    let adminAccessLatchedSubscriber = {
+      update(value: boolean) {
+        adminAccessLatched = value;
+        setAdminAccess();
+        callback(metadata).catch(unsubscribe);
+      }
+    };
+    let adminAccessActiveSubscriber = {
+      update(value: boolean) {
+        adminAccessActive = value;
+        setAdminAccess();
+        callback(metadata).catch(unsubscribe);
+      }
+    };
 
     let unsubscribe = () => {
       this.impl.storage.title.unsubscribe(titleSubscriber);
       this.impl.storage.totalCost.unsubscribe(costSubscriber);
       this.impl.storage.containsRestrictedData.unsubscribe(restrictedDataSubscriber);
       this.impl.storage.ownerInvitesOnly.unsubscribe(ownerInvitesOnlySubscriber);
+      this.impl.storage.instanceAdminLatched.unsubscribe(adminAccessLatchedSubscriber);
+      this.impl.storage.instanceAdminActive.unsubscribe(adminAccessActiveSubscriber);
       callback[Symbol.dispose]();
     };
 
@@ -11550,6 +12349,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.storage.totalCost.subscribe(costSubscriber);
     this.impl.storage.containsRestrictedData.subscribe(restrictedDataSubscriber);
     this.impl.storage.ownerInvitesOnly.subscribe(ownerInvitesOnlySubscriber);
+    this.impl.storage.instanceAdminLatched.subscribe(adminAccessLatchedSubscriber);
+    this.impl.storage.instanceAdminActive.subscribe(adminAccessActiveSubscriber);
 
     callback(metadata).catch(unsubscribe);
 
@@ -11849,9 +12650,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           throw new Error(`Agent spawner env entry "${name}" references gadget ${target}, ` +
               `which is still pending in a chat.`);
         }
-      } else if (!this.impl.storage.gatekeepers.get(target)) {
-        throw new Error(`Agent spawner env entry "${name}" references workpiece ${target}, ` +
-            `which does not exist.`);
+      } else {
+        let gatekeeper = this.impl.storage.gatekeepers.get(target);
+        if (!gatekeeper) {
+          throw new Error(`Agent spawner env entry "${name}" references workpiece ${target}, ` +
+              `which does not exist.`);
+        }
+        if (gatekeeperVendorId(gatekeeper) === INSTANCE_ADMIN_VENDOR_ID) {
+          throw new Error(INSTANCE_ADMIN_NOT_BINDABLE);
+        }
       }
     }
 
@@ -12018,6 +12825,13 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error(`Can't reject an observation: ${id}`);
     }
 
+    // The Workshop holds what an instance admin action does, so its facet is never asked.
+    if (action.instanceAdmin) {
+      let profile = await this.#getClientProfile();
+      this.impl.rejectInstanceAdminAction(id, profile);
+      return;
+    }
+
     if (action.action === "create") {
       // Rejecting a creation removes its connection, as disconnecting would (clearing queued
       // pushes' marks), and rejects every action queued against the simulated resource: none can
@@ -12067,6 +12881,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // sibling approval from resuming this turn. Like an approval, though, clearing this manual gate
     // may unblock later auto-eligible pending actions, whose turns do resume.
     this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId));
+  }
+
+  async turnOffDeploymentAdminAccess(): Promise<void> {
+    if (!this.isOwner) throw new Error(INSTANCE_ADMIN_OWNER_TURNS_OFF);
+    let profile = await this.#getClientProfile();
+    this.impl.turnOffInstanceAdmin(profile);
   }
 
   // Enable auto-approval of actions carrying `actionKind` on the given gatekeeper. Stores the
@@ -13045,6 +13865,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
   async approveAction(_id: number): Promise<void> { this.#deny(); }
   async rejectAction(_id: number): Promise<void> { this.#deny(); }
+  async turnOffDeploymentAdminAccess(): Promise<void> { this.#deny(); }
   async listHooks(): Promise<BoundHookInfo[]> { this.#deny(); }
   async enableHook(_id: number): Promise<void> { this.#deny(); }
   async disableHook(_id: number): Promise<void> { this.#deny(); }
@@ -13144,6 +13965,93 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async previewRevokeShareLink(_linkId: string): Promise<AffectedCollaborator[]> { this.#deny(); }
 }
 
+// The deployment admin power the Workshop lends the instance admin Gatekeeper for one session (see
+// InstanceAdminGrant): each call goes to OverseerImpl.callInstanceAdmin, which decides it. Keeps
+// what it holds in real private fields: RPC exposes an RpcTarget's properties as well as its
+// methods (see RestoreForgerImpl), and these carry admin power.
+@validateRpc()
+class InstanceAdminGrantImpl extends RpcTarget implements InstanceAdminGrant {
+  #impl: OverseerImpl;
+  #terms: InstanceAdminTerms;
+
+  constructor(impl: OverseerImpl, terms: InstanceAdminTerms) {
+    super();
+    this.#impl = impl;
+    this.#terms = terms;
+  }
+
+  callAdminApi(method: string, args: unknown[]): Promise<InstanceAdminCallResult> {
+    return this.#impl.callInstanceAdmin(this.#terms, method, args);
+  }
+}
+
+// An admin view an inspection opened for the instance admin Gatekeeper's agent run, as the run
+// receives it: every call goes through OverseerImpl.callInstanceAdminView, so the view works only
+// while the run's grant would, and each call is observed in the owner's workspace. Private fields
+// for the same reason as InstanceAdminGrantImpl's.
+@validateRpc()
+class InstanceAdminViewImpl extends RpcTarget implements AdminWorkspaceView {
+  #impl: OverseerImpl;
+  #terms: InstanceAdminTerms;
+  #view: RpcStub<AdminWorkspaceView>;
+  #description: {workspaceId: string; reason: string};
+
+  constructor(impl: OverseerImpl, terms: InstanceAdminTerms, view: RpcStub<AdminWorkspaceView>,
+              description: {workspaceId: string; reason: string}) {
+    super();
+    this.#impl = impl;
+    this.#terms = terms;
+    this.#view = view;
+    this.#description = description;
+  }
+
+  // `args` as the observation shows them, trailing omitted arguments left out.
+  #call<T>(method: Exclude<AdminWorkspaceMethod, "inspectWorkspace">, args: unknown[],
+           call: () => Promise<T>): Promise<T> {
+    while (args.length > 0 && args.at(-1) === undefined) args.pop();
+    return this.#impl.callInstanceAdminView(this.#terms, method, args, call, this.#description);
+  }
+
+  describe(): Promise<AdminWorkspaceDescription> {
+    return this.#call("describe", [], () => this.#view.describe());
+  }
+
+  listChats(): Promise<AiChatMetadata[]> {
+    return this.#call("listChats", [], () => this.#view.listChats());
+  }
+
+  getChat(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage> {
+    return this.#call("getChat", [chatId, beforeSequence],
+        () => this.#view.getChat(chatId, beforeSequence));
+  }
+
+  listActions(options?: {beforeId?: number, filter?: ActionHistoryFilter})
+      : Promise<ActionHistoryPage> {
+    return this.#call("listActions", [options], () => this.#view.listActions(options));
+  }
+
+  listFiles(gadgetId: WorkpieceId): Promise<TreeNode[]> {
+    return this.#call("listFiles", [gadgetId], () => this.#view.listFiles(gadgetId));
+  }
+
+  readFile(gadgetId: WorkpieceId, path: string): Promise<FileAtCommit> {
+    return this.#call<FileAtCommit>("readFile", [gadgetId, path],
+        async () => await this.#view.readFile(gadgetId, path));
+  }
+
+  listGatekeepers(): Promise<AdminGatekeeperInfo[]> {
+    return this.#call("listGatekeepers", [], () => this.#view.listGatekeepers());
+  }
+
+  getDiagnostics(): Promise<AdminWorkspaceDiagnostics> {
+    return this.#call("getDiagnostics", [], () => this.#view.getDiagnostics());
+  }
+
+  [Symbol.dispose](): void {
+    this.#view[Symbol.dispose]();
+  }
+}
+
 // A deployment admin's read-only view of the workspace (see AdminWorkspaceView in api.ts and
 // OverseerDurableObject.openForAdmin()). Deliberately not an Overseer: it holds no session, joins
 // no presence or fan-out, and never reads through a connection: its file reads never pull, and
@@ -13238,6 +14146,7 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
       admin: this.#adminId,
       sessionId: this.#sessionId,
       via: this.#terms.via,
+      ...(this.#terms.origin ? {origin: this.#terms.origin} : {}),
       // A title has no length limit of its own, and an uncut one could overflow the
       // deployment-wide row and so refuse every investigation of this workspace.
       workspaceTitle: cutAdminAuditText(impl.storage.title.get(), MAX_ADMIN_AUDIT_ARG_LENGTH),
@@ -13278,6 +14187,7 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
           () => impl.wrapUserDo(impl.users.get(impl.users.idFromString(ownerId))).whoami(),
           impl.logger);
       let collaborators = await (await impl.getSharingManager()).listCollaborators();
+      let deploymentAdminAccess = impl.deploymentAdminAccess();
       return {
         id: impl.ctx.id.toString(),
         // Live data, not a record, so whole.
@@ -13286,6 +14196,7 @@ class AdminWorkspaceViewImpl extends RpcTarget implements AdminWorkspaceView {
         containsRestrictedData: impl.storage.containsRestrictedData.get(),
         ownerInvitesOnly: impl.storage.ownerInvitesOnly.get(),
         defaultGadgetId: impl.defaultGadgetId,
+        ...(deploymentAdminAccess ? {deploymentAdminAccess} : {}),
         owner,
         workpieces: [...impl.storage.gadgets.list()]
             .map(record => workpieceSummary(record, access === "full")),

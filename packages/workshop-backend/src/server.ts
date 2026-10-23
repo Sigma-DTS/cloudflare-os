@@ -668,9 +668,15 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
     // resource catalog so RBAC-gated ones still surface for this admin.
     let adminUserId = this.#userId.name!;
+    // capnweb-validate refuses any other value already. Checked again here because a client stating
+    // "gatekeeper" would label its records as an agent's, which only the Workshop records.
+    let via = options?.via ?? "api";
+    if (via !== "api" && via !== "cli") {
+      throw new TypeError("An Admin API client's via must be \"api\" or \"cli\".");
+    }
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
-    return new AdminApiImpl(this.ctx, this.env, adminUserId, options?.via ?? "api");
+    return new AdminApiImpl(this.ctx, this.env, adminUserId, via);
   }
 }
 

@@ -92,6 +92,38 @@ tracks Context source/config edits for watch reruns while excluding its generate
 
 Run just these cases with `pnpm --filter @gadgets/integration-tests test:run __tests__/context-sharing.test.ts`.
 
+### The real instance admin Gatekeeper
+
+`__tests__/instance-admin-*.test.ts` boot the real `gatekeeper-instanceadmin` beside the Workshop
+and drive it as an admin's agent would, scripting the agent's `executeCode` calls (see
+[admin-access.md](admin-access.md#through-an-agent)).
+
+It is booted as `gatekeeper-github` is: from the validated tree its
+`@gadgets/gatekeeper-instanceadmin#build:integration-worker` writes into that package's
+`.wrangler/validate`, which the `test` task and `test:prebuild` build first, and
+`INSTANCE_ADMIN_GATEKEEPER` (`src/harness.ts`) deletes the config's `build` so no suite rebuilds it
+under its siblings. It is not in `src/worker-inputs.ts` either, for the same reason: that table also
+keys the eval cache, and the evals never boot this Gatekeeper.
+
+Each agent session is an admin account of its own, signed up by exact name and added to `ADMINS`
+in the suite's `patchWorkshop`. A session's turns reach its own script because the scripted model
+routes on the Workers AI account id of the model the session added, and an account can add only one
+model under the scripted model's id.
+
+- `instance-admin-gatekeeper.test.ts`: who is offered it, turning access on, where the capsule may
+  live, changes and their approval, inspections, the turns it serves (a callback's, a direct
+  session, a gadget binding, Stop), the withheld methods, turning access off, and the deployment
+  disabling it.
+- `instance-admin-gateway.test.ts`: in AI Gateway mode, a gateway test sends nothing until its one
+  call is approved, then exactly one request, and a rejected one never sends.
+- `instance-admin-demotion.test.ts`: a redeploy that drops the owner from `ADMINS` ends their
+  agent's admin power, hides the account and removes the capsule, and they can still turn access
+  off.
+
+Each runs serially on a harness of its own, since admin settings and the audit log are
+deployment-wide. Slash-command turns are covered by workshop-backend's
+`instance-admin-turns.test.ts` instead: no slash-command provider boots here.
+
 ### Storage isolation is by convention, because the alternative is worse
 
 `server.reset()` exists, and measuring it settles the question: **~3 s per call**, which is more than

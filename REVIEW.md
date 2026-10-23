@@ -34,7 +34,9 @@ through logs and errors, then everything else.
   where disabled gatekeepers and resources are enforced before a capability is minted, called by
   both of that file's mints: `getGatekeeperClassFor()` (not the same-named vendor method each
   gatekeeper implements) and `createResourceGatekeeper()`. Flag any new path that mints a
-  gatekeeper capability without going through it.
+  gatekeeper capability without going through it. Ambient singletons skip it: their chokepoint is
+  `getSingletonGatekeeperClass()`, which refuses, before it reaches the account, a vendor the
+  deployment disabled and an instance admin account the user is not offered (not an admin now).
 - Authentication and authorization config (`AUTH_GATEKEEPERS`, `DISABLE_PASSWORD_AUTH`) is
   deliberately env-var driven in `auth/config.ts` and must **not** move into `AdminConfig`, so a
   compromised admin session cannot change it. Reject changes that relocate it.
@@ -61,6 +63,47 @@ through logs and errors, then everything else.
 - Text a user or workspace member controls (display names, titles) enters the directory or the
   audit log only bounded: clamped to `MAX_DIRECTORY_TEXT_LENGTH`, or cut by `cutAdminAuditText()`.
   Flag a new copy of such text into either store without a bound.
+- The instance admin Gatekeeper (`packages/gatekeeper-instanceadmin`, see
+  [docs/admin-access.md](docs/admin-access.md#through-an-agent)) serves an admin's agent the Admin
+  API, and only the kernel exercises that power:
+  - A via-`"gatekeeper"` `AdminApiImpl` is constructed only in `OverseerImpl.adminApiForAgent()`,
+    never returned or stored, and its only callers are `callInstanceAdmin` (reads, approved
+    one-call runs and inspections, reached only through the `InstanceAdminGrantImpl` that
+    `#openInstanceAdminSession` mints for the ambient instanceadmin capsule) and
+    `#applyInstanceAdminAction`, the one place an approved change runs. Views it opens reach the
+    agent only inside `InstanceAdminViewImpl`, whose calls go through `callInstanceAdminView`. Flag
+    any other construction, any path that hands a Gatekeeper an `AdminApi`, and any call the
+    action record does not hold.
+  - Every `AdminApi` method has an `ADMIN_AGENT_ACCESS` entry, and the grant dispatches on it alone;
+    the apply checks it again for a held action (refusing one whose method no longer has that
+    kind). `read` is only for a method that neither changes nor spends; setters are `change`,
+    tagged `@mutates`; paid or committing calls are `confirm`, tagged `@confirmation`; only
+    `inspect` returns a capability, which the kernel wraps. Every read, confirm and view answer
+    goes through `assertPlainAdminResult`.
+  - Grants and views re-check before each call and before each answer: the agent's own code run
+    is running, not stopped, and within `INSTANCE_ADMIN_RUN_LIMIT_SECONDS` (`#activeCodeRuns`, by
+    `executionId`); its turn is the owner's own (the initiator, and `turnAnswersOwner`, for which a
+    slash command's expansion counts as its connection's, not the owner's, and the built-in
+    `/compact` continues the task before it, as a nudge does; flag any record without task text
+    that `turnAnswersOwner` treats as starting one), in a chat neither spawned nor a blueprint
+    review; the owner is an admin; the capsule is intact; no external reply is pending; access is
+    latched and active; and the vendor is enabled (read at each mint, grant call, view call and
+    apply).
+  - A grant call reads what it decides on in one await before its last check, and nothing is
+    awaited between that check and the `AdminApi` call or the queued action. Flag an await placed
+    in between.
+  - A consumed allowance's call is observed as soon as it settles, before its re-check. Flag a
+    re-check or an await placed ahead of that record.
+  - An approved call's id enters `#instanceAdminApplying` synchronously with the apply's last
+    check. Reject refuses it and turn-off skips it, so the action log never contradicts the
+    deployment log.
+  - Once a workspace is latched (deployment admin access was ever on), nobody but its owner may
+    ever open it. Flag anything that adds a collaborator, link, redemption or external message
+    there (`registerExternalMessageResponseTarget` refuses too), or that clears the latch.
+  - The capsule exists only in latched or private workspaces. Flag any path that adds it otherwise,
+    or that shares a workspace without dropping it.
+  - Only `packages/gatekeeper-instanceadmin` may be bound as `GATEKEEPER_INSTANCEADMIN`:
+    `releaseShortName` refuses any other package whose slug folds to `instanceadmin`.
 - In `packages/mcp-shared/`, `tools.ts` is the trust boundary: nothing outside it may read a tool's
   annotations, a tool is an observation only when the server declares `readOnlyHint: true`, and
   auto-applying a write additionally requires a `vetted` endpoint. Every SDK OAuth operation must be
@@ -76,6 +119,19 @@ user stories, what would you do differently? Check that the seams (resource gran
 sessions) partition authority along the lines users actually grant. The checklist is "Reviewing a
 gatekeeper" in `.agents/skills/write-gatekeeper/SKILL.md`.
 
+The instance admin Gatekeeper differs:
+
+- Review `packages/api-schema/generated/admin-api.agent.d.ts` as its `types.d.ts`. Its session has
+  no per-method code, so what a method may do belongs in `ADMIN_AGENT_ACCESS`.
+- Its types talk about approvals and its queued changes aren't simulated: a deliberate departure
+  from the write-gatekeeper skill, because the Workshop holds the queue.
+- `InstanceAdminSession` is the one RPC class without `@validateRpc()`. Its methods come from the
+  generated schema, `checkArguments` checks their arguments, and the Workshop's `AdminApiImpl`
+  validates them again. The facet's `startAdminSession()` is `@skipRpcValidation()` for the same
+  reason: capnweb-validate builds a return validator from the declared type, which declares none of
+  the session's methods, so a validated return would refuse every one of them. Flag any other RPC
+  class without `@validateRpc()`, and any per-method code added to this one.
+
 ## Logging, errors and secrets
 
 - Server code logs through `@gadgets/observability/logger` with a module-scoped logger and a stable
@@ -83,6 +139,9 @@ gatekeeper" in `.agents/skills/write-gatekeeper/SKILL.md`.
 - Never log or report secrets, prompts, headers, tokens, or request/response bodies. Exception
   messages and stacks reach the external Reporter, so the same rule applies to anything thrown or
   attached as report metadata.
+- Logs on the instance admin paths name the event and ids, and the method only as `operation`,
+  once `ADMIN_AGENT_ACCESS` has classified it. Flag one that logs arguments, results, reasons,
+  titles, an Admin API error's message, or a method name nothing classified.
 - Gatekeeper UIs must not report errors directly from their own Worker origin; they `postMessage`
   to the Workshop host, which validates the known frame window with origin `null`. Frontend reports
   never convey authority.

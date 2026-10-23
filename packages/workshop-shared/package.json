@@ -19,6 +19,10 @@
       "types": "./src/cloudflare-gatekeeper.ts",
       "import": "./src/cloudflare-gatekeeper.ts"
     },
+    "./instance-admin": {
+      "types": "./src/instance-admin.ts",
+      "import": "./src/instance-admin.ts"
+    },
     "./limits": {
       "types": "./src/limits.ts",
       "import": "./src/limits.ts"

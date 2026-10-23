@@ -95,6 +95,13 @@ new user. On a public server, set it to **Disabled** in the admin Gatekeepers pa
 accept that spend. A change applies to each workspace when it next opens; uninstalling the Worker
 stops searches at once.
 
+The **Instance admin** gatekeeper (`packages/gatekeeper-instanceadmin`) is installed on every new
+deploy too, but stays **Disabled** until an admin chooses a mode in the admin Gatekeepers panel,
+and is only ever offered to deployment admins. It lends deployment admin power to an admin's own
+agent, in a workspace they turn it on in (see [admin-access.md](admin-access.md#through-an-agent)).
+Its gateway tests spend as the Models tab's test does, sending real requests through the
+deployment's Gateway, but each runs only after the admin approves that one call.
+
 When using `CF_AI_GATEWAY*` in local development, start the server with
 `pnpm run dev-server -- --use-workers-ai-binding` so the server has a `WORKERS_AI` binding for
 the webFetch tool's document-to-Markdown conversion and for the gateway transport above (without

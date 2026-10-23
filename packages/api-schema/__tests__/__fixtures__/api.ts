@@ -3,9 +3,9 @@
 // stub, an optional middle parameter, string-literal and object unions, a nullable scalar, a
 // callback interface, a bare-function callback, an optional callback, a stream each way, a `{}`
 // handle, a recursive named type and an `any` tail; and the members and tags the format records
-// beside methods: properties, `@deprecated` services and methods, a `@mutates` method, a server
-// capability passed back as a parameter, and server capabilities reached through a callback
-// interface's and a function's parameters.
+// beside methods: properties, `@deprecated` services and methods, a `@mutates` method,
+// `@confirmation` methods with and without text, a server capability passed back as a parameter, and
+// server capabilities reached through a callback interface's and a function's parameters.
 //
 // Its doc comments are part of the expected schema (`schema.json`), so they stay byte for byte as
 // they are, including the ones that speak of a command-line client: the same fixture tests the
@@ -121,6 +121,20 @@ export interface Notebook extends RpcTarget {
 
   /** A recursive named result. */
   outline(): Promise<Outline>;
+
+  /**
+   * Publishes the notebook.
+   *
+   * @confirmation Sends a paid request.
+   */
+  publish(): Promise<void>;
+
+  /**
+   * Prints the notebook.
+   *
+   * @confirmation
+   */
+  print(copies: number): Promise<void>;
 }
 
 /** Implemented by the client, as upstream's subscribers. */

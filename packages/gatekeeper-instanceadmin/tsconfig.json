@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ESNext"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // @gadgets/api-schema's sources, which this Worker bundles, import each other with .ts
+    // extensions.
+    "allowImportingTsExtensions": true,
+    "types": ["./worker-configuration.d.ts"]
+  },
+  "include": ["src", "__tests__"],
+  "exclude": ["node_modules", ".wrangler"]
+}

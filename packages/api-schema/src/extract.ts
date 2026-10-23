@@ -5,9 +5,9 @@
 // Types are classified with capnweb-validate's rules (its `transform/type-introspector.ts`):
 // values versus capabilities (`RpcStub<X>`, `RpcPromise<X>`, interfaces extending `RpcTarget`,
 // method-only interfaces), functions, streams and `any` tails. Unlike capnweb-validate, the output
-// keeps names, JSDoc and the `@deprecated` and `@mutates` tags, records which side implements each
-// service, and is deterministic: services, shapes, properties and union branches are sorted, so the
-// committed schema does not move with TypeScript's internal type ordering.
+// keeps names, JSDoc and the `@deprecated`, `@mutates` and `@confirmation` tags, records which side
+// implements each service, and is deterministic: services, shapes, properties and union branches are
+// sorted, so the committed schema does not move with TypeScript's internal type ordering.
 //
 // typescript6 = npm:typescript@6.0.3: the TypeScript 7 package ships no JS compiler API.
 
@@ -284,6 +284,7 @@ class Extractor {
       return { name, type: shape, optional, doc: docOf(this.#checker, param, false) };
     });
     const deprecated = tagOf(this.#checker, prop, "deprecated");
+    const confirmation = tagOf(this.#checker, prop, "confirmation");
     return {
       name: prop.getName(),
       doc: docOf(this.#checker, prop),
@@ -291,6 +292,7 @@ class Extractor {
       returns: this.#shape(this.#awaited(signature.getReturnType()), 0),
       ...(deprecated === undefined ? {} : { deprecated }),
       ...(tagOf(this.#checker, prop, "mutates") === undefined ? {} : { mutates: true as const }),
+      ...(confirmation === undefined ? {} : { confirmation }),
     };
   }
 

@@ -22,7 +22,7 @@ import { createTypedStorage, collection, singleton, keyString } from "@gadgets/t
 import {
   actionChangeTime,
   type ActionState, type AdminAccessRecord, type AgentSpawnerConfig, type AiChatAuthorInfo, type AiChatMessage,
-  type AlwaysAvailableResource,
+  type AdminApi, type AlwaysAvailableResource,
   type AiChatMetadata, type BlueprintBindingAnnotation, type BlueprintMetadata,
   type BlueprintOutput, type ChatGadgetPinRecord, type CollaboratorRole, type GadgetUpstream,
   type GatekeeperCreationSpec, type PermissionEdge, type WorkpieceId,
@@ -427,6 +427,13 @@ export type ActionRecord = {
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+
+  /**
+   * Present on an action the Workshop queued for the instance admin Gatekeeper's binding: what
+   * approving it does, which the Workshop does itself (see InstanceAdminActionRecord). `action` is
+   * then the record's own id. Never sent to clients (actionRecordToLog lists its fields).
+   */
+  instanceAdmin?: InstanceAdminActionRecord;
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -457,6 +464,29 @@ export type ActionRecord = {
 export function actionLastChangedKey(record: ActionRecord): string {
   return `${keyString(actionChangeTime(record).valueOf())}.${keyString(record.id)}`;
 }
+
+/** What an instance admin action does, held by the Workshop: applyPendingAction makes it itself and
+ * never asks the facet. "activate" turns deployment admin access on in the workspace; the others
+ * are one AdminApi call, made on approval ("change") or allowed once to the agent's identical
+ * call ("confirm", "inspect"; see InstanceAdminAllowanceRecord). */
+export type InstanceAdminActionRecord = { kind: "activate" }
+  | { kind: "change" | "confirm" | "inspect"; method: keyof AdminApi;
+      /** The arguments as canonical JSON: what the card shows and the apply passes. */
+      args: string;
+      /** The queuing run's audit session. */
+      sessionId: string };
+
+/** One approved "confirm" or "inspect" call, waiting for the agent's identical call: the next one
+ * in chat `chatId`, with `method` and `args` (canonical JSON), before `expiresAt` runs once and
+ * deletes this. */
+export type InstanceAdminAllowanceRecord = {
+  /** The approving action's id. */
+  actionId: number;
+  chatId: number;
+  method: keyof AdminApi;
+  args: string;
+  expiresAt: Date;
+};
 
 export type BoundHookRecord = {
   id: number;
@@ -1274,6 +1304,15 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
       // Next id in `adminAccess`.
       nextAdminAccessId: 0,
+
+      // True once deployment admin access was ever turned on in this workspace (see
+      // GadgetMetadata.deploymentAdminAccess); never cleared. While set, nobody but the owner can
+      // open the workspace (SharingManager's ownerOnly hook) and it takes no external messages.
+      instanceAdminLatched: false,
+
+      // True while deployment admin access is on: the instance admin Gatekeeper's binding serves
+      // the owner's agent only while this is set. Cleared by turnOffDeploymentAdminAccess().
+      instanceAdminActive: false,
     },
 
     collections: {
@@ -1552,6 +1591,12 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
             return observer.observerId;
           }
         }
+      }),
+
+      // Approved one-call instance admin requests not yet used (see InstanceAdminAllowanceRecord),
+      // by the approving action's id.
+      instanceAdminAllowances: collection<InstanceAdminAllowanceRecord>()({
+        primaryKey: "actionId",
       }),
 
       // Admin calls into this workspace (see AdminAccessLogRecord): apart from `actions`, so that

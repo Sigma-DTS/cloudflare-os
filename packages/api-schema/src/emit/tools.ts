@@ -64,6 +64,8 @@ export interface Tool {
   deprecated?: string;
   /** `true` when the method is declared to change state (`@mutates`). */
   mutates?: true;
+  /** The method's `@confirmation` text (`""` when bare), when it has one. */
+  confirmation?: string;
   /** The arguments, as one object keyed by parameter name, in declaration order. */
   inputSchema: ToolInputSchema;
   /** The awaited result, self-contained like `inputSchema`. */
@@ -163,6 +165,7 @@ export function emitToolCatalog(schema: Schema, options: ToolCatalogOptions): To
     };
     if (method.deprecated !== undefined) tool.deprecated = method.deprecated;
     if (method.mutates) tool.mutates = true;
+    if (method.confirmation !== undefined) tool.confirmation = method.confirmation;
     const continuesOn = capabilityOf(schema, method.returns);
     if (continuesOn !== undefined && withTools.has(continuesOn)) tool.continuesOn = continuesOn;
     return tool;

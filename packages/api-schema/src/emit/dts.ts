@@ -64,8 +64,8 @@
 // - A stream is a `ReadableStream<T>` or `WritableStream<T>` of its element type, or of any chunk
 //   when the schema has none. A readable stream's chunks travel as the stream does, a writable
 //   one's the other way: the holder of a writable stream supplies them.
-// - The `@deprecated` and `@mutates` tags are in the JSDoc, from the schema's fields when its doc
-//   text does not already carry them.
+// - The `@deprecated`, `@mutates` and `@confirmation` tags are in the JSDoc, from the schema's
+//   fields when its doc text does not already carry them.
 //
 // The schema's names are kept where they are TypeScript identifiers. The others (the extractor
 // names a second instantiation of a generic by its printed form, `Foo<Bar>`, or `Name#2`, and an
@@ -424,8 +424,11 @@ class Renderer {
     const names = paramNames(method.params);
     const extra = method.params.flatMap((param, i) =>
       param.doc && !documentsParam(method.doc, param.name) ? [`@param ${names[i]} ${param.doc}`] : []);
-    const doc = withTags(method.doc, extra,
-      { deprecated: method.deprecated, mutates: method.mutates ? "" : undefined });
+    const doc = withTags(method.doc, extra, {
+      deprecated: method.deprecated,
+      mutates: method.mutates ? "" : undefined,
+      confirmation: method.confirmation,
+    });
     const returns = position === "out" ? this.#result(method.returns, "  ")
       : this.#awaitableOf(method.returns, "  ", position);
     const params = this.#params(method.params, "  ", flip(position), position !== "in");

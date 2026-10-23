@@ -5,6 +5,7 @@ import {
   createAdminAccessError, getAdminAccessErrorCode,
   type AdminAccessRecord, type AdminVia, type AdminViewAccess,
 } from "@gadgets/workshop-shared/api";
+import type { AdminGatekeeperCall } from "../src/admin-access.js";
 import { AdminApiImpl } from "../src/admin-settings.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import {
@@ -70,15 +71,20 @@ function deployment(options: {
     },
   } } as unknown as ExecutionContext;
   const deploymentEnv = { ADMINS: [ADMIN], ...options.vars } as unknown as Cloudflare.Env;
-  const mint = (adminUserId = ADMIN, via: AdminVia = "cli") => {
-    const api = new AdminApiImpl(ctx, deploymentEnv, adminUserId, via);
+  const mint = (adminUserId = ADMIN, via: AdminVia = "cli", gatekeeper?: AdminGatekeeperCall) => {
+    const api = new AdminApiImpl(ctx, deploymentEnv, adminUserId, via, gatekeeper);
     calls.length = 0;
     return api;
   };
   const callsTo = (target: string, method: string) =>
       calls.filter(call => call.target === target && call.method === method);
-  return { mint, calls, callsTo };
+  return { mint, calls, callsTo, ctx, deploymentEnv };
 }
+
+// What OverseerImpl.adminApiForAgent() passes for a run of an agent in workspace "w-admin".
+const AGENT_CALL: AdminGatekeeperCall = {
+  origin: { workspaceId: "w-admin", chatId: 7 }, sessionId: "agent-run-1",
+};
 
 async function rejection(call: Promise<unknown>): Promise<unknown> {
   try {
@@ -163,6 +169,7 @@ describe("AdminApiImpl.inspectWorkspace", () => {
         refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
       });
       expect(Object.keys(record.args)).toEqual(["expiresAt"]);
+      expect(record).not.toHaveProperty("origin");
       const expiresAt = Date.parse(record.args.expiresAt as string);
       expect(expiresAt).toBeGreaterThanOrEqual(before + 60_000);
       expect(expiresAt).toBeLessThanOrEqual(after + 60_000);
@@ -178,6 +185,21 @@ describe("AdminApiImpl.inspectWorkspace", () => {
       await rejection(api.inspectWorkspace(id, REASON, { access: "full" }));
       const [third] = callsTo("audit", "append")[2]!.args as [AdminAccessRecord];
       expect(third).toMatchObject({ requested: "full", access: "off" });
+    });
+
+    it("records an agent's refused open with via gatekeeper, its origin and its run's session",
+        async () => {
+      const { mint, callsTo } = offDeployment(() => "Quarterly plan");
+      const id = workspaceId();
+      const error = await rejection(
+          mint(ADMIN, "gatekeeper", AGENT_CALL).inspectWorkspace(id, REASON));
+      expect(getAdminAccessErrorCode(error)).toBe(ADMIN_ACCESS_ERROR_CODES.accessOff);
+      const [record] = callsTo("audit", "append")[0]!.args as [AdminAccessRecord];
+      expect(record).toMatchObject({
+        kind: "workspace", admin: ADMIN, via: "gatekeeper", origin: AGENT_CALL.origin,
+        sessionId: AGENT_CALL.sessionId, workspaceId: id, access: "off",
+        refused: ADMIN_ACCESS_ERROR_CODES.accessOff,
+      });
     });
 
     it("cuts a long title as the audit log cuts any", async () => {
@@ -238,12 +260,30 @@ describe("AdminApiImpl.inspectWorkspace", () => {
          { via: string; requested: AdminViewAccess; access: AdminViewAccess; expiresAt: Date }];
     expect([adminId, reason, typeof sessionId]).toEqual([ADMIN, REASON, "string"]);
     expect(terms.via).toBe("api");
+    expect(terms).not.toHaveProperty("origin");
     expect(terms.requested).toBe(requested ?? "metadata");
     expect(terms.access).toBe(access);
     const lifetime = DEFAULT_ADMIN_VIEW_LIFETIME_SECONDS * 1000;
     expect(terms.expiresAt.getTime()).toBeGreaterThanOrEqual(before + lifetime);
     expect(terms.expiresAt.getTime()).toBeLessThanOrEqual(after + lifetime);
     expect(callsTo("audit", "append")).toEqual([]);
+  });
+
+  it("opens an agent's view with via gatekeeper, its origin and its run's session", async () => {
+    const view = { describe: async () => "the minted view" };
+    const { mint, callsTo } = deployment({
+      config: { adminWorkspaceAccess: "full" },
+      vars: { ADMIN_WORKSPACE_ACCESS_MAX: "full" },
+      handlers: { overseer: { openForAdmin: () => view } },
+    });
+    const id = workspaceId();
+    await mint(ADMIN, "gatekeeper", AGENT_CALL).inspectWorkspace(id, REASON, { access: "full" });
+    const [adminId, , sessionId, terms] = callsTo("overseer", "openForAdmin")[0]!.args as
+        [string, string, string, Record<string, unknown>];
+    expect([adminId, sessionId]).toEqual([ADMIN, AGENT_CALL.sessionId]);
+    expect(terms).toMatchObject({
+      via: "gatekeeper", origin: AGENT_CALL.origin, requested: "full", access: "full",
+    });
   });
 
   it.each([
@@ -272,6 +312,20 @@ describe("AdminApiImpl.inspectWorkspace", () => {
   });
 });
 
+describe("AdminApiImpl construction", () => {
+  it("takes an agent's origin exactly when its via is gatekeeper", () => {
+    const { ctx, deploymentEnv } = deployment();
+    expect(() => new AdminApiImpl(ctx, deploymentEnv, ADMIN, "gatekeeper")).toThrow(TypeError);
+    for (let via of ["api", "cli"] as const) {
+      expect(() => new AdminApiImpl(ctx, deploymentEnv, ADMIN, via, AGENT_CALL))
+          .toThrow(TypeError);
+      expect(() => new AdminApiImpl(ctx, deploymentEnv, ADMIN, via)).not.toThrow();
+    }
+    expect(() => new AdminApiImpl(ctx, deploymentEnv, ADMIN, "gatekeeper", AGENT_CALL))
+        .not.toThrow();
+  });
+});
+
 describe("AdminApiImpl settings", () => {
   it("says who changes a setting, through which method and session", async () => {
     const { mint, callsTo } = deployment();
@@ -293,7 +347,24 @@ describe("AdminApiImpl settings", () => {
       admin: ADMIN, sessionId: actors[0]!.sessionId, via: "cli", method: "setUserModelsEnabled",
     });
     expect(actors[2]).toMatchObject({ via: "api", method: "setSiteName" });
+    expect(actors[2]).not.toHaveProperty("origin");
     expect(actors[2]!.sessionId).not.toBe(actors[0]!.sessionId);
+  });
+
+  it("says an agent's change came through the gatekeeper, from where, in its session", async () => {
+    const { mint, callsTo } = deployment();
+    const call = { ...AGENT_CALL, origin: { ...AGENT_CALL.origin, actionId: 12 } };
+    const api = mint(ADMIN, "gatekeeper", call);
+    await api.setSiteName("Acme");
+    await api.setUserModelsEnabled(true);
+    expect(callsTo("admin", "updateAdminConfig")[0]!.args.at(-1)).toStrictEqual({
+      admin: ADMIN, sessionId: call.sessionId, via: "gatekeeper", method: "setSiteName",
+      origin: call.origin,
+    });
+    expect(callsTo("admin", "setUserModelsEnabled")[0]!.args.at(-1)).toStrictEqual({
+      admin: ADMIN, sessionId: call.sessionId, via: "gatekeeper", method: "setUserModelsEnabled",
+      origin: call.origin,
+    });
   });
 });
 
@@ -351,13 +422,13 @@ describe("AdminApiImpl audit log", () => {
     });
     const since = new Date("2026-01-01T00:00:00Z");
     expect(await mint().listAdminAudit({
-      kind: "workspace", admin: ADMIN, workspace: "w", exposed: "content", since, cursor: "next",
-      extra: true,
+      kind: "workspace", admin: ADMIN, workspace: "w", exposed: "content", via: "gatekeeper",
+      since, cursor: "next", extra: true,
     } as Parameters<AdminApiImpl["listAdminAudit"]>[0])).toBe(page);
     expect(callsTo("audit", "list")[0]!.args).toStrictEqual([
       {
-        kind: "workspace", admin: ADMIN, workspace: "w", exposed: "content", since,
-        cursor: "next", limit: 50,
+        kind: "workspace", admin: ADMIN, workspace: "w", exposed: "content", via: "gatekeeper",
+        since, cursor: "next", limit: 50,
       },
       120,
     ]);

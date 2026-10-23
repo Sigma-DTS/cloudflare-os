@@ -466,6 +466,33 @@
           }
         },
         {
+          "name": "print",
+          "doc": "Prints the notebook.\n@confirmation",
+          "params": [
+            {
+              "name": "copies",
+              "type": {
+                "kind": "number"
+              },
+              "optional": false,
+              "doc": ""
+            }
+          ],
+          "returns": {
+            "kind": "void"
+          },
+          "confirmation": ""
+        },
+        {
+          "name": "publish",
+          "doc": "Publishes the notebook.\n@confirmation Sends a paid request.",
+          "params": [],
+          "returns": {
+            "kind": "void"
+          },
+          "confirmation": "Sends a paid request."
+        },
+        {
           "name": "subscribe",
           "doc": "A callback interface.",
           "params": [

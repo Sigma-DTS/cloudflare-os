@@ -44,6 +44,9 @@ const RETENTION = 90;
 const GATEKEEPER_ID = 0;
 const CHAT_ID = 1;
 
+// Where an instance admin Gatekeeper's call came from, as the Workshop records it.
+const GATEKEEPER_ORIGIN = { workspaceId: "admin-workspace", chatId: 3, actionId: 9 };
+
 type Workspace = {
   impl: any;
   instance: OverseerDurableObject;
@@ -206,7 +209,10 @@ describe("opening an admin view", () => {
     await expect(open(ws, {}, ADMIN, "   ")).rejects.toThrow(TypeError);
     await expect(open(ws, {}, ADMIN, "x".repeat(MAX_ADMIN_ACCESS_REASON_LENGTH + 1)))
         .rejects.toThrow(TypeError);
-    await expect(open(ws, { via: "gatekeeper" as any })).rejects.toThrow(TypeError);
+    await expect(open(ws, { via: "gatekeeper" })).rejects.toThrow(new TypeError(
+        "An admin view's via must be \"api\" or \"cli\", or \"gatekeeper\" with its origin."));
+    await expect(open(ws, { via: "cli", origin: GATEKEEPER_ORIGIN }))
+        .rejects.toThrow(TypeError);
     await expect(open(ws, { access: "off" as any })).rejects.toThrow(TypeError);
     await expect(open(ws, { requested: "off" as any })).rejects.toThrow(TypeError);
     await expect(open(ws, { requested: "everything" as any })).rejects.toThrow(TypeError);
@@ -240,6 +246,16 @@ describe("opening an admin view", () => {
       method: "inspectWorkspace", args: { expiresAt: expiresAt.toISOString() }, reason: REASON,
       requested: "metadata", access: "metadata", exposed: "metadata",
     });
+  }));
+
+  it("records a gatekeeper call's origin in both stores", () => withWorkspace(async ws => {
+    let view = await open(ws, { via: "gatekeeper", origin: GATEKEEPER_ORIGIN });
+    await view.listChats();
+    let records = await expectRecordsMatch(ws);
+    expect(records.map(r => [r.method, r.via, r.origin])).toStrictEqual([
+      ["inspectWorkspace", "gatekeeper", GATEKEEPER_ORIGIN],
+      ["listChats", "gatekeeper", GATEKEEPER_ORIGIN],
+    ]);
   }));
 
   it("records an open while the setting is off as refused, in both stores",
@@ -316,6 +332,7 @@ describe("a metadata view", () => {
     expect(description).toMatchObject({
       id: ws.id, title: "Quarterly plan", owner: OWNER, access: "metadata", collaborators: [],
     });
+    expect(description).not.toHaveProperty("deploymentAdminAccess");
     let gadget = description.workpieces.find(w => w.id === ws.gadgetId)!;
     expect(gadget).toMatchObject({ type: "gadget", title: "Notes", commitId: ws.commitId });
     expect(gadget).not.toHaveProperty("upstream");
@@ -329,6 +346,15 @@ describe("a metadata view", () => {
         .toStrictEqual([["On push", ""]]);
 
     expect(await view.listFiles(ws.gadgetId)).toStrictEqual([{ name: "notes.txt", kind: "file" }]);
+  }));
+
+  it("reports deployment admin access once it was ever on", () => withWorkspace(async ws => {
+    let view = await open(ws);
+    ws.impl.storage.instanceAdminLatched.put(true);
+    ws.impl.storage.instanceAdminActive.put(true);
+    expect((await view.describe()).deploymentAdminAccess).toBe("on");
+    ws.impl.storage.instanceAdminActive.put(false);
+    expect((await view.describe()).deploymentAdminAccess).toBe("off");
   }));
 
   it("changes nothing a member sees and joins no session", () => withWorkspace(async ws => {

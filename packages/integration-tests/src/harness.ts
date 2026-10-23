@@ -77,6 +77,23 @@ export type GatekeeperSpec = {
   patch?: (config: WorkerConfig) => void;
 };
 
+/** Directory of the instance admin Gatekeeper (packages/gatekeeper-instanceadmin). */
+export const INSTANCE_ADMIN_GATEKEEPER_DIR = resolve(HERE, "../../gatekeeper-instanceadmin");
+/** Its service binding suffix, so the vendor id the Workshop derives is "instanceadmin". */
+export const INSTANCE_ADMIN_BINDING = "INSTANCEADMIN";
+
+/**
+ * The instance admin Gatekeeper, booted from its prebuilt validated tree. The task graph builds
+ * that tree's `.wrangler/validate` before any suite boots (global-setup.ts checks it is there), and
+ * rebuilding it per suite would rewrite that directory under Workers booting from it, as it would
+ * the Workshop's own (see workshopConfig).
+ */
+export const INSTANCE_ADMIN_GATEKEEPER: GatekeeperSpec = {
+  binding: INSTANCE_ADMIN_BINDING,
+  dir: INSTANCE_ADMIN_GATEKEEPER_DIR,
+  patch: config => { delete config.build; },
+};
+
 // Read a checked-in wrangler.jsonc and make it usable as an *inline* harness config.
 //
 // A worker whose `main` is generated (capnweb-validate) needs `build.cwd` pinned to its own directory
