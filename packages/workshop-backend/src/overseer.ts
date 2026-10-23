@@ -13703,7 +13703,9 @@ class AgentSpawnerQueueImpl extends ApprovalQueueImpl implements AgentSpawnerQue
   // Writes no messages; the caller decides how the chat starts.
   async #createSpawnedChat(
       title: string, creatorUserId: string | undefined, spawnerTypes?: SpawnCallableOptions) {
-    if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
+    if (!this.impl.ownerId || this.impl.storage.deleting.get()) {
+      throw new Error("Workspace has been deleted or is being deleted.");
+    }
 
     // Resolve the model from the creating user's account (falls back to owner for
     // bindings created before collaborator support).
@@ -13711,6 +13713,10 @@ class AgentSpawnerQueueImpl extends ApprovalQueueImpl implements AgentSpawnerQue
     let initiatorUserId = this.impl.users.idFromString(resolveUserId).toString();
     let user = this.impl.users.get(this.impl.users.idFromString(resolveUserId));
     let userMeta = await user.getChatContext(this.#spawner().config.modelId);
+
+    if (!this.impl.ownerId || this.impl.storage.deleting.get()) {
+      throw new Error("Workspace has been deleted or is being deleted.");
+    }
 
     // Read again after the await, across which the spawner may have been deleted or edited.
     let {config, bindings: edges} = this.#spawner();

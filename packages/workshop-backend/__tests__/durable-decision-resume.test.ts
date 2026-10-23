@@ -261,23 +261,28 @@ describe("decision handoff using the existing execution row", () => {
 
   it.each(["prompt", "callable"] as const)("refuses %s spawning before and during deletion", async route => {
     const s = await scenario();
-    await s.visit(async (impl, instance) => {
+    await s.visit(async impl => {
       impl.ownerId = s.user.id.toString();
       const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
       modelLookup(impl, async () => {
         entered.resolve(); await release.promise; return {profile: USER, aiModel: MODEL};
       });
-      const config = {displayName: "Spawner", modelId: MODEL.profile.id, env: {}};
-      const spawn = () => route === "prompt" ? instance.spawnAgent("Task", "Do the work", config)
-        : instance.spawnCallableAgent("Task", {types: "interface Task {run(): void}", mainType: "Task"}, config);
+      const config = {displayName: "Spawner", modelId: MODEL.profile.id};
+      const cls = impl.ctx.exports.AgentSpawnerGatekeeper({props: {config, creatorUserId: s.user.id.toString()}});
+      using client = await impl.addGatekeeper(cls, {type: "agentSpawner", config}, s.user.id.toString());
+      using binding = await client.openSession();
+      const spawn = async () => {
+        if (route === "prompt") await binding.spawn("Task", "Do the work");
+        else await binding.spawnCallable("Task", {types: "interface Task {run(): void}", mainType: "Task"});
+      };
       const history = [...impl.storage.chats.list()], chats = [...impl.storage.chatMeta.list()];
       const spawning = spawn().then(() => null, (error: unknown) => error);
       await entered.promise;
       const deleting = Promise.withResolvers<void>(), releaseDeletion = Promise.withResolvers<void>();
-      using client = await failingDeletionClient(impl, async () => {
+      using deleter = await failingDeletionClient(impl, async () => {
         deleting.resolve(); await releaseDeletion.promise; throw new Error("Hook disable failed");
       });
-      const outcome = client.deleteSelf().then(() => null, (error: unknown) => error);
+      const outcome = deleter.deleteSelf().then(() => null, (error: unknown) => error);
       await deleting.promise;
       try {
         release.resolve();
