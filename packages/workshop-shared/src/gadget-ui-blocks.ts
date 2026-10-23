@@ -1,0 +1,151 @@
+// `<gadget-ui>` blocks in an agent's answer: live views the Workshop draws in place of the block's
+// text (see plans/inline-gadget-ui.md). This module is the one parser of the syntax. The Workshop
+// lays out a message with it, and the kernel decides what a block can reach with it, so both sides
+// always agree on which block an index names.
+
+import { validateBindingName } from "./api.js";
+
+/** One closed `<gadget-ui>` block of an agent answer. */
+export type GadgetUiBlock = {
+  kind: "block";
+
+  /**
+   * Position among the answer's closed blocks, counting blocks that have an `error`. This is the
+   * `index` that `Overseer.connectToUiBlockGadget` takes.
+   */
+  index: number;
+
+  /** The block's HTML: everything between its tags, trimmed. */
+  html: string;
+
+  /** The text of the block's `<title>` element, if it has one. */
+  title?: string;
+
+  /** The chat binding named by the block's `gadget` attribute, if it has one. */
+  gadget?: string;
+
+  /** Why the block must not run, e.g. a `gadget` value that is not a binding name. */
+  error?: string;
+};
+
+/** One part of an agent answer, in order: prose, a closed block, or a block still open. */
+export type GadgetUiSegment =
+  /** Prose. `start` is its offset in the answer, for positions such as `CapsuleSpecifier`'s. */
+  | { kind: "text"; text: string; start: number }
+  | GadgetUiBlock
+  /**
+   * An opening tag with no closing tag after it: the answer is still streaming, or the agent never
+   * closed the block. `text` runs from the tag to the end of the answer.
+   */
+  | { kind: "open"; text: string; title?: string };
+
+const CLOSE = "</gadget-ui>";
+
+// A tag counts only where it opens a line outside a code fence, so prose and examples that
+// mention the tag stay prose.
+const OPEN = /^[ \t]*<gadget-ui\b([^>]*)>/;
+
+// The `gadget` attribute itself (not `data-gadget`), with its value quoted or not, as HTML allows.
+const GADGET_ATTRIBUTE = /(?:^|\s)gadget\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/;
+
+const TITLE = /<title>([\s\S]*?)<\/title>/i;
+
+// Any line that may open a fence opens one: reading too much as code only keeps a block from
+// being drawn.
+const FENCE_OPEN = /^[ \t]*(`{3,}(?=[^`]*$)|~{3,})/;
+
+// Only a closing fence closes one: a marker alone on its line, indented at most three spaces more
+// than the line that opened it. A fence in a list item opens and closes at the item's indent.
+const FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;
+
+type Fence = { marker: string; indent: number };
+
+const indentOf = (line: string) => line.replaceAll("\t", "    ").search(/\S|$/);
+
+/** The fence open after `line`, given the fence open before it (null when none is). */
+function fenceAfter(fence: Fence | null, line: string): Fence | null {
+  if (fence === null) {
+    let marker = FENCE_OPEN.exec(line)?.[1];
+    return marker === undefined ? null : {marker, indent: indentOf(line)};
+  }
+  let marker = FENCE_CLOSE.exec(line)?.[1];
+  let closes = marker !== undefined && marker[0] === fence.marker[0] &&
+      marker.length >= fence.marker.length && indentOf(line) <= fence.indent + 3;
+  return closes ? null : fence;
+}
+
+// As HTML reads a title: runs of whitespace are one space.
+function titleOf(html: string): string | undefined {
+  let title = TITLE.exec(html)?.[1]?.replace(/\s+/g, " ").trim();
+  return title ? title : undefined;
+}
+
+function closedBlock(index: number, attributes: string, html: string): GadgetUiBlock {
+  let block: GadgetUiBlock = {kind: "block", index, html};
+  let title = titleOf(html);
+  if (title !== undefined) block.title = title;
+
+  let found = GADGET_ATTRIBUTE.exec(attributes);
+  let gadget = found?.[1] ?? found?.[2] ?? found?.[3];
+  if (gadget !== undefined) {
+    try {
+      validateBindingName(gadget);
+      block.gadget = gadget;
+    } catch (err) {
+      block.error = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return block;
+}
+
+/** Splits an agent answer into prose and `<gadget-ui>` blocks, in order. */
+export function parseGadgetUiBlocks(text: string): GadgetUiSegment[] {
+  let segments: GadgetUiSegment[] = [];
+  let prose = 0;
+  let line = 0;
+  let fence: Fence | null = null;
+  let index = 0;
+
+  let lineEndAt = (start: number) => {
+    let end = text.indexOf("\n", start);
+    return end === -1 ? text.length : end;
+  };
+
+  while (line < text.length) {
+    let lineEnd = lineEndAt(line);
+    let open = fence === null ? OPEN.exec(text.slice(line, lineEnd)) : null;
+    if (open === null) {
+      fence = fenceAfter(fence, text.slice(line, lineEnd));
+      line = lineEnd + 1;
+      continue;
+    }
+
+    if (prose < line) segments.push({kind: "text", text: text.slice(prose, line), start: prose});
+    let body = line + open[0].length;
+    let close = text.indexOf(CLOSE, body);
+    if (close === -1) {
+      let rest = text.slice(line);
+      let title = titleOf(rest);
+      segments.push(title === undefined ? {kind: "open", text: rest} : {kind: "open", text: rest, title});
+      return segments;
+    }
+
+    segments.push(closedBlock(index++, open[1] ?? "", text.slice(body, close).trim()));
+    prose = close + CLOSE.length;
+    line = lineEndAt(prose) + 1;
+  }
+
+  if (prose < text.length) segments.push({kind: "text", text: text.slice(prose), start: prose});
+  return segments;
+}
+
+/**
+ * An agent answer for a reader that shows only text, such as a chat gateway: each closed
+ * `<gadget-ui>` block becomes a note that names it. An unclosed block stays as written, as the
+ * chat shows it.
+ */
+export function gadgetUiAnswerAsText(text: string): string {
+  return parseGadgetUiBlocks(text).map(segment => segment.kind !== "block" ? segment.text
+      : segment.title === undefined ? "[View in the chat]" : `[View in the chat: ${segment.title}]`)
+      .join("");
+}

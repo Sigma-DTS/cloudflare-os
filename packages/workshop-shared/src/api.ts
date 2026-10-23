@@ -2984,6 +2984,17 @@ export interface Overseer extends RpcTarget {
   getChatMessage(chatId: number, sequence: number): Promise<AiChatMessage | undefined>;
 
   /**
+   * Opens the server of the gadget that a `<gadget-ui>` block names with its `gadget` attribute,
+   * for block `index` (see `GadgetUiBlock.index`) of the agent answer at `sequence`. It is the
+   * facet the chat's agent reaches through that binding, with the changes the chat proposes. The
+   * kernel reads the block from its stored copy of the answer, never from the caller. Throws unless
+   * that block exists, is valid, and names a gadget the chat binds. Dispose the stub when the
+   * block's frame unmounts.
+   */
+  // @ts-ignore - TODO: Fix type instantiation issue
+  connectToUiBlockGadget(chatId: number, sequence: number, index: number): Promise<RpcStub<any>>;
+
+  /**
    * Subscribe to all new chat messages (across all threads).
    *
    * If `startAt` is given, it must be a date in the past. All messages starting from that date

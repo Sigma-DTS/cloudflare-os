@@ -52,7 +52,7 @@ import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
-import { chatChangeStatuses, foldCompactedCode, isTurnPrompt } from "./agent-compaction";
+import { chatChangeStatuses, foldChatBindings, foldCompactedCode, isTurnPrompt } from "./agent-compaction";
 import type { CachedRequest } from "./ai-models";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { ambientGatekeeperMode } from "./provisioning-policy";
@@ -84,6 +84,7 @@ import { traceAgentTurn, traceToolApproval } from "./agent-tracing";
 import { isLoopLimitError, retryOnDoReset, shouldRetryAfterReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
 import type { CreationApproval, GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import { gadgetUiAnswerAsText, parseGadgetUiBlocks } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import {
   assertChatAttachmentSize,
   decodeChatAttachmentText,
@@ -6889,7 +6890,9 @@ class OverseerImpl implements AgentHooks {
           (message.type === "message" && message.author.type === "agent")) &&
         message.message.trim()
       ) {
-        this.deliverExternalMessageResponse(response, message.message);
+        // The gateway shows only text, so an answer gets a note in place of each view.
+        this.deliverExternalMessageResponse(response, message.type === "message"
+            ? gadgetUiAnswerAsText(message.message) : message.message);
         return;
       }
     }
@@ -7654,6 +7657,46 @@ class OverseerImpl implements AgentHooks {
       // The set of pending calls changed (or a turn started): recompute the alarm.
       this.#updateAlarm();
     }
+  }
+
+  // The gadget that block `index` of the agent answer at `sequence` names (see
+  // parseGadgetUiBlocks), resolved in the chat's binding scope. Throws unless that message is a
+  // stored agent answer with a valid block at `index` that names a gadget the chat binds.
+  uiBlockGadget(chatId: number, sequence: number, index: number): WorkpieceId {
+    let msg = this.storage.chats.get(chatKey(chatId, sequence));
+    if (msg?.type !== "message" || msg.author.type !== "agent") {
+      throw new Error(`Message ${sequence} of chat ${chatId} is not an agent answer.`);
+    }
+    for (let segment of parseGadgetUiBlocks(msg.message)) {
+      if (segment.kind !== "block" || segment.index !== index) continue;
+      if (segment.error !== undefined) throw new Error(segment.error);
+      if (segment.gadget === undefined) throw new Error("This block names no gadget.");
+      let gadgetId = this.resolveChatGadgetBinding(chatId, segment.gadget);
+      if (gadgetId === undefined) {
+        throw new Error(`"${segment.gadget}" is not a gadget in this chat.`);
+      }
+      return gadgetId;
+    }
+    throw new Error(`Message ${sequence} of chat ${chatId} has no block ${index}.`);
+  }
+
+  // The gadget `name` resolves to in the chat's binding scope, as the agent's `env` resolves it,
+  // or undefined if it resolves to no gadget. Reads only, unlike prepareChatBindings: the seed
+  // layer exists once the agent has run, which it has for any chat with an agent answer.
+  resolveChatGadgetBinding(chatId: number, name: string): WorkpieceId | undefined {
+    let checkpoint = this.getActiveChatCompaction(chatId);
+    let seed = Object.entries(this.getChatAgentContext(chatId).bindings ?? {});
+    let bindings = new Map<string, ChatBindingEntry>([
+      ...seed.map<[string, ChatBindingEntry]>(([seedName, id]) => [seedName, {type: "workpiece", id}]),
+      ...checkpoint?.chatBindings ?? [],
+    ]);
+    foldChatBindings(this.storage.chats.list({
+      prefix: chatKeyPrefix(chatId),
+      start: chatKey(chatId, checkpoint?.compactedTo ?? 0),
+    }), bindings);
+    let entry = bindings.get(name);
+    return entry?.type === "workpiece" && this.storage.gadgets.get(entry.id)?.type === "gadget"
+        ? entry.id : undefined;
   }
 
   getChatAgentContext(chatId: number): AiChatAgentContext {
@@ -12047,6 +12090,16 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return msg && this.#getChatMessageForClient(msg);
   }
 
+  async connectToUiBlockGadget(chatId: number, sequence: number, index: number)
+      : Promise<RpcStub<any>> {
+    let gadgetId = this.impl.uiBlockGadget(chatId, sequence, index);
+    // A gadget pane gets this from getUiBundle(); the worker loads only materialized changes.
+    this.impl.checkChatExistsAndMaterializeChanges(chatId);
+    // Counted toward the caller's session for as long as the stub lives, as
+    // GadgetClient.connectToGadget's stub is.
+    return this.impl.getGadgetFacet(gadgetId, chatId, this.#mintedCapabilityKind());
+  }
+
   #getChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
     if (msg.type === "action") {
       let record = this.impl.storage.actions.get(msg.actionId);
@@ -12833,6 +12886,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async getChatMessage(_chatId: number, _sequence: number): Promise<AiChatMessage | undefined> { this.#deny(); }
+  async connectToUiBlockGadget(_chatId: number, _sequence: number, _index: number): Promise<RpcStub<any>> { this.#deny(); }
   async listSlashCommands(): Promise<SlashCommandChoice[]> { this.#deny(); }
   async subscribeToChat(
       _subscriber: RpcStub<AiChatSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {
