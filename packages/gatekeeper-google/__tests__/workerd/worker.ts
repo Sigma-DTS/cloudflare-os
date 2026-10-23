@@ -134,6 +134,8 @@ class TestApprovalQueue extends RpcTarget {
     return new TestGitCache();
   }
 
+  async getAgentContext() { return null; }
+
   addObserver(id: string): void {
     this.#activeObservers.add(id);
   }

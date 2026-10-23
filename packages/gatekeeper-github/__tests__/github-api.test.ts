@@ -17,6 +17,32 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("GitHubApi native Git transport", () => {
+  it.each(["fetchGitUploadPack", "fetchGitReceivePack"] as const)(
+    "%s calls the default fetch without a receiver",
+    async method => {
+      let requestUrl: string | undefined;
+      vi.stubGlobal("fetch", async function(this: unknown, url: string, init: RequestInit) {
+        // Workers fetch rejects being called as a method on the GitHubApi instance.
+        expect(this).toBeUndefined();
+        requestUrl = url;
+        expect(new Headers(init.headers).get("Authorization"))
+          .toBe(`Basic ${btoa("x-access-token:test-token")}`);
+        return new Response("pack response");
+      });
+
+      const api = new GitHubApi(async () => "test-token");
+      const response = method === "fetchGitUploadPack"
+        ? await api.fetchGitUploadPack("cloudflare", "workerd", new Uint8Array())
+        : await api.fetchGitReceivePack("cloudflare", "workerd", new ReadableStream());
+      expect(requestUrl).toBe(
+        `https://github.com/cloudflare/workerd.git/${method === "fetchGitUploadPack" ? "git-upload-pack" : "git-receive-pack"}`,
+      );
+      expect(await response.text()).toBe("pack response");
+    },
+  );
+});
+
 describe("assertIssueSearchResultsInRepo", () => {
   it("accepts exact repository path segments case-insensitively", () => {
     expect(() => assertIssueSearchResultsInRepo("Cloudflare", "Workerd", [

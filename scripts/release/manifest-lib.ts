@@ -175,6 +175,10 @@ export interface WorkerEntry {
   shortName?: string;
   /** Whether the deploy wizard offers this worker for installation. */
   installable: boolean;
+  /** Supports installation-owned central OAuth without provider app secrets. */
+  centralOAuth?: true;
+  /** Can authenticate to an Access-protected broker. */
+  centralOAuthAccess?: true;
   /** Installed server-side on every fresh core deploy, with no user interaction. */
   preinstall?: true;
   /** Installable at most once per instance. */
@@ -518,6 +522,7 @@ export function buildWorkerEntry(
     kind,
     ...(kind === "gatekeeper" ? { shortName: releaseShortName(pkgName) } : {}),
     installable,
+    ...(["gatekeeper-google", "gatekeeper-github"].includes(pkgName) ? { centralOAuth: true as const, centralOAuthAccess: true as const } : {}),
     ...(PREINSTALL.has(pkgName) ? { preinstall: true } : {}),
     ...(SINGLETON.has(pkgName) ? { singleton: true } : {}),
     mainModule,

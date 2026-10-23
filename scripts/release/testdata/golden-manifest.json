@@ -312,7 +312,9 @@
       "shortName": "github",
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/github"
-      }
+      },
+      "centralOAuth": true,
+      "centralOAuthAccess": true
     },
     "gatekeeper-google": {
       "bindings": [
@@ -423,7 +425,9 @@
       "shortName": "google",
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/google"
-      }
+      },
+      "centralOAuth": true,
+      "centralOAuthAccess": true
     },
     "gatekeeper-homeassistant": {
       "bindings": [],

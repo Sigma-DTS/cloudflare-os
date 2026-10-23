@@ -26,6 +26,7 @@ type TestGoogleDocGatekeeper = GoogleDocGatekeeperImpl & {
 };
 
 class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
+  async getAgentContext(): Promise<null> { return null; }
   actionId?: number;
   actionDescription?: string;
   actionFields: ActionField[] = [];

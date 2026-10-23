@@ -4,6 +4,9 @@ export type GitHubOAuthGrant = {
   tokenType: string;
 };
 
+/** Optional transport for centrally delegated installations; direct installs use fetch. */
+export type GitHubTransport = (url: string, init: RequestInit) => Promise<Response>;
+
 export type GitHubSimpleUser = {
   login: string;
   name?: string | null;
@@ -284,6 +287,7 @@ async function request<T>(
   path: string,
   options: RequestOptions = {},
   getToken?: () => Promise<string>,
+  transport: GitHubTransport = fetch,
 ): Promise<RequestResult<T>> {
   const url = new URL(path, options.baseUrl ?? API_BASE_URL);
 
@@ -327,7 +331,7 @@ async function request<T>(
     body = JSON.stringify(options.body);
   }
 
-  const response = await fetch(url.toString(), {
+  const response = await transport(url.toString(), {
     method,
     headers,
     body,
@@ -443,9 +447,12 @@ export async function revokeOAuthToken(
 
 export class GitHubApi {
   #getToken: () => Promise<string>;
+  #transport: GitHubTransport;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, transport: GitHubTransport = fetch) {
     this.#getToken = getToken;
+    // Native Workers fetch must not receive this GitHubApi as its receiver.
+    this.#transport = (url, init) => transport(url, init);
   }
 
   async #request<T>(
@@ -453,7 +460,7 @@ export class GitHubApi {
     path: string,
     options: RequestOptions = {},
   ): Promise<RequestResult<T>> {
-    return await request<T>(method, path, options, this.#getToken);
+    return await request<T>(method, path, options, this.#getToken, this.#transport);
   }
 
   async #conditionalGet<T>(
@@ -1369,7 +1376,7 @@ export class GitHubApi {
    */
   async fetchGitUploadPack(owner: string, repo: string, requestBody: Uint8Array): Promise<Response> {
     const url = `${LOGIN_BASE_URL}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git/git-upload-pack`;
-    const response = await fetch(url, {
+    const response = await this.#transport(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-git-upload-pack-request",
@@ -1405,7 +1412,7 @@ export class GitHubApi {
     owner: string, repo: string, requestBody: ReadableStream<Uint8Array>,
   ): Promise<Response> {
     const url = `${LOGIN_BASE_URL}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git/git-receive-pack`;
-    const response = await fetch(url, {
+    const response = await this.#transport(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-git-receive-pack-request",

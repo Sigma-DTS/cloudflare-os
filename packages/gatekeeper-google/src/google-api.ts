@@ -9,6 +9,7 @@ import {
 import { createMimeMessage } from "mimetext/browser";
 import PostalMime, { addressParser } from "postal-mime";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import { proxyGoogleRequest, type BrokerEnv } from "./broker-api";
 
 /**
  * Internal type for parsed message info with raw label IDs (not yet resolved
@@ -207,11 +208,17 @@ export type GoogleAccountProfile = {
   picture?: string;
 };
 
-export async function getGoogleAccountProfile(accessToken: string | AccessTokenProvider): Promise<GoogleAccountProfile> {
-  const response = await fetchWithAuthRetry('https://www.googleapis.com/oauth2/v3/userinfo', {
-    method: 'GET',
-    headers: { 'Accept': 'application/json' },
-  }, typeof accessToken === "string" ? async () => accessToken : accessToken);
+export async function getGoogleAccountProfile(
+    accessToken: string | AccessTokenProvider,
+    broker?: BrokerEnv): Promise<GoogleAccountProfile> {
+  const url = 'https://www.googleapis.com/oauth2/v3/userinfo';
+  const response = typeof accessToken === "string" && accessToken.startsWith("gk1.")
+    ? await proxyGoogleRequest(requiredBroker(broker), accessToken, url,
+      { method: "GET", headers: { Accept: "application/json" } })
+    : await fetchWithAuthRetry(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+      }, typeof accessToken === "string" ? async () => accessToken : accessToken);
 
   if (!response.ok) {
     await response.body?.cancel();
@@ -224,13 +231,19 @@ export async function getGoogleAccountProfile(accessToken: string | AccessTokenP
 }
 
 /** Return the stable Google subject used to pin long-lived Gmail capabilities to one account. */
-export async function getGoogleAccountSubject(accessToken: string): Promise<string> {
-  return (await getGoogleAccountProfile(accessToken)).sub;
+function requiredBroker(broker: BrokerEnv | undefined): BrokerEnv {
+  if (!broker) throw new Error("A sealed Google grant requires the central broker transport.");
+  return broker;
 }
 
-export async function getGoogleAccountDescription(accessToken: string)
+export async function getGoogleAccountSubject(accessToken: string,
+                                              broker?: BrokerEnv): Promise<string> {
+  return (await getGoogleAccountProfile(accessToken, broker)).sub;
+}
+
+export async function getGoogleAccountDescription(accessToken: string, broker?: BrokerEnv)
     : Promise<AccountDescription> {
-  const data = await getGoogleAccountProfile(accessToken);
+  const data = await getGoogleAccountProfile(accessToken, broker);
 
   // Mapping the response to our specific interface
   return {
@@ -245,14 +258,16 @@ export async function getGoogleAccountDescription(accessToken: string)
  * verified (`email_verified`). Returns null otherwise, so the Workshop never keys an account by an
  * unverified address.
  */
-export async function getGoogleVerifiedEmail(accessToken: string): Promise<string | null> {
-  const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Accept': 'application/json',
-    },
-  });
+export async function getGoogleVerifiedEmail(accessToken: string,
+                                             broker?: BrokerEnv): Promise<string | null> {
+  const url = 'https://www.googleapis.com/oauth2/v3/userinfo';
+  const response = accessToken.startsWith("gk1.")
+    ? await proxyGoogleRequest(requiredBroker(broker), accessToken, url,
+      { method: "GET", headers: { Accept: "application/json" } })
+    : await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' },
+    });
 
   if (!response.ok) {
     response.body?.cancel();

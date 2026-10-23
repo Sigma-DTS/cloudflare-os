@@ -50,11 +50,12 @@ import {
   ActionDescriptionBuilder, buildDescription, RenderedDescription, sanitizeTitle,
 } from "@gadgets/gatekeeper-kit/action-description";
 import {AccessTokenCache, AccessTokenRequest} from "./auth-retry";
+import {brokerTokenProvider, type BrokerEnv} from "./broker-api";
 import {CursorPager} from "./cursor";
 import {ApprovalQueueRpcTarget, RpcCursor, SharedApprovalQueue} from "./shared-approval-queue";
 import TYPES_CODE from "./types.txt";
 
-type Env = Cloudflare.Env;
+type Env = Cloudflare.Env & BrokerEnv;
 
 const GMAIL_RESTRICTED_THREAD_PROVIDER_PAGE_SIZE = 500;
 const GMAIL_RESTRICTED_THREAD_RESULT_PAGE_SIZE = 20;
@@ -3638,7 +3639,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
 
   async #getTokenSubject(token: string): Promise<string> {
     if (token !== this.#subjectToken) {
-      this.#tokenSubject = await getGoogleAccountSubject(token);
+      this.#tokenSubject = await getGoogleAccountSubject(token, this.env);
       this.#subjectToken = token;
     }
     return this.#tokenSubject!;
@@ -3661,7 +3662,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     const cached = this.ctx.storage.kv.get<string>("selfEmail");
     const token = await this.#getAccessToken();
     const [subject, description] = await Promise.all([
-      this.#getTokenSubject(token), getGoogleAccountDescription(token),
+      this.#getTokenSubject(token), getGoogleAccountDescription(token, this.env),
     ]);
     if (!description.uniqueName) throw new Error("Google account has no email address.");
     const pinned = this.ctx.storage.kv.get<string>("gmail:accountSubject");
@@ -3742,7 +3743,8 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
       validateGmailQueryForGrouping(this.ctx.props.searchQuery);
     }
     const selfEmail = await this.#getSelfEmail();
-    const api = new GmailApi(selfEmail, opts => this.#getAccessToken(opts));
+    const api = new GmailApi(selfEmail,
+      brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     const bindingLabel = await this.#resolveBindingLabel(api);
     const store = new GmailStore(this.ctx.storage);
     const ctx: GmailContext = {
@@ -3767,7 +3769,8 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     this.#applying.add(actionId);
     try {
       const selfEmail = await this.#getSelfEmail();
-      const api = new GmailApi(selfEmail, opts => this.#getAccessToken(opts));
+      const api = new GmailApi(selfEmail,
+        brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
 
       await reconcileDraftActionAlias(api, store, initialAction);
       const action = store.getAction(actionId);

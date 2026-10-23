@@ -9,7 +9,7 @@ import {
   PreviewOAuthConfigurationError,
   type PreviewOAuthState,
 } from "@gadgets/gatekeeper-kit/preview-oauth";
-import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GoogleAccessToken, revokeGoogleToken } from "./google-api";
+import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GoogleAccessToken, revokeGoogleToken, type GoogleOAuthGrant } from "./google-api";
 import { GoogleDocSession, DocMetadata, type GoogleDocReadSession, type GoogleDocTab } from "./docs-types";
 import { GoogleDocsApi, type GoogleDocsDocument, type GoogleDocsTab } from "./docs-api";
 import { GoogleSheetsApi } from "./sheets-api";
@@ -86,6 +86,10 @@ import DRIVE_FOLDER_CONFIGURATOR_HTML from "./generated/drive-folder-configurato
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
+import {
+  beginBrokerOAuth, brokerTokenProvider, redeemBrokerGrant, refreshBrokerToken, revokeManagedGoogleGrant,
+  type BrokerEnv,
+} from "./broker-api";
 import {
   BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
   GOOGLE_CHAT_RESOURCE, GOOGLE_CHAT_SPACE_RESOURCE, GOOGLE_CHAT_THREAD_RESOURCE,
@@ -170,7 +174,7 @@ function generateNonce(): string {
 
 
 // Declare optional environment variables here since they may be omitted from wrangler.jsonc.
-type Env = Cloudflare.Env & GoogleOAuthEnv & {
+type Env = Cloudflare.Env & GoogleOAuthEnv & BrokerEnv & {
   // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
   CLIENT_ID?: string;
   CLIENT_SECRET?: string;
@@ -223,7 +227,7 @@ export default {
     let path = relPath.slice(1).split("/");
 
     if (path.length === 2 && path[0].length === 64 && path[1].length === NONCE_BYTES * 2) {
-      if (!env.CLIENT_ID || !env.CLIENT_SECRET) {
+      if (!(env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) && (!env.CLIENT_ID || !env.CLIENT_SECRET)) {
         return new Response(NOT_CONFIGURED_HTML, {
           headers: {
             "Content-Type": "text/html; charset=utf-8"
@@ -234,6 +238,21 @@ export default {
       let doId = path[0];
       let initiationNonce = path[1];
       let stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
+      if (env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) {
+        const begun = await stub.beginOAuthFlow(initiationNonce, `${getBaseUrl(env)}/oauth`);
+        if (begun === null) return new Response(INVALID_LINK_HTML, {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+        try {
+          const authorizationUrl = await beginBrokerOAuth(
+            env, `${basePath}/oauth`, doId, begun.oauthNonce, begun.scopes);
+          return Response.redirect(authorizationUrl, 302);
+        } catch (error) {
+          console.error("Central Google broker failed to start consent", error);
+          return new Response("Central Google broker is unavailable. Please try again.",
+            { status: 502 });
+        }
+      }
       let previewOAuth: PreviewOAuth;
       try {
         previewOAuth = new PreviewOAuth({
@@ -254,7 +273,7 @@ export default {
       }
 
       let newUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-      newUrl.searchParams.set("client_id", env.CLIENT_ID);
+      newUrl.searchParams.set("client_id", env.CLIENT_ID!);
       newUrl.searchParams.set("redirect_uri", previewOAuth.redirectUri);
       newUrl.searchParams.set("response_type", "code");
       newUrl.searchParams.set("scope", begun.scopes.join(" "));
@@ -271,6 +290,27 @@ export default {
       return Response.redirect(newUrl.toString(), 302);
     } else if (relPath === "/oauth") {
       // Completion redirect.
+      if (env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) {
+        const ticket = url.searchParams.get("ticket");
+        if (!ticket) return new Response("Missing OAuth handoff ticket", { status: 400 });
+        let delivery;
+        try {
+          delivery = await redeemBrokerGrant(env, ticket);
+        } catch {
+          return new Response("Invalid or expired OAuth handoff ticket", { status: 400 });
+        }
+        let userObjectId;
+        try {
+          userObjectId = ctx.exports.UserAccount.idFromString(delivery.accountId);
+        } catch {
+          return new Response("Error: malformed state", { status: 400 });
+        }
+        const stub = ctx.exports.UserAccount.get(userObjectId);
+        const handoff = await stub.acceptBrokerGrant(delivery.grant, delivery.nonce);
+        return handoff ? htmlResponse(connectHandoffPageHtml(handoff))
+          : new Response(INVALID_LINK_HTML,
+            { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      }
 
       let state = url.searchParams.get("state");
       if (!state) return new Response("Error: no 'state' provided", { status: 400 });
@@ -361,7 +401,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     let authOnly = options?.scopes === "auth";
     let requestedResources = authOnly
         ? []
-        : options?.resourceUrlPatterns ?? SUPPORTED_RESOURCES.map(resource => resource.urlPattern);
+        : options?.resourceUrlPatterns ?? (this.env.CENTRAL_GATEKEEPER_URL || this.env.BROKER_URL ? []
+          : SUPPORTED_RESOURCES.map(resource => resource.urlPattern));
     let mode: OAuthFlowMode = authOnly ? "auth" : "connect";
     await this.ctx.exports.UserAccount.get(userObjectId)
         .setCallback(callback, initiationNonce, requestedResources, mode);
@@ -498,7 +539,27 @@ export class UserAccount extends DurableObject<Env> {
     if (!clientId || !clientSecret) {
       throw new Error("The Google Gatekeeper is not configured.");
     }
+    const grant = await exchangeAuthCode(
+      code, clientId, clientSecret, flow.oauthRedirectUri,
+      AbortSignal.timeout(AUTH_CODE_EXCHANGE_TIMEOUT_MS));
+    return this.#acceptGrant(grant, flow);
+  }
 
+  /** Complete a broker handoff only for the nonce generated by this account's consent attempt. */
+  async acceptBrokerGrant(grant: GoogleOAuthGrant, oauthNonce: string): Promise<ConnectHandoff | null> {
+    const managed = this.env.CENTRAL_GATEKEEPER_URL && /^cgc1\.[0-9a-f]{64}$/.test(grant.refreshToken ?? "") &&
+      !!grant.accessToken.token && !grant.accessToken.token.startsWith("gk1.");
+    const delegated = !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL &&
+      grant.refreshToken?.startsWith("gk1.") && grant.accessToken.token === grant.refreshToken;
+    if (!managed && !delegated) {
+      throw new Error("OAuth broker did not return a sealed grant.");
+    }
+    const flow = claimStoredOAuthFlow(this.ctx.storage.kv, oauthNonce, Date.now());
+    return flow ? this.#acceptGrant(grant, flow) : null;
+  }
+
+  async #acceptGrant(response: GoogleOAuthGrant, flow: NonNullable<ReturnType<
+      typeof claimStoredOAuthFlow>>): Promise<ConnectHandoff> {
     // The credential swap is serialized against minting and revoke, but the callbacks below are
     // not: they are outbound RPCs that can re-enter this object, and awaiting one while holding the
     // mutex would deadlock. So the locked section returns what the notifications need and the
@@ -509,10 +570,6 @@ export class UserAccount extends DurableObject<Env> {
         // Must have timed out.
         throw new Error("Took too long to complete the authorization. Please try again.");
       }
-
-      let response = await exchangeAuthCode(
-          code, clientId, clientSecret, flow.oauthRedirectUri,
-          AbortSignal.timeout(AUTH_CODE_EXCHANGE_TIMEOUT_MS));
 
       if (!response.refreshToken) {
         throw new Error("OAuth exchange didn't return refresh token?");
@@ -601,7 +658,7 @@ export class UserAccount extends DurableObject<Env> {
 
   async getAccessToken(opts?: AccessTokenRequest): Promise<GoogleAccessToken> {
     let { CLIENT_ID: clientId, CLIENT_SECRET: clientSecret } = this.env;
-    if (!clientId || !clientSecret) {
+    if (!(this.env.CENTRAL_GATEKEEPER_URL || this.env.BROKER_URL) && (!clientId || !clientSecret)) {
       throw new Error("The Google Gatekeeper is not configured.");
     }
 
@@ -647,9 +704,14 @@ export class UserAccount extends DurableObject<Env> {
             : "google.token.mint.expiry",
       });
 
-      // TODO: If new refresh token returned, use it.
-      let result = await getAccessToken(refreshToken, clientId, clientSecret,
-          AbortSignal.timeout(TOKEN_MINT_TIMEOUT_MS));
+      // Managed instances receive usable access tokens; legacy delegated instances keep sealed
+      // tokens and proxy traffic through their broker. Both renew through the central authority.
+      let result = this.env.CENTRAL_GATEKEEPER_URL || this.env.BROKER_URL
+        ? await refreshBrokerToken(this.env, refreshToken,
+            AbortSignal.timeout(TOKEN_MINT_TIMEOUT_MS),
+            opts?.staleToken ?? (opts?.forceRefresh ? this.ctx.storage.kv.get<GoogleAccessToken>("accessToken")?.token : undefined))
+        : await getAccessToken(refreshToken, clientId!, clientSecret!,
+            AbortSignal.timeout(TOKEN_MINT_TIMEOUT_MS));
       if (!result.ok) {
         // Both are permanent, so both mark the connection dead. They differ in the remedy:
         // re-authenticating fixes a revoked grant but cannot grant a scope an admin has blocked.
@@ -677,6 +739,9 @@ export class UserAccount extends DurableObject<Env> {
         throw new Error("Google credentials changed while refreshing. Please try again.");
       }
 
+      if ("sealedGrant" in result && typeof result.sealedGrant === "string") {
+        this.ctx.storage.kv.put<string>("refreshToken", result.sealedGrant);
+      }
       this.ctx.storage.kv.put<GoogleAccessToken>("accessToken", result.token);
       return result.token;
     });
@@ -704,7 +769,9 @@ export class UserAccount extends DurableObject<Env> {
   async revoke(): Promise<void> {
     await this.#credentials.run(async () => {
       let refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
-      if (refreshToken) {
+      if (refreshToken && this.env.CENTRAL_GATEKEEPER_URL) {
+        await revokeManagedGoogleGrant(this.env, refreshToken);
+      } else if (refreshToken && !this.env.BROKER_URL) {
         await revokeGoogleToken(refreshToken, AbortSignal.timeout(TOKEN_REVOKE_TIMEOUT_MS));
       }
       this.ctx.storage.deleteAlarm();
@@ -726,7 +793,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     let tokenPromise = obj.getAccessToken();
     let grantedResourcesPromise = obj.getGrantedResourceUrlPatterns();
     let token = await tokenPromise;
-    let description = await getGoogleAccountDescription(token.token);
+    let description = await getGoogleAccountDescription(token.token, this.env);
 
     description.grantedResourceUrlPatterns = await grantedResourcesPromise;
     return description;
@@ -741,7 +808,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       let obj = this.ctx.exports.UserAccount.get(id);
       let token = await obj.getAccessToken();
       if (!token) return null;
-      return await getGoogleVerifiedEmail(token.token);
+      return await getGoogleVerifiedEmail(token.token, this.env);
     } catch {
       return null;
     }
@@ -820,7 +887,9 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
     let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     let account = this.ctx.exports.UserAccount.get(id);
-    let getToken = async (opts?: AccessTokenRequest) => await account.getAccessToken(opts);
+    let getToken = Object.assign(
+      async (opts?: AccessTokenRequest) => await account.getAccessToken(opts),
+      { broker: !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL ? this.env : undefined });
 
     if (resourceUrlPattern === BIGQUERY_RESOURCE.urlPattern) {
       return {
@@ -1010,7 +1079,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasDocAccess(documentId: string): Promise<boolean> {
-    let api = new GoogleDocsApi(opts => this.#getToken(opts));
+    let api = new GoogleDocsApi(brokerTokenProvider(this.env, opts => this.#getToken(opts)));
     try {
       await api.getDocumentMetadata(documentId);
       return true;
@@ -1021,7 +1090,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasSpreadsheetAccess(spreadsheetId: string): Promise<boolean> {
-    let api = new GoogleSheetsApi(opts => this.#getToken(opts));
+    let api = new GoogleSheetsApi(brokerTokenProvider(this.env, opts => this.#getToken(opts)));
     try {
       await api.getSpreadsheet(spreadsheetId);
       return true;
@@ -1032,7 +1101,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasCalendarWriterAccess(calendarId: string): Promise<boolean> {
-    let api = new GoogleCalendarApi(opts => this.#getToken(opts));
+    let api = new GoogleCalendarApi(brokerTokenProvider(this.env, opts => this.#getToken(opts)));
     try {
       let calendar = await api.getCalendar(calendarId);
       return calendar.accessRole === "writer" || calendar.accessRole === "owner";
@@ -1043,7 +1112,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasCalendarFreeBusyAccess(calendarId: string): Promise<boolean> {
-    let api = new GoogleCalendarApi(opts => this.#getToken(opts));
+    let api = new GoogleCalendarApi(brokerTokenProvider(this.env, opts => this.#getToken(opts)));
     try {
       return await api.hasFreeBusyAccess(calendarId);
     } catch (error) {
@@ -1053,7 +1122,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasDatasetAccess(projectId: string, datasetId: string): Promise<boolean> {
-    let api = new BigQueryApi(opts => this.#getToken(opts));
+    let api = new BigQueryApi(brokerTokenProvider(this.env, opts => this.#getToken(opts)));
     try {
       await api.getDataset(projectId, datasetId);
       return true;
@@ -1086,7 +1155,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
     let baselineAllowed = hasDriveResourceGrant(granted);
     if (!baselineAllowed) return { baselineAllowed, allowed: observations.map(() => false) };
 
-    let api = new DriveApi(opts => this.#getToken(opts));
+    let api = new DriveApi(brokerTokenProvider(this.env, opts => this.#getToken(opts)));
     return {
       baselineAllowed,
       allowed: await api.checkObservations(observations),
@@ -1740,7 +1809,7 @@ export class GoogleDocGatekeeperImpl
   }
 
   async describe(): Promise<ResourceDescription> {
-    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleDocsApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let doc = await api.getDocumentMetadata(this.ctx.props.documentId);
     return {
       url: `https://docs.google.com/document/d/${this.ctx.props.documentId}/edit`,
@@ -1761,11 +1830,11 @@ export class GoogleDocGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<GoogleDocSession> {
-    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleDocsApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let pendingActions = new PendingActionStore<GoogleDocAction>(this.ctx.storage.kv);
     return new GoogleDocSessionImpl(
         api,
-        new DriveApi(opts => this.#getAccessToken(opts)),
+        new DriveApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts))),
         this.ctx.props.documentId,
         approvalQueue.dup(),
         pendingActions,
@@ -1808,7 +1877,7 @@ export class GoogleDocGatekeeperImpl
       pendingActions.put(actionId, action);
     }
     let writeMarkerName = googleDocWriteMarkerName(action.writeId);
-    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleDocsApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let doc = await api.getDocument(action.documentId);
     doc = await this.#reconcileDocWriteReceipt(api, doc);
     let snapshot = googleDocSnapshot(doc);
@@ -2285,7 +2354,7 @@ export class GoogleSheetsGatekeeperImpl
   }
 
   async describe(): Promise<ResourceDescription> {
-    let api = new GoogleSheetsApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleSheetsApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let spreadsheet = await api.getSpreadsheet(this.ctx.props.spreadsheetId);
     return {
       url: `https://docs.google.com/spreadsheets/d/${this.ctx.props.spreadsheetId}/edit`,
@@ -2305,7 +2374,7 @@ export class GoogleSheetsGatekeeperImpl
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleSpreadsheetSession> {
-    let api = new GoogleSheetsApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleSheetsApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let queue = approvalQueue.dup();
     // A spreadsheet binding's scope is the one spreadsheet, so there is nothing to revalidate.
     return new GoogleSpreadsheetSessionImpl(
@@ -2586,7 +2655,7 @@ export class GoogleCalendarGatekeeperImpl
   }
 
   async describe(): Promise<ResourceDescription> {
-    let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleCalendarApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let calendar = await api.getCalendar(this.ctx.props.calendarId);
     let availability = this.ctx.props.availabilityMode === "allVisible"
         ? " Availability lookup covers all calendars visible to the account."
@@ -2610,7 +2679,7 @@ export class GoogleCalendarGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<GoogleCalendarSession> {
-    let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleCalendarApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     let pendingActions = new PendingActionStore<GoogleCalendarAction>(this.ctx.storage.kv);
     return new GoogleCalendarSessionImpl(
       api,
@@ -2629,7 +2698,7 @@ export class GoogleCalendarGatekeeperImpl
       throw new Error(`Unknown pending Google Calendar action: ${actionId}`);
     }
 
-    let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleCalendarApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     switch (action.type) {
       case "createEvent": {
         let created = await api.createEvent(action.calendarId, action.event, action.sendUpdates);
@@ -2681,7 +2750,7 @@ export class GoogleCalendarGatekeeperImpl
       };
     }
 
-    let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
+    let api = new GoogleCalendarApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     switch (revertInfo.type) {
       case "createdEvent":
         await api.deleteEvent(revertInfo.calendarId, revertInfo.eventId, revertInfo.sendUpdates);
@@ -2954,7 +3023,7 @@ export class GoogleDriveGatekeeperImpl
         tsType: "GoogleDriveSession",
       };
     }
-    let api = new DriveApi(opts => this.#getAccessToken(opts));
+    let api = new DriveApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     if (scope.kind === "folder") {
       // Validated here too, so a hand-built resource URL fails at connect rather than minting a
       // presentable binding whose every call then refuses.
@@ -2988,7 +3057,8 @@ export class GoogleDriveGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleDriveSession> {
     let observerTracker = this.#observerTracker();
-    let getDriveAccessToken = (opts?: AccessTokenRequest) => this.#getAccessToken(opts);
+    let getDriveAccessToken = brokerTokenProvider(this.env,
+      (opts?: AccessTokenRequest) => this.#getAccessToken(opts));
     return new GoogleDriveSessionImpl(
       new DriveApi(getDriveAccessToken),
       new GoogleDocsApi(getDriveAccessToken),
@@ -3334,7 +3404,7 @@ export class BigQueryGatekeeperImpl
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<BigQuerySession> {
-    let api = new BigQueryApi(opts => this.#getAccessToken(opts));
+    let api = new BigQueryApi(brokerTokenProvider(this.env, opts => this.#getAccessToken(opts)));
     return new BigQuerySessionImpl(
       api,
       approvalQueue.dup(),

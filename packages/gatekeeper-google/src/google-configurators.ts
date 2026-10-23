@@ -6,6 +6,7 @@ import { ChatApi, chatSpaceIdFromReference, isChatNoAccessError } from "./chat-a
 import type { ChatSpaceInfo } from "./chat-types";
 import { GoogleAccessToken } from "./google-api";
 import { AccessTokenProvider, AccessTokenRequest } from "./auth-retry";
+import { brokerTokenProvider, type BrokerEnv } from "./broker-api";
 import { DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE } from "./drive-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
 import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurator-types";
@@ -26,7 +27,10 @@ import type { DriveFolderConfiguratorRpc } from "./configurator/drive-folder-con
  * Mints an access token for a configurator, forwarding `AccessTokenRequest` to the `UserAccount`
  * so a client built on it can heal a 401 by asking for a fresh one.
  */
-type ConfiguratorTokenGetter = (opts?: AccessTokenRequest) => Promise<GoogleAccessToken>;
+type ConfiguratorTokenGetter = {
+  (opts?: AccessTokenRequest): Promise<GoogleAccessToken>;
+  broker?: BrokerEnv;
+};
 
 const googleTokenGetters = new WeakMap<object, ConfiguratorTokenGetter>();
 const calendarConfiguratorCaches = new WeakMap<object, Promise<ConfiguratorOption[]>>();
@@ -47,7 +51,9 @@ function googleToken(target: object, opts?: AccessTokenRequest): Promise<GoogleA
 
 /** A provider that re-asks on every call, so `fetchWithAuthRetry` can refresh a rejected token. */
 function googleTokenProvider(target: object): AccessTokenProvider {
-  return async opts => (await googleToken(target, opts)).token;
+  const provider: AccessTokenProvider = async opts => (await googleToken(target, opts)).token;
+  const broker = googleTokenGetters.get(target)?.broker;
+  return broker ? brokerTokenProvider(broker, provider) : provider;
 }
 
 async function withDriveApiEnabled<T>(

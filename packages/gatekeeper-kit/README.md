@@ -85,6 +85,7 @@ import {
 | `./simulation` | Pending-action replay and provisional-ID mapping. | An action continues with simulation and later reads must include its projected effect. |
 | `./observers` | Observer admission strategies and per-read authorization. | A gatekeeper implements its required observer methods. |
 | `./oauth-client` | OAuth 2.0 token-endpoint client, PKCE, and refresh adapter. | A gatekeeper exchanges, refreshes, or revokes OAuth 2.0 tokens. |
+| `./central-oauth` | Signed consent, ticket redemption, renewal and disconnect for managed instances. | The instance receives access tokens while a Cloudflare-operated central vault retains provider refresh tokens. |
 | `./preview-oauth` | Signed OAuth state and stable-to-preview callback relay. | Preview Workers share one callback registered with the OAuth provider. |
 | `./endpoint` | User-supplied provider endpoint normalization. | A user enters a self-hosted provider URL. |
 | `./http-errors` | HTTP access-error classification and ACL probes. | A verifier distinguishes no access from provider failure. |

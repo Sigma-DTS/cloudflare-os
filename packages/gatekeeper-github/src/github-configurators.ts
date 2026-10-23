@@ -2,6 +2,7 @@ import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import {
   GitHubApi,
+  type GitHubTransport,
   type GitHubIssueResponse,
   type GitHubPullRequestResponse,
   type GitHubRepoResponse,
@@ -17,6 +18,7 @@ const GITHUB_OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
 const GITHUB_REPO_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 const githubTokenGetters = new WeakMap<object, () => Promise<string>>();
+const githubTransports = new WeakMap<object, GitHubTransport>();
 // Per-instance cache of the authenticated user's login. Used to scope `searchRepos` to repos
 // the user can access. Fetched lazily on first need and reused for the configurator's lifetime.
 const githubViewerLogins = new WeakMap<object, Promise<string>>();
@@ -24,7 +26,7 @@ const githubViewerLogins = new WeakMap<object, Promise<string>>();
 function githubApi(target: object): GitHubApi {
   const getToken = githubTokenGetters.get(target);
   if (!getToken) throw new Error("GitHub configurator is not initialized.");
-  return new GitHubApi(getToken);
+  return new GitHubApi(getToken, githubTransports.get(target));
 }
 
 function viewerLogin(target: object): Promise<string> {
@@ -120,9 +122,10 @@ function pullRequestSearchOption(pullRequest: GitHubIssueResponse) {
 // Capability exposed to the configurator iframe.
 @validateRpc()
 export class GitHubRepoConfiguratorUI extends RpcTarget implements GitHubRepoConfiguratorRpc {
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, transport?: GitHubTransport) {
     super();
     githubTokenGetters.set(this, getToken);
+    if (transport) githubTransports.set(this, transport);
   }
 
   async listRepos(query: string): Promise<ConfiguratorOption[]> {

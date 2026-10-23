@@ -23,13 +23,14 @@ import {
 import {
   ActionDescriptionBuilder, buildDescription, codeSpan, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   GitHubApi,
   GitHubApiError,
   exchangeAuthCode,
   revokeOAuthToken,
+  type GitHubOAuthGrant,
   type ConditionalRequestResult,
   type GitHubCompareResponse,
   type GitHubIssueCommentResponse,
@@ -39,6 +40,15 @@ import {
   type GitHubPullRequestResponse,
   type GitHubPullRequestReviewCommentResponse,
 } from "./github-api";
+import {
+  beginBrokerOAuth,
+  brokerTransport,
+  redeemBrokerGrant,
+  refreshBrokerGrant,
+  revokeBrokerGrant,
+  type BrokerEnv,
+  type SealedGitHubGrant,
+} from "./broker-api";
 import { assertIssueSearchResultsInRepo, buildIssueSearchQuery } from "./github-search";
 import {
   actorFromUser,
@@ -70,6 +80,7 @@ import {
   validateBranchName,
 } from "./git-transport";
 import GITHUB_LOGO_SVG from "./github-logo.svg";
+import { validateBootstrapFetch } from "./git-bootstrap";
 import type {
   GitHubActor,
   GitHubBranchFilter,
@@ -126,7 +137,7 @@ const logger = obsContext.createLogger({
   component: "gatekeeper.github", vendorId: VENDOR_ID,
 });
 
-type Env = Cloudflare.Env & {
+type Env = Cloudflare.Env & BrokerEnv & {
   BASE_URL?: string;
   CLIENT_ID?: string;
   CLIENT_SECRET?: string;
@@ -143,6 +154,8 @@ type StoredNonce = {
    */
   reconnect?: true;
 };
+
+type ConnectedGrant = GitHubOAuthGrant & { expiresAt?: number; centralCredential?: string };
 
 type ResourceKind = "repo" | "issue" | "pull";
 type EntityKind = "issue" | "pull";
@@ -604,6 +617,12 @@ function getBasePath(env: Env): string {
 }
 
 function ensureConfigured(env: Env): void {
+  if (env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) {
+    if (!env.CFOS_INSTALL_ID || !env.CFOS_INSTALL_KEY_ID || !env.CFOS_INSTALL_PRIVATE_KEY) {
+      throw new Error("The delegated GitHub gatekeeper has no registered installation identity.");
+    }
+    return;
+  }
   if (!env.CLIENT_ID || !env.CLIENT_SECRET) {
     throw new Error("The GitHub gatekeeper is not configured.");
   }
@@ -1282,7 +1301,7 @@ export default {
     const path = relPath.slice(1).split("/");
 
     if (path.length === 2 && path[0].length === 64 && path[1].length === NONCE_BYTES * 2) {
-      if (!env.CLIENT_ID || !env.CLIENT_SECRET) {
+      if (!(env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) && (!env.CLIENT_ID || !env.CLIENT_SECRET)) {
         return new Response(NOT_CONFIGURED_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
@@ -1298,16 +1317,38 @@ export default {
         });
       }
 
+      if (env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) {
+        try {
+          const authorization = await beginBrokerOAuth(env, doId, begun.oauthNonce, begun.scopes,
+            `${basePath}/oauth`);
+          return Response.redirect(authorization, 302);
+        } catch (error) {
+          console.error("GitHub broker failed to start consent", error);
+          return htmlResponse(errorPageHtml("GitHub connection unavailable",
+            "Unable to start authorization. Contact your Cloudflare OS administrator, then restart the connection flow."), 503);
+        }
+      }
       const redirectUrl = new URL("https://github.com/login/oauth/authorize");
-      redirectUrl.searchParams.set("client_id", env.CLIENT_ID);
+      redirectUrl.searchParams.set("client_id", env.CLIENT_ID!);
       redirectUrl.searchParams.set("redirect_uri", `${getBaseUrl(env)}/oauth`);
       redirectUrl.searchParams.set("scope", begun.scopes.join(" "));
       redirectUrl.searchParams.set("state", `${doId}:${begun.oauthNonce}`);
-
       return Response.redirect(redirectUrl.toString(), 302);
     }
 
     if (relPath === "/oauth") {
+      if (env.CENTRAL_GATEKEEPER_URL || env.BROKER_URL) {
+        const ticket = url.searchParams.get("ticket");
+        if (!ticket) return new Response(INVALID_LINK_HTML, { status: 400,
+          headers: { "Content-Type": "text/html; charset=utf-8" } });
+        const delivery = await redeemBrokerGrant(env, ticket);
+        const stub = ctx.exports.UserAccount.get(
+          ctx.exports.UserAccount.idFromString(delivery.accountId));
+        const handoff = await stub.acceptBrokerGrant(delivery.grant, delivery.nonce);
+        return handoff ? htmlResponse(connectHandoffPageHtml(handoff))
+          : new Response(INVALID_LINK_HTML, { status: 400,
+            headers: { "Content-Type": "text/html; charset=utf-8" } });
+      }
       const error = url.searchParams.get("error");
       if (error) {
         return new Response("GitHub authorization failed. Please restart the connection flow from Cloudflare OS.", {
@@ -1383,6 +1424,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
 }
 
 export class UserAccount extends DurableObject<Env> {
+  #refreshing?: Promise<string>;
+
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string,
                     requestedScopes?: string[], ephemeral?: boolean): Promise<void> {
     if (!this.ctx.storage.kv.get<string>("accessToken")) {
@@ -1446,12 +1489,37 @@ export class UserAccount extends DurableObject<Env> {
       throw new Error("GitHub OAuth is not configured.");
     }
 
-    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-    if (!callback) {
-      throw new Error("Took too long to complete authorization. Please try again.");
-    }
-
     const grant = await exchangeAuthCode(code, clientId, clientSecret, `${getBaseUrl(this.env)}/oauth`);
+    return this.#completeGrant(grant, stored);
+  }
+
+  /** Redeem only an installation-bound encrypted grant; a GitHub token never enters this Worker. */
+  async acceptBrokerGrant(grant: SealedGitHubGrant, oauthNonce: string): Promise<ConnectHandoff | null> {
+    const managed = this.env.CENTRAL_GATEKEEPER_URL && /^cgc1\.[0-9a-f]{64}$/.test(grant.sealed) && !!grant.accessToken;
+    const delegated = !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL && grant.sealed.startsWith("ghg1.");
+    if ((!managed && !delegated) || !Number.isFinite(grant.expiresAt) || !Array.isArray(grant.scopes)) return null;
+    const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
+    if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
+        !constantTimeEqual(stored.value, oauthNonce)) return null;
+    this.ctx.storage.kv.delete("nonce");
+    return this.#completeGrant({ accessToken: managed ? grant.accessToken! : grant.sealed, scopes: grant.scopes,
+      tokenType: "bearer", expiresAt: grant.expiresAt,
+      ...(managed ? { centralCredential: grant.sealed } : {}) }, stored);
+  }
+
+  #storeGrant(grant: ConnectedGrant): void {
+    this.ctx.storage.kv.put("accessToken", grant.accessToken);
+    this.ctx.storage.kv.put("scopes", grant.scopes);
+    if (grant.centralCredential) this.ctx.storage.kv.put("centralCredential", grant.centralCredential);
+    else this.ctx.storage.kv.delete("centralCredential");
+    if (grant.expiresAt !== undefined) this.ctx.storage.kv.put("expiresAt", grant.expiresAt);
+    else this.ctx.storage.kv.delete("expiresAt");
+    this.ctx.storage.kv.put("expiredNotified", false);
+  }
+
+  async #completeGrant(grant: ConnectedGrant, stored: StoredNonce): Promise<ConnectHandoff> {
+    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
+    if (!callback) throw new Error("Took too long to complete authorization. Please try again.");
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
@@ -1462,15 +1530,15 @@ export class UserAccount extends DurableObject<Env> {
       const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
       handoff = await callback.reconnectComplete(stageId);
     } else {
-      this.ctx.storage.kv.put("accessToken", grant.accessToken);
-      this.ctx.storage.kv.put("scopes", grant.scopes);
-      this.ctx.storage.kv.put("expiredNotified", false);
+      this.#storeGrant(grant);
       try {
         const props = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (error) {
         this.ctx.storage.kv.delete("accessToken");
         this.ctx.storage.kv.delete("scopes");
+        this.ctx.storage.kv.delete("expiresAt");
+        this.ctx.storage.kv.delete("centralCredential");
         throw error;
       }
       // Auth-only sign-in grants are transient: the caller read the email via complete(), so
@@ -1488,18 +1556,50 @@ export class UserAccount extends DurableObject<Env> {
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<Awaited<ReturnType<typeof exchangeAuthCode>>>(
+    const grant = commitStagedCredentials<ConnectedGrant>(
       this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.ctx.storage.kv.put("accessToken", grant.accessToken);
-    this.ctx.storage.kv.put("scopes", grant.scopes);
-    this.ctx.storage.kv.put("expiredNotified", false);
+    this.#storeGrant(grant);
   }
 
-  getAccessToken(): string {
+  async getAccessToken(): Promise<string> {
     const accessToken = this.ctx.storage.kv.get<string>("accessToken");
     if (!accessToken) {
       throw new Error("GitHub credentials have not been configured for this account.");
+    }
+    if (this.env.CENTRAL_GATEKEEPER_URL || this.env.BROKER_URL) {
+      const centralCredential = this.ctx.storage.kv.get<string>("centralCredential");
+      if (this.env.CENTRAL_GATEKEEPER_URL ? !centralCredential : !accessToken.startsWith("ghg1.")) throw new Error("Reconnect to use central GitHub delegation.");
+      const expiresAt = this.ctx.storage.kv.get<number>("expiresAt");
+      if (!expiresAt) throw new Error("Delegated GitHub grant has no expiry.");
+      if (expiresAt <= Date.now() + 60_000) {
+        // A GitHub refresh token is rotated on use. Serialize refresh for this account DO so two
+        // overlapping API reads never exchange the same old token and strand one another.
+        if (!this.#refreshing) {
+          this.#refreshing = (async () => {
+            const refreshed = await refreshBrokerGrant(this.env, centralCredential ?? accessToken);
+            // A reconnect or revoke can land while the provider exchange is in flight. Never
+            // overwrite that newer grant (or resurrect a revoked account) with this result.
+            const current = this.ctx.storage.kv.get<string>("accessToken");
+            if (current !== accessToken || (centralCredential !== undefined &&
+                this.ctx.storage.kv.get<string>("centralCredential") !== centralCredential)) {
+              if (!current) throw new Error("GitHub account was disconnected.");
+              return current;
+            }
+            if (!refreshed.ok) {
+              await this.noteCredentialsExpired();
+              throw new Error("GitHub credentials expired. Please reconnect the account.");
+            }
+            const nextToken = refreshed.grant.accessToken ?? refreshed.grant.sealed;
+            this.#storeGrant({ accessToken: nextToken,
+              scopes: refreshed.grant.scopes, tokenType: "bearer",
+              expiresAt: refreshed.grant.expiresAt,
+              ...(centralCredential ? { centralCredential: refreshed.grant.sealed } : {}) });
+            return nextToken;
+          })().finally(() => { this.#refreshing = undefined; });
+        }
+        return this.#refreshing;
+      }
     }
     return accessToken;
   }
@@ -1530,9 +1630,16 @@ export class UserAccount extends DurableObject<Env> {
 
   async revoke(): Promise<void> {
     const accessToken = this.ctx.storage.kv.get<string>("accessToken");
-    if (accessToken && this.env.CLIENT_ID && this.env.CLIENT_SECRET) {
+    if (accessToken) {
       try {
-        await revokeOAuthToken(accessToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
+        if (this.env.CENTRAL_GATEKEEPER_URL || this.env.BROKER_URL) {
+          const reference = this.env.CENTRAL_GATEKEEPER_URL
+            ? this.ctx.storage.kv.get<string>("centralCredential") : accessToken;
+          if (reference) await revokeBrokerGrant(this.env, reference);
+        }
+        else if (this.env.CLIENT_ID && this.env.CLIENT_SECRET) {
+          await revokeOAuthToken(accessToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
+        }
       } catch (error) {
         logger.error("failed to revoke GitHub OAuth token", {
           event: "oauth.token.revoke.failed", error,
@@ -1555,7 +1662,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
     const scopes = await account.getScopes();
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = new GitHubApi(async () => await account.getAccessToken(),
+      !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL ? brokerTransport(this.env) : undefined);
     try {
       return await fn(api, scopes);
     } catch (error) {
@@ -1634,25 +1742,26 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       const account = this.ctx.exports.UserAccount.get(id);
       return await account.getAccessToken();
     };
+    const transport = !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL ? brokerTransport(this.env) : undefined;
 
     if (resourceUrlPattern === REPO_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_REPO_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken, transport)),
       };
     }
 
     if (resourceUrlPattern === ISSUE_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_ISSUE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken, transport)),
       };
     }
 
     if (resourceUrlPattern === PULL_REQUEST_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_PULL_REQUEST_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken, transport)),
       };
     }
 
@@ -1726,7 +1835,8 @@ export class GitHubVerifier extends WorkerEntrypoint<Env, GitHubVerifierProps>
   async hasRepoAccess(owner: string, repo: string): Promise<boolean> {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = new GitHubApi(async () => await account.getAccessToken(),
+      !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL ? brokerTransport(this.env) : undefined);
     try {
       await api.getRepo(owner, repo);
       return true;
@@ -1763,7 +1873,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   async #withApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
     const account = this.#userAccount();
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = new GitHubApi(async () => await account.getAccessToken(),
+      !this.env.CENTRAL_GATEKEEPER_URL && this.env.BROKER_URL ? brokerTransport(this.env) : undefined);
     try {
       return await fn(api);
     } catch (error) {
@@ -3752,6 +3863,14 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     await this.#withApi(api => pullGitObjectsIntoCache(
       body => api.fetchGitUploadPack(this.ctx.props.owner, this.ctx.props.repo, body),
       oids, hints, cache));
+  }
+
+  /** Repository-scoped, exact-commit native fetch. The OAuth token stays in the API transport. */
+  async gitReadPack(commit: GitOid, request: Uint8Array): Promise<ReadableStream<Uint8Array>> {
+    validateBootstrapFetch(commit, request);
+    const response = await this.#withApi(api => api.fetchGitUploadPack(this.ctx.props.owner, this.ctx.props.repo, request));
+    if (!response.body) throw new Error("Git provider returned no pack stream.");
+    return response.body;
   }
 
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {

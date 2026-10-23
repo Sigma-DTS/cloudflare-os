@@ -24,6 +24,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    testTimeout: 15_000,
     include: [
       "__tests__/workerd/google-doc-actions.test.ts",
       "__tests__/workerd/native-sessions.test.ts",

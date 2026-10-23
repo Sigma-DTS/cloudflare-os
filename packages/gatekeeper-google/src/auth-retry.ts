@@ -44,7 +44,11 @@ export type AccessTokenRequest = {
   reloadStored?: boolean;
 };
 
-export type AccessTokenProvider = (opts?: AccessTokenRequest) => Promise<string>;
+export type AccessTokenProvider = {
+  (opts?: AccessTokenRequest): Promise<string>;
+  /** Present only on an installation-bound broker connection; the token is sealed ciphertext. */
+  transport?: (url: string, init: RequestInit, sealedGrant: string) => Promise<Response>;
+};
 
 export type FetchWithAuthRetryOptions = {
   /**
@@ -125,15 +129,23 @@ export async function fetchWithAuthRetry(
     let signal = signals.length > 0 ? AbortSignal.any(signals) : undefined;
 
     let headers = new Headers(init.headers);
-    headers.set("Authorization", `Bearer ${token}`);
+    const sealed = token.startsWith("gk1.");
+    if (sealed && !getAccessToken.transport) {
+      throw new Error("A sealed Google grant requires the central broker transport.");
+    }
+    if (sealed) headers.delete("Authorization");
+    else headers.set("Authorization", `Bearer ${token}`);
 
     let response: Response;
     try {
-      response = await fetch(url, {
+      const request: RequestInit = {
         ...init,
         headers,
         ...(signal ? { signal } : {}),
-      });
+      };
+      response = sealed
+        ? await getAccessToken.transport!(url, request, token)
+        : await fetch(url, request);
     } catch (error) {
       // Network error or timeout: ambiguous, so retry only when the request is safe to replay.
       if (replayable && idempotent && attempt < retries - 1) {

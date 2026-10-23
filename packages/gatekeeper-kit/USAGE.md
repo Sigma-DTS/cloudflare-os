@@ -826,3 +826,33 @@ cannot exceed the provider's page cap.
 - Every callback the kit invokes must throw display-safe errors. `discardMint`, the rejection heal,
   and the expiry notification all log what they catch, so a thrown token, header, or response body
   lands in the deployment's logs.
+
+## Managed central OAuth
+
+`./central-oauth` signs server-to-server consent, redemption, refresh and disconnect calls for a
+Cloudflare-managed instance. The installer supplies `CENTRAL_GATEKEEPER_URL` and the installation's
+`CFOS_INSTALL_ID`, `CFOS_INSTALL_KEY_ID` and P-256 `CFOS_INSTALL_PRIVATE_KEY`. Do not take that URL or
+identity from a customer-facing configurator. The browser carries only a single-use ticket; check
+the account's outstanding OAuth nonce and preserve the normal Workshop reconnect approval before
+committing the returned grant.
+
+The instance receives a usable provider access token and stores `cgc1.<credentialId>` as its refresh
+reference. Provider refresh tokens and client secrets stay in the central vault. Send API traffic
+directly to the provider. On Google 401 recovery, pass the rejected access token to
+`refreshCentralOAuth` so the service replaces it even before its recorded expiry. Transient central
+or provider failures leave the reference retryable; a permanent grant error prompts reconnect.
+
+Disconnect disables central renewal. It does not revoke project-wide Google authorization, and
+already-issued tokens remain valid until provider expiry. Fleet suspension has the same limit.
+Legacy `BROKER_URL` mode uses sealed proxy tokens; changing modes requires reconnecting existing
+provider accounts. A managed reference must never be exchanged at the provider's token endpoint.
+
+### Access-protected central broker transport
+
+For `./central-oauth`, set both `CENTRAL_GATEKEEPER_ACCESS_CLIENT_ID` and
+`CENTRAL_GATEKEEPER_ACCESS_CLIENT_SECRET` as Worker secrets to authenticate to an Access-protected
+`CENTRAL_GATEKEEPER_URL`. The pair is sent only in headers on signed `/begin`, `/redeem`,
+`/refresh` and `/revoke` requests. Incomplete pairs fail before network access; redirects are never
+followed. Omitting both preserves use with brokers that do not require this transport. Access
+authentication supplements the installation signature and never selects a tenant or grant.
+Keep these credentials separate from any credentials used to reach an upstream provider.
