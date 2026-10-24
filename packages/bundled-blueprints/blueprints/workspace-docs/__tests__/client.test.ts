@@ -256,6 +256,21 @@ describe("more edits", () => {
     expect(Array.from(editor().querySelectorAll('[data-block-id="x2"] td'), (c) => c.innerHTML)).toEqual(["First ", "<br>", " cell"]);
   });
 
+  // Text dropped in a code block is code, not Markdown: "# comment" stays a comment.
+  it("drops text into a code block as it is", () => {
+    send([{ id: "c7", html: "<pre>x = 1</pre>", version: 1 }]);
+    const at = document.createRange();
+    at.setStart(editor().querySelector('[data-block-id="c7"]')!.firstChild!, 5);
+    const execCommand = vi.fn(() => true);
+    Object.assign(document, { caretRangeFromPoint: () => at, execCommand });
+    const event = Object.assign(new Event("drop", { bubbles: true, cancelable: true }), {
+      clientX: 0, clientY: 0,
+      dataTransfer: { items: [], files: [], getData: (type: string) => (type === "text/plain" ? "\n# comment\nprint(1)" : "") },
+    });
+    try { editor().dispatchEvent(event); } finally { delete (document as { caretRangeFromPoint?: unknown }).caretRangeFromPoint; delete (document as { execCommand?: unknown }).execCommand; }
+    expect(execCommand).toHaveBeenCalledWith("insertHTML", false, "\n# comment\nprint(1)");
+  });
+
   // A grid dropped on a table cell fills the cells from there, as pasting it does.
   it("fills a table's cells with a grid dropped on one", () => {
     send([{ id: "g2", html: "<table><tbody><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></tbody></table>", version: 1 }]);

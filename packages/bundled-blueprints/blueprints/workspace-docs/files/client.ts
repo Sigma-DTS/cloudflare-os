@@ -2440,8 +2440,9 @@ editor.addEventListener("drop", (e) => {
   if (html?.trim() || text) {
     e.preventDefault();
     setCaretFromPoint(e.clientX, e.clientY);
-    // Dropped on a table cell, it fills the cells as a paste there does.
+    // Dropped in code or on a table cell, it goes in as a paste there does.
     const range = getRange();
+    if (range && insertIntoCode(range, text || "")) return;
     const cell = range && cellOf(range.startContainer);
     if (cell) pasteIntoCell(cell, html || "", text || "");
     else insertPasted(clipboardHtml(html, text));
@@ -2473,6 +2474,14 @@ function insertPasted(html: string) {
   const last = editor.lastElementChild;
   if (last?.tagName === "TABLE") { last.after(emptyParagraph()); changed(); }
 }
+// Text pasted or dropped into code stays literal: a code block keeps its
+// lines, inline code joins them.
+function insertIntoCode(range: Range, text: string): boolean {
+  if (closestEl(range.startContainer, "pre")) exec("insertHTML", escapeHtml(text));
+  else if (closestEl(range.startContainer, "code")) exec("insertText", text.replace(/\s*\n\s*/g, " "));
+  else return false;
+  return true;
+}
 editor.addEventListener("paste", (e) => {
   const cb = e.clipboardData;
   if (!cb) return;
@@ -2486,8 +2495,7 @@ editor.addEventListener("paste", (e) => {
   const range = getRange();
   const text = cb.getData("text/plain") || "";
   const html = cb.getData("text/html");
-  if (range && closestEl(range.startContainer, "pre")) { exec("insertHTML", escapeHtml(text)); return; }
-  if (range && closestEl(range.startContainer, "code")) { exec("insertText", text.replace(/\s*\n\s*/g, " ")); return; }
+  if (range && insertIntoCode(range, text)) return;
   // Pasting a URL over selected text turns the text into a link.
   if (range && !range.collapsed && looksLikeUrl(text) && !/\n/.test(range.toString())) { exec("createLink", normalizeHref(text)); return; }
   const cell = range && cellOf(range.startContainer);
