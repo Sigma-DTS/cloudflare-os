@@ -79,6 +79,12 @@ them:
 - Admin operations are exposed as an `AdminApi` capability obtained via
   `AuthenticatedApi.getAdminApi()` (returns null for non-admins). The `#isAdmin()` check happens once
   when the capability is minted, so the individual methods don't re-check.
+- `cf-os api` names itself in its User-Agent (`cf-os-api/<version>`), and on a deployment the `/api`
+  route lets it act only as a deployment admin: `PublicApiImpl` refuses its sign-ins as anyone else
+  and every call that signs no one in. A local dev instance, whose backend has `LOCAL_DEV_INSTANCE`
+  (set only by `run-dev-server.ts` and the integration harness; a deployment must never set it),
+  lets it do anything. A speed bump against casual use, not authorization: any client can send any
+  User-Agent.
 - `user.ts:#assertResourceEnabled()` is the single core chokepoint where disabled
   gatekeepers/resources are enforced before a capability is minted. Both mints call it:
   `getGatekeeperClassFor()` (gadget/agent code can't reach it directly) and
