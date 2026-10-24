@@ -339,10 +339,13 @@ function inlineMarkdown(text: unknown): string {
     return src ? keep('<img class="doc-image" src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt.replace(/\\([\\[\]])/g, "$1")) + '">') : m;
   });
   s = s.replace(/\\([!-/:-@[-`{-~])/g, (_, c: string) => keep(escapeHtml(c)));
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, label: string, url: string) => {
+  // A label may hold a line break (but not a blank line), and a URL in it is
+  // its text, not another link.
+  s = s.replace(/\[((?:[^\]\n]|\n(?!\s*\n))+)\]\(([^)\s]+)\)/g, (m, label: string, url: string) => {
     // A code span inside the URL was already taken out; such a link stays text.
     const href = url.includes("\0") ? null : safeUrl(url);
-    return href ? keep('<a href="' + escapeHtml(href) + '">') + label + keep("</a>") : m;
+    const text = label.replace(/https?:\/\/[^\s<\0*~]*[^\s<\0.,;:!?)\]'"*_~]/g, (u) => keep(escapeHtml(u)));
+    return href ? keep('<a href="' + escapeHtml(href) + '">') + text + keep("</a>") : m;
   });
   s = s.replace(/(^|[\s(])(https?:\/\/[^\s<\0]+[^\s<\0.,;:!?)\]'"])/g, (_, pre: string, url: string) => pre + keep('<a href="' + escapeHtml(url) + '">' + escapeHtml(url) + "</a>"));
   s = escapeHtml(s).replace(/&lt;(\/?)(strong|em|del)&gt;/g, (_, close: string, tag: string) => `<${close}${{ strong: "b", em: "i", del: "s" }[tag]}>`);

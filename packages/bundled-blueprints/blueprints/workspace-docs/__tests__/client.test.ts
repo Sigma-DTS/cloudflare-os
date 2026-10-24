@@ -231,6 +231,31 @@ describe("more edits", () => {
     expect(Array.from(table.querySelectorAll("tr"), (tr) => Array.from(tr.cells, (c) => c.textContent))).toEqual([["A", "B"], ["X", "Y"]]);
   });
 
+  it("sizes and inserts a table from the keyboard", () => {
+    send([{ id: "k9", html: "<p>Here</p>", version: 1 }]);
+    caretIn(editor().querySelector('[data-block-id="k9"]')!.firstChild!, 4);
+    const before = editor().querySelectorAll("table").length;
+    document.querySelector<HTMLButtonElement>('button[aria-label="Table"]')!.click();
+    const grid = document.activeElement as HTMLElement;
+    expect(grid.getAttribute("aria-label")).toMatch(/table size/i);
+    for (const key of ["ArrowRight", "ArrowDown", "ArrowDown", "Enter"]) grid.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    const tables = editor().querySelectorAll("table");
+    expect(tables).toHaveLength(before + 1);
+    // Inserted after the paragraph, the last block.
+    const table = tables[tables.length - 1]!;
+    expect([table.rows.length, table.rows[0]!.cells.length]).toEqual([5, 4]);
+  });
+
+  // Only the selected text goes: the start of the first cell and the end of the last stay.
+  it("deletes a selection across cells without the text around it", () => {
+    send([{ id: "x2", html: "<table><tbody><tr><td>First cell</td><td>Middle</td><td>Second cell</td></tr></tbody></table>", version: 1 }]);
+    const cells = editor().querySelectorAll('[data-block-id="x2"] td');
+    caretIn(cells[0]!.firstChild!, 6);
+    getSelection()!.getRangeAt(0).setEnd(cells[2]!.firstChild!, 6);
+    editor().dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", bubbles: true, cancelable: true }));
+    expect(Array.from(editor().querySelectorAll('[data-block-id="x2"] td'), (c) => c.innerHTML)).toEqual(["First ", "<br>", " cell"]);
+  });
+
   // A grid dropped on a table cell fills the cells from there, as pasting it does.
   it("fills a table's cells with a grid dropped on one", () => {
     send([{ id: "g2", html: "<table><tbody><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></tbody></table>", version: 1 }]);

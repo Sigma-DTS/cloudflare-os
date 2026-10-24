@@ -132,7 +132,8 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
       // Backslash escapes are literal inside a code span, so none there.
       else if (inCode) inline += text.replace(/\s+/g, " ");
       else {
-        const words = text.replace(/\s+/g, " ").replace(/([\\*_[\]<`])/g, "\\$1");
+        // (Doubled tildes would read as strikethrough; a lone one is left as it is.)
+        const words = text.replace(/\s+/g, " ").replace(/([\\*_[\]<`])/g, "\\$1").replace(/~(?=~)|(?<=~)~/g, "\\~");
         space ||= words.startsWith(" ");
         if (words.trim()) {
           // At the start of a line, text that reads as a heading, quote, list or rule marker is escaped.

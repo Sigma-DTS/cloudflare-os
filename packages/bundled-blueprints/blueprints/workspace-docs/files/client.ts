@@ -4259,7 +4259,8 @@ document.head.appendChild(el("style", { text: `
 .tbl-tint { border-radius: 3px !important; }
 body.tbl-resizing, body.tbl-resizing * { cursor: col-resize !important; -webkit-user-select: none; user-select: none; }
 .pop.tbl-picker { min-width: 0; padding: 4px 10px 9px; }
-.tp-grid { display: grid; grid-template-columns: repeat(8, 16px); gap: 3px; }
+.tp-grid { display: grid; grid-template-columns: repeat(8, 16px); gap: 3px; border-radius: 3px; }
+.tp-grid:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .tp-cell { width: 16px; height: 16px; border-radius: 3.5px; box-shadow: inset 0 0 0 1px var(--line-strong); cursor: pointer; transition: background-color .06s, box-shadow .06s; }
 .tp-cell.on { background: var(--accent-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent); }
 .tp-label { margin-top: 8px; font: 12px/1 var(--font-ui); color: var(--muted); text-align: center; font-variant-numeric: tabular-nums; }
@@ -4477,18 +4478,27 @@ function pipeRowToTable(range: Range) {
   settle(before);
   return true;
 }
-// The toolbar's size picker: sweep across the grid, click to insert.
+// The toolbar's size picker: sweep across the grid, click to insert. From the
+// keyboard, the arrow keys size it and Enter inserts.
 function tablePicker(owner: HTMLElement) {
   const R = 8, C = 8;
   let rows = 3, cols = 3;
-  const label = el("div", { class: "tp-label" });
+  const label = el("div", { class: "tp-label", id: "tp-label", "aria-live": "polite" });
   const cells: HTMLElement[] = [];
   const paint = (r: number, c: number) => {
     rows = r; cols = c;
     cells.forEach((d, i) => d.classList.toggle("on", Math.floor(i / C) < r && i % C < c));
     label.textContent = `${c} × ${r}`;
   };
-  const grid = el("div", { class: "tp-grid" });
+  const grid = el("div", { class: "tp-grid", tabindex: "0", role: "group", "aria-label": "Table size, columns by rows", "aria-describedby": "tp-label" });
+  grid.addEventListener("keydown", (e) => {
+    const step = ({ ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] } as Record<string, [number, number]>)[e.key];
+    if (step) paint(clamp(rows + step[0], 1, R), clamp(cols + step[1], 1, C));
+    else if (e.key === "Enter" || e.key === " ") { closePop(); insertTable(rows, cols); }
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  });
   for (let r = 0; r < R; r++) for (let c = 0; c < C; c++) {
     const d = el("div", { class: "tp-cell" });
     d.addEventListener("pointerenter", () => paint(r + 1, c + 1));
@@ -4498,6 +4508,7 @@ function tablePicker(owner: HTMLElement) {
   }
   paint(3, 3);
   showPop([el("div", { class: "mhead" }, "Insert table"), grid, label], owner.getBoundingClientRect(), { owner, className: "tbl-picker", align: "center" });
+  grid.focus();
 }
 
 // ── Keys inside a table ──────────────────────────────────────────────────
@@ -4511,16 +4522,26 @@ function handleTableKey(e: KeyboardEvent) {
   if (!cell) return besideTable(e, range);
   const table = cell.closest("table")!;
   const endCell = cellOf(range.endContainer);
-  // A selection across cells: Backspace/Delete empties them, keeping the grid.
+  // A selection across cells: Backspace/Delete empties the cells it covers,
+  // keeping the grid and the unselected text in the first and last of them.
   if (endCell !== cell) {
     if ((e.key === "Backspace" || e.key === "Delete") && endCell?.closest("table") === table) {
       e.preventDefault();
       const all = Array.from(table.rows).flatMap((r) => Array.from(r.cells));
       const i = all.indexOf(cell), j = all.indexOf(endCell);
+      const part = (c: HTMLTableCellElement, set: (r: Range) => void) => {
+        const r = document.createRange();
+        r.selectNodeContents(c);
+        set(r);
+        const f = r.cloneContents();
+        return f.textContent || f.querySelector("img") ? f : null;
+      };
+      const before = part(cell, (r) => r.setEnd(range.startContainer, range.startOffset));
+      const after = part(endCell, (r) => r.setStart(range.endContainer, range.endOffset));
       tableOp(table, (t) => {
-        const cs = Array.from(t.rows).flatMap((r) => Array.from(r.cells)).slice(Math.min(i, j), Math.max(i, j) + 1);
-        cs.forEach((c) => c.replaceChildren(document.createElement("br")));
-        return { caret: cs[0], start: true };
+        const cs = Array.from(t.rows).flatMap((r) => Array.from(r.cells)).slice(i, j + 1);
+        cs.forEach((c, k) => c.replaceChildren((k === 0 ? before : k === cs.length - 1 ? after : null) || document.createElement("br")));
+        return { caret: cs[0], start: !before };
       });
       return true;
     }

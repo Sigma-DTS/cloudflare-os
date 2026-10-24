@@ -195,6 +195,16 @@ describe("Markdown round trips", () => {
     expect(runs("1. a\n2. b")).toEqual([["ol", 2]]);
   });
 
+  it("keeps literal doubled tildes as text", () => {
+    expect(roundTrip("<p>Use ~~text~~ literally, ~5 min.</p>")).toEqual(["<p>Use ~~text~~ literally, ~5 min.</p>"]);
+    expect(roundTrip("<p><s>gone</s></p>")).toEqual(["<p><s>gone</s></p>"]);
+  });
+
+  it("keeps a link whose label holds a URL or a line break", () => {
+    expect(roundTrip('<p><a href="https://target.example/">Docs at https://docs.example/</a> x</p>')).toEqual(['<p><a href="https://target.example/">Docs at https://docs.example/</a> x</p>']);
+    expect(roundTrip('<p><a href="https://example.com/">first<br>second</a> x</p>')).toEqual(['<p><a href="https://example.com/">first<br>second</a> x</p>']);
+  });
+
   it("keeps a table cell's literal <br> text", () => {
     expect(htmlToMarkdown("<table><tbody><tr><td>&lt;br&gt;</td></tr></tbody></table>")).toContain("| \\<br> |");
   });
