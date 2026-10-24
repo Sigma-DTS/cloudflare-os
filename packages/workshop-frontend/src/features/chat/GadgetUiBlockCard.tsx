@@ -1,11 +1,11 @@
 import { type RefObject, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from 'react'
 import { Banner, Text } from '@cloudflare/kumo'
-import { CaretDownIcon, CaretRightIcon, PaperPlaneRightIcon } from '@phosphor-icons/react'
+import { PaperPlaneRightIcon } from '@phosphor-icons/react'
 import { newMessagePortRpcSession, type RpcStub } from 'capnweb'
 import type { Overseer } from '@gadgets/workshop-shared/api'
 import type { GadgetUiBlock } from '@gadgets/workshop-shared/gadget-ui-blocks'
 import { useTheme } from '../../ThemeContext'
-import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
+import { WorkshopButton } from '../../components/WorkshopControls'
 import {
   createUiBlockHtml,
   readUiBlockTheme,
@@ -26,16 +26,18 @@ export type GadgetUiBlockCardProps = {
   overseer: RpcStub<Overseer>
   chatId: number
   block: GadgetUiBlock
+  /** The answer is still streaming: its tool calls have not run yet. */
+  streaming: boolean
   /** Sends a message as the viewer, as the composer does. Reports its own failures, then throws. */
   onSendMessage: (message: string) => Promise<void>
   /** Why the viewer cannot send now, e.g. the chat waits on an approval. */
   sendBlockedReason?: string
   /**
-   * Runs after the card's height may have changed: its view reported a new height, its chip came
-   * or went, or a binding's name joined its header.
+   * Runs after the view's height may have changed: its frame reported a new height, its chip came
+   * or went, or a binding's name joined the line under it.
    */
   onHeightChange: () => void
-  /** The chat's scrolling message list. It clips the card before the window does. */
+  /** The chat's scrolling message list. It clips the view before the window does. */
   scrollRoot: RefObject<HTMLElement | null>
 }
 
@@ -45,9 +47,9 @@ type Chip = { message: string; sending: boolean }
 const clampHeight = (height: number) =>
   Math.min(Math.max(height, MIN_HEIGHT), Math.min(MAX_HEIGHT, window.innerHeight - 120))
 
-/** A live `<gadget-ui>` block of a stored agent answer, drawn in a sandboxed frame. */
+/** A live `<gadget-ui>` block of an agent answer, drawn in place in a sandboxed frame. */
 export const GadgetUiBlockCard = ({
-  overseer, chatId, block, onSendMessage, sendBlockedReason, onHeightChange, scrollRoot,
+  overseer, chatId, block, streaming, onSendMessage, sendBlockedReason, onHeightChange, scrollRoot,
 }: GadgetUiBlockCardProps) => {
   const { resolvedThemeMode } = useTheme()
   const cardRef = useRef<HTMLDivElement>(null)
@@ -55,7 +57,8 @@ export const GadgetUiBlockCard = ({
   const frameRef = useRef<RpcStub<UiBlockFrame> | null>(null)
   const quickBreaksRef = useRef(0)
   const [nearViewport, setNearViewport] = useState(false)
-  const [collapsed, setCollapsed] = useState(false)
+  // The viewer stopped the view: its frame and stubs are gone until they run it again.
+  const [stopped, setStopped] = useState(false)
   const [height, setHeight] = useState(MIN_HEIGHT)
   const [error, setError] = useState<string | null>(block.error ?? null)
   // The latest uncaught error in the block's own code. The view keeps running.
@@ -64,8 +67,6 @@ export const GadgetUiBlockCard = ({
   const [chip, setChip] = useState<Chip | null>(null)
   // Names the view's code opened, in the order it opened them.
   const [names, setNames] = useState<string[]>([])
-  // The first document's theme avoids a flash; the handshake sends the current one.
-  const [srcDoc] = useState(() => createUiBlockHtml(block.html, readUiBlockTheme()))
 
   // The Overseer connection the current frame load asked for a binding on. Its stubs and lookups
   // die with that connection, so a new one (the Workshop reconnected) needs a new load. A frame
@@ -76,13 +77,27 @@ export const GadgetUiBlockCard = ({
     setFrameKey(key => key + 1)
   }
 
-  const openBinding = useEffectEvent((name: string) => {
+  // A lookup failed while the answer streamed. The answer's tool calls run after its text, so they
+  // may add the binding: the view loads again once the answer is stored.
+  const [failedWhileStreaming, setFailedWhileStreaming] = useState(false)
+  if (failedWhileStreaming && !streaming) {
+    setFailedWhileStreaming(false)
+    setFrameKey(key => key + 1)
+  }
+
+  const openBinding = useEffectEvent(async (name: string) => {
     // Marked before the lookup, so a lookup still in flight when the Workshop reconnects counts.
     setAskedOn(current => current ?? { stub: overseer })
-    return overseer.connectToChatBinding(chatId, name)
+    const askedWhileStreaming = streaming
+    try {
+      return await overseer.connectToChatBinding(chatId, name)
+    } catch (err) {
+      if (askedWhileStreaming) setFailedWhileStreaming(true)
+      throw err
+    }
   })
 
-  const live = nearViewport && !collapsed && error === null
+  const live = nearViewport && error === null && !stopped
 
   useEffect(() => {
     const card = cardRef.current
@@ -182,55 +197,51 @@ export const GadgetUiBlockCard = ({
 
   const title = block.title ?? 'View'
   return (
-    <div ref={cardRef} className="my-2 overflow-hidden rounded-lg border border-kumo-line bg-kumo-base">
-      <div className="flex flex-wrap items-center gap-2 px-2 py-1.5">
-        <WorkshopIconButton
-          aria-label={collapsed ? `Show ${title}` : `Hide ${title}`}
-          aria-expanded={!collapsed}
-          onClick={() => setCollapsed(value => !value)}
-          className="!h-7 !w-7"
-        >
-          {collapsed ? <CaretRightIcon size={14} /> : <CaretDownIcon size={14} />}
-        </WorkshopIconButton>
-        <Text size="sm" bold>{title}</Text>
-        {names.map(name => (
-          <span key={name} className="rounded bg-kumo-tint px-1.5 font-mono text-[11px] leading-5 text-kumo-subtle">
-            {name}
-          </span>
-        ))}
-      </div>
-      {!collapsed && (error !== null ? (
-        <div className="px-3 pb-3">
-          <Banner
-            variant="error"
-            title="This view stopped"
-            description={error}
-            // A block the parser refused must never run.
-            action={block.error === undefined ? <Banner.Action onClick={reload}>Reload</Banner.Action> : undefined}
-          />
+    <div ref={cardRef} className="group/view my-3">
+      {error !== null ? (
+        <Banner
+          variant="error"
+          title="This view stopped"
+          description={error}
+          // A block the parser refused must never run.
+          action={block.error === undefined ? <Banner.Action onClick={reload}>Reload</Banner.Action> : undefined}
+        />
+      ) : !stopped && (
+        // The frame reaches past the answer's column by the body's padding, so the view's content
+        // lines up with the prose around it.
+        <div className="-mx-1 -my-1" style={{ height }}>
+          {live && <ViewFrame key={frameKey} ref={iframeRef} html={block.html} title={title} />}
         </div>
-      ) : (
-        <div className="border-t border-kumo-line" style={{ height }}>
-          {live && (
-            <iframe
-              key={frameKey}
-              ref={iframeRef}
-              srcDoc={srcDoc}
-              title={title}
-              sandbox="allow-scripts"
-              className="block h-full w-full border-0"
-            />
-          )}
-        </div>
-      ))}
-      {!collapsed && error === null && codeError !== null && (
-        <div className="border-t border-kumo-line px-3 py-1.5">
+      )}
+      {error === null && codeError !== null && (
+        <div className="mt-1">
           <Text size="sm" variant="error">{codeError}</Text>
         </div>
       )}
+      {error === null && (
+        // Workshop chrome the frame cannot draw: where the view ends, and what it reached.
+        <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11px] leading-4 text-kumo-inactive">
+          <span>{stopped ? 'View stopped' : 'Live view'}</span>
+          {!stopped && names.length > 0 && <span className="font-mono">{names.join(', ')}</span>}
+          <button
+            type="button"
+            aria-label={stopped ? `Run ${title} again` : `Stop ${title}`}
+            onClick={() => {
+              // Run starts afresh, as Reload does.
+              if (stopped) quickBreaksRef.current = 0
+              setStopped(!stopped)
+            }}
+            className={`cursor-pointer rounded px-1 font-medium transition-[color,opacity] duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none ${
+              stopped ? '' : 'sm:opacity-0 sm:group-hover/view:opacity-100 sm:group-focus-within/view:opacity-100'
+            }`}
+          >
+            {stopped ? 'Run' : 'Stop'}
+          </button>
+        </div>
+      )}
       <div aria-live="polite">
-        {!collapsed && chip && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-kumo-line px-3 py-2" role="group" aria-label="Send to the agent">
+        {chip && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-kumo-line px-3 py-2" role="group" aria-label="Send to the agent">
             <PaperPlaneRightIcon size={14} className="text-kumo-subtle" aria-hidden />
             <div
               // A keyboard user has to be able to scroll a long message to read it all.
@@ -255,9 +266,19 @@ export const GadgetUiBlockCard = ({
   )
 }
 
-/** A `<gadget-ui>` block still streaming: its title, and no frame until the answer is stored. */
+/**
+ * One load of a view's frame. Its document starts in the theme of the moment it mounts, so a view
+ * that reloads or scrolls back after a theme change starts in the new one; the handshake keeps it
+ * current after that.
+ */
+const ViewFrame = ({ ref, html, title }: { ref: RefObject<HTMLIFrameElement | null>; html: string; title: string }) => {
+  const [srcDoc] = useState(() => createUiBlockHtml(html, readUiBlockTheme()))
+  return <iframe ref={ref} srcDoc={srcDoc} title={title} sandbox="allow-scripts" className="block h-full w-full border-0" />
+}
+
+/** A `<gadget-ui>` block still streaming: a line naming it, until its closing tag arrives. */
 export const GadgetUiBlockPending = ({ title }: { title?: string }) => (
-  <div className="my-2 flex items-center gap-2 rounded-lg border border-dashed border-kumo-line px-3 py-2.5">
+  <div className="my-3">
     <Text size="sm" variant="secondary">Drawing {title ?? 'a view'}…</Text>
   </div>
 )

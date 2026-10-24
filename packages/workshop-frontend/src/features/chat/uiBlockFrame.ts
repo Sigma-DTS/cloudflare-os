@@ -14,7 +14,7 @@ export type UiBlockBinding = { rpc: RpcStub<any> } | RpcStub<any>
 /** The Workshop's theme, as a block's frame applies it. */
 export type UiBlockTheme = {
   scheme: 'light' | 'dark'
-  /** Kumo token values by token name, e.g. `--color-kumo-base`. */
+  /** Theme values by custom property name, e.g. `--color-kumo-base` or `--font-sans`. */
   tokens: Record<string, string>
 }
 
@@ -43,7 +43,8 @@ export interface UiBlockFrame {
   setTheme(theme: UiBlockTheme): void
 }
 
-// The Kumo tokens a block can use. Blocks get these names only; the agent's instructions list them.
+// The theme values a block can use. Blocks get these names only; the agent's instructions list the
+// colours, and the frame's own style applies the fonts.
 const THEME_TOKENS = [
   '--color-kumo-base',
   '--color-kumo-elevated',
@@ -54,6 +55,9 @@ const THEME_TOKENS = [
   '--color-kumo-success',
   '--color-kumo-warning',
   '--color-kumo-danger',
+  // Installed fonts that the Workshop never downloads, so the frame's CSP does not block them.
+  '--font-sans',
+  '--font-mono',
 ] as const
 
 /**
@@ -84,7 +88,7 @@ const BINDING_LIMITS: RateLimitOptions = {
 /** What a block's host does for its card. */
 export type UiBlockHostOptions = {
   /** Asks the kernel for the chat binding `name`. The host disposes the result when it closes. */
-  openBinding: (name: string) => RpcPromise<ViewBinding>
+  openBinding: (name: string) => Promise<Awaited<RpcPromise<ViewBinding>>>
   /** The block's code opened `name`. */
   onBinding: (name: string) => void
   /** A binding's stub broke, e.g. because its gadget's server restarted. */
@@ -213,9 +217,15 @@ export function createUiBlockHtml(html: string, theme: UiBlockTheme): string {
   <style>
     ${themeStyle(theme)}
     html, body { margin: 0; height: auto; background: transparent; }
-    /* The padding keeps a view's borders and focus rings off the card's edge, and stops a child's
-       margin from collapsing through the body, which would leave it out of the measured height. */
-    body { padding: 12px; color: var(--text-color-kumo-default); font: 14px/1.45 system-ui, sans-serif; }
+    /* The padding keeps a child's margin inside the measured height and focus rings inside the
+       frame, which the view widens to match. Its own formatting context keeps floats inside too.
+       The text matches the answer's prose around it. */
+    body {
+      display: flow-root; padding: 4px; color: var(--text-color-kumo-default);
+      font: 14px/1.6 var(--font-sans); letter-spacing: -0.25px;
+    }
+    button, input, select, textarea { font: inherit; letter-spacing: inherit; }
+    code, kbd, pre, samp { font-family: var(--font-mono); }
   </style>
   <script type="module" src="${BOOTSTRAP_URL}"></script>
 </head>

@@ -150,14 +150,22 @@ describe('GadgetUiBlockCard', () => {
 
   const scrollRoot = { current: null }
   const onHeightChange = () => {}
-  const card = (fake: FakeOverseer, block: GadgetUiBlock, sendBlockedReason?: string) => (
-    <GadgetUiBlockCard overseer={new RpcStub(fake) as unknown as RpcStub<Overseer>} chatId={1}
-      block={block} scrollRoot={scrollRoot} sendBlockedReason={sendBlockedReason} onHeightChange={onHeightChange}
-      onSendMessage={message => { sent.push(message); return reply() }} />
+  // One stub for each fake, so rendering again with the same fake keeps the same connection.
+  const stubs = new WeakMap<FakeOverseer, RpcStub<Overseer>>()
+  const stubOf = (fake: FakeOverseer) => {
+    let stub = stubs.get(fake)
+    if (!stub) stubs.set(fake, stub = new RpcStub(fake) as unknown as RpcStub<Overseer>)
+    return stub
+  }
+  type CardOptions = { sendBlockedReason?: string; streaming?: boolean }
+  const card = (fake: FakeOverseer, block: GadgetUiBlock, { sendBlockedReason, streaming = false }: CardOptions = {}) => (
+    <GadgetUiBlockCard overseer={stubOf(fake)} chatId={1}
+      block={block} streaming={streaming} scrollRoot={scrollRoot} sendBlockedReason={sendBlockedReason}
+      onHeightChange={onHeightChange} onSendMessage={message => { sent.push(message); return reply() }} />
   )
 
-  async function renderCard(block = BLOCK, sendBlockedReason?: string) {
-    await act(async () => root.render(card(overseer, block, sendBlockedReason)))
+  async function renderCard(block = BLOCK, options?: CardOptions) {
+    await act(async () => root.render(card(overseer, block, options)))
     await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
     return container.querySelector('iframe')!
   }
@@ -205,7 +213,7 @@ describe('GadgetUiBlockCard', () => {
   })
 
   it('holds Send while the chat waits on the viewer', async () => {
-    const host = await handshake(await renderCard(BLOCK, 'Approve the pending action above.'))
+    const host = await handshake(await renderCard(BLOCK, { sendBlockedReason: 'Approve the pending action above.' }))
     await host.requestMessage('Pick Aero.')
     await vi.waitFor(() => expect(buttonNamed('Send')).toBeDefined())
 
@@ -251,7 +259,7 @@ describe('GadgetUiBlockCard', () => {
     await expect(host.binding('GITHUB').listIssues()).resolves.toEqual(['#12'])
 
     expect(overseer.lookups).toEqual([[1, 'EXPENSES'], [1, 'GITHUB']])
-    await vi.waitFor(() => expect(container.textContent).toContain('EXPENSESGITHUB'))
+    await vi.waitFor(() => expect(container.textContent).toContain('EXPENSES, GITHUB'))
   })
 
   it('rejects a lookup that fails, and the view keeps running', async () => {
@@ -259,10 +267,26 @@ describe('GadgetUiBlockCard', () => {
     await expect(host.binding('MODEL')).rejects.toThrow(`"MODEL" can't be used in a view.`)
     await expect(host.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
 
-    // The header names only what the view could open.
+    // The line under the view names only what the view could open.
     await vi.waitFor(() => expect(container.textContent).toContain('EXPENSES'))
     expect(container.textContent).not.toContain('MODEL')
     expect(buttonNamed('Reload')).toBeUndefined()
+  })
+
+  it('loads a view again once its answer is stored, if a lookup failed while the answer streamed', async () => {
+    const first = await renderCard(BLOCK, { streaming: true })
+    await expect((await handshake(first)).binding('MODEL')).rejects.toThrow(`"MODEL" can't be used in a view.`)
+    expect(container.querySelector('iframe')).toBe(first)
+
+    await act(async () => root.render(card(overseer, BLOCK)))
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBe(first))
+
+    // A lookup that fails in a stored answer has no later tool call to wait for.
+    const second = container.querySelector('iframe')!
+    await expect((await handshake(second)).binding('MODEL')).rejects.toThrow(`"MODEL" can't be used in a view.`)
+    await settle()
+    expect(container.querySelector('iframe')).toBe(second)
+    expect(overseer.lookups).toEqual([[1, 'MODEL'], [1, 'MODEL']])
   })
 
   it('refuses a name that is not a string, and a 33rd name', async () => {
@@ -380,6 +404,19 @@ describe('GadgetUiBlockCard', () => {
     await host.binding('GITHUB').listIssues()
     await act(async () => root.render(<></>))
     await vi.waitFor(() => expect(overseer.served.map(target => target.disposed)).toEqual([true, true]))
+  })
+
+  it('disposes every binding when the viewer stops the view, and runs it again on Run', async () => {
+    const host = await handshake(await renderCard())
+    await host.binding('EXPENSES').rpc.read()
+    await act(async () => buttonNamed('Stop')!.click())
+    expect(container.querySelector('iframe')).toBeNull()
+    await vi.waitFor(() => expect(overseer.served[0]!.disposed).toBe(true))
+
+    await act(async () => buttonNamed('Run')!.click())
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const again = await handshake(container.querySelector('iframe')!)
+    await expect(again.binding('EXPENSES').rpc.read()).resolves.toBe('gadget data')
   })
 
   it('runs nothing for a block that must not run', async () => {
