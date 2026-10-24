@@ -120,6 +120,14 @@ describe("editing", () => {
     press({ key: "z", shiftKey: true });
     expect(li.getAttribute("data-checked")).toBe("true");
   });
+
+  it("takes inline code off the selected words only", () => {
+    const block = show("c1", "<p><code>one two three</code></p>");
+    select(block.querySelector("code")!.firstChild!, 4, 7);
+    press({ key: "e" });
+    expect(block.innerHTML).toBe("<code>one </code>two<code> three</code>");
+    expect(getSelection()!.toString()).toBe("two");
+  });
 });
 
 describe("a save in flight", () => {

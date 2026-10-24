@@ -1452,6 +1452,12 @@ function toggleCode() {
       refreshToolbar();
       return;
     }
+    // A selection inside the code takes off only its own words: the code's
+    // other words are split off first and stay code.
+    if (!range.collapsed) {
+      splitAtRange(code, range);
+      setRange(range);
+    }
     keepSelection(() => unwrap(code));
     changed();
     return;

@@ -92,6 +92,12 @@ describe("sanitizePastedHtml", () => {
       .toBe("<p>Hello <b>world</b> and <i>more</i></p><p>next</p><pre>one\ntwo</pre>");
   });
 
+  // A cell spanning rows leaves an empty cell below it, so the next row's cells keep their columns.
+  it("keeps cells in their columns past a pasted row span", () => {
+    expect(paste('<table><thead><tr><th>Owner</th><th>Task</th></tr></thead><tbody><tr><td rowspan="2">Ada</td><td>Build</td></tr><tr><td>Test</td></tr></tbody></table>'))
+      .toBe("<table><thead><tr><th>Owner</th><th>Task</th></tr></thead><tbody><tr><td>Ada</td><td>Build</td></tr><tr><td><br></td><td>Test</td></tr></tbody></table>");
+  });
+
   it("keeps a pasted table cell's alignment", () => {
     expect(paste('<table><thead><tr><th align="center">a</th><th style="text-align: right">b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>'))
       .toBe('<table><thead><tr><th style="text-align: center;">a</th><th style="text-align: right;">b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>');

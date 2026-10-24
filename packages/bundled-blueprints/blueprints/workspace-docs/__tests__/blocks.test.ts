@@ -137,6 +137,14 @@ describe("list items through Markdown", () => {
     expect(markdownToSpecs(md.replace("Third", "THIRD")).map(specHtml)).toEqual(["<ul><li>First<br>Second</li><li>THIRD</li></ul>"]);
     expect(htmlToMarkdown("<ol><li>a<ul><li>b<br>c</li></ul></li></ol>")).toBe("1. a\n  - b  \n    c\n");
   });
+
+  // Under one item, a bulleted list after a numbered one stays its own list.
+  it("keeps nested lists of different kinds apart", () => {
+    const html = "<ul><li>Parent<ol><li>Numbered</li></ol><ul><li>Bullet</li></ul></li></ul>";
+    const md = htmlToMarkdown(html);
+    expect(markdownToSpecs(md).map(specHtml)).toEqual([html]);
+    expect(markdownToSpecs(md.replace("Parent", "Renamed")).map(specHtml)).toEqual([html.replace("Parent", "Renamed")]);
+  });
 });
 
 describe("stripUnsafe", () => {

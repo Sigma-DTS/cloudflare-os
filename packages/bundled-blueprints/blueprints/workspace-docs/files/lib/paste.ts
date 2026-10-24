@@ -307,10 +307,16 @@ export function sanitizePastedHtml(html: string, pc: PasteContext): string {
     if (!rows.length) return null;
     const first = rows[0];
     const header = first.parentElement?.tagName === "THEAD" || first.cells.length > 0 && Array.from(first.cells).every((c) => c.tagName === "TH");
+    // Per column, the rows below that a cell above still spans into: they get
+    // an empty cell there, so the row's own cells stay in their columns.
+    const covered: number[] = [];
     const grid = rows.map((row, i) => {
       const tag = header && i === 0 ? "th" : "td";
       const out: HTMLElement[] = [];
+      const skipCovered = () => { while (covered[out.length]! > 0) out.push(document.createElement(tag)); };
       for (const cell of row.cells) {
+        skipCovered();
+        const at = out.length;
         const n = document.createElement(tag);
         inlineLines(cell, n, fmtOf(cell, ctx, pc));
         while (n.lastChild?.nodeName === "BR" && n.childNodes.length > 1) n.lastChild.remove();
@@ -318,7 +324,11 @@ export function sanitizePastedHtml(html: string, pc: PasteContext): string {
         if (align === "center" || align === "right") n.style.textAlign = align;
         out.push(n);
         for (let k = 1; k < Math.min(cell.colSpan || 1, 20); k++) out.push(document.createElement(tag));
+        const down = Math.min(cell.rowSpan || 1, rows.length - i);
+        for (let k = at; k < out.length; k++) covered[k] = down;
       }
+      skipCovered();
+      for (let k = 0; k < covered.length; k++) if (covered[k]! > 0) covered[k] = covered[k]! - 1;
       return out;
     });
     const cols = Math.max(...grid.map((r) => r.length));

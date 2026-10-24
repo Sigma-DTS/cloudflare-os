@@ -527,6 +527,7 @@ export function specHtml(input: unknown): string {
   }
 }
 
+const isListKind = (kind: unknown): kind is "ul" | "ol" | "todo" => kind === "ul" || kind === "ol" || kind === "todo";
 function listHtml(kind: BlockKind, items: unknown, inChecklist: boolean): string {
   const tag = kind === "ol" ? "ol" : "ul";
   const cls = kind === "todo" && !inChecklist ? ' class="checklist"' : "";
@@ -534,7 +535,14 @@ function listHtml(kind: BlockKind, items: unknown, inChecklist: boolean): string
     const item: BlockSpec = typeof raw === "string" ? { text: raw } : isRecord(raw) ? raw : { text: raw === null || raw === undefined ? "" : String(raw) };
     const checked = (kind === "todo" || inChecklist) && item.checked ? ' data-checked="true"' : "";
     const childKind = Array.isArray(item.items) && item.items.length ? blockKind(item.listType ?? item.type, kind) : null;
-    const nested = childKind ? listHtml(childKind === "todo" || childKind === "ul" || childKind === "ol" ? childKind : kind, item.items, inChecklist || kind === "todo") : "";
+    // Consecutive children of one kind make one nested list (see MarkdownItem.run).
+    const runs: { kind: BlockKind; items: unknown[] }[] = [];
+    if (childKind) for (const child of item.items as unknown[]) {
+      const run = isRecord(child) && isListKind(child.run) ? child.run : isListKind(childKind) ? childKind : kind;
+      if (runs.at(-1)?.kind === run) runs.at(-1)!.items.push(child);
+      else runs.push({ kind: run, items: [child] });
+    }
+    const nested = runs.map((r) => listHtml(r.kind, r.items, inChecklist || kind === "todo")).join("");
     const body = { ...item, type: undefined };
     const content = inlineContent(body);
     return `<li${checked}>${content === "<br>" && nested ? "" : content}${nested}</li>`;
@@ -548,6 +556,8 @@ interface MarkdownItem {
   checked: boolean;
   items?: MarkdownItem[];
   listType?: BlockKind;
+  /** The kind of the nested list it is in, when that isn't its parent's `listType`. */
+  run?: BlockKind;
 }
 
 // Block-level Markdown -> specs: headings, paragraphs, (nested) bulleted,
@@ -598,7 +608,7 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
       // One list block per run of same-kind top-level items; deeper
       // indentation nests under the item above.
       let block: { type: BlockKind; items: MarkdownItem[] } | null = null;
-      let levels: { indent: number; items: MarkdownItem[] }[] = [];
+      let levels: { indent: number; items: MarkdownItem[]; parent?: MarkdownItem }[] = [];
       for (; i < lines.length; i++) {
         const l = lines[i];
         if (!l.trim()) {
@@ -626,7 +636,7 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
           const parent = level.items[level.items.length - 1];
           parent.items = parent.items || [];
           parent.listType = parent.listType || kind;
-          levels.push({ indent, items: parent.items });
+          levels.push({ indent, items: parent.items, parent });
           level = levels[levels.length - 1];
         } else {
           while (levels.length > 1 && indent < level.indent) { levels.pop(); level = levels[levels.length - 1]; }
@@ -637,6 +647,9 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
           levels = [{ indent, items: block.items }];
           level = levels[0];
         }
+        // A nested run of another kind (a bulleted list after a numbered one
+        // under the same item) stays a list of its own.
+        if (level.parent && kind !== level.parent.listType) item.run = kind;
         level.items.push(item);
       }
       i--;
