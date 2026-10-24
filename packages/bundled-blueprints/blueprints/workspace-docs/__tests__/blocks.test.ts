@@ -147,6 +147,13 @@ describe("list items through Markdown", () => {
   });
 });
 
+describe("Markdown headings", () => {
+  // Only a closing run of #s after a space is markup: "C#" keeps its hash.
+  it("keeps a hash that ends the heading's last word", () => {
+    expect(markdownToSpecs("## Learn C#\n### Done ###").map(specHtml)).toEqual(["<h2>Learn C#</h2>", "<h3>Done</h3>"]);
+  });
+});
+
 describe("stripUnsafe", () => {
   it("drops scripts, svg, event handlers and script URLs, leaving text and safe attributes alone", () => {
     expect(stripUnsafe(

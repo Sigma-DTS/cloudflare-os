@@ -4628,7 +4628,9 @@ function clipboardGrid(html: string, text: string) {
   // A Markdown pipe table.
   const tpl = document.createElement("template");
   tpl.innerHTML = textToHtml(text);
-  const t = tpl.content.children.length === 1 && tpl.content.querySelector<HTMLTableElement>(":scope > table");
+  // (`:scope` matches nothing in a fragment, so the one child is checked itself.)
+  const only = tpl.content.children.length === 1 ? tpl.content.firstElementChild : null;
+  const t = only instanceof HTMLTableElement ? only : null;
   return t ? Array.from(t.rows, (r) => Array.from(r.cells, (c) => c.innerHTML)) : null;
 }
 function flattenToInline(html: string) {
@@ -5764,7 +5766,12 @@ async function sendChanges(failures = 0): Promise<SaveOutcome> {
     // was in flight; never step a block back to an older one.
     // (An unknown block's missing version compares false.)
     const acknowledge = (b: StoredBlock) => { if (!(acknowledged.get(b.id)?.version! > b.version)) acknowledged.set(b.id, { html: b.html, version: b.version }); };
-    for (const b of result.upserts || []) acknowledge(b);
+    for (const b of result.upserts || []) {
+      acknowledge(b);
+      // A block deleted remotely while it was being typed in, and re-created by
+      // this save: the deletion is settled, and the next merge rests on the save.
+      if (pendingByBlock.get(b.id)?.type === "delete") pendingByBlock.delete(b.id);
+    }
     for (const id of result.deletedIds || []) acknowledged.delete(id);
   } finally {
     savingIds = null;

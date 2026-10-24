@@ -590,7 +590,8 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
       specs.push({ type: "table", rows, header: true });
       continue;
     }
-    const heading = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
+    // A closing run of #s needs a space before it: "Learn C#" keeps its #.
+    const heading = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/.exec(line);
     if (heading) { flush(); specs.push({ type: "h" + Math.min(3, heading[1].length), text: heading[2] }); continue; }
     if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); specs.push({ type: "divider" }); continue; }
     const image = /^\s*!\[([^\]]*)\]\(([^)\s]+)\)\s*$/.exec(line);

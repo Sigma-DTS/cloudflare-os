@@ -195,3 +195,62 @@ describe("block order", () => {
     expect(applyOperation.mock.calls[0]![0].order?.[0]).toBe("o1");
   });
 });
+
+describe("more edits", () => {
+  // The table flashes the cells a paste filled.
+  beforeAll(() => {
+    Element.prototype.animate ??= () => ({ finished: Promise.resolve(), cancel() {} }) as unknown as Animation;
+    Range.prototype.getClientRects ??= () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect ??= () => new DOMRect();
+  });
+  let revision = 40;
+  const ids = () => Array.from(editor().children, (n) => n.getAttribute("data-block-id")!);
+  const send = (upserts: { id: string; html: string; version: number }[], deletedIds: string[] = []) =>
+    subscriber.operation({ type: "operation", senderId: "someone", revision: ++revision, title: "Doc", lastModified: 0, upserts, deletedIds, order: [...ids().filter((id) => !deletedIds.includes(id)), ...upserts.map((b) => b.id).filter((id) => !ids().includes(id))] });
+  const caretIn = (node: Node, offset: number) => {
+    if (editor().tabIndex < 0) editor().tabIndex = 0;
+    editor().focus();
+    const range = document.createRange();
+    range.setStart(node, offset);
+    getSelection()!.removeAllRanges();
+    getSelection()!.addRange(range);
+  };
+  const applyOperation = () => vi.mocked((globalThis as unknown as { gadget: GadgetStub }).gadget.applyOperation);
+
+  // Pasting a Markdown table into a cell fills the cells from there.
+  it("pastes a Markdown table into a table's cells", () => {
+    send([{ id: "g1", html: "<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>", version: 1 }]);
+    const block = editor().querySelector('[data-block-id="g1"]')!;
+    caretIn(block.querySelector("td")!.firstChild!, 0);
+    const text = "| A | B |\n| --- | --- |\n| X | Y |";
+    const event = Object.assign(new Event("paste", { bubbles: true, cancelable: true }), {
+      clipboardData: { items: [], files: [], getData: (type: string) => (type === "text/plain" ? text : "") },
+    });
+    editor().dispatchEvent(event);
+    const table = editor().querySelector('[data-block-id="g1"]')!;
+    expect(Array.from(table.querySelectorAll("tr"), (tr) => Array.from(tr.cells, (c) => c.textContent))).toEqual([["A", "B"], ["X", "Y"]]);
+  });
+
+  // A block deleted remotely while it was typed in, then re-created by this page's save: the next
+  // remote change merges against that save, not the text from before the deletion.
+  it("merges against a re-created block's save, not the deleted version", async () => {
+    send([{ id: "d1", html: "<p>foo</p>", version: 1 }]);
+    const block = editor().querySelector('[data-block-id="d1"]')!;
+    caretIn(block.firstChild!, 3);
+    send([], ["d1"]);
+    expect(editor().querySelector('[data-block-id="d1"]')).toBe(block);
+    (block.firstChild as Text).appendData(" A");
+    applyOperation().mockImplementationOnce(async (op) => ({
+      status: "applied", revision: ++revision, conflicts: [], order: op.order,
+      upserts: (op.upserts ?? []).map((b) => ({ id: b.id, html: b.html, version: b.baseVersion + 1 })),
+    }));
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.waitFor(() => expect(applyOperation()).toHaveBeenCalled());
+    await vi.waitFor(() => expect(applyOperation().mock.results.at(-1)?.type).toBe("return"));
+    await Promise.resolve();
+    getSelection()!.removeAllRanges();
+    editor().blur();
+    send([{ id: "d1", html: "<p>bar A</p>", version: 2 }]);
+    await vi.waitFor(() => expect(editor().querySelector('[data-block-id="d1"]')?.textContent).toBe("bar A"));
+  });
+});
