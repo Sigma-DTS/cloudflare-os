@@ -34,6 +34,16 @@ describe("parseGadgetUiBlocks", () => {
     ]);
   });
 
+  it("parses a long block whose <title> never closes", () => {
+    // Large enough that a pattern which rescans from each unclosed <title> exceeds the test timeout.
+    let html = "<title>" + "<title>a".repeat(100_000);
+    expect(parseGadgetUiBlocks(lines("<gadget-ui>", html, "</gadget-ui>")))
+        .toEqual([{ kind: "block", html }]);
+    expect(parseGadgetUiBlocks(lines("<gadget-ui>", html))).toEqual([
+      { kind: "open", text: lines("<gadget-ui>", html) },
+    ]);
+  });
+
   it("leaves a tag in a code fence or mid-line as prose", () => {
     let text = lines(
       "Write `<gadget-ui>` to draw a view:",

@@ -33,8 +33,6 @@ const CLOSE = "</gadget-ui>";
 // mention the tag stay prose.
 const OPEN = /^[ \t]*<gadget-ui\b[^>]*>/;
 
-const TITLE = /<title>([\s\S]*?)<\/title>/i;
-
 // Any line that may open a fence opens one: reading too much as code only keeps a block from
 // being drawn.
 const FENCE_OPEN = /^[ \t]*(`{3,}(?=[^`]*$)|~{3,})/;
@@ -59,17 +57,27 @@ function fenceAfter(fence: Fence | null, line: string): Fence | null {
   return closes ? null : fence;
 }
 
-// As HTML reads a title: runs of whitespace are one space.
-function titleOf(html: string): string | undefined {
-  let title = TITLE.exec(html)?.[1]?.replace(/\s+/g, " ").trim();
-  return title ? title : undefined;
+// The first <title> element of `html`: its text as HTML reads it, with runs of whitespace as one
+// space, and the HTML around it. Two plain searches, because a lazy pattern rescans the rest of the
+// HTML from every <title> that never closes, and the Workshop parses on every streamed delta.
+function splitTitle(html: string): {title: string | undefined; rest: string} {
+  let open = html.search(/<title>/i);
+  let textStart = open + "<title>".length;
+  let textLength = open === -1 ? -1 : html.slice(textStart).search(/<\/title>/i);
+  if (textLength === -1) return {title: undefined, rest: html};
+  let textEnd = textStart + textLength;
+  let title = html.slice(textStart, textEnd).replace(/\s+/g, " ").trim();
+  return {
+    title: title === "" ? undefined : title,
+    rest: html.slice(0, open) + html.slice(textEnd + "</title>".length),
+  };
 }
 
 function closedBlock(html: string): GadgetUiBlock {
   let block: GadgetUiBlock = {kind: "block", html};
-  let title = titleOf(html);
+  let {title, rest} = splitTitle(html);
   if (title !== undefined) block.title = title;
-  if (html.replace(TITLE, "").trim() === "") block.error = "This view has no content.";
+  if (rest.trim() === "") block.error = "This view has no content.";
   return block;
 }
 
@@ -99,7 +107,7 @@ export function parseGadgetUiBlocks(text: string): GadgetUiSegment[] {
     let close = text.indexOf(CLOSE, body);
     if (close === -1) {
       let rest = text.slice(line);
-      let title = titleOf(rest);
+      let {title} = splitTitle(rest);
       segments.push(title === undefined ? {kind: "open", text: rest} : {kind: "open", text: rest, title});
       return segments;
     }
