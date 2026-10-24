@@ -17,6 +17,7 @@ describe("textToHtml", () => {
   });
 
   it("keeps a quote's blocks: a quote per paragraph, its list and code between", () => {
+    expect(markdownToHtml("````\n```\nx\n```\n````")).toBe("<pre>```\nx\n```</pre>");
     expect(markdownToHtml("> one\n> two\n>\n> - a\n> - b\n>\n> ```\n> x\n> ```\n>\n> end")).toBe(
       "<blockquote>one<br>two</blockquote><ul><li>a</li><li>b</li></ul><pre>x</pre><blockquote>end</blockquote>",
     );

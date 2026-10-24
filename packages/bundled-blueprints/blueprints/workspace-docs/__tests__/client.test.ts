@@ -270,6 +270,24 @@ describe("more edits", () => {
     await vi.waitFor(() => expect(editor().querySelector('[data-block-id="d1"]')?.textContent).toBe("bar A"));
   });
 
+  // Another editor re-creates a block (at version 1) while this page's deletion of it is in
+  // flight: once the deletion's reply comes, the re-created block shows.
+  it("shows a block re-created while this page's deletion of it was saving", async () => {
+    send([{ id: "r1", html: "<p>one</p>", version: 1 }, { id: "r2", html: "<p>keep</p>", version: 1 }]);
+    send([{ id: "r1", html: "<p>one more</p>", version: 3 }]);
+    let reply!: () => void;
+    applyOperation().mockImplementationOnce((op) => new Promise((resolve) => {
+      reply = () => resolve({ status: "applied", revision: ++revision, conflicts: [], order: op.order, deletedIds: (op.deletes ?? []).map((d) => d.id) });
+    }));
+    editor().querySelector('[data-block-id="r1"]')!.remove();
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.waitFor(() => expect(reply).toBeDefined());
+    send([{ id: "r1", html: "<p>again</p>", version: 1 }]);
+    reply();
+    await vi.waitFor(() => expect(applyOperation().mock.results.at(-1)?.type).toBe("return"));
+    await vi.waitFor(() => expect(editor().querySelector('[data-block-id="r1"]')?.textContent).toBe("again"));
+  });
+
   // A deletion that arrives while a save is in flight is newer than that save's conflict reply:
   // the stale version the reply carries must not bring the block back.
   it("keeps a block deleted after the version a conflict reply brings", async () => {

@@ -6,7 +6,7 @@
 // unsafe-markup filter, and the reverse direction the block listings use
 // (a block's type, and its Markdown via ./markdown.ts).
 import type { BlockContent, BlockDescription, BlockPosition, BlockSource, StoredBlock } from "./protocol.ts";
-import { decodeHtml, htmlToMarkdown, readHtmlAttribute } from "./markdown.ts";
+import { closesFence, decodeHtml, htmlToMarkdown, readHtmlAttribute } from "./markdown.ts";
 
 /**
  * A block spec as an agent passes it: `{ type, text | html | items | rows | src | code | markdown,
@@ -587,11 +587,11 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) { flush(); continue; }
-    const fence = /^\s*(```+|~~~+)/.exec(line);
+    const fence = /^\s*(`{3,}|~{3,})/.exec(line);
     if (fence) {
       flush();
       const body: string[] = [];
-      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) body.push(raw[i]);
+      for (i++; i < lines.length && !closesFence(lines[i], fence[1]); i++) body.push(raw[i]);
       specs.push({ type: "code", text: body.join("\n") });
       continue;
     }

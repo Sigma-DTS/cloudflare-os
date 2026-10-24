@@ -159,6 +159,19 @@ describe("fenced code", () => {
   it("keeps tabs inside a fence", () => {
     expect(markdownToSpecs("```\nall:\n\tcc main.c\n```").map(specHtml)).toEqual(["<pre>all:\n\tcc main.c</pre>"]);
   });
+
+  // An agent edits a code block through its Markdown, so code holding a fence must survive the trip.
+  it("round-trips code that holds a fence of its own", () => {
+    const html = "<pre>intro\n```js\nconst x = 1\n```\noutro</pre>";
+    const md = htmlToMarkdown(html);
+    expect(md.trim().split("\n")[0]).toBe("````");
+    expect(markdownToSpecs(md).map(specHtml)).toEqual([html]);
+  });
+
+  it("closes a fence only on a bare fence line at least as long", () => {
+    expect(markdownToSpecs("```\na\n```js\nb\n```\nafter").map(specHtml)).toEqual(["<pre>a\n```js\nb</pre>", "<p>after</p>"]);
+    expect(markdownToSpecs("````\na\n```\n````").map(specHtml)).toEqual(["<pre>a\n```</pre>"]);
+  });
 });
 
 describe("Markdown headings", () => {

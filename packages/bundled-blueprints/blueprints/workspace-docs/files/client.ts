@@ -30,6 +30,7 @@ import type {
 } from "./lib/protocol.ts";
 import { escapeHtml, inlineMarkdown, isCodeEditorHtml, normalizeHref, parseTsv, pipeCells, sanitizePastedHtml as sanitizeHtml, textToHtml, type PasteContext } from "./lib/paste.ts";
 import { MARK_TAGS, VOID_TAGS, mergeBlockHtml } from "./lib/merge.ts";
+import { codeFence } from "./lib/markdown.ts";
 
 // The bindings the Workshop's iframe bootstrap defines before this module runs: the RPC stub to
 // this gadget's Durable Object, and Cap'n Web's RpcTarget for the callbacks it is handed.
@@ -3585,7 +3586,10 @@ function unitPlain(u: Element) {
     case "H2": return "## " + t;
     case "H3": case "H4": case "H5": case "H6": return "### " + t;
     case "BLOCKQUOTE": return u.getAttribute("style") ? t : t.split("\n").map((l) => "> " + l).join("\n");
-    case "PRE": return "```\n" + u.textContent.replace(/\u200B/g, "").replace(/\n$/, "") + "\n```";
+    case "PRE": {
+      const code = u.textContent.replace(/\u200B/g, "").replace(/\n$/, ""), fence = codeFence(code);
+      return fence + "\n" + code + "\n" + fence;
+    }
     case "HR": return "---";
     case "TABLE": return tableToMarkdown(u as HTMLTableElement);
     default: return t;
@@ -5685,10 +5689,12 @@ const pendingByBlock = new Map<string, PendingChange>(); // id -> remote change 
 // reply comes. If the reply is lost, the server's copy of that very draft is
 // recognized as this page's own when it comes back, rather than merged.
 const sentDrafts = new Map<string, { baseVersion: number; html: string }>();
-// The blocks whose save is in flight, and the remote changes to them that came
-// meanwhile (null for a deletion). A remote version may already include that
-// save, so it is applied only once the reply has said which version the draft
-// became: merged against the older one, the saved text would be added twice.
+// The blocks whose save (or deletion) is in flight, and the remote changes to
+// them that came meanwhile (null for a deletion). A remote version may already
+// include that save, so it is applied only once the reply has said which
+// version the draft became: merged against the older one, the saved text would
+// be added twice. A block re-created meanwhile starts again at version 1, so
+// it is told apart from the deleted one only once the deletion is confirmed.
 let savingIds: Set<string> | null = null;
 const heldWhileSaving = new Map<string, StoredBlock | null>();
 
@@ -5759,7 +5765,7 @@ async function sendChanges(failures = 0): Promise<SaveOutcome> {
   // carries this very text at the next version, and sentDrafts recognizes it
   // as this page's own: nothing is merged or written twice.
   const sent = upserts.map((b) => { const draft = { baseVersion: b.baseVersion, html: b.html }; sentDrafts.set(b.id, draft); return [b.id, draft] as const; });
-  savingIds = new Set(sent.map(([id]) => id));
+  savingIds = new Set([...sent.map(([id]) => id), ...deletes.map((d) => d.id)]);
   let result: ApplyOperationResult;
   try {
     result = await withTimeout(gadget.applyOperation({ senderId: clientId, baseRevision: revision, upserts, deletes, order: sentOrder }), saveTimeoutMs(failures));

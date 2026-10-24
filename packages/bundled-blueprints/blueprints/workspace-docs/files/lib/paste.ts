@@ -14,6 +14,8 @@
 // styling are dropped.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { closesFence } from "./markdown.ts";
+
 /** What the paste conversions need from the editor. */
 export interface PasteContext {
   /** The palette colour names (`blue`, …, and `default`) a tc-/hl- class may carry. */
@@ -512,10 +514,11 @@ export function markdownToHtml(md: string): string {
   let html = "", i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (/^```/.test(line)) {
+    const fence = /^`{3,}/.exec(line);
+    if (fence) {
       const body: string[] = [];
       i++;
-      while (i < lines.length && !/^```/.test(lines[i])) body.push(lines[i++]);
+      while (i < lines.length && !closesFence(lines[i], fence[0])) body.push(lines[i++]);
       i++;
       html += `<pre>${escapeHtml(body.join("\n")) || "<br>"}</pre>`;
       continue;

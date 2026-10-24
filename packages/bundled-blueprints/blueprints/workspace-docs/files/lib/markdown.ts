@@ -80,7 +80,7 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
   // spelled out when the block ends.
   let inline = "";
   let changes: EmphasisChange[] = [];
-  let inPre = false, inCode = false, inHeading = false;
+  let inPre = false, inCode = false, inHeading = false, preStart = 0;
   // Space and <br>s since the last content, written only once more content
   // follows: an empty line is a lone <br>, and a break that ends a block
   // breaks nothing.
@@ -169,10 +169,12 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
         case "code":
           if (!inPre && inCode) { inline += "`"; inCode = false; }
           break;
-        case "pre":
-          markdown += "\n```\n\n";
+        case "pre": {
+          const code = markdown.slice(preStart), fence = codeFence(code);
+          markdown = markdown.slice(0, preStart) + fence + "\n" + code + "\n" + fence + "\n\n";
           inPre = false;
           break;
+        }
         case "a": {
           const destination = links.pop();
           // Emphasis can't pair across a link label's brackets: the label
@@ -244,7 +246,8 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
         if (!inPre && !inCode) { beginInline(); inline += "`"; inCode = true; }
         break;
       case "pre":
-        markdown += "\n\n```\n";
+        markdown += "\n\n";
+        preStart = markdown.length;
         inPre = true;
         break;
       case "blockquote":
@@ -421,6 +424,18 @@ function charClass(char: string | undefined): "space" | "punctuation" | "word" {
 }
 
 /** The decoded value of attribute `name` in a tag's attribute source, or "" when it has none. */
+// A code fence longer than any run of backticks in `code`, so no line of it
+// can close the fence early.
+export function codeFence(code: string): string {
+  return "`".repeat(Math.max(2, ...(code.match(/`+/g) ?? []).map((run) => run.length)) + 1);
+}
+// Whether `line` closes the fence `open` began: the same character, at least
+// as many, and nothing else.
+export function closesFence(line: string, open: string): boolean {
+  const t = line.trim();
+  return t.length >= open.length && t === open[0].repeat(t.length);
+}
+
 export function readHtmlAttribute(source: string, name: string): string {
   // Attributes are read one by one, so neither another attribute ending in the name (`data-src`
   // for `src`) nor text inside another's value (`alt="x src=y"`) is mistaken for it.
