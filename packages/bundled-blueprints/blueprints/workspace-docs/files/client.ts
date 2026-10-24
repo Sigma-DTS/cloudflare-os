@@ -2080,6 +2080,9 @@ function openLinkEditor() {
   // asks what it should say. Left empty, the address itself is shown, and the
   // placeholder previews exactly that.
   const fresh = !anchor && saved.collapsed;
+  // A remote update can replace what the card was opened on (the saved range
+  // then collapses where the text was, or the link is gone): nothing is linked.
+  const targetGone = () => anchor ? !editor.contains(anchor) : !fresh && saved.collapsed;
   const TEXT_HINT = "Text to show (optional)";
   const textInput = fresh ? el("input", { type: "text", placeholder: TEXT_HINT, spellcheck: "true", autocomplete: "off", "aria-label": "Text to show" }) : null;
   const card = fresh
@@ -2123,7 +2126,8 @@ function openLinkEditor() {
     const href = normalizeHref(raw);
     closePop();
     restore();
-    if (anchor && editor.contains(anchor)) {
+    if (targetGone()) return;
+    if (anchor) {
       if (!href) { const r = document.createRange(); r.selectNodeContents(anchor); setRange(r); exec("unlink"); }
       else anchor.setAttribute("href", href);
       changed();

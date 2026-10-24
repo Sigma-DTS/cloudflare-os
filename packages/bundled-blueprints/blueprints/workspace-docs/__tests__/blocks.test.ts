@@ -182,6 +182,8 @@ describe("Markdown round trips", () => {
     expect(htmlToMarkdown("<p>run <code>echo `date`</code> now</p>").trim()).toBe("run `` echo `date` `` now");
     expect(roundTrip("<p>run <code>echo `date`</code> now</p>")).toEqual(["<p>run <code>echo `date`</code> now</p>"]);
     expect(roundTrip("<p>x <code>``</code> and <code>a</code></p>")).toEqual(["<p>x <code>``</code> and <code>a</code></p>"]);
+    // Chromium splits pasted code into adjacent elements: they are one span.
+    expect(roundTrip("<p>Run <code>echo</code><code> hi</code> old</p>")).toEqual(["<p>Run <code>echo hi</code> old</p>"]);
     // Escapes are literal inside code, and outside it a backslash keeps a backtick from opening one.
     expect(roundTrip("<p>x <code>echo \\`date\\`</code> y</p>")).toEqual(["<p>x <code>echo \\`date\\`</code> y</p>"]);
     expect(markdownToSpecs("a \\`b` c").map(specHtml)).toEqual(["<p>a `b` c</p>"]);

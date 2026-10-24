@@ -81,6 +81,9 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
   let inline = "";
   let changes: EmphasisChange[] = [];
   let inPre = false, inCode = false, inHeading = false, preStart = 0, codeStart = 0;
+  // The code span last closed: where it ends, and its code, so one that opens
+  // right there continues it (`a``b` would read as one span holding a backtick).
+  let lastCode = { start: 0, end: -1, code: "", changes: 0 };
   // Space and <br>s since the last content, written only once more content
   // follows: an empty line is a lone <br>, and a break that ends a block
   // breaks nothing.
@@ -114,9 +117,11 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
     const pad = /^`|`$|^ .*[^ ].* $/.test(code) ? " " : "";
     inline = inline.slice(0, codeStart) + fence + pad + code + pad + fence;
     inCode = false;
+    lastCode = { start: codeStart, end: inline.length, code, changes: changes.length };
   };
   const endBlock = () => {
     if (inCode) closeCode();
+    lastCode.end = -1;
     closeTo(0);
     markdown += spellEmphasis(inline, changes);
     inline = "";
@@ -253,7 +258,14 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
         else breaks++;
         break;
       case "code":
-        if (!inPre && !inCode) { beginInline(); codeStart = inline.length; inCode = true; }
+        if (!inPre && !inCode) {
+          beginInline();
+          if (inline.length === lastCode.end && changes.length === lastCode.changes) {
+            codeStart = lastCode.start;
+            inline = inline.slice(0, codeStart) + lastCode.code;
+          } else codeStart = inline.length;
+          inCode = true;
+        }
         break;
       case "pre":
         markdown += "\n\n";

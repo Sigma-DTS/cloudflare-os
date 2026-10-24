@@ -246,6 +246,24 @@ describe("more edits", () => {
     expect([table.rows.length, table.rows[0]!.cells.length]).toEqual([5, 4]);
   });
 
+  // A collaborator's change replaced the paragraph while the link card was open: the address is
+  // not inserted where the selection collapsed to.
+  it("links nothing when the selected text was replaced while the link card was open", () => {
+    send([{ id: "lk", html: "<p>First two old</p>", version: 1 }]);
+    const text = editor().querySelector('[data-block-id="lk"]')!.firstChild!;
+    caretIn(text, 6);
+    getSelection()!.getRangeAt(0).setEnd(text, 9);
+    document.querySelector<HTMLButtonElement>('button[aria-label="Link"]')!.click();
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="Link address"]')!;
+    send([{ id: "lk", html: "<p>First two NEW</p>", version: 2 }]);
+    input.value = "https://example.com/";
+    const execCommand = vi.fn(() => true);
+    Object.assign(document, { execCommand });
+    try { input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); } finally { delete (document as { execCommand?: unknown }).execCommand; }
+    expect(execCommand).not.toHaveBeenCalled();
+    expect(editor().querySelector('[data-block-id="lk"]')!.innerHTML).toBe("First two NEW");
+  });
+
   // Only the selected text goes: the start of the first cell and the end of the last stay.
   it("deletes a selection across cells without the text around it", () => {
     send([{ id: "x2", html: "<table><tbody><tr><td>First cell</td><td>Middle</td><td>Second cell</td></tr></tbody></table>", version: 1 }]);
