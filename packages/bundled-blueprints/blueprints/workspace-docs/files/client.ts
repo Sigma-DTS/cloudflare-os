@@ -5660,6 +5660,14 @@ type PendingChange =
 let ready = false, buffered: DocumentEvent[] = [], revision = 0, applyingRemote = false;
 const acknowledged = new Map<string, { html: string; version: number }>(); // id -> { html, version } the server has confirmed
 let ackOrder: string[] = []; // block order the server has confirmed
+let ackOrderRevision = 0; // the revision it was confirmed at
+// A save's reply can arrive after a live event from a later revision: the
+// order it confirms is then older, and must not replace the event's.
+function confirmOrder(order: string[], rev: number) {
+  if (rev < ackOrderRevision) return;
+  ackOrder = order;
+  ackOrderRevision = rev;
+}
 const pendingByBlock = new Map<string, PendingChange>(); // id -> remote change held back from a block being edited
 // id -> the draft last sent for a block and the version it rested on, until the
 // reply comes. If the reply is lost, the server's copy of that very draft is
@@ -5745,7 +5753,7 @@ async function sendChanges(failures = 0): Promise<SaveOutcome> {
     result = await withTimeout(gadget.applyOperation({ senderId: clientId, baseRevision: revision, upserts, deletes, order: sentOrder }), saveTimeoutMs(failures));
     for (const [id, draft] of sent) if (sentDrafts.get(id) === draft) sentDrafts.delete(id);
     revision = Math.max(revision, result.revision || 0);
-    ackOrder = Array.isArray(result.order) ? result.order : sentOrder;
+    confirmOrder(Array.isArray(result.order) ? result.order : sentOrder, result.revision || 0);
     // A newer version may already have arrived as a live event while this reply
     // was in flight; never step a block back to an older one.
     // (An unknown block's missing version compares false.)
@@ -5903,7 +5911,7 @@ function applyRemoteOperation(event: OperationEvent) {
     for (const b of event.upserts || []) remoteUpsert(b, activeId);
     for (const id of event.deletedIds || []) remoteDelete(id, activeId);
     applyOrder(event.order);
-    if (Array.isArray(event.order)) ackOrder = event.order;
+    if (Array.isArray(event.order)) confirmOrder(event.order, event.revision || 0);
     applyingRemote = false;
   });
   afterRemoteChange();
@@ -5927,6 +5935,7 @@ function applySnapshot(doc: DocumentSnapshot) {
     acknowledged.set(block.id, { html: node ? canonicalBlockHtml(node) : block.html, version: block.version });
   }
   ackOrder = (doc.blocks || []).map((b: StoredBlock) => b.id);
+  ackOrderRevision = revision;
   applyingRemote = false;
 
   afterRemoteChange();
@@ -5948,7 +5957,7 @@ function reconcileSnapshot(doc: DocumentSnapshot) {
     }
     for (const id of Array.from(acknowledged.keys())) if (!serverIds.has(id)) remoteDelete(id, activeId);
     applyOrder((doc.blocks || []).map((b: StoredBlock) => b.id));
-    ackOrder = (doc.blocks || []).map((b: StoredBlock) => b.id);
+    confirmOrder((doc.blocks || []).map((b: StoredBlock) => b.id), doc.revision || 0);
     applyingRemote = false;
   });
   afterRemoteChange();

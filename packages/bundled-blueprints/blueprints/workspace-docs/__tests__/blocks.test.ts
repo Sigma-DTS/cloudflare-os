@@ -129,6 +129,16 @@ describe("splitTopLevelHtml", () => {
   });
 });
 
+describe("list items through Markdown", () => {
+  // A line break in an item is an indented continuation, so editing another word keeps the list whole.
+  it("keeps a list item's line break", () => {
+    const md = htmlToMarkdown("<ul><li>First<br>Second</li><li>Third</li></ul>");
+    expect(md).toBe("- First  \n  Second\n- Third\n");
+    expect(markdownToSpecs(md.replace("Third", "THIRD")).map(specHtml)).toEqual(["<ul><li>First<br>Second</li><li>THIRD</li></ul>"]);
+    expect(htmlToMarkdown("<ol><li>a<ul><li>b<br>c</li></ul></li></ol>")).toBe("1. a\n  - b  \n    c\n");
+  });
+});
+
 describe("stripUnsafe", () => {
   it("drops scripts, svg, event handlers and script URLs, leaving text and safe attributes alone", () => {
     expect(stripUnsafe(

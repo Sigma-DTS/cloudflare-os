@@ -612,7 +612,8 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
           if (/^\s{2,}\S/.test(l) && levels.length) {
             const items = levels[levels.length - 1].items;
             const last = items[items.length - 1];
-            last.text += " " + l.trim();
+            // An indented line continues the item after a line break.
+            last.text = last.text.replace(/\s+$/, "") + "\n" + l.trim();
             continue;
           }
           break;

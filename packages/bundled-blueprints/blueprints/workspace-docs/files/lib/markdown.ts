@@ -28,6 +28,8 @@ interface OpenList {
   type: "ul" | "ol" | "check";
   count: number;
   bullet: Bullet;
+  /** Spaces that put a line under the current item's text, after a hard break. */
+  indent?: string;
 }
 interface OpenTable {
   rows: string[][];
@@ -94,8 +96,9 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
     while (kept < written.length && wanted.includes(written[kept])) kept++;
     closeTo(kept);
     // A hard break is "  \n", marked \u0001 so the trailing-space cleanup
-    // below can't strip it. Table cells take a plain "\n" (written as <br>).
-    inline += breaks ? (inCell() ? "\n" : "\u0001\n").repeat(breaks) : space ? " " : "";
+    // below can't strip it, and indented under a list item's text so the item
+    // continues. Table cells take a plain "\n" (written as <br>).
+    inline += breaks ? (inCell() ? "\n" : "\u0001\n" + (lists.at(-1)?.indent ?? "")).repeat(breaks) : space ? " " : "";
     space = false;
     breaks = 0;
     for (const marker of wanted) {
@@ -286,7 +289,9 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
         list.count += 1;
         const b = list.bullet;
         const marker = list.type === "ol" ? list.count + b + " " : list.type === "check" ? (readHtmlAttribute(attributes, "data-checked") === "true" ? b + " [x] " : b + " [ ] ") : b + " ";
-        markdown += (markdown.endsWith("\n") ? "" : "\n") + "  ".repeat(Math.max(0, lists.length - 1)) + marker;
+        const lead = "  ".repeat(Math.max(0, lists.length - 1));
+        list.indent = lead + " ".repeat(marker.length);
+        markdown += (markdown.endsWith("\n") ? "" : "\n") + lead + marker;
         break;
       }
       case "a": {

@@ -356,6 +356,12 @@ describe("Word export", () => {
     expect(pictures[0]).toContain('<w:ind w:left="420"/>');
   });
 
+  it("sizes a table's grid for the columns a row span carries down", async () => {
+    const { document } = await exportDocx(["<table><tr><td rowspan=\"2\">A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>"]);
+    expect(document.match(/<w:gridCol /g)).toHaveLength(3);
+    for (const text of ["A", "B", "C", "D"]) paragraph(document, text);
+  });
+
   it("numbers a list item split by a picture once, and a picture-only item too", async () => {
     const img = `<img class="doc-image" src="${PNG}" alt="x" style="width:100px">`;
     const { document } = await exportDocx([`<ol><li>Before${img}After</li><li>${img}</li><li>Third</li></ol>`]);

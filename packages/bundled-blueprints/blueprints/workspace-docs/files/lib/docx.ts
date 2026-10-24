@@ -1145,7 +1145,7 @@ class DocxWriter {
     if (!rows.length) return;
     // The editor never writes spans; agent HTML may.
     const grid = rows.map((row) => row.node.children.filter((c): c is ElementNode => isElement(c) && (c.tag === "td" || c.tag === "th")));
-    const columnCount = grid.reduce((most, cells) => Math.max(most, cells.reduce((n, c) => n + spanOf(c, "colspan"), 0)), Math.max(1, cols.length));
+    const columnCount = Math.max(tableColumns(grid), 1, cols.length);
     // Every row is written out to the full width, so spans could multiply a few cells into millions.
     this.#tableCells += rows.length * columnCount;
     if (this.#tableCells > DOCX_LIMITS.tableCells) {
@@ -1231,6 +1231,26 @@ class DocxWriter {
   }
 }
 
+// The columns a table's cells fill: a row's cells start after the columns that
+// cells above still span down into. Stops counting once the table is past the
+// export's cell limit, which the caller then refuses.
+function tableColumns(grid: ElementNode[][]): number {
+  const covered: number[] = []; // per column, the rows a cell above still covers
+  let most = 0;
+  for (const cells of grid) {
+    let col = 0;
+    for (const cell of cells) {
+      while (covered[col]! > 0) col++;
+      const span = spanOf(cell, "colspan"), down = spanOf(cell, "rowspan");
+      for (let k = 0; k < span; k++) covered[col + k] = down;
+      col += span;
+      most = Math.max(most, col);
+      if (most * grid.length > DOCX_LIMITS.tableCells) return most;
+    }
+    for (let k = 0; k < covered.length; k++) if (covered[k]! > 0) covered[k] = covered[k]! - 1;
+  }
+  return most;
+}
 function spanOf(cell: ElementNode, name: "colspan" | "rowspan"): number {
   const n = Number.parseInt(cell.attrs[name] ?? "", 10);
   return Number.isFinite(n) && n > 1 ? Math.min(n, 1000) : 1;

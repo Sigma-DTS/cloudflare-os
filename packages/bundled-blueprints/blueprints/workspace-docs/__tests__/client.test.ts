@@ -160,3 +160,30 @@ describe("menus", () => {
     expect(picked).toHaveBeenCalled();
   });
 });
+
+describe("block order", () => {
+  // A save's reply confirms the order as of its revision; a live event from a later revision that
+  // arrived first must keep its order, or a later move of the new block is never saved.
+  it("keeps a newer event's order over an older save reply", async () => {
+    const ids = () => Array.from(editor().children, (n) => n.getAttribute("data-block-id")!);
+    const applyOperation = vi.mocked((globalThis as unknown as { gadget: GadgetStub }).gadget.applyOperation);
+    let reply!: () => void;
+    applyOperation.mockImplementationOnce((op) => new Promise((resolve) => {
+      const upserts = (op.upserts ?? []).map((b) => ({ id: b.id, html: b.html, version: b.baseVersion + 1 }));
+      reply = () => resolve({ status: "applied", revision: 30, conflicts: [], upserts, order: op.order });
+    }));
+    editor().firstElementChild!.append(" edited");
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.waitFor(() => expect(reply).toBeDefined());
+    subscriber.operation({ type: "operation", senderId: "someone", revision: 31, title: "Doc", lastModified: 0, upserts: [{ id: "o1", html: "<p>new</p>", version: 1 }], deletedIds: [], order: [...ids(), "o1"] });
+    reply();
+    await vi.waitFor(() => expect(applyOperation.mock.results.at(-1)?.type).toBe("return"));
+    await Promise.resolve();
+    const moved = editor().querySelector('[data-block-id="o1"]')!;
+    editor().prepend(moved);
+    applyOperation.mockClear();
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.waitFor(() => expect(applyOperation).toHaveBeenCalled());
+    expect(applyOperation.mock.calls[0]![0].order?.[0]).toBe("o1");
+  });
+});

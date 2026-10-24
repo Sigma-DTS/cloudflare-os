@@ -35,7 +35,7 @@ for (const spec of [{ type: "h2", text: "Risks" }, { type: "ul", items: ["Legal 
 
 ## Block API
 
-Every write runs in the Durable Object's mutation queue, bumps the version of each block whose HTML changed, persists, and broadcasts an `operation` event with `senderId: "agent"` (which is what the editor animates). The first write to a document never saved before broadcasts a `snapshot` instead. Writes return `{ status: "applied" | "unchanged", revision, ids }`, where `ids` are the blocks created or touched. Errors throw with a readable message, e.g. `Unknown block id: …`.
+Every write runs in the Durable Object's mutation queue. One that changes the document bumps the version of each block whose HTML changed, persists, and broadcasts an `operation` event with `senderId: "agent"` (which is what the editor animates). The first write to a document never saved before broadcasts a `snapshot` instead. Writes return `{ status: "applied" | "unchanged", revision, ids }`, where `ids` are the blocks created or touched. Errors throw with a readable message, e.g. `Unknown block id: …`.
 
 | Method | Notes |
 | --- | --- |
@@ -72,7 +72,7 @@ Every write runs in the Durable Object's mutation queue, bumps the version of ea
 ## Document model and settings
 
 - Stored under `document:v2`: `{ revision, title, blocks: [{ id, html, version }], lastModified }`. Each top-level element in the editor is one block with a stable `data-block-id`; a whole list or table is one block.
-- Clients send only changed blocks with the version they rest on; the server accepts non-conflicting changes and returns the authoritative block for stale ones, which the client merges word by word with its draft and resends. Two people typing in one paragraph both keep their words.
+- Clients send only changed blocks with the version they rest on; the server accepts non-conflicting changes and returns the authoritative block for stale ones, which the client merges word by word with its draft and resends. Two people changing different words of one paragraph both keep their changes; where both changed the same words, the later save's words win.
 - `title` exists in storage but isn't shown or edited (the gadget has its own title; the browser tab shows the first non-empty line).
 - Shared presentation settings, stored under `settings`: `{ font: "sans" | "serif" | "mono", wide: boolean }` (`wide` widens the page from 700px to 980px). Read and write them with `getSettings()` / `setSettings({ font?, wide? })`. There is deliberately no per-run font or size; text styles come from the block type.
 - Documents from before blocks (a legacy `content` HTML key) are converted to blocks on first load.
