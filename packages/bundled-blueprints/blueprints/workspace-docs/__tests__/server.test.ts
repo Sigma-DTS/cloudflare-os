@@ -243,6 +243,16 @@ describe("block API", () => {
   });
 
   // Open editors see just what changed: unchanged blocks keep their ids and versions.
+  // The editor saves each block with its root's data-block-id; HTML from Markdown has none.
+  it("keeps editor-saved blocks that setMarkdown leaves unchanged", async () => {
+    const { gadget } = inMemoryGadget();
+    await gadget.initializeBlocks({ blocks: [{ id: "a", html: '<p data-block-id="a">One</p>' }, { id: "b", html: '<p data-block-id="b">Two</p>' }], title: "Doc", senderId: "c1" });
+    await gadget.setMarkdown({ markdown: "New\n\nOne\n\nTwo", replace: true });
+    const { blocks } = await gadget.listBlocks();
+    expect(blocks.map((b) => b.markdown.trim())).toEqual(["New", "One", "Two"]);
+    expect(blocks.slice(1).map((b) => [b.id, b.version])).toEqual([["a", 1], ["b", 1]]);
+  });
+
   it("replaces the document with setMarkdown, keeping unchanged blocks", async () => {
     const { gadget, blocks } = await withMarkdown("a\n\nb\n\nc");
     const result = await gadget.setMarkdown({ markdown: "a\n\nB\n\nc", title: "New", replace: true });

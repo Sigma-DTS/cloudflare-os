@@ -231,6 +231,22 @@ describe("more edits", () => {
     expect(Array.from(table.querySelectorAll("tr"), (tr) => Array.from(tr.cells, (c) => c.textContent))).toEqual([["A", "B"], ["X", "Y"]]);
   });
 
+  // A grid dropped on a table cell fills the cells from there, as pasting it does.
+  it("fills a table's cells with a grid dropped on one", () => {
+    send([{ id: "g2", html: "<table><tbody><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></tbody></table>", version: 1 }]);
+    const at = document.createRange();
+    at.setStart(editor().querySelector('[data-block-id="g2"] td')!.firstChild!, 0);
+    Object.assign(document, { caretRangeFromPoint: () => at });
+    const event = Object.assign(new Event("drop", { bubbles: true, cancelable: true }), {
+      clientX: 0, clientY: 0,
+      dataTransfer: { items: [], files: [], getData: (type: string) => (type === "text/plain" ? "X\tY\nZ\tW" : "") },
+    });
+    try { editor().dispatchEvent(event); } finally { delete (document as { caretRangeFromPoint?: unknown }).caretRangeFromPoint; }
+    const table = editor().querySelector('[data-block-id="g2"]')!;
+    expect(table.querySelectorAll("table table")).toHaveLength(0);
+    expect(Array.from(table.querySelectorAll("tr"), (tr) => Array.from(tr.cells, (c) => c.textContent))).toEqual([["X", "Y"], ["Z", "W"]]);
+  });
+
   // A block deleted remotely while it was typed in, then re-created by this page's save: the next
   // remote change merges against that save, not the text from before the deletion.
   it("merges against a re-created block's save, not the deleted version", async () => {

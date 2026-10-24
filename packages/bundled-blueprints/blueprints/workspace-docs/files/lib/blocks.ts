@@ -46,9 +46,19 @@ export function resolvePosition(list: BlockContent[], { afterId, beforeId, index
 // Line up a new list of block HTML against the current blocks: identical
 // blocks are matched (longest common subsequence), and between matches the
 // leftovers pair up in order as in-place updates.
+/**
+ * Whether two blocks' HTML is the same content: the editor saves a block with its root's
+ * `data-block-id`, which HTML built from a spec doesn't carry.
+ */
+export function sameBlockHtml(a: string, b: string): boolean {
+  return a === b || withoutBlockId(a) === withoutBlockId(b);
+}
+const withoutBlockId = (html: string) => html.replace(/^(\s*<[a-z0-9]+\b[^>]*?)\s+data-block-id="[^"]*"/i, "$1");
+
 export function mergeBlockList(old: BlockContent[], htmls: string[]): BlockContent[] {
   const n = old.length, m = htmls.length, w = m + 1;
-  const same = (i: number, j: number) => old[i].html === htmls[j];
+  const oldKeys = old.map((b) => withoutBlockId(b.html)), newKeys = htmls.map(withoutBlockId);
+  const same = (i: number, j: number) => oldKeys[i] === newKeys[j];
   const dp = (n + 1) * w <= 4e6 ? new Uint32Array((n + 1) * w) : null;
   if (dp) for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i * w + j] = same(i, j) ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
   const out: BlockContent[] = [];
@@ -563,7 +573,9 @@ interface MarkdownItem {
 // Block-level Markdown -> specs: headings, paragraphs, (nested) bulleted,
 // numbered and task lists, quotes, fenced code, dividers and images.
 export function markdownToSpecs(markdown: unknown): BlockSpec[] {
-  const lines = String(markdown ?? "").replace(/\r\n?/g, "\n").replace(/\t/g, "    ").split("\n");
+  // Tabs count as four spaces of indentation, except in fenced code, which is kept as written.
+  const raw = String(markdown ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const lines = raw.map((line) => line.replace(/\t/g, "    "));
   const specs: BlockSpec[] = [];
   // An empty item ("-", "2.", "- [ ]") is still an item.
   const LIST = /^(\s*)([-*+]|\d{1,9}[.)])(?:\s+|$)(?:\[([ xX])\](?:\s+|$))?(.*)$/;
@@ -579,7 +591,7 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
     if (fence) {
       flush();
       const body: string[] = [];
-      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) body.push(lines[i]);
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) body.push(raw[i]);
       specs.push({ type: "code", text: body.join("\n") });
       continue;
     }

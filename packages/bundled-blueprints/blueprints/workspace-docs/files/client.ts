@@ -2439,7 +2439,11 @@ editor.addEventListener("drop", (e) => {
   if (html?.trim() || text) {
     e.preventDefault();
     setCaretFromPoint(e.clientX, e.clientY);
-    insertPasted(clipboardHtml(html, text));
+    // Dropped on a table cell, it fills the cells as a paste there does.
+    const range = getRange();
+    const cell = range && cellOf(range.startContainer);
+    if (cell) pasteIntoCell(cell, html || "", text || "");
+    else insertPasted(clipboardHtml(html, text));
   }
 });
 

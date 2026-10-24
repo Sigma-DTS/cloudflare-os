@@ -154,6 +154,13 @@ describe("list items through Markdown", () => {
   });
 });
 
+describe("fenced code", () => {
+  // A Makefile recipe needs its tab: code is kept exactly as written.
+  it("keeps tabs inside a fence", () => {
+    expect(markdownToSpecs("```\nall:\n\tcc main.c\n```").map(specHtml)).toEqual(["<pre>all:\n\tcc main.c</pre>"]);
+  });
+});
+
 describe("Markdown headings", () => {
   // Only a closing run of #s after a space is markup: "C#" keeps its hash.
   it("keeps a hash that ends the heading's last word", () => {

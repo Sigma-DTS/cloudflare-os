@@ -45,6 +45,7 @@ import {
   isEmptyLine,
   isRecord,
   mergeBlockList,
+  sameBlockHtml,
   newBlockId,
   repairBlockHtml,
   resolvePosition,
@@ -280,8 +281,8 @@ export class Gadget extends DurableObject<unknown, unknown> implements GadgetStu
     };
   }
 
-  // `client` is what an older editor said about itself; with no presence it is not kept.
-  async subscribe(callback: SubscriberCallbacks, client: unknown = {}): Promise<SubscribeSnapshot> {
+  // `_client` is what an older editor said about itself; with no presence it is not kept.
+  async subscribe(callback: SubscriberCallbacks, _client: unknown = {}): Promise<SubscribeSnapshot> {
     this.subscribers.add(callback, {});
     const [doc, settings] = await Promise.all([this.loadDocument(), this.getSettings()]);
     return { ...doc, settings };
@@ -480,7 +481,7 @@ export class Gadget extends DurableObject<unknown, unknown> implements GadgetStu
       const upserts: StoredBlock[] = [];
       const blocks = list.map((b) => {
         const old = before.get(b.id);
-        if (old && old.html === b.html) return old;
+        if (old && sameBlockHtml(old.html, b.html)) return old;
         const next = { id: b.id, html: b.html, version: (old?.version || 0) + 1 };
         upserts.push(next);
         return next;
