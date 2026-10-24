@@ -121,3 +121,42 @@ describe("editing", () => {
     expect(li.getAttribute("data-checked")).toBe("true");
   });
 });
+
+describe("a save in flight", () => {
+  // The agent's version can already include this page's save while the reply is still on its
+  // way: it must not be merged against the version before the save, or the saved words repeat.
+  it("applies a newer remote version against the save it includes", async () => {
+    subscriber.operation({ type: "operation", senderId: "someone", revision: 20, title: "Doc", lastModified: 0, upserts: [{ id: "r1", html: "<p>foo</p>", version: 1 }], deletedIds: [], order: [...Array.from(editor().children, (n) => n.getAttribute("data-block-id")!), "r1"] });
+    const block = editor().querySelector('[data-block-id="r1"]')!;
+    const applyOperation = vi.mocked((globalThis as unknown as { gadget: GadgetStub }).gadget.applyOperation);
+    let reply!: () => void;
+    applyOperation.mockImplementationOnce(() => new Promise((resolve) => {
+      reply = () => resolve({ status: "applied", revision: 21, conflicts: [], upserts: [{ id: "r1", html: "<p>foo A</p>", version: 2 }] });
+    }));
+    block.textContent = "foo A";
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.waitFor(() => expect(reply).toBeDefined());
+    subscriber.operation({ type: "operation", senderId: "agent", revision: 22, title: "Doc", lastModified: 0, upserts: [{ id: "r1", html: "<p>bar A</p>", version: 3 }], deletedIds: [], order: Array.from(editor().children, (n) => n.getAttribute("data-block-id")!) });
+    reply();
+    await vi.waitFor(() => expect(editor().querySelector('[data-block-id="r1"]')?.textContent).toBe("bar A"));
+  });
+});
+
+describe("menus", () => {
+  it("are driven from the keyboard", () => {
+    const align = document.querySelector<HTMLButtonElement>(".tb.align")!;
+    align.focus();
+    align.click();
+    const rows = () => Array.from(document.querySelectorAll<HTMLElement>('.pop [role="menuitemradio"]'));
+    expect(rows()).toHaveLength(4);
+    const key = (key: string) => document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    key("ArrowDown");
+    expect(document.activeElement).toBe(rows()[0]);
+    key("ArrowUp");
+    expect(document.activeElement).toBe(rows()[3]);
+    const picked = vi.fn();
+    rows()[3].addEventListener("click", picked);
+    key("Enter");
+    expect(picked).toHaveBeenCalled();
+  });
+});

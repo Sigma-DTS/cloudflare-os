@@ -520,7 +520,8 @@ ${paletteCss.classes}
   padding: 6px 10px 6px 7px; border-radius: 7px;
   cursor: pointer; user-select: none; white-space: nowrap;
 }
-.mi:hover, .mi.active { background: var(--hover); }
+.mi:hover, .mi.active, .mi:focus-visible { background: var(--hover); }
+.mi:focus { outline: none; }
 .mi-icon { width: 22px; height: 22px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; color: var(--muted); }
 .mi-icon svg { display: block; }
 .mi-text { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; }
@@ -1842,6 +1843,27 @@ document.addEventListener("keydown", (e) => {
     else if (!wasLinkEdit) editor.focus({ preventScroll: true });
   }
 });
+// A menu works from the keyboard: the arrows, from the button that opened it or
+// inside it, move through its rows, and Enter or Space picks one. Its action
+// puts back the editor selection the menu was opened from (toggleMenu).
+document.addEventListener("keydown", (e) => {
+  if (openPop?.kind !== "menu") return;
+  const { pop, owner } = openPop;
+  const inPop = pop.contains(document.activeElement);
+  if (!inPop && document.activeElement !== owner) return;
+  const rows = Array.from(pop.querySelectorAll<HTMLElement>(".mi"));
+  if (!rows.length) return;
+  const i = rows.indexOf(document.activeElement as HTMLElement);
+  const move = (to: number) => rows[(to + rows.length) % rows.length].focus();
+  if (e.key === "ArrowDown") move(i + 1);
+  else if (e.key === "ArrowUp") move(i < 0 ? -1 : i - 1);
+  else if (e.key === "Home" && inPop) move(0);
+  else if (e.key === "End" && inPop) move(-1);
+  else if ((e.key === "Enter" || e.key === " ") && i >= 0) rows[i].click();
+  else if (e.key === "Tab" && inPop) { closePop(); owner?.focus(); }
+  else return;
+  e.preventDefault();
+});
 canvas.addEventListener("scroll", () => {
   if (!openPop) return;
   if (openPop.reposition) {
@@ -1877,6 +1899,7 @@ function menuItem({ icon, label, keys, md, checked, checkSlot = false, role = "m
     icon ? el("span", { class: "mi-icon", html: svg(ICONS[icon], 17) }) : null,
     text
   ]);
+  item.tabIndex = -1;
   item.addEventListener("click", () => { closePop(); onSelect(); });
   return item;
 }
@@ -5642,6 +5665,12 @@ const pendingByBlock = new Map<string, PendingChange>(); // id -> remote change 
 // reply comes. If the reply is lost, the server's copy of that very draft is
 // recognized as this page's own when it comes back, rather than merged.
 const sentDrafts = new Map<string, { baseVersion: number; html: string }>();
+// The blocks whose save is in flight, and the remote changes to them that came
+// meanwhile (null for a deletion). A remote version may already include that
+// save, so it is applied only once the reply has said which version the draft
+// became: merged against the older one, the saved text would be added twice.
+let savingIds: Set<string> | null = null;
+const heldWhileSaving = new Map<string, StoredBlock | null>();
 
 const saver = new SaveScheduler({
   save: sendChanges, isDirty, onStatus: setSync,
@@ -5710,16 +5739,23 @@ async function sendChanges(failures = 0): Promise<SaveOutcome> {
   // carries this very text at the next version, and sentDrafts recognizes it
   // as this page's own: nothing is merged or written twice.
   const sent = upserts.map((b) => { const draft = { baseVersion: b.baseVersion, html: b.html }; sentDrafts.set(b.id, draft); return [b.id, draft] as const; });
-  const result: ApplyOperationResult = await withTimeout(gadget.applyOperation({ senderId: clientId, baseRevision: revision, upserts, deletes, order: sentOrder }), saveTimeoutMs(failures));
-  for (const [id, draft] of sent) if (sentDrafts.get(id) === draft) sentDrafts.delete(id);
-  revision = Math.max(revision, result.revision || 0);
-  ackOrder = Array.isArray(result.order) ? result.order : sentOrder;
-  // A newer version may already have arrived as a live event while this reply
-  // was in flight; never step a block back to an older one.
-  // (An unknown block's missing version compares false.)
-  const acknowledge = (b: StoredBlock) => { if (!(acknowledged.get(b.id)?.version! > b.version)) acknowledged.set(b.id, { html: b.html, version: b.version }); };
-  for (const b of result.upserts || []) acknowledge(b);
-  for (const id of result.deletedIds || []) acknowledged.delete(id);
+  savingIds = new Set(sent.map(([id]) => id));
+  let result: ApplyOperationResult;
+  try {
+    result = await withTimeout(gadget.applyOperation({ senderId: clientId, baseRevision: revision, upserts, deletes, order: sentOrder }), saveTimeoutMs(failures));
+    for (const [id, draft] of sent) if (sentDrafts.get(id) === draft) sentDrafts.delete(id);
+    revision = Math.max(revision, result.revision || 0);
+    ackOrder = Array.isArray(result.order) ? result.order : sentOrder;
+    // A newer version may already have arrived as a live event while this reply
+    // was in flight; never step a block back to an older one.
+    // (An unknown block's missing version compares false.)
+    const acknowledge = (b: StoredBlock) => { if (!(acknowledged.get(b.id)?.version! > b.version)) acknowledged.set(b.id, { html: b.html, version: b.version }); };
+    for (const b of result.upserts || []) acknowledge(b);
+    for (const id of result.deletedIds || []) acknowledged.delete(id);
+  } finally {
+    savingIds = null;
+    applyHeldChanges();
+  }
   if (!result.conflicts?.length) return "saved";
   // A stale block is merged with the server's newer version, exactly as if
   // that version had arrived as a live event; the next send saves the merge.
@@ -5769,7 +5805,24 @@ function pendingBaseline(id: string) {
   const existing = pendingByBlock.get(id);
   return existing ? existing.baseHtml : acknowledged.get(id)?.html;
 }
+function applyHeldChanges() {
+  if (!heldWhileSaving.size) return;
+  const held = Array.from(heldWhileSaving);
+  heldWhileSaving.clear();
+  const activeId = editingBlockId();
+  keepSelection(() => {
+    applyingRemote = true;
+    for (const [id, block] of held) {
+      if (block) remoteUpsert(block, activeId);
+      else remoteDelete(id, activeId);
+    }
+    applyingRemote = false;
+  });
+  afterRemoteChange();
+  saveMergedDrafts();
+}
 function remoteUpsert(block: StoredBlock, activeId: string | null) {
+  if (savingIds?.has(block.id)) { heldWhileSaving.set(block.id, block); return; }
   // Already have this version (or a newer one): nothing to do. (An unknown
   // block's missing version compares false.)
   if (acknowledged.get(block.id)?.version! >= block.version) return;
@@ -5806,6 +5859,7 @@ function insertByServerOrder(node: HTMLElement) {
   else editor.appendChild(node);
 }
 function remoteDelete(id: string, activeId: string | null) {
+  if (savingIds?.has(id)) { heldWhileSaving.set(id, null); return; }
   const baseHtml = pendingBaseline(id);
   acknowledged.delete(id);
   const old = findBlock(id);
@@ -5865,6 +5919,7 @@ function applySnapshot(doc: DocumentSnapshot) {
   acknowledged.clear();
   pendingByBlock.clear();
   sentDrafts.clear();
+  heldWhileSaving.clear();
   editor.replaceChildren(...(doc.blocks || []).map(parseBlock));
   normalize();
   for (const block of doc.blocks || []) {

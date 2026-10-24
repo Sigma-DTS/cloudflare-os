@@ -356,6 +356,16 @@ describe("Word export", () => {
     expect(pictures[0]).toContain('<w:ind w:left="420"/>');
   });
 
+  it("numbers a list item split by a picture once, and a picture-only item too", async () => {
+    const img = `<img class="doc-image" src="${PNG}" alt="x" style="width:100px">`;
+    const { document } = await exportDocx([`<ol><li>Before${img}After</li><li>${img}</li><li>Third</li></ol>`]);
+    const numbered = paragraphs(document).filter((p) => p.includes("<w:numPr>"));
+    expect(numbered.map(textOf)).toEqual(["Before", "", "Third"]);
+    const after = paragraph(document, "After");
+    expect(after).not.toContain("w:hanging");
+    expect(after).toContain('w:left="');
+  });
+
   it("keeps a cell's lists in the cell's text size, with no margin below the cell's last block", async () => {
     const { document, part } = await exportDocx(["<table><tbody><tr><td><ul><li>cell item</li><li>last item</li></ul></td></tr></tbody></table>"]);
     expect(attr(paragraph(document, "cell item"), /<w:pStyle w:val="([^"]+)"/)).toBe("TableList");

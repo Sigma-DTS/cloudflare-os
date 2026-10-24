@@ -818,8 +818,11 @@ class DocxWriter {
 
   // ── Paragraphs ─────────────────────────────────────────────────────────────
   // Writes one paragraph (or several, when pictures split it) of inline nodes.
+  // A list item's marker goes on its first paragraph only (one of its own when
+  // a picture comes first); the rest continue the item at its text indent.
   #paragraph(children: HtmlNode[], options: ParagraphOptions): void {
     const { style, fmt, pPr } = options;
+    const continued = continuationPPr(pPr);
     let prefix = options.prefix;
     let emitted = false;
     const write = (paragraphStyle: ParagraphStyle | null, props: string, runs: string): void => {
@@ -832,19 +835,20 @@ class DocxWriter {
       ink: style === "Quote" ? INK_2 : style === "Caption" ? MUTED : INK,
       flush() {
         trimTrailingBreaks(this.runs);
-        write(style, pPr, this.runs.join(""));
+        write(style, emitted ? continued : pPr, this.runs.join(""));
         this.runs = [];
         this.atLineStart = true;
         this.lastSpace = false;
         this.column = 0;
       },
       flushImage(drawing) {
+        if (!emitted && (prefix || continued !== pPr)) write(style, pPr, "");
         write(style === "Code" ? null : style, imagePPr(pPr), drawing);
       },
     };
     for (const child of children) this.#inline(child, fmt, ctx);
     trimTrailingBreaks(ctx.runs);
-    if (ctx.runs.length || !emitted) write(style, pPr, ctx.runs.join(""));
+    if (ctx.runs.length || !emitted) write(style, emitted ? continued : pPr, ctx.runs.join(""));
   }
 
   // ── Blocks ─────────────────────────────────────────────────────────────────
@@ -1270,6 +1274,11 @@ function blockLevelFormat(node: ElementNode, basePt: number): RunFormat {
 function paragraphXml(style: ParagraphStyle | null, pPr: string, runs: string): string {
   const props = (style ? `<w:pStyle w:val="${style}"/>` : "") + pPr;
   return `<w:p>${props ? `<w:pPr>${props}</w:pPr>` : ""}${runs}</w:p>`;
+}
+
+// The paragraph properties for the rest of a list item: no marker and no hanging indent.
+function continuationPPr(pPr: string): string {
+  return pPr.replace(/<w:numPr>.*?<\/w:numPr>|<w:tabs>.*?<\/w:tabs>/g, "").replace(/ w:hanging="\d+"/g, "").replace(/<w:ind\/>/, "");
 }
 
 // A picture's paragraph keeps the block's left indentation (a list item's text
