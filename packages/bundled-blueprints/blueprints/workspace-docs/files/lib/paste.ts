@@ -178,9 +178,10 @@ const hasContent = (n: Element) => !!n.textContent?.trim() || !!n.querySelector(
 // Word's list paragraph: `style="mso-list:l0 level2 lfo1"`, its marker ("·",
 // "o", "1.") in a `mso-list:Ignore` span that only Word's own renderer hides.
 const WORD_LIST = /mso-list:\s*l\d+\s+level(\d+)/i;
+const WORD_LIST_TAGS = /^(P|DIV|LI)$/;
 const ORDERED_MARKER = /^\(?([0-9]+|[a-z]|[ivxlcdm]+)[.)]$/i;
 function wordListItem(node: Node): { level: number; ordered: boolean } | null {
-  if (!isElement(node) || !/^(P|DIV|LI)$/.test(node.tagName)) return null;
+  if (!isElement(node) || !WORD_LIST_TAGS.test(node.tagName)) return null;
   const m = WORD_LIST.exec(node.getAttribute("style") || "");
   if (!m) return null;
   const marker = node.querySelector('[style*="mso-list:ignore" i], [style*="mso-list: ignore" i]');
@@ -372,7 +373,8 @@ export function sanitizePastedHtml(html: string, pc: PasteContext): string {
       flush();
       if (!isElement(node) || SKIP.has(node.tagName)) continue;
       const tag = node.tagName;
-      if (WORD_LIST.test(node.getAttribute("style") || "")) {
+      // (Only an element Word lists are made of starts one: a heading styled as a list item doesn't.)
+      if (WORD_LIST_TAGS.test(tag) && WORD_LIST.test(node.getAttribute("style") || "")) {
         const paras: { node: Element; level: number; ordered: boolean }[] = [];
         for (; i < nodes.length; i++) {
           const n = nodes[i];
@@ -492,9 +494,8 @@ export function parseTsv(text: string): string[][] | null {
 }
 // A quote of several Markdown blocks: a quote per paragraph, lists and code between.
 function quoteHtml(inner: string) {
-  const template = document.createElement("template");
-  template.innerHTML = inner;
-  return Array.from(template.content.children, (b) => b.tagName === "P" || /^H[1-3]$/.test(b.tagName) ? `<blockquote>${b.innerHTML}</blockquote>` : b.outerHTML).join("");
+  const body = new DOMParser().parseFromString(inner, "text/html").body;
+  return Array.from(body.children, (b) => b.tagName === "P" || /^H[1-3]$/.test(b.tagName) ? `<blockquote>${b.innerHTML}</blockquote>` : b.outerHTML).join("");
 }
 export function markdownToHtml(md: string): string {
   const lines = md.replace(/\r\n?/g, "\n").split("\n");

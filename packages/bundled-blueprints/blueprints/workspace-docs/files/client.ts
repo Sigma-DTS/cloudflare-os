@@ -836,6 +836,24 @@ function textWithBreaks(fragmentOrNode: Node) {
   walk(fragmentOrNode);
   return out;
 }
+// Moves the parts of `wrapper` before and after `range` into copies of it beside it.
+function splitAtRange(wrapper: Element, range: Range) {
+  for (const after of [true, false]) {
+    const boundary: Point = after ? [range.endContainer, range.endOffset] : [range.startContainer, range.startOffset];
+    if (!wrapper.contains(boundary[0])) continue;
+    const part = document.createRange();
+    part.selectNodeContents(wrapper);
+    if (after) part.setStart(...boundary);
+    else part.setEnd(...boundary);
+    if (part.collapsed) continue;
+    const copy = wrapper.cloneNode(false) as Element;
+    copy.appendChild(part.extractContents());
+    if (copy.textContent || copy.querySelector("img, br")) {
+      if (after) wrapper.after(copy);
+      else wrapper.before(copy);
+    }
+  }
+}
 function unwrap(node: ChildNode) {
   const parent = node.parentNode;
   if (!parent) return;
@@ -1407,10 +1425,12 @@ function setBlockType(key: BlockKind) {
   exec("formatBlock", `<${BLOCK_TAG[key]}>`);
   changed();
 }
+// Undone by ⌘Z like a block move (the browser's own undo doesn't see it).
 function toggleCheck(li: Element) {
+  recordBlockStep();
   if (li.getAttribute("data-checked") === "true") li.removeAttribute("data-checked");
   else li.setAttribute("data-checked", "true");
-  changed();
+  blockChanged();
 }
 
 function toggleCode() {
@@ -1574,11 +1594,18 @@ function clearFormatting() {
   exec("removeFormat");
   const range = getRange();
   if (range) {
+    const inline = (n: Element) => /^(SPAN|FONT|CODE|U|S|STRIKE)$/.test(n.tagName);
+    const found = Array.from(editor.querySelectorAll('[class*="tc-"], [class*="hl-"], code, font, u, s, strike'))
+      .filter((n) => !n.closest("pre") && range.intersectsNode(n));
+    // A wrapper reaching past the selection is split at its edges first, so
+    // the words around the selection keep their formatting. The selection's
+    // range follows the split; what is left inside it is then unwrapped.
+    for (const n of found) if (inline(n) && n.isConnected && range.intersectsNode(n)) splitAtRange(n, range);
+    const hits = found.filter((n) => n.isConnected && range.intersectsNode(n));
+    setRange(range);
     keepSelection(() => {
-      const hits = Array.from(editor.querySelectorAll('[class*="tc-"], [class*="hl-"], code, font, u, s, strike'))
-        .filter((n) => !n.closest("pre") && range.intersectsNode(n));
       for (const n of hits) {
-        if (n.tagName === "SPAN" || n.tagName === "FONT" || n.tagName === "CODE" || n.tagName === "U" || n.tagName === "S" || n.tagName === "STRIKE") unwrap(n);
+        if (inline(n)) unwrap(n);
         else { removeKindClass(n, "tc"); removeKindClass(n, "hl"); cleanClass(n); }
       }
     });
@@ -3238,17 +3265,22 @@ function nudge(units: Element[], dir: number) {
 // Moves, duplicates and deletes rearrange existing nodes, so a snapshot of
 // the structure (which nodes, in which order) undoes them exactly while
 // keeping every node -- and so the browser's own undo history for typing --
-// intact. Any other edit clears these snapshots (see changed()).
+// intact. The snapshot also notes which to-do items are ticked, so ticking
+// one is undone the same way. Any other edit clears these snapshots (see
+// changed()).
 function clearBlockHistory() { blockHistory.undo.length = 0; blockHistory.redo.length = 0; }
 /** A snapshot of the block structure (which nodes, in which order) and of what was selected. */
 interface BlockState {
   structure: { node: HTMLElement; kids: ChildNode[] | null }[];
+  /** The to-do items that were ticked. */
+  checked: Element[];
   sel: { anchor: Element; focus: Element } | null;
   caret: SavedSelection | null;
 }
 function captureState(): BlockState {
   return {
     structure: Array.from(editor.children, (node) => ({ node, kids: isListEl(node) ? Array.from(node.childNodes) : null })),
+    checked: Array.from(editor.querySelectorAll("li[data-checked]")),
     sel: blockSel ? { anchor: blockSel.anchor, focus: blockSel.focus } : null,
     caret: !blockSel && document.activeElement === editor ? saveSelection() : null
   };
@@ -3261,6 +3293,11 @@ function restoreState(s: BlockState) {
     for (const k of kids) node.appendChild(k);
   }
   editor.replaceChildren(...s.structure.map((x) => x.node));
+  const checked = new Set(s.checked);
+  for (const li of editor.querySelectorAll("ul.checklist li")) {
+    if (checked.has(li)) li.setAttribute("data-checked", "true");
+    else li.removeAttribute("data-checked");
+  }
   if (s.sel && s.sel.anchor.isConnected && s.sel.focus.isConnected) selectBlocks(s.sel.anchor, s.sel.focus);
   else if (s.caret) { clearBlockSel(); editor.focus({ preventScroll: true }); restoreSelection(s.caret); }
 }

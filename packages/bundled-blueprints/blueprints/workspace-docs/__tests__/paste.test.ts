@@ -32,6 +32,11 @@ describe("inlineMarkdown", () => {
 });
 
 describe("sanitizePastedHtml", () => {
+  // Word can put its list style on a heading, which isn't a list item: it stays a heading.
+  it("pastes a heading carrying Word's list style as a heading", () => {
+    expect(paste('<h1 style="mso-list:l0 level1 lfo1">Heading</h1>')).toBe("<h1>Heading</h1>");
+  });
+
   it("rebuilds Word's list paragraphs as nested lists without their markers", () => {
     const item = (list: string, level: number, marker: string, text: string) =>
       `<p class=MsoListParagraph style='margin-left:.5in;text-indent:-.25in;mso-list:${list} level${level} lfo1'><![if !supportLists]>` +

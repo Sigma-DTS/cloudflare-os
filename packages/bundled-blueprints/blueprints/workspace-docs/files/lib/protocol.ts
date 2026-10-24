@@ -41,8 +41,9 @@ export interface StoredDocument {
 
 /**
  * What the server returns for a document that has not been converted to blocks yet: the former
- * HTML snapshot under the legacy `content`/`title`/`lastModified` keys, with `blocks: null`. The
- * first editor converts it and calls `initializeBlocks` (the block API converts it itself).
+ * HTML snapshot under the legacy `content`/`title`/`lastModified` keys, with `blocks: null`. It is
+ * returned only when converting at startup failed: the first editor then converts it and calls
+ * `initializeBlocks` (the block API converts it itself).
  */
 export interface LegacyDocument {
   revision: 0;

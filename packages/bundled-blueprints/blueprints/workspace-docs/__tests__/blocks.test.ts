@@ -154,6 +154,7 @@ describe("stripUnsafe", () => {
     expect(stripUnsafe('<!-- <a title="--><img src=x onerror=1>"> -->')).toBe('<!-- <a title="--><img src=x>"> -->');
     // Tags inside raw-text elements are text.
     expect(stripUnsafe("<xmp><b onclick=1></b></xmp>")).toBe("<xmp><b onclick=1></b></xmp>");
+    expect(stripUnsafe('<title><a href="</title><img src=x onerror=alert(1)>">')).toBe('<img src=x>">');
     // A tag the input ends inside is dropped, as a browser drops it.
     expect(stripUnsafe('<p>t <a href="x')).toBe("<p>t ");
   });

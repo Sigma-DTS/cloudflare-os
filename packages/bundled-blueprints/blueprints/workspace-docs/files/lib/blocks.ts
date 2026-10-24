@@ -387,7 +387,7 @@ export function stripUnsafe(html: string): string {
   return out;
 }
 
-const UNSAFE_ELEMENTS = new Set(["script", "style", "iframe", "frame", "frameset", "object", "embed", "link", "meta", "base", "form", "input", "button", "textarea", "select", "svg", "math", "noscript", "template"]);
+const UNSAFE_ELEMENTS = new Set(["script", "style", "iframe", "frame", "frameset", "object", "embed", "link", "meta", "base", "form", "input", "button", "textarea", "title", "select", "svg", "math", "noscript", "template"]);
 // Elements whose content a browser reads as text up to their end tag (the unsafe ones aside):
 // copied as written, since tags inside them are not tags.
 const RAW_TEXT_ELEMENTS = new Set(["xmp", "noembed", "noframes", "plaintext"]);

@@ -81,3 +81,43 @@ describe("saving", () => {
     expect(Array.from(editor().children, (n) => n.getAttribute("data-block-id"))).toEqual(["b1", "b2", "b3"]);
   });
 });
+
+describe("editing", () => {
+  let revision = 10;
+  const show = (id: string, html: string) => {
+    const order = [...Array.from(editor().children, (n) => n.getAttribute("data-block-id")!), id];
+    subscriber.operation({ type: "operation", senderId: "someone", revision: ++revision, title: "Doc", lastModified: 0, upserts: [{ id, html, version: 1 }], deletedIds: [], order });
+    return editor().querySelector<HTMLElement>(`[data-block-id="${id}"]`)!;
+  };
+  // The editor acts on the selection only while it has focus.
+  const select = (node: Node, start: number, end = start) => {
+    if (editor().tabIndex < 0) editor().tabIndex = 0;
+    editor().focus();
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    getSelection()!.removeAllRanges();
+    getSelection()!.addRange(range);
+  };
+  const press = (init: KeyboardEventInit) => editor().dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, metaKey: true, ctrlKey: true, ...init }));
+
+  it("clears formatting from the selected words only", () => {
+    const block = show("f1", '<p><span class="tc-red">one two three</span></p>');
+    select(block.querySelector("span")!.firstChild!, 4, 7);
+    press({ key: "\\", code: "Backslash" });
+    expect(block.innerHTML).toBe('<span class="tc-red">one </span>two<span class="tc-red"> three</span>');
+    expect(getSelection()!.toString()).toBe("two");
+  });
+
+  it("undoes ticking a to-do item", () => {
+    const block = show("t1", '<ul class="checklist"><li>Task</li></ul>');
+    const li = block.querySelector("li")!;
+    select(li.firstChild!, 2);
+    press({ key: "Enter" });
+    expect(li.getAttribute("data-checked")).toBe("true");
+    press({ key: "z" });
+    expect(li.hasAttribute("data-checked")).toBe(false);
+    press({ key: "z", shiftKey: true });
+    expect(li.getAttribute("data-checked")).toBe("true");
+  });
+});

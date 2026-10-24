@@ -107,8 +107,8 @@ export class Gadget extends DurableObject<unknown, unknown> implements GadgetStu
     const doc = await this.ctx.storage.get<StoredDocument>("document:v2");
     if (doc) return doc;
 
-    // Keep old documents readable. The first editor converts the legacy HTML
-    // into stable top-level blocks and calls initializeBlocks().
+    // Old documents are converted to blocks at startup. If that failed, the
+    // first editor converts the legacy HTML and calls initializeBlocks().
     const [content, title, lastModified] = await Promise.all([
       this.ctx.storage.get<string>("content"),
       this.ctx.storage.get<string>("title"),
