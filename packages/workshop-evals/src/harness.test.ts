@@ -29,6 +29,8 @@ const fakes = vi.hoisted(() => {
   const result: AgentTurnResult = { outcome, history, compactions: [], workpieces, usage: {} };
   const session: WorkshopAgentSession = {
     username: "agent",
+    workspaceId: "workspace",
+    chatId: 1,
     connectionDrops: 0,
     runTurn: async () => result,
     approveActionsAndWait: async () => result,
