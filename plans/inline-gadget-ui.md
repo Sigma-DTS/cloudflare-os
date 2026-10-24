@@ -14,14 +14,17 @@ Food spending is up 18% on September, mostly eating out.
 
 <gadget-ui>
 <title>Food spending against budget, October</title>
-<div id="chart"></div>
+<h3>Food spending against budget, October</h3>
+<div id="chart">Loading…</div>
 <script type="module">
   const [weeks, limit] = await Promise.all([
     env.EXPENSES.rpc.totalsByWeek({ month: "2026-10", category: "food" }),
     env.BUDGET.rpc.weeklyLimit({ category: "food" }),
   ]);
+  const chart = document.getElementById("chart");
+  chart.replaceChildren();
   for (const w of weeks) {
-    const bar = document.getElementById("chart").appendChild(document.createElement("button"));
+    const bar = chart.appendChild(document.createElement("button"));
     bar.textContent = `Week ${w.week}: $${w.total} of $${limit}`;
     bar.onclick = () => agent.send(`Show me week ${w.week} in detail.`);
   }
@@ -43,8 +46,9 @@ Acceptance criteria:
 
 - An agent answer that contains a `<gadget-ui>` block shows the block as a live, interactive
   view in the chat, in the Workshop's light or dark theme.
-- While a block streams, the answer shows a line that names it. The view starts as soon as the
-  block closes, while the rest of the answer streams. When the answer is stored, the view keeps
+- While a block streams, its markup draws in the view as it arrives. Classic scripts run, and
+  inline event handlers listen, as soon as they arrive. Module scripts run as soon as the block
+  closes, while the rest of the answer streams. When the answer is stored, the view keeps
   running: it does not reload or read its data again, unless one of its lookups failed while the
   answer streamed or this client saw other streamed text (see "Keeping a view across the store").
 - A view sits in the answer as its prose does, in the chat's font, with no border, header or
@@ -71,13 +75,14 @@ Acceptance criteria:
   keeps `skipHtml`. The block frame is stricter than a gadget frame in one way: its sandbox is
   `allow-scripts` only, with no popups (see "What a block can reach").
 - **The answer's text is the source.** The frontend draws a block from its copy of the answer:
-  the streamed text while the answer streams, and the stored message after that. A block runs
-  once it closes, because no later text can change it. The cost is that code which ran may never
-  be stored: a stopped or failed model request stores nothing, and then the view's calls in the
-  action log and its cards in the chat are the only record of it. The kernel does not check which
-  block asks for a binding. It would authorize nothing: the viewer's own Workshop tab already
-  reaches every gadget and connection in the chat's scope (`getGadget(id).connectToGadget(chatId)`,
-  `getGatekeeperById(id).openSession()`), and block code reaches the kernel only through the host.
+  the streamed text while the answer streams, and the stored message after that. A block's markup
+  draws as it streams, and its module scripts run once it closes, because no later text can change
+  it. The cost is that code which ran may never be stored: a stopped or failed model request
+  stores nothing, and then the view's calls in the action log and its cards in the chat are the
+  only record of it. The kernel does not check which block asks for a binding. It would authorize
+  nothing: the viewer's own Workshop tab already reaches every gadget and connection in the chat's
+  scope (`getGadget(id).connectToGadget(chatId)`, `getGatekeeperById(id).openSession()`), and
+  block code reaches the kernel only through the host.
 - **A block has no name.** A view is the block's place in its message, so the parser needs no
   rules for duplicate names.
 - **A block declares nothing.** `env.NAME` asks the kernel for `NAME` the first time block code
@@ -129,11 +134,12 @@ Acceptance criteria:
   gadget's facet joins through `getGadgetFacet`. A connection's session joins through a proxy like
   `getGadgetFacet`'s, so the lease cannot be split from the session. The owner's stubs join
   nothing, as the owner's never do.
-- **The host holds every limit.** Block code can take the frame's handshake before the bootstrap
-  does, because a classic script runs before module scripts, so no limit can live in the frame.
-  The host opens each name once per frame load, opens at most 32 names, and wraps each binding in
-  `createRateLimitedCapability`. That paces calls on the binding itself. Stubs that a call returns,
-  such as cursors and issues, are not paced, as in gatekeeper apps (see "Known edge cases").
+- **The host holds every limit.** Block code runs in the same realm as the bootstrap, so it can
+  reach the frame's Cap'n Web port, for example by patching `MessagePort.prototype`. No limit can
+  live in the frame. The host opens each name once per frame load, opens at most 32 names, and
+  wraps each binding in `createRateLimitedCapability`. That paces calls on the binding itself.
+  Stubs that a call returns, such as cursors and issues, are not paced, as in gatekeeper apps (see
+  "Known edge cases").
 - **A message to the agent needs a trusted click.** `agent.send` in the frame only asks the host
   to show the message. The Workshop draws it in its own DOM, so block code cannot click Send. Only
   the viewer's click calls the kernel. A block that calls `agent.send` on load or in a loop
@@ -209,8 +215,11 @@ alike.
 - A block ends at the next `</gadget-ui>`. A block with no end is still streaming, or the agent
   did not close it. Once its message is stored, the chat shows an unclosed block as code and does
   not run it.
-- The body is HTML. Its `<title>`, if present, names the view, with each run of whitespace read
-  as one space, as HTML reads it.
+- The body is the HTML between the tags, trimmed. Its `<title>`, if present, names the view, with
+  each run of whitespace read as one space, as HTML reads it.
+- An open block's HTML so far is the text after its opening tag, without a closing tag that has
+  only partly arrived, trimmed. It is always the start of the HTML the block has once it closes,
+  so the Workshop can write it into the frame as it grows.
 - A body that is empty once its `<title>` is removed is an error: "This view has no content." It
   shows an error and runs nothing.
 - Only agent answers can hold blocks: stored messages of type `message` with an author of type
@@ -293,8 +302,8 @@ restricted data. This plan does not change gadget frames.
   `MarkdownMessage`. Each block becomes a view in place: the frame, then a muted line that says
   "Live view", with the names of the bindings the view has opened and a Stop button that shows on
   hover or focus. Only names that resolved are listed, so block code cannot put arbitrary labels
-  in Workshop chrome. The `<title>` is the frame's accessible name and the text of the line a
-  streaming block shows. Copy still copies the raw message.
+  in Workshop chrome. The `<title>` is the frame's accessible name. Copy still copies the raw
+  message.
 - **No box.** The view has no border, header or background. A box marked where the view's area
   ends, so without one a view can imitate the transcript around it, such as a user's message or
   an approval card. That can mislead a reader, but it cannot act: approvals, the Send chip and
@@ -308,28 +317,30 @@ restricted data. This plan does not change gadget frames.
   `buildChatDisplayEntries` takes the streamed text and reasoning and adds them as the last
   message entry, marked `streaming`, so the agent's model-change row and the row's spacing come
   out as they will once the message is stored. The row uses the stored agent row's markup. It has
-  no actions and looks nothing up by sequence. An open block shows a line, "Drawing Spending…". A
-  closed block runs. Tool calls in progress, "Thinking" and "Compacting" stay below the row, as
-  they are today.
+  no actions and looks nothing up by sequence. An open block is already a view: its markup draws
+  as it streams, and its line says "Drawing…" in place of "Live view" until it closes, with the
+  names and Stop as before. A block that closes with no content then shows its error, and its
+  frame goes away. Tool calls in progress, "Thinking" and "Compacting" stay below the row, as they
+  are today.
 - **Keeping a view across the store.** When the stored message arrives, its row takes the
   streaming row's React key, so React keeps the row and the frames in it. The stream handler
   mints a key from a session counter when the streamed text or reasoning starts, so each step and
   each retry after `streamReset` gets its own. The subscriber's `message` callback maps the stored
   message's sequence to that key (`answerKeys`), for the agent message that ends the streamed
   text, and only when the stored text equals the streamed text. `buildChatDisplayEntries` uses the
-  mapped key. Equal text and a parser that reads a prefix the same way keep each closed block at
-  its index among the answer's segments, so each view keeps its block. A client that joined
-  mid-answer, or lost deltas while it reconnected, has other streamed text, so its stored message
-  mounts its views fresh.
+  mapped key. Equal text and a parser that reads a prefix the same way keep each block at its
+  index among the answer's segments, from the moment it opens, so each view keeps its block and
+  an open block's view becomes the closed block's. A client that joined mid-answer, or lost deltas
+  while it reconnected, has other streamed text, so its stored message mounts its views fresh.
 - **The answer's own tool calls.** A step's tool calls run after the model finishes the step's
   text, so a view runs before them. If one of a view's lookups fails while its answer streams,
   the view reloads once when the answer is stored, because those tool calls may have added the
   binding. A code change to a gadget the view uses already reloads the view.
 - **Frame interfaces.** The host exports `UiBlockHost` to the frame. It has `binding(name)`,
   `requestMessage(message)`, `resize(height)` and `reportError(message)`. The frame exports
-  `UiBlockFrame`, with `setTheme(theme)`. Both are typed and documented in
-  `features/chat/uiBlockFrame.ts`, beside the bootstrap. The frontend has no capnweb-validate
-  transform, so the host checks its own arguments.
+  `UiBlockFrame`, with `setTheme(theme)`, `write(html)` and `close()`. Both are typed and
+  documented in `features/chat/uiBlockFrame.ts`, beside the bootstrap. The frontend has no
+  capnweb-validate transform, so the host checks its own arguments.
 - **Bindings.** `binding(name)` refuses anything but a string that passes `validateBindingName`.
   The host keeps one entry per name for the frame load, and at most 32 names. The first call for a
   name calls `connectToChatBinding` and keeps its promise, then wraps the result: a gadget becomes
@@ -348,13 +359,39 @@ restricted data. This plan does not change gadget frames.
   having asked when `binding` is first called, before the lookup runs, so a lookup in flight across
   a reconnect counts. A frame that never asked keeps running. Lookups use the current Overseer
   stub.
-- **Document.** The block document starts with one bootstrap module, whose URL is built once per
-  page, since it embeds all of Cap'n Web. It sets up the Cap'n Web session, then defines
+- **Shell.** A frame loads a shell: the sandbox head, the frame's style in the theme of that
+  moment, and one bootstrap module, whose URL is built once per page, since it embeds all of Cap'n
+  Web. The bootstrap waits for the shell's `load` event, so that the event cannot fire in the
+  block's document once `write` opens it. It then sets up the Cap'n Web session, and defines
   `globalThis.env` and `globalThis.agent`. `env` is a proxy: reading a string property other than
   `then` asks the host for that binding once and returns the same promise after that, so
-  `env.NAME.rpc.method()` pipelines. `agent` has one method, `send(message)`. Module scripts run
-  in document order, so a block's `<script type="module">` sees both globals. The bootstrap's cache
-  only keeps `env.NAME` stable; the host enforces every limit.
+  `env.NAME.rpc.method()` pipelines. `agent` has one method, `send(message)`. The bootstrap's
+  cache only keeps `env.NAME` stable; the host enforces every limit.
+- **Writing the block.** After the handshake the host calls `write` with the start of the block
+  document (its doctype, and a head with the frame's style in the theme of that moment), then with
+  the block's HTML so far, then with each new part as the answer streams, and calls `close` once
+  the block closes. A stored block takes the same path, with all of its HTML in one `write`. The
+  host settles each call, and the bootstrap each of its own calls to the host, so that Cap'n Web
+  releases it: a block streams in many parts, and its view resizes as it grows. The first `write`
+  calls `document.open()`, and each one calls `document.write()`, so the browser's own HTML parser
+  adds the markup as it arrives, as it does for a page that loads slowly. A tag or a text that one
+  part cuts in two joins up with the next part. Classic scripts and `async` module scripts run, and
+  inline event handlers listen, as soon as they are parsed. Other module scripts wait until
+  `close` ends the document, then run in document order, so a block's `<script type="module">`
+  sees all of its markup, `env` and `agent`. Checked in Chromium 150, Firefox 157 and Safari's
+  WebKit:
+  - The CSP that the shell's `<meta>` set stays after `document.open()`, because the document
+    keeps its policy container. Code in the new document still has no network.
+  - `document.open()` keeps the window, its globals and the Cap'n Web port. It removes every node,
+    and every event listener on the document and the window, so the bootstrap adds its error
+    listeners and its `ResizeObserver` after the first `write`.
+  - The doctype in the first `write` keeps the document in standards mode.
+  - Chromium runs a module script inside `close()`, and puts "Failed to execute 'close' on
+    'Document': " before the message of an error that the script throws at once. The bootstrap
+    takes that text off.
+  - WebKit reports an error in a classic script that `document.write()` added only as "Script
+    error.", and an error in a module script as an `unhandledrejection`, which the bootstrap also
+    reports. The instructions ask for module scripts, whose errors keep their message.
 - **One load per session.** The host accepts one handshake per frame load. A second handshake
   means the document navigated by itself, so the Workshop disposes the session and stops the view.
 - **Send chip.** `requestMessage` only stores the block's latest message, and refuses anything
@@ -370,21 +407,21 @@ restricted data. This plan does not change gadget frames.
   of padding, which keeps a child's margin inside the measured height and focus rings inside the
   frame, and is its own formatting context (`display: flow-root`), which keeps floats inside too.
   The frame reaches 4 px past the answer's column on each side, so the view's content lines up
-  with the prose. The bootstrap reports the body's height through a `ResizeObserver`. The host
-  clamps it between 40 px and `min(720, innerHeight - 120)`. Taller content scrolls inside the
-  frame. A view tells the chat when its height changes, so a list at the bottom stays there as a
-  view grows or its chip comes and goes. The instructions forbid `vh` units and percentage heights
-  on the page.
+  with the prose. The bootstrap reports the body's height through a `ResizeObserver`, so the view
+  grows as its markup streams in. The host clamps it between 40 px and `min(720, innerHeight -
+  120)`. Taller content scrolls inside the frame. A view tells the chat when its height changes, so
+  a list at the bottom stays there as a view grows or its chip comes and goes. The instructions
+  forbid `vh` units and percentage heights on the page.
 - **Theme.** The block document's root sets `color-scheme` and the token values, its background is
   transparent, and its text uses `var(--text-color-kumo-default)`. The host reads the mode from the
   `data-mode` attribute that `applyThemeMode` sets on `<html>`, and the computed values of a fixed
   list of Kumo tokens, under their Kumo names. Some values contain `light-dark()`, which the frame
-  resolves through its own `color-scheme`. Each frame load builds its document in the theme of
-  that moment, so a view that reloads or scrolls back after a theme change starts in the new one,
-  and the host calls `setTheme` again when the theme changes. The browser paints an opaque
-  backdrop behind a frame whose root `color-scheme` differs from the frame element's (CSS Color
-  Adjust §2.2). The element inherits the Workshop's scheme, so the backdrop can show only in the
-  moment a theme change takes to reach a running view.
+  resolves through its own `color-scheme`. Each frame load starts its shell, and then its
+  document, in the theme of that moment, so a view that reloads or scrolls back after a theme
+  change starts in the new one, and the host calls `setTheme` again when the theme changes. The
+  browser paints an opaque backdrop behind a frame whose root `color-scheme` differs from the
+  frame element's (CSS Color Adjust §2.2). The element inherits the Workshop's scheme, so the
+  backdrop can show only in the moment a theme change takes to reach a running view.
 - **Fonts.** The theme also carries `--font-sans` and `--font-mono`. The body uses the chat's
   font, size, line height and letter spacing, form controls inherit them, and code uses the mono
   font. Both are lists of installed fonts that the Workshop never downloads, so the frame's CSP,
@@ -404,14 +441,17 @@ restricted data. This plan does not change gadget frames.
 - The guidance on when to create a Gadget says that a one-off interactive demo, tool or visual is
   a view in the answer, even when the user calls it an app. A Gadget is for something that must
   last: keep its own data, run in the background, or be opened again later.
-- The view section: when to draw one, the syntax, that the view runs as soon as its block closes
-  and before the tool calls of the same answer, so the Gadgets and connections it uses must exist
-  before the agent writes it, that the `<title>` is not shown and the view sits in the answer with
-  no border or padding around it, module scripts, `env` as in `executeCode` and what it lacks, that
-  each write waits for a person's decision in the chat, that code on load must only read and no
-  code may poll or loop over calls, `textContent` rather than `innerHTML` for data, `agent.send` in
-  the user's words, no network, the Kumo colour tokens, the height rules, and that a view keeps no
-  state.
+- The view section: when to draw one, the syntax, that the view's markup draws as the agent
+  writes it and its module scripts run as soon as its block closes, so any style comes first, then
+  the markup, and the script last, that the scripts run before the tool calls of the same answer,
+  so the Gadgets and connections the view uses must exist before the agent writes it, that the
+  `<title>` is not shown and the view sits in the answer with no border or padding around it,
+  module scripts, `env` as in `executeCode` and what it lacks, that each write waits for a
+  person's decision in the chat, that code on load must only read and no code may poll or loop
+  over calls, `textContent` rather than `innerHTML` for data, `agent.send` in the user's words, no
+  network, the Kumo colour tokens, the height rules, and that a view keeps no state. The example
+  draws its heading and a loading line as markup, and its script fills in the bars, since models
+  copy the example more than they follow the rules.
 
 ## Rejected alternatives
 
@@ -471,12 +511,21 @@ restricted data. This plan does not change gadget frames.
   the transcript's DOM order, so keyboard focus and screen readers would reach them out of place.
 - **Keying each view by its HTML as well as its place.** A block's HTML cannot change under one
   key: the streamed text only grows, `streamReset` mints a new row key, and the stored message
-  keeps the key only when its text is the streamed text. Streaming markup into the frame, the next
-  change, needs a key that survives the HTML growing.
+  keeps the key only when its text is the streamed text. And the view of an open block needs a key
+  that stays as its HTML grows.
 - **Holding a lookup that failed while streaming until the store, and retrying it then.** It saves
   the view's other reads, but the host would have to cancel the wait at teardown and on a new
   Overseer stub. A lookup that fails while its answer streams is rare enough that one reload is
   simpler.
+- **Setting the frame body's `innerHTML` on each delta.** Each delta would parse the whole block
+  again and replace its nodes, which loses their state. Scripts set through `innerHTML` never run,
+  so the frame would have to make each one again, in order, at the end.
+- **Keeping a stored block's HTML in the shell.** It would be a second way to load a view. A
+  stored block takes the streaming path with one `write`.
+- **Holding classic scripts and inline handlers until the block closes.** The frame would have to
+  rewrite the HTML as it streams. Module scripts already wait, and the instructions ask for module
+  scripts. Code that runs early reaches the host as any block code does, and the host holds every
+  limit.
 
 ## Commits
 
@@ -501,13 +550,20 @@ Drawing views in place and running them when their block closes adds three more:
    streaming row and the key its stored message keeps, and the reload after a lookup that failed
    while the answer streamed.
 
+Streaming a block's markup into its frame adds three more:
+
+1. **This plan's update.**
+2. **Kernel.** An open block's HTML so far in the parser, its test, and the agent instructions.
+3. **Frontend.** The shell, the frame's `write` and `close`, and the view that writes to them.
+
 ## Verification
 
 - Parser unit tests (`workshop-backend/__tests__/gadget-ui-blocks.test.ts`): prose offsets, fences
   and their closing rules, tags in the middle of a line, unclosed blocks, several blocks in one
   message, empty bodies and title-only bodies as errors whatever the attributes, the same blocks
-  at the same index among the segments at every cut of a streamed answer once they close, and the
-  text form a chat gateway gets.
+  at the same index among the segments at every cut of a streamed answer once they close, an open
+  block at every cut at the index it closes at, with HTML that starts the HTML it closes with, and
+  the text form a chat gateway gets.
 - Backend tests for `connectToChatBinding` (`ui-blocks.test.ts`):
   - It refuses a name the chat does not bind, a worktree, a model, an agent spawner, an ambient
     gatekeeper and a connection with no `creationSpec`.
@@ -529,19 +585,23 @@ Drawing views in place and running them when their block closes adds three more:
   quick restarts; two stubs that break together reload the view once; a second handshake stops
   the view; a new Overseer connection reloads a view that asked for a binding, including one whose
   lookup is still in flight, and leaves one that did not; unmounting disposes every stub; an empty
-  block shows its error, no frame and no Reload; Stop disposes every stub and Run starts the view
-  again; a lookup that failed while the answer streamed reloads the view once the answer is
-  stored, and a failed lookup in a stored answer does not.
-- `ChatInterface` tests: an open block in a streaming answer shows its line, the block runs once
-  it closes, and the stored message keeps the same frame element; a stored message whose text
-  differs from the streamed text mounts its view fresh.
+  block shows its error, no frame and no Reload, and so does an open block that closes with
+  nothing but a title; Stop disposes every stub and Run starts the view again; a lookup that
+  failed while the answer streamed reloads the view once the answer is stored, and a failed
+  lookup in a stored answer does not; a stored block's frame gets the document's start, all of the
+  block in one write, then `close`; an open block's HTML reaches the frame in parts as it grows,
+  after the document's start, and `close` follows the last part once it closes, in the same frame;
+  a new frame load gets the start and then all of the HTML so far.
+- `ChatInterface` tests: an open block in a streaming answer is already a frame, and the closed
+  block and then the stored message keep that frame element; a stored message whose text differs
+  from the streamed text mounts its view fresh.
 - A browser run on the dev server with a real model: the agent draws a view that combines two
   gadgets and a connection, `env.NAME.rpc.method()` pipelines in the real frame, the view follows
   a theme change, a connection write waits as a card in the chat, a click shows the message, and
-  Send posts it as the viewer's message. The view goes live before the answer finishes, and the
-  stored answer does not reload it: one handshake, and one action-log read for each connection
-  call. Screenshots in light and dark, and after a theme change, show the view with no box around
-  it.
+  Send posts it as the viewer's message. The view's markup draws while its block streams, its
+  module script runs once, at the block's close, and the stored answer does not reload it: one
+  handshake, and one action-log read for each connection call. Screenshots in light and dark, and
+  after a theme change, show the view with no box around it.
 
 ## Known edge cases
 
@@ -574,6 +634,13 @@ Drawing views in place and running them when their block closes adds three more:
 - **A write from a view that is still streaming.** Its action card is stored at once, and the
   answer only at the end of its step, so the card sits above the answer that holds the view. A
   stored view's card sits below it.
+- **A block the agent never closes.** Its markup drew while it streamed, its classic scripts ran,
+  and its inline event handlers listened. Once the answer is stored, the view goes away and the
+  block shows as code.
+- **A view drawn mostly by its script.** Markup that is only empty elements shows nothing until
+  the script runs at the block's close. A `<style>` applies only once its end tag arrives. The
+  instructions ask for the style first, then the markup, and the script last, so the view takes
+  shape as it streams.
 - **Context cost.** The block's HTML stays in the agent's message, so the model reads it again on
   each later turn until compaction summarizes that part of the chat.
 
@@ -584,8 +651,6 @@ Drawing views in place and running them when their block closes adds three more:
 
 ## Future work
 
-- Stream a block's markup into its frame as it arrives, and run its scripts once the block closes
-  (the next change).
 - Server code in a block: the block becomes a chat-scoped gadget whose files live in the message,
   run by the gadget loader with its own storage, for views that must keep state or cache reads.
 - Context Library and other free auto-provided services in views, once a gatekeeper can say that
