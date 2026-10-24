@@ -351,7 +351,7 @@ function inlineMarkdown(text: unknown): string {
   s = escapeHtml(s).replace(/&lt;(\/?)(strong|em|del)&gt;/g, (_, close: string, tag: string) => `<${close}${{ strong: "b", em: "i", del: "s" }[tag]}>`);
   s = s.replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "<b>$1</b>").replace(/__(?=\S)([\s\S]*?\S)__/g, "<b>$1</b>");
   s = s.replace(/~~(?=\S)([\s\S]*?\S)~~/g, "<s>$1</s>");
-  s = s.replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, "$1<i>$2</i>").replace(/(^|[^\w])_(?=\S)([^_\n]*?\S)_(?!\w)/g, "$1<i>$2</i>");
+  s = s.replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?!\*)/g, "$1<i>$2</i>").replace(/(^|[^\w])_(?=\S)([^_\n]*?\S)_(?!\w)/g, "$1<i>$2</i>");
   s = s.replace(/\n/g, "<br>");
   return s.replace(/\0(\d+)\0/g, (_, i: string) => stash[Number(i)]);
 }

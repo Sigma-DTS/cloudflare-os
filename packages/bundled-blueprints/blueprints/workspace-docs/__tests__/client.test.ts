@@ -264,6 +264,17 @@ describe("more edits", () => {
     expect(editor().querySelector('[data-block-id="lk"]')!.innerHTML).toBe("First two NEW");
   });
 
+  // A code block's lines are <br>s; copied as plain text, they stay lines.
+  it("copies a code block's lines as plain text", () => {
+    send([{ id: "cb", html: "<pre>const a = 1;<br>const b = 2;</pre>", version: 1 }]);
+    caretIn(editor().querySelector('[data-block-id="cb"]')!.firstChild!, 0);
+    editor().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    const data = new Map<string, string>();
+    const copy = Object.assign(new Event("copy", { bubbles: true, cancelable: true }), { clipboardData: { setData: (type: string, value: string) => data.set(type, value) } });
+    (document.activeElement ?? document).dispatchEvent(copy);
+    expect(data.get("text/plain")).toBe("```\nconst a = 1;\nconst b = 2;\n```");
+  });
+
   // Only the selected text goes: the start of the first cell and the end of the last stay.
   it("deletes a selection across cells without the text around it", () => {
     send([{ id: "x2", html: "<table><tbody><tr><td>First cell</td><td>Middle</td><td>Second cell</td></tr></tbody></table>", version: 1 }]);

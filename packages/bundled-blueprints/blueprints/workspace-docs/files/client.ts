@@ -3599,7 +3599,7 @@ function unitPlain(u: Element) {
     case "H3": case "H4": case "H5": case "H6": return "### " + t;
     case "BLOCKQUOTE": return u.getAttribute("style") ? t : t.split("\n").map((l) => "> " + l).join("\n");
     case "PRE": {
-      const code = u.textContent.replace(/\u200B/g, "").replace(/\n$/, ""), fence = codeFence(code);
+      const code = textWithBreaks(u).replace(/\u200B/g, "").replace(/\n$/, ""), fence = codeFence(code);
       return fence + "\n" + code + "\n" + fence;
     }
     case "HR": return "---";

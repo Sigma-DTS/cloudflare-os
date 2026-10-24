@@ -197,6 +197,11 @@ describe("Markdown round trips", () => {
     expect(runs("1. a\n2. b")).toEqual([["ol", 2]]);
   });
 
+  // The serializer closes italics mid-word (`*pre*existing`); reading it back keeps them.
+  it("keeps italics that end inside a word", () => {
+    expect(roundTrip("<p><i>pre</i>existing wording</p>")).toEqual(["<p><i>pre</i>existing wording</p>"]);
+  });
+
   it("keeps literal doubled tildes as text", () => {
     expect(roundTrip("<p>Use ~~text~~ literally, ~5 min.</p>")).toEqual(["<p>Use ~~text~~ literally, ~5 min.</p>"]);
     expect(roundTrip("<p><s>gone</s></p>")).toEqual(["<p><s>gone</s></p>"]);
