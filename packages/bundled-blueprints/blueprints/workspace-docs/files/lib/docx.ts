@@ -610,6 +610,8 @@ interface InlineContext {
   /** The paragraph's text colour, which a link's runs repeat. */
   ink: string;
   maxTwips: number;
+  /** The link being written: its target, and where its runs start in `runs`. */
+  link: { href: string; start: number } | null;
   /** Ends the paragraph so far; `image` then writes the picture's own paragraph. */
   flush(): void;
   flushImage(drawing: string): void;
@@ -713,22 +715,16 @@ class DocxWriter {
     if (tag === "a") {
       // Only a link Word can follow looks like one; an unsafe href is dropped.
       const href = safeHref(node.attrs.href);
-      const before = ctx.runs.length;
       const linkFmt: RunFormat = href ? { ...next, link: true } : next;
       if (href && !linkFmt.style && !fmt.code) linkFmt.style = "Hyperlink";
       // The text colour is written out: Apple's readers paint a link with no
       // colour of its own blue, where the page keeps the text's colour.
       if (href) linkFmt.color ??= ctx.ink;
+      const outer = ctx.link;
+      ctx.link = href ? { href, start: ctx.runs.length } : null;
       for (const child of node.children) this.#inline(child, linkFmt, ctx);
-      if (href && ctx.runs.length > before && this.#hyperlinks.size < DOCX_LIMITS.hyperlinks) {
-        let id = this.#hyperlinks.get(href);
-        if (!id) {
-          id = this.#rel(REL_HYPERLINK, href, true);
-          this.#hyperlinks.set(href, id);
-        }
-        const inner = ctx.runs.splice(before).join("");
-        ctx.runs.push(`<w:hyperlink r:id="${id}" w:history="1">${inner}</w:hyperlink>`);
-      }
+      this.#closeLink(ctx);
+      ctx.link = outer;
       return;
     }
     if (next.code && !fmt.code && !ctx.pre) next.style = "InlineCode";
@@ -803,13 +799,34 @@ class DocxWriter {
     return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="${id}" name="Picture ${id}" descr="${alt}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="${id}" name="Picture ${id}" descr="${alt}"/><pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="${entry.rel}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val ${corner}"/></a:avLst></a:prstGeom><a:ln w="6350"><a:solidFill><a:srgbClr val="${LINE}"/></a:solidFill></a:ln></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
   }
 
+  // Wraps the runs written since the current link began in a hyperlink.
+  #closeLink(ctx: InlineContext): void {
+    const link = ctx.link;
+    const id = link && ctx.runs.length > link.start ? this.#linkId(link.href) : null;
+    if (!link || !id) return;
+    const inner = ctx.runs.splice(link.start).join("");
+    ctx.runs.push(`<w:hyperlink r:id="${id}" w:history="1">${inner}</w:hyperlink>`);
+  }
+  #linkId(href: string): string | null {
+    let id = this.#hyperlinks.get(href);
+    if (!id && this.#hyperlinks.size < DOCX_LIMITS.hyperlinks) {
+      id = this.#rel(REL_HYPERLINK, href, true);
+      this.#hyperlinks.set(href, id);
+    }
+    return id ?? null;
+  }
+
   #image(node: ElementNode, ctx: InlineContext): void {
     const drawing = this.#imageDrawing(node, ctx.maxTwips);
     if (drawing) {
       // Block-level in the editor (img.doc-image is display: block): the
-      // picture gets a paragraph of its own, between the text around it.
+      // picture gets a paragraph of its own, between the text around it. A
+      // link around it carries on into that paragraph and the one after.
+      this.#closeLink(ctx);
       if (ctx.runs.length) ctx.flush();
-      ctx.flushImage(drawing);
+      const id = ctx.link && this.#linkId(ctx.link.href);
+      ctx.flushImage(id ? `<w:hyperlink r:id="${id}" w:history="1">${drawing}</w:hyperlink>` : drawing);
+      if (ctx.link) ctx.link.start = 0;
       return;
     }
     const alt = (node.attrs.alt ?? "").trim();
@@ -831,7 +848,7 @@ class DocxWriter {
       emitted = true;
     };
     const ctx: InlineContext = {
-      runs: [], pre: options.pre, atLineStart: true, lastSpace: false, column: 0, maxTwips: options.maxTwips,
+      runs: [], pre: options.pre, atLineStart: true, lastSpace: false, column: 0, maxTwips: options.maxTwips, link: null,
       ink: style === "Quote" ? INK_2 : style === "Caption" ? MUTED : INK,
       flush() {
         trimTrailingBreaks(this.runs);

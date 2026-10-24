@@ -228,6 +228,14 @@ describe("Word export", () => {
     expect(textOf(paragraph(document, "safe"))).toBe("safe unsafe mail");
   });
 
+  // A picture is a paragraph of its own: the text before and after it, and the picture, all link.
+  it("keeps a link around a picture on every part of it", async () => {
+    const { document } = await exportDocx([`<p><a href="https://example.com/">Before<img class="doc-image" src="${PNG}" alt="Dot">After</a></p>`]);
+    const hyperlinks = [...document.matchAll(/<w:hyperlink r:id="([^"]+)"[^>]*>([\s\S]*?)<\/w:hyperlink>/g)];
+    expect(hyperlinks.map((m) => [textOf(m[2]), m[2].includes("<w:drawing>")])).toEqual([["Before", false], ["", true], ["After", false]]);
+    expect(new Set(hyperlinks.map((m) => m[1])).size).toBe(1);
+  });
+
   it("styles quotes, code, dividers and the document's typeface", async () => {
     const { document, part } = await exportDocx(["<blockquote>Quoted</blockquote>", "<pre>let x = 1;\nx++</pre>", "<hr>"], { settings: { font: "serif" } });
     expect(attr(paragraph(document, "Quoted"), /<w:pStyle w:val="([^"]+)"/)).toBe("Quote");
