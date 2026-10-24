@@ -41,10 +41,15 @@ chokepoint, the action log and the composer's send path.
 
 Acceptance criteria:
 
-- A stored agent answer that contains a `<gadget-ui>` block shows the block as a live,
-  interactive frame in the chat, in the Workshop's light or dark theme.
-- While the answer streams, the chat shows a placeholder card. The frame starts only after the
-  message is stored.
+- An agent answer that contains a `<gadget-ui>` block shows the block as a live, interactive
+  view in the chat, in the Workshop's light or dark theme.
+- While a block streams, the answer shows a line that names it. The view starts as soon as the
+  block closes, while the rest of the answer streams. When the answer is stored, the view keeps
+  running: it does not reload or read its data again, unless one of its lookups failed while the
+  answer streamed or this client saw other streamed text (see "Keeping a view across the store").
+- A view sits in the answer as its prose does, in the chat's font, with no border, header or
+  background of its own. Under it the Workshop shows the names of the bindings the view used, a
+  Stop button, its Send chip, and its errors.
 - Block code reads `env.NAME` for any binding in the chat's scope that a view may use. A gadget is
   `env.NAME.rpc`, the server the agent's `env.NAME.rpc` reaches: the chat's draft when the chat
   proposes changes to the gadget, and mainline otherwise. A connection the user made is a session
@@ -65,18 +70,21 @@ Acceptance criteria:
   the gadget UI CSP. A block's HTML never goes into the Workshop document, and `MarkdownMessage`
   keeps `skipHtml`. The block frame is stricter than a gadget frame in one way: its sandbox is
   `allow-scripts` only, with no popups (see "What a block can reach").
-- **The stored message is the source.** The frontend draws a block from its copy of the message
-  text, and only stored agent answers run. The kernel does not check which block asks for a
-  binding. It would authorize nothing: the viewer's own Workshop tab already reaches every gadget
-  and connection in the chat's scope (`getGadget(id).connectToGadget(chatId)`,
+- **The answer's text is the source.** The frontend draws a block from its copy of the answer:
+  the streamed text while the answer streams, and the stored message after that. A block runs
+  once it closes, because no later text can change it. The cost is that code which ran may never
+  be stored: a stopped or failed model request stores nothing, and then the view's calls in the
+  action log and its cards in the chat are the only record of it. The kernel does not check which
+  block asks for a binding. It would authorize nothing: the viewer's own Workshop tab already
+  reaches every gadget and connection in the chat's scope (`getGadget(id).connectToGadget(chatId)`,
   `getGatekeeperById(id).openSession()`), and block code reaches the kernel only through the host.
-- **A block has no name.** A card is the block's place in its message, so the parser needs no
+- **A block has no name.** A view is the block's place in its message, so the parser needs no
   rules for duplicate names.
 - **A block declares nothing.** `env.NAME` asks the kernel for `NAME` the first time block code
   reads it. A declaration would not limit the agent, which writes the declaration and the code
   together. It would limit only code injected into a view by data the view shows unsafely, and
   the instructions tell the agent to show data with `textContent` instead. Without one, the agent
-  writes view code exactly as it writes `executeCode`, and the card can list the names a view
+  writes view code exactly as it writes `executeCode`, and the Workshop can list the names a view
   actually used.
 - **A view is its own caller.** The kernel opens a connection's session with the caller
   `{from: "view", chatId}`, through `openGatekeeperSession`, the chokepoint for every session. A
@@ -201,12 +209,12 @@ alike.
 - A block ends at the next `</gadget-ui>`. A block with no end is still streaming, or the agent
   did not close it. Once its message is stored, the chat shows an unclosed block as code and does
   not run it.
-- The body is HTML. Its `<title>`, if present, gives the card title, with each run of whitespace
-  read as one space, as HTML reads it.
+- The body is HTML. Its `<title>`, if present, names the view, with each run of whitespace read
+  as one space, as HTML reads it.
 - A body that is empty once its `<title>` is removed is an error: "This view has no content." It
   shows an error and runs nothing.
-- Only stored messages of type `message` with an author of type `agent` can hold blocks. The
-  parser runs on nothing else.
+- Only agent answers can hold blocks: stored messages of type `message` with an author of type
+  `agent`, and the text an agent streams. The parser runs on nothing else.
 - A chat gateway shows only text, so the answer it gets has a note, such as
   `[View in the chat: Spending]`, in place of each closed block (`gadgetUiAnswerAsText`). An
   unclosed block stays as written, as the chat shows it.
@@ -281,12 +289,42 @@ restricted data. This plan does not change gadget frames.
 
 ### Rendering (frontend)
 
-- `ChatInterface` splits each agent message with `parseGadgetUiBlocks`. Prose still goes through
-  `MarkdownMessage`. Each block becomes a card: a header with the title and the names of the
-  bindings the view has opened, then the frame. Only names that resolved are listed, so block code
-  cannot put arbitrary labels in Workshop chrome. Copy still copies the raw message.
-- Provisional text goes through the same parser. An open block shows a placeholder card with its
-  title and no frame. The frame mounts when the stored message arrives.
+- `ChatInterface` splits each agent answer with `parseGadgetUiBlocks`. Prose still goes through
+  `MarkdownMessage`. Each block becomes a view in place: the frame, then a muted line that says
+  "Live view", with the names of the bindings the view has opened and a Stop button that shows on
+  hover or focus. Only names that resolved are listed, so block code cannot put arbitrary labels
+  in Workshop chrome. The `<title>` is the frame's accessible name and the text of the line a
+  streaming block shows. Copy still copies the raw message.
+- **No box.** The view has no border, header or background. A box marked where the view's area
+  ends, so without one a view can imitate the transcript around it, such as a user's message or
+  an approval card. That can mislead a reader, but it cannot act: approvals, the Send chip and
+  every other action that matters stay in Workshop DOM. The muted line is the one mark under every
+  view that the frame cannot draw. A box would not have stopped imitation either, since a view can
+  draw a fake box edge and fake transcript inside its own area.
+- **Stop.** Stop unmounts the frame and disposes its stubs, so a viewer can end a view that loops
+  or floods its chip while it is on screen. The line then says "View stopped", and Run starts the
+  view again.
+- **Streaming.** The answer that streams in is drawn as the message it will become.
+  `buildChatDisplayEntries` takes the streamed text and reasoning and adds them as the last
+  message entry, marked `streaming`, so the agent's model-change row and the row's spacing come
+  out as they will once the message is stored. The row uses the stored agent row's markup. It has
+  no actions and looks nothing up by sequence. An open block shows a line, "Drawing Spending…". A
+  closed block runs. Tool calls in progress, "Thinking" and "Compacting" stay below the row, as
+  they are today.
+- **Keeping a view across the store.** When the stored message arrives, its row takes the
+  streaming row's React key, so React keeps the row and the frames in it. The stream handler
+  mints a key from a session counter when the streamed text or reasoning starts, so each step and
+  each retry after `streamReset` gets its own. The subscriber's `message` callback maps the stored
+  message's sequence to that key (`answerKeys`), for the agent message that ends the streamed
+  text, and only when the stored text equals the streamed text. `buildChatDisplayEntries` uses the
+  mapped key. Equal text and a parser that reads a prefix the same way keep each closed block at
+  its index among the answer's segments, so each view keeps its block. A client that joined
+  mid-answer, or lost deltas while it reconnected, has other streamed text, so its stored message
+  mounts its views fresh.
+- **The answer's own tool calls.** A step's tool calls run after the model finishes the step's
+  text, so a view runs before them. If one of a view's lookups fails while its answer streams,
+  the view reloads once when the answer is stored, because those tool calls may have added the
+  binding. A code change to a gadget the view uses already reloads the view.
 - **Frame interfaces.** The host exports `UiBlockHost` to the frame. It has `binding(name)`,
   `requestMessage(message)`, `resize(height)` and `reportError(message)`. The frame exports
   `UiBlockFrame`, with `setTheme(theme)`. Both are typed and documented in
@@ -299,16 +337,17 @@ restricted data. This plan does not change gadget frames.
   for the name get the same entry, failures included. At teardown the host disposes every kernel
   promise, which also disposes a result that arrives after it. A lookup that fails rejects in the
   block's code, and the view keeps running.
-- **Connection.** The card checks the handshake as `GadgetUI` does: the message must come from the
-  card's own frame window, with origin `"null"`. A broken binding stub reloads the frame, because a
-  gadget's server restarts on each code change and an agent can change code every few seconds. A
-  frame load reloads at most once, however many of its stubs break. The first reload is at once.
-  Each next one within 10 seconds of the frame's handshake waits twice as long as the last, from 1
-  second up to 30, so a server that fails as it starts cannot reload the view in a loop. A new
-  Overseer stub (the Workshop reconnected) reloads a frame that has asked for a binding, because
-  its stubs and lookups were on the old connection. The host marks the frame as having asked when
-  `binding` is first called, before the lookup runs, so a lookup in flight across a reconnect
-  counts. A frame that never asked keeps running. Lookups use the current Overseer stub.
+- **Connection.** The Workshop checks the handshake as `GadgetUI` does: the message must come from
+  the view's own frame window, with origin `"null"`. A broken binding stub reloads the frame,
+  because a gadget's server restarts on each code change and an agent can change code every few
+  seconds. A frame load reloads at most once, however many of its stubs break. The first reload is
+  at once. Each next one within 10 seconds of the frame's handshake waits twice as long as the
+  last, from 1 second up to 30, so a server that fails as it starts cannot reload the view in a
+  loop. A new Overseer stub (the Workshop reconnected) reloads a frame that has asked for a
+  binding, because its stubs and lookups were on the old connection. The host marks the frame as
+  having asked when `binding` is first called, before the lookup runs, so a lookup in flight across
+  a reconnect counts. A frame that never asked keeps running. Lookups use the current Overseer
+  stub.
 - **Document.** The block document starts with one bootstrap module, whose URL is built once per
   page, since it embeds all of Cap'n Web. It sets up the Cap'n Web session, then defines
   `globalThis.env` and `globalThis.agent`. `env` is a proxy: reading a string property other than
@@ -317,34 +356,44 @@ restricted data. This plan does not change gadget frames.
   in document order, so a block's `<script type="module">` sees both globals. The bootstrap's cache
   only keeps `env.NAME` stable; the host enforces every limit.
 - **One load per session.** The host accepts one handshake per frame load. A second handshake
-  means the document navigated by itself, so the card disposes the session and stops the view.
+  means the document navigated by itself, so the Workshop disposes the session and stops the view.
 - **Send chip.** `requestMessage` only stores the block's latest message, and refuses anything
-  but a non-empty string. The card shows the whole message under the frame, in a focusable region
-  that scrolls past a few lines, with Send and Dismiss. Send calls the composer's send handler, so
-  it trims the message, runs on the composer's model, and reports a failure as the composer does;
-  the chip then stays for another try. While a connection request or an awaited action holds the
-  composer, the chip shows the composer's reason and Send is off. A newer message from the same
-  block replaces the chip, and a message goes away with the frame that asked. A Send that
-  finishes after a newer message arrived leaves the newer one in place. The chip sits in a polite
-  live region, so a screen reader announces it.
-- **Height.** The block document sets `html, body { margin: 0; height: auto }`, and gives the body
-  12 px of padding, so a view's borders and focus rings stay off the card's edge and a child's
-  margin cannot collapse out of the measured height. The bootstrap reports the body's height
-  through a `ResizeObserver`. The host clamps it between 40 px and `min(720, innerHeight - 120)`.
-  Taller content scrolls inside the frame. A card tells the chat when its height changes, so a
-  list at the bottom stays there as a view grows or its chip comes and goes. The instructions
-  forbid `vh` units and percentage heights on the page.
+  but a non-empty string. The Workshop shows the whole message under the view, in a focusable
+  region that scrolls past a few lines, with Send and Dismiss. Send calls the composer's send
+  handler, so it trims the message, runs on the composer's model, and reports a failure as the
+  composer does; the chip then stays for another try. While a connection request or an awaited
+  action holds the composer, the chip shows the composer's reason and Send is off. A newer message
+  from the same block replaces the chip, and a message goes away with the frame that asked. A Send
+  that finishes after a newer message arrived leaves the newer one in place. The chip sits in a
+  polite live region, so a screen reader announces it.
+- **Height.** The block document sets `html, body { margin: 0; height: auto }`. The body has 4 px
+  of padding, which keeps a child's margin inside the measured height and focus rings inside the
+  frame, and is its own formatting context (`display: flow-root`), which keeps floats inside too.
+  The frame reaches 4 px past the answer's column on each side, so the view's content lines up
+  with the prose. The bootstrap reports the body's height through a `ResizeObserver`. The host
+  clamps it between 40 px and `min(720, innerHeight - 120)`. Taller content scrolls inside the
+  frame. A view tells the chat when its height changes, so a list at the bottom stays there as a
+  view grows or its chip comes and goes. The instructions forbid `vh` units and percentage heights
+  on the page.
 - **Theme.** The block document's root sets `color-scheme` and the token values, its background is
   transparent, and its text uses `var(--text-color-kumo-default)`. The host reads the mode from the
   `data-mode` attribute that `applyThemeMode` sets on `<html>`, and the computed values of a fixed
   list of Kumo tokens, under their Kumo names. Some values contain `light-dark()`, which the frame
-  resolves through its own `color-scheme`. The host calls `setTheme` again when the theme changes.
-  Blocks use system fonts, since the CSP has no `font-src`.
-- **Mounting.** A frame is live only while its card is within one height of the chat's message
-  list from that list's visible area, through an `IntersectionObserver` rooted at the list, and
-  while the card is expanded. Scrolling far away unmounts the frame and disposes its stubs, so the
-  number of live frames is bounded by what is near the screen. A card keeps its last height while
-  its frame is gone, so the transcript does not jump.
+  resolves through its own `color-scheme`. Each frame load builds its document in the theme of
+  that moment, so a view that reloads or scrolls back after a theme change starts in the new one,
+  and the host calls `setTheme` again when the theme changes. The browser paints an opaque
+  backdrop behind a frame whose root `color-scheme` differs from the frame element's (CSS Color
+  Adjust §2.2). The element inherits the Workshop's scheme, so the backdrop can show only in the
+  moment a theme change takes to reach a running view.
+- **Fonts.** The theme also carries `--font-sans` and `--font-mono`. The body uses the chat's
+  font, size, line height and letter spacing, form controls inherit them, and code uses the mono
+  font. Both are lists of installed fonts that the Workshop never downloads, so the frame's CSP,
+  which has no `font-src`, does not block them.
+- **Mounting.** A frame is live only while its view is within one height of the chat's message
+  list from that list's visible area, through an `IntersectionObserver` rooted at the list.
+  Scrolling far away unmounts the frame and disposes its stubs, so the number of live frames is
+  bounded by what is near the screen. A view keeps its last height while its frame is gone, so the
+  transcript does not jump.
 - **Errors.** Block console output goes nowhere. It must not reach the pane's buffer, which the
   composer offers to the agent. An uncaught error in block code, a failed lookup included, shows
   under the view, which keeps running. No automatic error reporting captures block errors, since
@@ -355,11 +404,14 @@ restricted data. This plan does not change gadget frames.
 - The guidance on when to create a Gadget says that a one-off interactive demo, tool or visual is
   a view in the answer, even when the user calls it an app. A Gadget is for something that must
   last: keep its own data, run in the background, or be opened again later.
-- The view section: when to draw one, the syntax, that the body is the whole view, module scripts,
-  `env` as in `executeCode` and what it lacks, that each write waits for a person's decision in the
-  chat, that code on load must only read and no code may poll or loop over calls, `textContent`
-  rather than `innerHTML` for data, `agent.send` in the user's words, no network, the Kumo colour
-  tokens, the height rules, and that a view keeps no state.
+- The view section: when to draw one, the syntax, that the view runs as soon as its block closes
+  and before the tool calls of the same answer, so the Gadgets and connections it uses must exist
+  before the agent writes it, that the `<title>` is not shown and the view sits in the answer with
+  no border or padding around it, module scripts, `env` as in `executeCode` and what it lacks, that
+  each write waits for a person's decision in the chat, that code on load must only read and no
+  code may poll or loop over calls, `textContent` rather than `innerHTML` for data, `agent.send` in
+  the user's words, no network, the Kumo colour tokens, the height rules, and that a view keeps no
+  state.
 
 ## Rejected alternatives
 
@@ -408,6 +460,23 @@ restricted data. This plan does not change gadget frames.
   connect time gives the same answer.
 - **Serving blocks from a separate origin by URL, as Kinu does.** Gadget UIs already get isolation
   from opaque-origin srcDoc frames.
+- **A card with a border, a header and a collapse button.** A border marks where a view ends, but
+  a view can draw a fake one (see "No box"). The header repeated the heading that most views draw.
+  Stop keeps what collapse gave a viewer: a way to end a view on screen.
+- **Running a view only once its answer is stored.** The first version. A view in a long answer
+  waited for the whole step, its tool calls included.
+- **Moving a running frame from the streaming row to the stored row.** An iframe that leaves the
+  document unloads. `Element.moveBefore()` keeps it loaded, but not every browser has it.
+- **One layer that holds every frame over placeholders in the transcript.** The frames would leave
+  the transcript's DOM order, so keyboard focus and screen readers would reach them out of place.
+- **Keying each view by its HTML as well as its place.** A block's HTML cannot change under one
+  key: the streamed text only grows, `streamReset` mints a new row key, and the stored message
+  keeps the key only when its text is the streamed text. Streaming markup into the frame, the next
+  change, needs a key that survives the HTML growing.
+- **Holding a lookup that failed while streaming until the store, and retrying it then.** It saves
+  the view's other reads, but the host would have to cancel the wait at teardown and on a new
+  Overseer stub. A lookup that fails while its answer streams is rare enough that one reload is
+  simpler.
 
 ## Commits
 
@@ -423,12 +492,22 @@ apart so reviewers can read the kernel lines alone:
 The kernel commit removes `connectToUiBlockGadget`, which the frontend still calls until the next
 commit, so the frontend does not build at the kernel commit alone.
 
+Drawing views in place and running them when their block closes adds three more:
+
+1. **This plan's update.**
+2. **Kernel.** The agent instructions, and the parser test that a closed block keeps its index at
+   every cut.
+3. **Frontend.** The view without card chrome, its muted line and Stop, the chat's font, the
+   streaming row and the key its stored message keeps, and the reload after a lookup that failed
+   while the answer streamed.
+
 ## Verification
 
 - Parser unit tests (`workshop-backend/__tests__/gadget-ui-blocks.test.ts`): prose offsets, fences
   and their closing rules, tags in the middle of a line, unclosed blocks, several blocks in one
-  message, empty bodies and title-only bodies as errors whatever the attributes, the same
-  blocks at every cut of a streamed answer once they close, and the text form a chat gateway gets.
+  message, empty bodies and title-only bodies as errors whatever the attributes, the same blocks
+  at the same index among the segments at every cut of a streamed answer once they close, and the
+  text form a chat gateway gets.
 - Backend tests for `connectToChatBinding` (`ui-blocks.test.ts`):
   - It refuses a name the chat does not bind, a worktree, a model, an agent spawner, an ambient
     gatekeeper and a connection with no `creationSpec`.
@@ -445,21 +524,29 @@ commit, so the frontend does not build at the kernel commit alone.
   until Send; Dismiss; Send held while the composer is held; a failed Send; a Send that finishes
   after a newer message; `binding` reaches a gadget's `rpc` and a connection's session; two calls
   for one name make one kernel call; a 33rd name and a name that is not a string are refused; a
-  failed lookup rejects and the view keeps running; the header lists only names that resolved; a
-  result that arrives after unmount is disposed; a view reloads after each of five quick restarts;
-  two stubs that break together reload the view once; a second handshake stops the view; a new
-  Overseer connection reloads a view that asked for a binding, including one whose lookup is still
-  in flight, and leaves one that did not; unmounting disposes every stub; an empty block shows its
-  error, no frame and no Reload.
+  failed lookup rejects and the view keeps running; the line under the view lists only names that
+  resolved; a result that arrives after unmount is disposed; a view reloads after each of five
+  quick restarts; two stubs that break together reload the view once; a second handshake stops
+  the view; a new Overseer connection reloads a view that asked for a binding, including one whose
+  lookup is still in flight, and leaves one that did not; unmounting disposes every stub; an empty
+  block shows its error, no frame and no Reload; Stop disposes every stub and Run starts the view
+  again; a lookup that failed while the answer streamed reloads the view once the answer is
+  stored, and a failed lookup in a stored answer does not.
+- `ChatInterface` tests: an open block in a streaming answer shows its line, the block runs once
+  it closes, and the stored message keeps the same frame element; a stored message whose text
+  differs from the streamed text mounts its view fresh.
 - A browser run on the dev server with a real model: the agent draws a view that combines two
   gadgets and a connection, `env.NAME.rpc.method()` pipelines in the real frame, the view follows
   a theme change, a connection write waits as a card in the chat, a click shows the message, and
-  Send posts it as the viewer's message.
+  Send posts it as the viewer's message. The view goes live before the answer finishes, and the
+  stored answer does not reload it: one handshake, and one action-log read for each connection
+  call. Screenshots in light and dark, and after a theme change, show the view with no box around
+  it.
 
 ## Known edge cases
 
 - **Old messages.** A block's code stays fixed in its message, but its data is live. If a binding
-  changes shape, an old block can fail. The card shows the error, and the agent can draw a new
+  changes shape, an old block can fail. The view shows the error, and the agent can draw a new
   block.
 - **Deleted gadget or connection.** The lookup fails in the view's code, and the error shows under
   the view.
@@ -481,6 +568,12 @@ commit, so the frontend does not build at the kernel commit alone.
 - **Who made a call.** A view caller carries no user id, so the action log does not say which
   person's view read or wrote. `GatekeeperClient.openSession` has the same gap today.
 - **A running agent.** Send while the agent runs steers that turn, as a typed message does.
+- **An answer that is never stored.** A stopped or failed model request stores nothing, so its
+  views go away with its text. A view in it may have run already: its reads stay in the action
+  log, and its writes stay as cards. A retried request runs its views again.
+- **A write from a view that is still streaming.** Its action card is stored at once, and the
+  answer only at the end of its step, so the card sits above the answer that holds the view. A
+  stored view's card sits below it.
 - **Context cost.** The block's HTML stays in the agent's message, so the model reads it again on
   each later turn until compaction summarizes that part of the chat.
 
@@ -491,6 +584,8 @@ commit, so the frontend does not build at the kernel commit alone.
 
 ## Future work
 
+- Stream a block's markup into its frame as it arrives, and run its scripts once the block closes
+  (the next change).
 - Server code in a block: the block becomes a chat-scoped gadget whose files live in the message,
   run by the gadget loader with its own storage, for views that must keep state or cache reads.
 - Context Library and other free auto-provided services in views, once a gatekeeper can say that
