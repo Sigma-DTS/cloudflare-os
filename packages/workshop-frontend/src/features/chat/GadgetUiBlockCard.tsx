@@ -3,11 +3,12 @@ import { Banner, Text } from '@cloudflare/kumo'
 import { PaperPlaneRightIcon } from '@phosphor-icons/react'
 import { newMessagePortRpcSession, type RpcStub } from 'capnweb'
 import type { Overseer } from '@gadgets/workshop-shared/api'
-import type { GadgetUiBlock } from '@gadgets/workshop-shared/gadget-ui-blocks'
+import type { GadgetUiSegment } from '@gadgets/workshop-shared/gadget-ui-blocks'
 import { useTheme } from '../../ThemeContext'
 import { WorkshopButton } from '../../components/WorkshopControls'
 import {
-  createUiBlockHtml,
+  createUiBlockDocumentStart,
+  createUiBlockShell,
   readUiBlockTheme,
   UiBlockHostImpl,
   type UiBlockFrame,
@@ -25,7 +26,8 @@ const reloadDelay = (quickBreaks: number) =>
 export type GadgetUiBlockCardProps = {
   overseer: RpcStub<Overseer>
   chatId: number
-  block: GadgetUiBlock
+  /** The block: closed, or still open while its answer streams, with its HTML so far. */
+  block: Exclude<GadgetUiSegment, { kind: 'text' }>
   /** The answer is still streaming: its tool calls have not run yet. */
   streaming: boolean
   /** Sends a message as the viewer, as the composer does. Reports its own failures, then throws. */
@@ -54,13 +56,17 @@ export const GadgetUiBlockCard = ({
   const { resolvedThemeMode } = useTheme()
   const cardRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
-  const frameRef = useRef<RpcStub<UiBlockFrame> | null>(null)
+  // The current frame load: its frame, and how much of the block it has.
+  const loadRef = useRef<{ frame: RpcStub<UiBlockFrame>; written: number; closed: boolean } | null>(null)
   const quickBreaksRef = useRef(0)
   const [nearViewport, setNearViewport] = useState(false)
   // The viewer stopped the view: its frame and stubs are gone until they run it again.
   const [stopped, setStopped] = useState(false)
   const [height, setHeight] = useState(MIN_HEIGHT)
-  const [error, setError] = useState<string | null>(block.error ?? null)
+  // Why the view stopped itself, until the viewer reloads it. A block the parser refused never runs.
+  const [stopReason, setStopReason] = useState<string | null>(null)
+  const refused = block.kind === 'block' ? block.error : undefined
+  const error = refused ?? stopReason
   // The latest uncaught error in the block's own code. The view keeps running.
   const [codeError, setCodeError] = useState<string | null>(null)
   const [frameKey, setFrameKey] = useState(0)
@@ -97,6 +103,23 @@ export const GadgetUiBlockCard = ({
     }
   })
 
+  // Sends the frame what it lacks of the block: the HTML that arrived since its last write, then
+  // the end of its document once the block closes. Each call is settled so that capnweb releases
+  // it; one rejects only when its frame has gone.
+  const writeBlock = useEffectEvent(() => {
+    const load = loadRef.current
+    if (!load) return
+    if (block.html.length > load.written) {
+      load.frame.write(block.html.slice(load.written)).catch(() => {})
+      load.written = block.html.length
+    }
+    if (block.kind === 'block' && !load.closed) {
+      load.frame.close().catch(() => {})
+      load.closed = true
+    }
+  })
+  useEffect(() => writeBlock(), [block.html, block.kind])
+
   const live = nearViewport && error === null && !stopped
 
   useEffect(() => {
@@ -118,7 +141,7 @@ export const GadgetUiBlockCard = ({
     let reloading = false
     const resources: Disposable[] = []
     const teardown = () => {
-      frameRef.current = null
+      loadRef.current = null
       // A request needs the frame that made it, and an error the document that threw it.
       setChip(null)
       setCodeError(null)
@@ -135,7 +158,7 @@ export const GadgetUiBlockCard = ({
         // The document loaded again without the Workshop reloading it: its code navigated.
         port.close()
         teardown()
-        setError('This view reloaded itself, so it was stopped.')
+        setStopReason('This view reloaded itself, so it was stopped.')
         return
       }
       const openedAt = Date.now()
@@ -157,8 +180,9 @@ export const GadgetUiBlockCard = ({
       resources.push(host)
       const frame = newMessagePortRpcSession<UiBlockFrame>(port, host)
       resources.push(frame)
-      frameRef.current = frame
-      void frame.setTheme(readUiBlockTheme())
+      loadRef.current = { frame, written: 0, closed: false }
+      frame.write(createUiBlockDocumentStart(readUiBlockTheme())).catch(() => {})
+      writeBlock()
     }
 
     window.addEventListener('message', handleMessage)
@@ -171,7 +195,7 @@ export const GadgetUiBlockCard = ({
 
   useEffect(() => {
     // ThemeProvider applies a mode to the document before it publishes it.
-    void frameRef.current?.setTheme(readUiBlockTheme())
+    loadRef.current?.frame.setTheme(readUiBlockTheme()).catch(() => {})
   }, [resolvedThemeMode])
 
   useLayoutEffect(() => onHeightChange(), [height, chip, names, onHeightChange])
@@ -191,7 +215,7 @@ export const GadgetUiBlockCard = ({
 
   const reload = () => {
     quickBreaksRef.current = 0
-    setError(null)
+    setStopReason(null)
     setFrameKey(key => key + 1)
   }
 
@@ -204,13 +228,13 @@ export const GadgetUiBlockCard = ({
           title="This view stopped"
           description={error}
           // A block the parser refused must never run.
-          action={block.error === undefined ? <Banner.Action onClick={reload}>Reload</Banner.Action> : undefined}
+          action={refused === undefined ? <Banner.Action onClick={reload}>Reload</Banner.Action> : undefined}
         />
       ) : !stopped && (
         // The frame reaches past the answer's column by the body's padding, so the view's content
         // lines up with the prose around it.
         <div className="-mx-1 -my-1" style={{ height }}>
-          {live && <ViewFrame key={frameKey} ref={iframeRef} html={block.html} title={title} />}
+          {live && <ViewFrame key={frameKey} ref={iframeRef} title={title} />}
         </div>
       )}
       {error === null && codeError !== null && (
@@ -221,7 +245,7 @@ export const GadgetUiBlockCard = ({
       {error === null && (
         // Workshop chrome the frame cannot draw: where the view ends, and what it reached.
         <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11px] leading-4 text-kumo-inactive">
-          <span>{stopped ? 'View stopped' : 'Live view'}</span>
+          <span>{stopped ? 'View stopped' : block.kind === 'open' ? 'Drawing…' : 'Live view'}</span>
           {!stopped && names.length > 0 && <span className="font-mono">{names.join(', ')}</span>}
           <button
             type="button"
@@ -267,18 +291,11 @@ export const GadgetUiBlockCard = ({
 }
 
 /**
- * One load of a view's frame. Its document starts in the theme of the moment it mounts, so a view
- * that reloads or scrolls back after a theme change starts in the new one; the handshake keeps it
- * current after that.
+ * One load of a view's frame. Its shell starts in the theme of the moment it mounts, so a view that
+ * reloads or scrolls back after a theme change starts in the new one. The block's document and
+ * `setTheme` keep it current after that.
  */
-const ViewFrame = ({ ref, html, title }: { ref: RefObject<HTMLIFrameElement | null>; html: string; title: string }) => {
-  const [srcDoc] = useState(() => createUiBlockHtml(html, readUiBlockTheme()))
+const ViewFrame = ({ ref, title }: { ref: RefObject<HTMLIFrameElement | null>; title: string }) => {
+  const [srcDoc] = useState(() => createUiBlockShell(readUiBlockTheme()))
   return <iframe ref={ref} srcDoc={srcDoc} title={title} sandbox="allow-scripts" className="block h-full w-full border-0" />
 }
-
-/** A `<gadget-ui>` block still streaming: a line naming it, until its closing tag arrives. */
-export const GadgetUiBlockPending = ({ title }: { title?: string }) => (
-  <div className="my-3">
-    <Text size="sm" variant="secondary">Drawing {title ?? 'a view'}…</Text>
-  </div>
-)

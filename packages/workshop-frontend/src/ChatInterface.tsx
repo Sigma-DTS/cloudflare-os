@@ -120,7 +120,7 @@ import {
   findUnresolvedConflicts, listConflictedFiles, type UnresolvedConflict,
 } from "./features/chat/mergeConflicts";
 import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDialog";
-import { GadgetUiBlockCard, GadgetUiBlockPending, type GadgetUiBlockCardProps } from "./features/chat/GadgetUiBlockCard";
+import { GadgetUiBlockCard, type GadgetUiBlockCardProps } from "./features/chat/GadgetUiBlockCard";
 import { parseGadgetUiBlocks } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
 import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
@@ -1291,8 +1291,8 @@ function asCodeBlock(text: string): string {
 type AnswerBlocks = Omit<GadgetUiBlockCardProps, "block" | "streaming">;
 
 /**
- * An agent answer: Markdown prose, with each closed `<gadget-ui>` block drawn as a live view. An
- * open block shows a line naming it while the answer streams, and shows as code once it is stored.
+ * An agent answer: Markdown prose, with each `<gadget-ui>` block drawn as a live view. A block
+ * draws as it streams, and shows as code if its stored answer never closed it.
  */
 const AgentAnswer = (
   { message, capsules, formats, blocks, streaming }: {
@@ -1316,11 +1316,11 @@ const AgentAnswer = (
       case "text":
         return <MarkdownMessage key={i} message={part.text} capsules={part.capsules} formats={part.formats} />;
       case "block":
-        return <GadgetUiBlockCard key={i} {...blocks} block={part} streaming={streaming} />;
       case "open":
-        return streaming
-          ? <GadgetUiBlockPending key={i} title={part.title} />
-          : <MarkdownMessage key={i} message={asCodeBlock(part.text)} />;
+        // An open block's view stays the closed block's: the same component, at the same place.
+        return part.kind === "open" && !streaming
+          ? <MarkdownMessage key={i} message={asCodeBlock(part.text)} />
+          : <GadgetUiBlockCard key={i} {...blocks} block={part} streaming={streaming} />;
     }
   });
 };

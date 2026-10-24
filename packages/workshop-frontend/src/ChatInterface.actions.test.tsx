@@ -558,12 +558,11 @@ describe('live views', () => {
     const cut = answer.indexOf('<p>')
 
     chat.emitStream(1, { type: 'textDelta', delta: answer.slice(0, cut) })
-    expect(document.body.textContent).toContain('Drawing Spending…')
-    expect(document.querySelector('iframe')).toBeNull()
-
-    chat.emitStream(1, { type: 'textDelta', delta: answer.slice(cut) })
     const streamed = document.querySelector('iframe[title="Spending"]')
     expect(streamed).not.toBeNull()
+
+    chat.emitStream(1, { type: 'textDelta', delta: answer.slice(cut) })
+    expect(document.querySelector('iframe[title="Spending"]')).toBe(streamed)
 
     chat.emitMessage({ type: 'message', chatId: 1, sequence: 0, timestamp: new Date(), author: agent, message: stored })
     flushFrames()
@@ -571,7 +570,7 @@ describe('live views', () => {
     return { streamed, stored: document.querySelector('iframe[title="Spending"]') }
   }
 
-  it('runs a view once its block closes, and keeps the same frame when the answer is stored', async () => {
+  it('draws a view as its block streams, and keeps the same frame as it closes and is stored', async () => {
     const { streamed, stored } = await streamThenStore(answer)
     expect(stored).toBe(streamed)
   })

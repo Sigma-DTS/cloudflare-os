@@ -41,6 +41,15 @@ export interface UiBlockHost {
 export interface UiBlockFrame {
   /** Applies a new theme, e.g. after the viewer switches between light and dark. */
   setTheme(theme: UiBlockTheme): void
+
+  /**
+   * Adds `html` to the end of the block's document, which the browser parses as it arrives. The
+   * first call starts a new document, so it takes `createUiBlockDocumentStart`.
+   */
+  write(html: string): void
+
+  /** Ends the block's document once the block closes, so its module scripts run. */
+  close(): void
 }
 
 // The theme values a block can use. Blocks get these names only; the agent's instructions list the
@@ -99,8 +108,8 @@ export type UiBlockHostOptions = {
 }
 
 /**
- * The Workshop's end of a block's frame session. Block code can take the frame's handshake before
- * the bootstrap does, so every limit lives here.
+ * The Workshop's end of a block's frame session. Block code runs in the bootstrap's realm and can
+ * reach its port, so every limit lives here.
  */
 export class UiBlockHostImpl extends RpcTarget implements UiBlockHost {
   readonly #options: UiBlockHostOptions
@@ -163,8 +172,8 @@ export class UiBlockHostImpl extends RpcTarget implements UiBlockHost {
   }
 }
 
-// Runs before the block's own module scripts, which run in document order, so they see `env` and
-// `agent`. A classic script runs first and cannot use them.
+// Runs in the frame's shell, before any of the block's code, which arrives later through
+// Frame.write.
 const BOOTSTRAP_URL = `data:text/javascript;charset=utf-8,${encodeURIComponent(String.raw`//# sourceURL=gadget-ui-bootstrap.js
 import { RpcTarget, newMessagePortRpcSession } from "${CAPNWEB_MODULE_URL}";
 
@@ -173,10 +182,42 @@ const applyTheme = ({ scheme, tokens }) => {
   root.colorScheme = scheme;
   for (const [name, value] of Object.entries(tokens)) root.setProperty(name, value);
 };
+
+// Chromium runs a module script inside close(), and puts this before the message of an error that
+// the script throws at once.
+const CLOSE_ERROR = "Failed to execute 'close' on 'Document': ";
+
+// The bootstrap's own calls to the host are settled so that capnweb releases them.
+const reportError = message => {
+  message = String(message);
+  host.reportError(message.startsWith(CLOSE_ERROR) ? message.slice(CLOSE_ERROR.length) : message)
+      .catch(() => {});
+};
+const reportHeight = () =>
+  host.resize(Math.ceil(document.body.getBoundingClientRect().height)).catch(() => {});
+
+let started = false;
 class Frame extends RpcTarget {
   setTheme(theme) { applyTheme(theme); }
+  write(html) {
+    const first = !started;
+    if (first) {
+      started = true;
+      // The new document keeps this window, its globals, the port and the CSP. It drops the old
+      // document's nodes, and every listener on the document and the window.
+      document.open();
+      window.addEventListener("error", event => reportError(event.error?.message ?? event.message));
+      window.addEventListener("unhandledrejection",
+          event => reportError(event.reason?.message ?? event.reason));
+    }
+    document.write(html);
+    if (first) new ResizeObserver(reportHeight).observe(document.body);
+  }
+  close() { document.close(); }
 }
 
+// The first write opens a new document. The shell's load event, if still to come, would fire in it.
+if (document.readyState !== "complete") await new Promise(resolve => addEventListener("load", resolve, { once: true }));
 const { port1, port2 } = new MessageChannel();
 window.parent.postMessage("handshake", "*", [port2]);
 const host = newMessagePortRpcSession(port1, new Frame());
@@ -194,26 +235,14 @@ globalThis.env = new Proxy({}, {
 globalThis.agent = Object.freeze({
   send: message => host.requestMessage(message),
 });
-
-new ResizeObserver(() => host.resize(Math.ceil(document.body.getBoundingClientRect().height)))
-    .observe(document.body);
-window.addEventListener("error", event => host.reportError(event.error?.message ?? event.message));
-window.addEventListener("unhandledrejection",
-    event => host.reportError(event.reason?.message ?? String(event.reason)));
 `)}`
 
 const themeStyle = ({ scheme, tokens }: UiBlockTheme) =>
   `:root { color-scheme: ${scheme}; ${Object.entries(tokens).map(([name, value]) => `${name}: ${value};`).join(' ')} }`
 
-/**
- * The document a block's frame runs: the gadget UI sandbox head, the theme, the bootstrap, then
- * the block's HTML as written.
- */
-export function createUiBlockHtml(html: string, theme: UiBlockTheme): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  ${SANDBOX_HEAD}
+// The head of the frame's shell and of the block's document: the gadget UI sandbox head, the theme,
+// and the style that fits the block into the answer.
+const frameHead = (theme: UiBlockTheme) => `${SANDBOX_HEAD}
   <style>
     ${themeStyle(theme)}
     html, body { margin: 0; height: auto; background: transparent; }
@@ -226,11 +255,30 @@ export function createUiBlockHtml(html: string, theme: UiBlockTheme): string {
     }
     button, input, select, textarea { font: inherit; letter-spacing: inherit; }
     code, kbd, pre, samp { font-family: var(--font-mono); }
-  </style>
+  </style>`
+
+/**
+ * The document a block's frame loads: its head and the bootstrap. The host writes the block's own
+ * document over it once the bootstrap's handshake arrives (see `UiBlockFrame.write`).
+ */
+export function createUiBlockShell(theme: UiBlockTheme): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  ${frameHead(theme)}
   <script type="module" src="${BOOTSTRAP_URL}"></script>
 </head>
-<body>
-${html}
-</body>
+<body></body>
 </html>`
+}
+
+/** The start of a block's document, which the frame's first `write` takes: all but its body. */
+export function createUiBlockDocumentStart(theme: UiBlockTheme): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  ${frameHead(theme)}
+</head>
+<body>
+`
 }

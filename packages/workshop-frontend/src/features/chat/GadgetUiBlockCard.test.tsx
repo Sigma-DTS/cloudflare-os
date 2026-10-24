@@ -7,7 +7,7 @@ import { newMessagePortRpcSession, RpcStub, RpcTarget } from 'capnweb'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Overseer } from '@gadgets/workshop-shared/api'
 import type { GadgetUiBlock } from '@gadgets/workshop-shared/gadget-ui-blocks'
-import type { UiBlockFrame, UiBlockHost } from './uiBlockFrame'
+import { createUiBlockDocumentStart, readUiBlockTheme, type UiBlockFrame, type UiBlockHost } from './uiBlockFrame'
 
 const testGlobal = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
 const previousActEnvironment = testGlobal.IS_REACT_ACT_ENVIRONMENT
@@ -32,7 +32,7 @@ vi.mock('@cloudflare/kumo', () => ({
 }))
 vi.mock('../../ThemeContext', () => ({ useTheme: () => ({ resolvedThemeMode: 'light' }) }))
 
-import { GadgetUiBlockCard } from './GadgetUiBlockCard'
+import { GadgetUiBlockCard, type GadgetUiBlockCardProps } from './GadgetUiBlockCard'
 
 // Every card is near the viewport.
 class VisibleIntersectionObserver {
@@ -111,8 +111,12 @@ class FakeOverseer extends RpcTarget {
   }
 }
 
+// The block's document as the frame gets it, in order: each write, then 'close' once it ends.
 class FakeFrame extends RpcTarget implements UiBlockFrame {
+  received: string[] = []
   setTheme() {}
+  write(html: string) { this.received.push(html) }
+  close() { this.received.push('close') }
 }
 
 // The host as the block's frame sees it. A name that is not a string is what block code can send.
@@ -120,7 +124,10 @@ type TestHost = Omit<UiBlockHost, 'binding'> & {
   binding(name: string | number): Promise<{ rpc: FakeGadget } & FakeSession>
 }
 
+type CardBlock = GadgetUiBlockCardProps['block']
+
 const BLOCK: GadgetUiBlock = { kind: 'block', html: '<p>hi</p>', title: 'Spending' }
+const open = (html: string): CardBlock => ({ kind: 'open', text: `<gadget-ui>\n${html}`, html })
 
 describe('GadgetUiBlockCard', () => {
   let container: HTMLDivElement
@@ -158,13 +165,13 @@ describe('GadgetUiBlockCard', () => {
     return stub
   }
   type CardOptions = { sendBlockedReason?: string; streaming?: boolean }
-  const card = (fake: FakeOverseer, block: GadgetUiBlock, { sendBlockedReason, streaming = false }: CardOptions = {}) => (
+  const card = (fake: FakeOverseer, block: CardBlock, { sendBlockedReason, streaming = false }: CardOptions = {}) => (
     <GadgetUiBlockCard overseer={stubOf(fake)} chatId={1}
       block={block} streaming={streaming} scrollRoot={scrollRoot} sendBlockedReason={sendBlockedReason}
       onHeightChange={onHeightChange} onSendMessage={message => { sent.push(message); return reply() }} />
   )
 
-  async function renderCard(block = BLOCK, options?: CardOptions) {
+  async function renderCard(block: CardBlock = BLOCK, options?: CardOptions) {
     await act(async () => root.render(card(overseer, block, options)))
     await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
     return container.querySelector('iframe')!
@@ -172,9 +179,9 @@ describe('GadgetUiBlockCard', () => {
 
   // Plays the frame's side of the handshake, as the block document's bootstrap does. The host's
   // calls queue on the port until the card answers.
-  async function handshake(iframe: HTMLIFrameElement) {
+  async function handshake(iframe: HTMLIFrameElement, frame = new FakeFrame()) {
     const { port1, port2 } = new MessageChannel()
-    const host = newMessagePortRpcSession<TestHost>(port1, new FakeFrame())
+    const host = newMessagePortRpcSession<TestHost>(port1, frame)
     frameSessions.push(host)
     await act(async () => {
       window.dispatchEvent(new MessageEvent('message', {
@@ -421,6 +428,47 @@ describe('GadgetUiBlockCard', () => {
 
   it('runs nothing for a block that must not run', async () => {
     await act(async () => root.render(card(overseer, { ...BLOCK, error: 'This view has no content.' })))
+    expect(container.textContent).toContain('This view has no content.')
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(buttonNamed('Reload')).toBeUndefined()
+  })
+
+  it('gives a stored block\'s frame the start of the document, all of the block, then the end', async () => {
+    const frame = new FakeFrame()
+    await handshake(await renderCard(), frame)
+    await vi.waitFor(() => expect(frame.received).toEqual([createUiBlockDocumentStart(readUiBlockTheme()), BLOCK.html, 'close']))
+  })
+
+  it('writes an open block into its frame as it streams, and ends the document once it closes', async () => {
+    const iframe = await renderCard(open('<p>Fo'), { streaming: true })
+    const frame = new FakeFrame()
+    await handshake(iframe, frame)
+    expect(container.textContent).toContain('Drawing…')
+
+    await act(async () => root.render(card(overseer, open('<p>Food'), { streaming: true })))
+    await act(async () => root.render(card(overseer, { kind: 'block', html: '<p>Food</p>' }, { streaming: true })))
+    await vi.waitFor(() => expect(frame.received)
+      .toEqual([createUiBlockDocumentStart(readUiBlockTheme()), '<p>Fo', 'od', '</p>', 'close']))
+    expect(container.querySelector('iframe')).toBe(iframe)
+    expect(container.textContent).toContain('Live view')
+  })
+
+  it('gives a new frame load the start of the document, then all of the block so far', async () => {
+    await handshake(await renderCard(open('<p>Fo'), { streaming: true }))
+    await act(async () => buttonNamed('Stop')!.click())
+    await act(async () => root.render(card(overseer, open('<p>Food'), { streaming: true })))
+    await act(async () => buttonNamed('Run')!.click())
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+
+    const frame = new FakeFrame()
+    await handshake(container.querySelector('iframe')!, frame)
+    await vi.waitFor(() => expect(frame.received).toEqual([createUiBlockDocumentStart(readUiBlockTheme()), '<p>Food']))
+  })
+
+  it('stops an open block that closes with nothing but a title', async () => {
+    await handshake(await renderCard(open('<title>Plan</title>'), { streaming: true }))
+    await act(async () => root.render(card(overseer,
+      { kind: 'block', html: '<title>Plan</title>', title: 'Plan', error: 'This view has no content.' }, { streaming: true })))
     expect(container.textContent).toContain('This view has no content.')
     expect(container.querySelector('iframe')).toBeNull()
     expect(buttonNamed('Reload')).toBeUndefined()
