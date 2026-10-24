@@ -126,3 +126,6 @@ contributor to broaden scope, add refactors, or take on adjacent cleanup.
 - `pnpm-lock.yaml`, unless the change is itself a dependency change — then check it against the
   `minimumReleaseAge` supply-chain policy in `pnpm-workspace.yaml`.
 - Committed `*.gadget` archives in a blueprint directory, which are opaque data.
+- `packages/api-cli/generated/`, `pnpm cf-os api`'s command table and its copy of the agent
+  declarations: `pnpm api-schema:generate` writes them and `pnpm api-schema:check` keeps them in
+  step with `api.ts`, so review `packages/api-cli/generator/emit.ts` instead.
