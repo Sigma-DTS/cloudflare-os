@@ -34,6 +34,7 @@ Reviewing a pull request: follow `REVIEW.md` as well.
 * packages/workshop-backend: The Gadgets Workshop server, on Cloudflare Workers. This is the **kernel** (see below).
 * packages/workshop-shared: The application's RPC interface, shared by client and server. The protocol is Cap'n Web, which has similar semantics to Cloudflare's Worker-to-Worker RPC while being able to run in a browser over WebSocket.
 * packages/bundled-blueprints: The blueprints the deployment ships with; `blueprints/<name>/` holds each blueprint's `blueprint.json` plus its gadget code under `files/`, which may be TypeScript.
+* packages/api-cli: `pnpm cf-os api ...` drives a running instance through its API, by default `pnpm dev-server`'s http://localhost:8787 (`--url <origin>` or `CFOS_API_URL` for another). Start with `pnpm cf-os api search "<task>"`, which prints the matching commands as whole command lines (`--dry-run` connects to nothing). A command that returns a capability is chained with the next on one line (`open-gadget <id> list-chats`). Exit 2 means the command must change before it runs again: either nothing was sent, or the server asked through a callback for an answer the command did not give (an `--answer '<Callback>.<method>=<json>'` answers a method's first call only). stderr then shows what it asked, as JSON, and the flag to rerun with. `pnpm cf-os api types [<service>]` prints the API as TypeScript declarations. On a local instance, `CFOS_API_PASSWORD=... pnpm cf-os api create-account <name>` makes a user to act as with `--username <name>`. cf-os's other commands are cloudflare-os-starter's, whose `cf-os api` is to run this same CLI from its submodule, in place of its own copy. See `packages/api-cli/README.md`.
 * packages/configurator-ui: The authoring API, sandbox runtime and build for gatekeeper resource configurator UI frames.
 * packages/ui: Shared runtime React UI used across the Workshop and gatekeeper management apps.
 * packages/gatekeeper-*: Gatekeeper workers for external service integrations. Scheduled Tasks (`gatekeeper-scheduler`) and GitLab (`gatekeeper-gitlab`, design record `plans/gitlab-gatekeeper.md`) are described in their READMEs.
@@ -76,7 +77,7 @@ Each Worker's `cloudflare.config.ts` (`@cloudflare/config` format, built from th
 
 ## API schema
 
-Changing `packages/workshop-shared/src/api.ts` means running `pnpm api-schema:generate` and committing the regenerated `packages/api-schema/generated/` files (the capnweb-schema, and the agent `.d.ts`, fragments and tool catalog, written for the starter's `cf-os api` and for agents, neither of which reads them yet); they are never edited by hand, and `pnpm api-schema:check` (part of `pnpm lint` and CI) fails on a stale one.
+Changing `packages/workshop-shared/src/api.ts` means running `pnpm api-schema:generate` and committing what it regenerates: `packages/api-schema/generated/` (the capnweb-schema, and the agent `.d.ts`, fragments and tool catalog) and `packages/api-cli/generated/` (`pnpm cf-os api`'s command table and its copy of the agent declarations). They are never edited by hand. `pnpm api-schema:check` (part of `pnpm lint` and CI) fails on a stale one, and a method the CLI cannot represent fails the generation, naming it.
 
 ## Development checks
 
