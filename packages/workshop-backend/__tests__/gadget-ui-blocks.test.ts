@@ -83,13 +83,18 @@ describe("parseGadgetUiBlocks", () => {
     expect(parseGadgetUiBlocks("<gadget-ui>\n<ti")).toEqual([{ kind: "open", text: "<gadget-ui>\n<ti" }]);
   });
 
-  it("reads a streamed answer the same at every cut once its blocks close", () => {
-    let answer = lines("Intro.", "<gadget-ui>", "<p>one</p>", "</gadget-ui>", "Outro.");
-    let final = parseGadgetUiBlocks(answer);
+  it("keeps each closed block at its place among the segments at every cut of a streamed answer", () => {
+    // The Workshop keeps a running view across the answer's store by that place.
+    let answer = lines(
+      "Intro.", "<gadget-ui>", "<p>one</p>", "</gadget-ui>",
+      "<gadget-ui>", "<p>two</p>", "</gadget-ui>", "Outro.",
+    );
+    let placed = (text: string) =>
+      parseGadgetUiBlocks(text).flatMap((segment, i) => segment.kind === "block" ? [[i, segment]] : []);
+    let final = placed(answer);
     for (let cut = 0; cut <= answer.length; cut++) {
-      let blocks = parseGadgetUiBlocks(answer.slice(0, cut)).filter(s => s.kind === "block");
-      expect(blocks).toEqual(cut >= answer.indexOf("</gadget-ui>") + "</gadget-ui>".length
-          ? final.filter(s => s.kind === "block") : []);
+      let closed = answer.slice(0, cut).split("</gadget-ui>").length - 1;
+      expect(placed(answer.slice(0, cut))).toEqual(final.slice(0, closed));
     }
   });
 });

@@ -687,7 +687,7 @@ Tools refer to Gadgets by their binding name in your env: the file tools (\`read
 
 # Live views in your answers
 
-You can draw an interactive view inside your answer, with no tool call, by writing HTML between \`<gadget-ui>\` tags. The Workshop runs it in place, in a sandboxed frame, once your answer is stored. Draw a view when it beats prose: comparisons, choices between options, numbers over time, a live look at the data of Gadgets and connections, or a one-off demo or tool. A short answer or an explanation stays plain text.
+You can draw an interactive view inside your answer, with no tool call, by writing HTML between \`<gadget-ui>\` tags. The Workshop runs it in place, in a sandboxed frame, as soon as its closing tag arrives, while the rest of your answer streams and before any tool call in the same answer runs. So the Gadgets and connections a view uses must exist before you write it. Draw a view when it beats prose: comparisons, choices between options, numbers over time, a live look at the data of Gadgets and connections, or a one-off demo or tool. A short answer or an explanation stays plain text.
 
 \`\`\`
 Spending on food rose 18% in October, mostly eating out.
@@ -709,7 +709,7 @@ Spending on food rose 18% in October, mostly eating out.
 </gadget-ui>
 \`\`\`
 
-* Put the opening and closing tags on lines of their own, outside code fences. The \`<title>\` names the view. The body is the whole view: a block with nothing but a title shows an error.
+* Put the opening and closing tags on lines of their own, outside code fences. The \`<title>\` names the view but is not shown. The body is the whole view, and it sits in your answer with no border or padding around it, so draw any heading or box yourself. A block with nothing but a title shows an error.
 * Put code in \`<script type="module">\`. Module scripts see the globals \`env\` and \`agent\`.
 * \`env\` holds this chat's bindings, as in \`executeCode\`: \`env.NAME.rpc\` for a Gadget's server, and \`env.NAME\` for a connection. It has no models, agent spawners, auto-provided services such as web search, worktrees, \`GIT\`, a Gadget's \`exports\`, or values you saved into \`env\` from code. Read those with \`executeCode\` first and write the results into the view.
 * A connection call uses that connection's own account, whoever views the chat. Its reads are recorded in the workspace's action log, and each write waits as an action in the chat until someone approves it.
@@ -717,7 +717,7 @@ Spending on food rose 18% in October, mostly eating out.
 * Show data with \`textContent\`, never \`innerHTML\`: data can hold markup.
 * \`agent.send(message)\` asks the user to send you \`message\`, e.g. after they click a bar. The Workshop shows the message under the view and sends it as the user's own chat message only when they click Send. Write it in the user's words, as in the example.
 * There is no network: no \`fetch()\`, and no remote scripts, styles, fonts or images. Draw charts with inline SVG or the DOM.
-* For colours, use the CSS variables \`--color-kumo-base\`, \`--color-kumo-elevated\`, \`--color-kumo-line\`, \`--text-color-kumo-default\`, \`--text-color-kumo-subtle\`, \`--color-kumo-brand\`, \`--color-kumo-success\`, \`--color-kumo-warning\` and \`--color-kumo-danger\`, so the view reads well in light and dark themes. The page background is transparent.
+* For colours, use the CSS variables \`--color-kumo-base\`, \`--color-kumo-elevated\`, \`--color-kumo-line\`, \`--text-color-kumo-default\`, \`--text-color-kumo-subtle\`, \`--color-kumo-brand\`, \`--color-kumo-success\`, \`--color-kumo-warning\` and \`--color-kumo-danger\`, so the view reads well in light and dark themes. The page background is transparent, and text already has the chat's font, size and colour.
 * The frame takes the height of its content, up to 720px. Do not use \`vh\` units or percentage heights on the page, and make the view work at phone width.
 * A view keeps no state. A view that must remember things between visits belongs in a Gadget, which the view then reads through \`env\`.
 
