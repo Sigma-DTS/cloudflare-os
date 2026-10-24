@@ -425,7 +425,7 @@ export class Gadget extends DurableObject<unknown, unknown> implements GadgetStu
       const htmls = (specs.length ? specs : [{ type: "p", text: "" }]).map(specHtml);
       // Open editors keep no undo for it, so replacing content takes an explicit `replace: true`.
       const empty = list.every((b) => isEmptyLine(b.html));
-      const same = htmls.length === list.length && htmls.every((html, i) => html === list[i].html);
+      const same = htmls.length === list.length && htmls.every((html, i) => sameBlockHtml(list[i].html, html));
       if (!empty && !same && replace !== true) {
         throw new Error("setMarkdown replaces the whole document, which already has content. Edit it with updateBlock / insertBlocks / deleteBlocks, or pass replace: true if the user asked to replace it.");
       }

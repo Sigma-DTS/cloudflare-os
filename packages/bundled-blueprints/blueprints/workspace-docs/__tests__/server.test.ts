@@ -253,6 +253,12 @@ describe("block API", () => {
     expect(blocks.slice(1).map((b) => [b.id, b.version])).toEqual([["a", 1], ["b", 1]]);
   });
 
+  it("takes the editor-saved document's own Markdown back without replace", async () => {
+    const { gadget } = inMemoryGadget();
+    await gadget.initializeBlocks({ blocks: [{ id: "a", html: '<p data-block-id="a">One</p>' }], title: "Doc", senderId: "c1" });
+    expect(await gadget.setMarkdown({ markdown: "One" })).toMatchObject({ status: "unchanged" });
+  });
+
   it("replaces the document with setMarkdown, keeping unchanged blocks", async () => {
     const { gadget, blocks } = await withMarkdown("a\n\nb\n\nc");
     const result = await gadget.setMarkdown({ markdown: "a\n\nB\n\nc", title: "New", replace: true });

@@ -67,7 +67,7 @@ Every write runs in the Durable Object's mutation queue. One that changes the do
 
 **Markdown** (`markdown` arguments) supports headings (h4+ become h3), paragraphs (line breaks kept), nested `-` / `1.` / `- [ ]` lists (one block per run of the same kind), `>` quotes, fenced code, `---`, `![alt](https://…)` images and GFM pipe tables.
 
-**Editor markup**, if you write `html` directly: bold `<b>`, italic `<i>`, `<u>`, `<s>`, `<code>`; to-do lists `<ul class="checklist"><li data-checked="true">…`; images `<p><img class="doc-image" src="…" alt="…"></p>`; tables `<table>[<colgroup><col style="width:30%">…</colgroup>]<thead><tr><th>…</thead><tbody><tr><td>…</tbody></table>` with inline content and `<br>` only in cells. Colours are classes, never hex, so they adapt to dark mode: text `<span class="tc-blue">`, highlight `<span class="hl-yellow">`, with `gray`, `brown`, `orange`, `yellow`, `green`, `blue`, `purple`, `pink`, `red`.
+**Editor markup**, if you write `html` directly: bold `<b>`, italic `<i>`, `<u>`, `<s>`, `<code>`; to-do lists `<ul class="checklist"><li data-checked="true">…`; images `<p><img class="doc-image" src="…" alt="…"></p>`; tables `<table>[<colgroup><col style="width:30%">…</colgroup>]<thead><tr><th>…</th></tr></thead><tbody><tr><td>…</td></tr></tbody></table>` with inline content and `<br>` only in cells. Colours are classes, never hex, so they adapt to dark mode: text `<span class="tc-blue">`, highlight `<span class="hl-yellow">`, with `gray`, `brown`, `orange`, `yellow`, `green`, `blue`, `purple`, `pink`, `red`.
 
 ## Document model and settings
 

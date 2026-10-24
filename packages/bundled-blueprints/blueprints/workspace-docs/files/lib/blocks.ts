@@ -305,18 +305,35 @@ function safeUrl(url: unknown, { image = false } = {}): string | null {
   return /^[a-z][a-z0-9+.-]*:/i.test(u) ? null : u;
 }
 
+// Code spans, taken out first: what is inside one is literal, escapes too.
+// Outside one, a backslash keeps a backtick from opening a span. A span closes
+// on a run of as many backticks as opened it, and one space just inside both
+// ends is padding.
+function codeSpans(s: string, keep: (html: string) => string): string {
+  let out = "";
+  for (let i = 0; i < s.length;) {
+    if (s[i] === "\\") { out += s.slice(i, i + 2); i += 2; continue; }
+    if (s[i] !== "`") { out += s[i++]; continue; }
+    let j = i;
+    while (s[j] === "`") j++;
+    const fence = s.slice(i, j), close = new RegExp(`(?<!\`)${fence}(?!\`)`, "g");
+    close.lastIndex = j;
+    const end = close.exec(s)?.index ?? -1;
+    const c = s.slice(j, end);
+    if (end < 0 || c.includes("\n")) { out += fence; i = j; continue; }
+    out += keep("<code>" + escapeHtml(/^ .*[^ ].* $/.test(c) ? c.slice(1, -1) : c) + "</code>");
+    i = end + fence.length;
+  }
+  return out;
+}
+
 // Inline Markdown -> the editor's own markup (<b>, <i>, <s>, <code>, <a>, <img>). The <strong>,
 // <em> and <del> that htmlToMarkdown writes where asterisks would pair wrongly are read back too.
 function inlineMarkdown(text: unknown): string {
   const stash: string[] = [];
   const keep = (html: string) => "\0" + (stash.push(html) - 1) + "\0";
   let s = String(text ?? "").replace(/\0/g, "");
-  // An escaped backtick opens no code span; other escapes are literal inside one, so they come after.
-  s = s.replace(/\\`/g, () => keep("`"));
-  // A span closes on a run of as many backticks as opened it; one space just
-  // inside both ends is padding.
-  s = s.replace(/(?<!`)(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)/g, (_, _fence: string, c: string) =>
-    keep("<code>" + escapeHtml(/^ .*[^ ].* $/.test(c) ? c.slice(1, -1) : c) + "</code>"));
+  s = codeSpans(s, keep);
   s = s.replace(/!\[((?:\\.|[^\]\\\n])*)\]\(<?([^)\s>]+)>?\)/g, (m, alt: string, url: string) => {
     const src = url.includes("\0") ? null : safeUrl(url, { image: true });
     return src ? keep('<img class="doc-image" src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt.replace(/\\([\\[\]])/g, "$1")) + '">') : m;
