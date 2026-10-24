@@ -21,6 +21,10 @@ declare global {
       // The fewest days the admin audit log keeps a record, whatever admins choose: a positive
       // whole number. 90 when unset, blank or invalid.
       ADMIN_AUDIT_RETENTION_MIN_DAYS?: string;
+      // `true` on a local dev instance only: set by `pnpm dev-server` (scripts/run-dev-server.ts)
+      // and the integration harness, and never by a deployment, which must not set it. It lifts the
+      // limit on what `cf-os api` may do (see the /api route in server.ts).
+      LOCAL_DEV_INSTANCE?: boolean;
 
       // Workers AI binding (injected by generate-wrangler-prod / run-dev-server; not in base wrangler.jsonc).
       WORKERS_AI: Ai;
