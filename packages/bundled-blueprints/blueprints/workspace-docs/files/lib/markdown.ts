@@ -80,7 +80,7 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
   // spelled out when the block ends.
   let inline = "";
   let changes: EmphasisChange[] = [];
-  let inPre = false, inCode = false, inHeading = false, preStart = 0;
+  let inPre = false, inCode = false, inHeading = false, preStart = 0, codeStart = 0;
   // Space and <br>s since the last content, written only once more content
   // follows: an empty line is a lone <br>, and a break that ends a block
   // breaks nothing.
@@ -107,7 +107,16 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
       changes.push({ at: inline.length, marker, open: true });
     }
   };
+  // A code span that starts or ends with a backtick (or a space at both ends)
+  // is padded with spaces, which reading it back drops.
+  const closeCode = () => {
+    const code = inline.slice(codeStart), fence = codeFence(code, 1);
+    const pad = /^`|`$|^ .*[^ ].* $/.test(code) ? " " : "";
+    inline = inline.slice(0, codeStart) + fence + pad + code + pad + fence;
+    inCode = false;
+  };
   const endBlock = () => {
+    if (inCode) closeCode();
     closeTo(0);
     markdown += spellEmphasis(inline, changes);
     inline = "";
@@ -167,7 +176,7 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
           break;
         }
         case "code":
-          if (!inPre && inCode) { inline += "`"; inCode = false; }
+          if (!inPre && inCode) closeCode();
           break;
         case "pre": {
           const code = markdown.slice(preStart), fence = codeFence(code);
@@ -197,7 +206,7 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
           // A cell's Markdown is cut out of the stream and kept for its row.
           const table = tables.at(-1);
           if (!table || table.cellStart === null) break;
-          const text = markdown.slice(table.cellStart).trim().replace(/\s*\n+\s*/g, "<br>").replace(/(<br>)+$/, "").replace(/\|/g, "\\|");
+          const text = markdown.slice(table.cellStart).trim().replace(/\s*\n+\s*/g, "<br>").replace(/(?<!\\)(<br>)+$/, "").replace(/\|/g, "\\|");
           markdown = markdown.slice(0, table.cellStart);
           table.cellStart = null;
           if (!table.rows.length) { table.rows.push([]); table.aligns.push([]); }
@@ -243,7 +252,7 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
         else breaks++;
         break;
       case "code":
-        if (!inPre && !inCode) { beginInline(); inline += "`"; inCode = true; }
+        if (!inPre && !inCode) { beginInline(); codeStart = inline.length; inCode = true; }
         break;
       case "pre":
         markdown += "\n\n";
@@ -424,10 +433,10 @@ function charClass(char: string | undefined): "space" | "punctuation" | "word" {
 }
 
 /** The decoded value of attribute `name` in a tag's attribute source, or "" when it has none. */
-// A code fence longer than any run of backticks in `code`, so no line of it
-// can close the fence early.
-export function codeFence(code: string): string {
-  return "`".repeat(Math.max(2, ...(code.match(/`+/g) ?? []).map((run) => run.length)) + 1);
+// A code fence (or, with `min` 1, a code span's delimiter) longer than any
+// run of backticks in `code`, so none of them can close it early.
+export function codeFence(code: string, min = 3): string {
+  return "`".repeat(Math.max(min - 1, ...(code.match(/`+/g) ?? []).map((run) => run.length)) + 1);
 }
 // Whether `line` closes the fence `open` began: the same character, at least
 // as many, and nothing else.

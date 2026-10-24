@@ -174,6 +174,29 @@ describe("fenced code", () => {
   });
 });
 
+// Agents edit blocks through their Markdown: what the edit doesn't touch must come back as it was.
+describe("Markdown round trips", () => {
+  const roundTrip = (html: string) => markdownToSpecs(htmlToMarkdown(html)).map(specHtml);
+
+  it("keeps inline code that holds backticks", () => {
+    expect(htmlToMarkdown("<p>run <code>echo `date`</code> now</p>").trim()).toBe("run `` echo `date` `` now");
+    expect(roundTrip("<p>run <code>echo `date`</code> now</p>")).toEqual(["<p>run <code>echo `date`</code> now</p>"]);
+    expect(roundTrip("<p>x <code>``</code> and <code>a</code></p>")).toEqual(["<p>x <code>``</code> and <code>a</code></p>"]);
+  });
+
+  // The serializer switches markers to keep adjacent lists apart; a new marker is a new list.
+  it("keeps adjacent lists apart by their markers", () => {
+    const runs = (md: string) => markdownToSpecs(md).map((s) => [s.type, (s as { items?: unknown[] }).items?.length]);
+    expect(runs("1. First\n\n1) Second")).toEqual([["ol", 1], ["ol", 1]]);
+    expect(runs("- a\n* b")).toEqual([["ul", 1], ["ul", 1]]);
+    expect(runs("1. a\n2. b")).toEqual([["ol", 2]]);
+  });
+
+  it("keeps a table cell's literal <br> text", () => {
+    expect(htmlToMarkdown("<table><tbody><tr><td>&lt;br&gt;</td></tr></tbody></table>")).toContain("| \\<br> |");
+  });
+});
+
 describe("Markdown headings", () => {
   // Only a closing run of #s after a space is markup: "C#" keeps its hash.
   it("keeps a hash that ends the heading's last word", () => {

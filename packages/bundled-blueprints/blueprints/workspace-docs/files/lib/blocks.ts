@@ -43,9 +43,6 @@ export function resolvePosition(list: BlockContent[], { afterId, beforeId, index
   return list.length;
 }
 
-// Line up a new list of block HTML against the current blocks: identical
-// blocks are matched (longest common subsequence), and between matches the
-// leftovers pair up in order as in-place updates.
 /**
  * Whether two blocks' HTML is the same content: the editor saves a block with its root's
  * `data-block-id`, which HTML built from a spec doesn't carry.
@@ -55,6 +52,9 @@ export function sameBlockHtml(a: string, b: string): boolean {
 }
 const withoutBlockId = (html: string) => html.replace(/^(\s*<[a-z0-9]+\b[^>]*?)\s+data-block-id="[^"]*"/i, "$1");
 
+// Line up a new list of block HTML against the current blocks: identical
+// blocks are matched (longest common subsequence), and between matches the
+// leftovers pair up in order as in-place updates.
 export function mergeBlockList(old: BlockContent[], htmls: string[]): BlockContent[] {
   const n = old.length, m = htmls.length, w = m + 1;
   const oldKeys = old.map((b) => withoutBlockId(b.html)), newKeys = htmls.map(withoutBlockId);
@@ -313,7 +313,10 @@ function inlineMarkdown(text: unknown): string {
   let s = String(text ?? "").replace(/\0/g, "");
   // An escaped backtick opens no code span; other escapes are literal inside one, so they come after.
   s = s.replace(/\\`/g, () => keep("`"));
-  s = s.replace(/`([^`\n]+)`/g, (_, c: string) => keep("<code>" + escapeHtml(c) + "</code>"));
+  // A span closes on a run of as many backticks as opened it; one space just
+  // inside both ends is padding.
+  s = s.replace(/(?<!`)(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)/g, (_, _fence: string, c: string) =>
+    keep("<code>" + escapeHtml(/^ .*[^ ].* $/.test(c) ? c.slice(1, -1) : c) + "</code>"));
   s = s.replace(/!\[((?:\\.|[^\]\\\n])*)\]\(<?([^)\s>]+)>?\)/g, (m, alt: string, url: string) => {
     const src = url.includes("\0") ? null : safeUrl(url, { image: true });
     return src ? keep('<img class="doc-image" src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt.replace(/\\([\\[\]])/g, "$1")) + '">') : m;
@@ -619,9 +622,10 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
     }
     if (LIST.test(line)) {
       flush();
-      // One list block per run of same-kind top-level items; deeper
+      // One list block per run of top-level items of the same kind and
+      // marker (a new marker, `1)` after `1.`, starts a new list); deeper
       // indentation nests under the item above.
-      let block: { type: BlockKind; items: MarkdownItem[] } | null = null;
+      let block: { type: BlockKind; items: MarkdownItem[]; marker?: string } | null = null;
       let levels: { indent: number; items: MarkdownItem[]; parent?: MarkdownItem }[] = [];
       for (; i < lines.length; i++) {
         const l = lines[i];
@@ -644,6 +648,7 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
         }
         const indent = m[1].length;
         const kind: BlockKind = m[3] !== undefined ? "todo" : /\d/.test(m[2]) ? "ol" : "ul";
+        const marker = m[2].slice(-1);
         const item: MarkdownItem = { text: m[4], checked: m[3] !== undefined && m[3] !== " " };
         let level = levels[levels.length - 1];
         if (level && indent > level.indent) {
@@ -655,9 +660,9 @@ export function markdownToSpecs(markdown: unknown): BlockSpec[] {
         } else {
           while (levels.length > 1 && indent < level.indent) { levels.pop(); level = levels[levels.length - 1]; }
         }
-        if (!level || levels.length === 1 && block && block.type !== kind) {
-          block = { type: kind, items: [] };
-          specs.push(block);
+        if (!level || levels.length === 1 && block && (block.type !== kind || block.marker !== marker)) {
+          block = { type: kind, items: [], marker };
+          specs.push({ type: kind, items: block.items });
           levels = [{ indent, items: block.items }];
           level = levels[0];
         }
