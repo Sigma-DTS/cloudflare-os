@@ -23,9 +23,10 @@ export type GadgetUiSegment =
   | GadgetUiBlock
   /**
    * An opening tag with no closing tag after it: the answer is still streaming, or the agent never
-   * closed the block. `text` runs from the tag to the end of the answer.
+   * closed the block. `text` runs from the tag to the end of the answer. `html` is the block's
+   * HTML so far, which is always the start of its `html` once it closes.
    */
-  | { kind: "open"; text: string; title?: string };
+  | { kind: "open"; text: string; html: string; title?: string };
 
 const CLOSE = "</gadget-ui>";
 
@@ -81,6 +82,13 @@ function closedBlock(html: string): GadgetUiBlock {
   return block;
 }
 
+// An open block's HTML so far: its body, trimmed as a closed block's is, without a closing tag
+// that has only partly arrived. Any part of a closing tag starts at its only "<".
+function openHtml(body: string): string {
+  let tag = body.lastIndexOf("<");
+  return (tag !== -1 && CLOSE.startsWith(body.slice(tag)) ? body.slice(0, tag) : body).trim();
+}
+
 /** Splits an agent answer into prose and `<gadget-ui>` blocks, in order. */
 export function parseGadgetUiBlocks(text: string): GadgetUiSegment[] {
   let segments: GadgetUiSegment[] = [];
@@ -108,7 +116,8 @@ export function parseGadgetUiBlocks(text: string): GadgetUiSegment[] {
     if (close === -1) {
       let rest = text.slice(line);
       let {title} = splitTitle(rest);
-      segments.push(title === undefined ? {kind: "open", text: rest} : {kind: "open", text: rest, title});
+      let html = openHtml(text.slice(body));
+      segments.push(title === undefined ? {kind: "open", text: rest, html} : {kind: "open", text: rest, html, title});
       return segments;
     }
 

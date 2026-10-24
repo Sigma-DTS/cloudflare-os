@@ -40,7 +40,7 @@ describe("parseGadgetUiBlocks", () => {
     expect(parseGadgetUiBlocks(lines("<gadget-ui>", html, "</gadget-ui>")))
         .toEqual([{ kind: "block", html }]);
     expect(parseGadgetUiBlocks(lines("<gadget-ui>", html))).toEqual([
-      { kind: "open", text: lines("<gadget-ui>", html) },
+      { kind: "open", text: lines("<gadget-ui>", html), html },
     ]);
   });
 
@@ -74,27 +74,35 @@ describe("parseGadgetUiBlocks", () => {
     expect(segments.map(s => s.kind)).toEqual(["text", "block", "text"]);
   });
 
-  it("keeps an unclosed block open, with its title once streamed", () => {
+  it("keeps an unclosed block open, with its HTML so far and its title once streamed", () => {
     let streamed = lines("Here it comes:", "<gadget-ui>", "<title>Plan</title>", "<div>");
     expect(parseGadgetUiBlocks(streamed)).toEqual([
       { kind: "text", text: "Here it comes:\n", start: 0 },
-      { kind: "open", text: "<gadget-ui>\n<title>Plan</title>\n<div>", title: "Plan" },
+      { kind: "open", text: "<gadget-ui>\n<title>Plan</title>\n<div>", html: "<title>Plan</title>\n<div>", title: "Plan" },
     ]);
-    expect(parseGadgetUiBlocks("<gadget-ui>\n<ti")).toEqual([{ kind: "open", text: "<gadget-ui>\n<ti" }]);
+    expect(parseGadgetUiBlocks("<gadget-ui>\n<ti")).toEqual([{ kind: "open", text: "<gadget-ui>\n<ti", html: "<ti" }]);
   });
 
-  it("keeps each closed block at its place among the segments at every cut of a streamed answer", () => {
-    // The Workshop keeps a running view across the answer's store by that place.
+  it("keeps each block at its place among the segments at every cut of a streamed answer", () => {
+    // The Workshop keeps a view by that place, from the moment its block opens, and writes an open
+    // block's HTML into the view as it grows.
     let answer = lines(
-      "Intro.", "<gadget-ui>", "<p>one</p>", "</gadget-ui>",
-      "<gadget-ui>", "<p>two</p>", "</gadget-ui>", "Outro.",
+      "Intro.", "<gadget-ui>", "<title>One</title>", "<p>1 < 2</p>", "</gadget-ui>",
+      "<gadget-ui class='wide'>", "  <p>two</p>  ", "", "</gadget-ui>", "Outro.",
     );
-    let placed = (text: string) =>
-      parseGadgetUiBlocks(text).flatMap((segment, i) => segment.kind === "block" ? [[i, segment]] : []);
-    let final = placed(answer);
+    let final = parseGadgetUiBlocks(answer);
+    let blocksAt = final.flatMap((segment, i) => segment.kind === "block" ? [i] : []);
+    let opensAt = [...answer.matchAll(/^<gadget-ui[^>]*>/gm)].map(tag => tag.index + tag[0].length);
     for (let cut = 0; cut <= answer.length; cut++) {
-      let closed = answer.slice(0, cut).split("</gadget-ui>").length - 1;
-      expect(placed(answer.slice(0, cut))).toEqual(final.slice(0, closed));
+      let parsed = parseGadgetUiBlocks(answer.slice(0, cut));
+      expect(parsed.flatMap((segment, i) => segment.kind === "text" ? [] : [i]), `blocks at cut ${cut}`)
+        .toEqual(blocksAt.filter((_, n) => opensAt[n] <= cut));
+      parsed.forEach((segment, i) => {
+        let block = final[i];
+        if (segment.kind === "text" || block?.kind !== "block") return;
+        if (segment.kind === "block") expect(segment).toEqual(block);
+        else expect(block.html.slice(0, segment.html.length)).toBe(segment.html);
+      });
     }
   });
 });
