@@ -135,17 +135,17 @@ describe("editor protocol", () => {
     expect(await gadget.applyOperation({ senderId: "c1", deletes, order: ["a", "b"] })).toMatchObject({ status: "unchanged" });
   });
 
-  it("keeps shared settings clean and tells the other editors", async () => {
+  it("keeps shared settings clean, an invalid field keeping the stored value, and tells the other editors", async () => {
     const { gadget } = inMemoryGadget();
     const { callbacks, events } = subscriber();
     await gadget.subscribe(callbacks);
     expect(await gadget.setSettings({ font: "serif", senderId: "c1" })).toEqual({ font: "serif", wide: false });
-    expect(await gadget.setSettings({ font: "comic" as "sans", wide: true })).toEqual({ font: "sans", wide: true });
+    expect(await gadget.setSettings({ font: "comic" as "sans", wide: true })).toEqual({ font: "serif", wide: true });
     expect(events).toEqual([
       { type: "settings", senderId: "c1", settings: { font: "serif", wide: false } },
-      { type: "settings", senderId: undefined, settings: { font: "sans", wide: true } },
+      { type: "settings", senderId: undefined, settings: { font: "serif", wide: true } },
     ]);
-    expect(await gadget.getSettings()).toEqual({ font: "sans", wide: true });
+    expect(await gadget.getSettings()).toEqual({ font: "serif", wide: true });
   });
 
   // No presence (README); an editor from before that keeps calling it and must not fail.
@@ -260,6 +260,35 @@ describe("block API", () => {
     expect((await gadget.listBlocks()).blocks.map((block) => block.markdown)).toEqual(["keep", "this"]);
     await gadget.setMarkdown({ markdown: "# replaced", replace: true });
     expect((await gadget.listBlocks()).blocks.map((block) => block.markdown)).toEqual(["# replaced"]);
+  });
+
+  // Clearing a document in the editor leaves one empty line, saved with its block id.
+  it("fills a document cleared in the editor", async () => {
+    const cleared = () => inMemoryGadget({ "document:v2": { revision: 5, title: "", lastModified: 0, blocks: [{ id: "e", html: '<p data-block-id="e"><br></p>', version: 3 }] } });
+    const filled = cleared();
+    await filled.ready;
+    await filled.gadget.setMarkdown({ markdown: "# New document" });
+    expect((await filled.gadget.listBlocks()).blocks.map((block) => block.markdown)).toEqual(["# New document"]);
+    const inserted = cleared();
+    await inserted.ready;
+    await inserted.gadget.insertBlocks({ markdown: "First" });
+    expect((await inserted.gadget.listBlocks()).blocks.map((block) => block.markdown)).toEqual(["First"]);
+  });
+
+  // An agent edits a block by changing the Markdown listBlocks gave it; what it didn't change stays.
+  it("keeps an inline image and spelled-out emphasis when a listed block comes back edited", async () => {
+    const src = "data:image/png;base64," + "A".repeat(4096);
+    const { gadget, ready } = inMemoryGadget({ "document:v2": { revision: 1, title: "", lastModified: 0, blocks: [
+      { id: "a", html: `<p>Before<img class="doc-image" src="${src}" alt="Shot [1]">after</p>`, version: 1 },
+      { id: "b", html: "<p>a<b>b</b>c text</p>", version: 1 },
+    ] } });
+    await ready;
+    const { blocks } = await gadget.listBlocks();
+    expect(blocks[1].markdown).toBe("a<strong>b</strong>c text");
+    for (const block of blocks) await gadget.updateBlock({ id: block.id, markdown: block.markdown.replace("Before", "Earlier").replace("text", "edited") });
+    const [image, bold] = await gadget.getBlocks();
+    expect(image.html).toBe(`<p>Earlier<img class="doc-image" src="${src}" alt="Shot [1]">after</p>`);
+    expect(bold.html).toBe("<p>a<b>b</b>c edited</p>");
   });
 
   // A screenshot's data: URI would cost an agent tens of thousands of tokens per read.

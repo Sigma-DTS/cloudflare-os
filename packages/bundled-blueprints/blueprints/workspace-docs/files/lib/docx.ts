@@ -212,7 +212,7 @@ class ParseBudget {
   nodes = 0;
   take(): void {
     if (++this.nodes > DOCX_LIMITS.nodes) {
-      throw new Error(`The document is too large to export as Word (more than ${DOCX_LIMITS.nodes} elements).`);
+      throw new Error(`The document is too large to export as Word (more than ${DOCX_LIMITS.nodes} nodes).`);
     }
   }
 }

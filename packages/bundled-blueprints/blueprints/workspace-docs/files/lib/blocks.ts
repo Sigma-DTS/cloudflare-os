@@ -84,10 +84,10 @@ export function retypeSpec(html: string, type: unknown): BlockSpec {
   if (m && textual.includes(current) && !/<(p|div|h[1-6]|ul|ol|pre|table|blockquote)\b/i.test(inner)) {
     if (textual.includes(kind)) return { type: "html", html: `<${kind === "quote" ? "blockquote" : kind}${style}>${inner.trim() ? inner : "<br>"}</${kind === "quote" ? "blockquote" : kind}>` };
     if (lists.includes(kind)) return { type: kind, items: [{ html: inner }] };
-    if (kind === "code") return { type: "code", text: decodeHtml(inner.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]*>/g, "")) };
+    if (kind === "code") return { type: "code", text: decodeHtml(stripTags(inner.replace(/<br\s*\/?>/gi, "\n"))) };
   }
   if (m && current === "code" && (textual.includes(kind) || lists.includes(kind))) {
-    const lines = inner.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]*>/g, "").replace(/\n$/, "").split("\n");
+    const lines = stripTags(inner.replace(/<br\s*\/?>/gi, "\n")).replace(/\n$/, "").split("\n").map((line) => escapeHtml(decodeHtml(line)));
     if (lists.includes(kind)) return { type: kind, items: lines.map((line) => ({ html: line })) };
     const tag = kind === "quote" ? "blockquote" : kind;
     return { type: "html", html: `<${tag}>${lines.join("<br>") || "<br>"}</${tag}>` };
@@ -101,8 +101,18 @@ export function retypeSpec(html: string, type: unknown): BlockSpec {
   throw new Error(`Can't turn this ${current} block into ${kind} by type alone: pass its new content too (text, items, rows…).`);
 }
 
+// An empty paragraph, whatever its attributes (the editor saves its block id on it).
 export function isEmptyLine(html: string): boolean {
-  return /^<p>(?:<br\s*\/?>)?<\/p>$/i.test(String(html).trim());
+  return /^<p\b[^>]*>(?:<br\s*\/?>)?<\/p>$/i.test(String(html).trim());
+}
+
+// The text of `html` with every tag removed, repeatedly, so a tag split by another can't remain.
+function stripTags(html: string): string {
+  for (let prev = ""; prev !== html; ) {
+    prev = html;
+    html = html.replace(/<[^>]*>/g, "");
+  }
+  return html;
 }
 
 export const TYPE_ALIASES: Record<string, BlockKind> = {
@@ -190,7 +200,7 @@ function splitPieces(html: string): { html: string; run: boolean }[] {
 const LINE_OPEN = /^<(p|h[1-6])\b([^>]*)>/i;
 
 function hasInlineContent(html: string): boolean {
-  return /<(img|br)\b/i.test(html) || !!decodeHtml(html.replace(/<[^>]*>/g, "")).replace(/[\s​]/g, "");
+  return /<(img|br)\b/i.test(html) || !!decodeHtml(stripTags(html)).replace(/[\s​]/g, "");
 }
 
 export function repairBlockHtml(html: string, depth = 0): string[] {
@@ -285,7 +295,8 @@ function safeUrl(url: unknown, { image = false } = {}): string | null {
   return /^[a-z][a-z0-9+.-]*:/i.test(u) ? null : u;
 }
 
-// Inline Markdown -> the editor's own markup (<b>, <i>, <s>, <code>, <a>).
+// Inline Markdown -> the editor's own markup (<b>, <i>, <s>, <code>, <a>, <img>). The <strong>,
+// <em> and <del> that htmlToMarkdown writes where asterisks would pair wrongly are read back too.
 function inlineMarkdown(text: unknown): string {
   const stash: string[] = [];
   const keep = (html: string) => "\0" + (stash.push(html) - 1) + "\0";
@@ -293,6 +304,10 @@ function inlineMarkdown(text: unknown): string {
   // An escaped backtick opens no code span; other escapes are literal inside one, so they come after.
   s = s.replace(/\\`/g, () => keep("`"));
   s = s.replace(/`([^`\n]+)`/g, (_, c: string) => keep("<code>" + escapeHtml(c) + "</code>"));
+  s = s.replace(/!\[((?:\\.|[^\]\\\n])*)\]\(<?([^)\s>]+)>?\)/g, (m, alt: string, url: string) => {
+    const src = url.includes("\0") ? null : safeUrl(url, { image: true });
+    return src ? keep('<img class="doc-image" src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt.replace(/\\([\\[\]])/g, "$1")) + '">') : m;
+  });
   s = s.replace(/\\([!-/:-@[-`{-~])/g, (_, c: string) => keep(escapeHtml(c)));
   s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, label: string, url: string) => {
     // A code span inside the URL was already taken out; such a link stays text.
@@ -300,7 +315,7 @@ function inlineMarkdown(text: unknown): string {
     return href ? keep('<a href="' + escapeHtml(href) + '">') + label + keep("</a>") : m;
   });
   s = s.replace(/(^|[\s(])(https?:\/\/[^\s<\0]+[^\s<\0.,;:!?)\]'"])/g, (_, pre: string, url: string) => pre + keep('<a href="' + escapeHtml(url) + '">' + escapeHtml(url) + "</a>"));
-  s = escapeHtml(s);
+  s = escapeHtml(s).replace(/&lt;(\/?)(strong|em|del)&gt;/g, (_, close: string, tag: string) => `<${close}${{ strong: "b", em: "i", del: "s" }[tag]}>`);
   s = s.replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "<b>$1</b>").replace(/__(?=\S)([\s\S]*?\S)__/g, "<b>$1</b>");
   s = s.replace(/~~(?=\S)([\s\S]*?\S)~~/g, "<s>$1</s>");
   s = s.replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, "$1<i>$2</i>").replace(/(^|[^\w])_(?=\S)([^_\n]*?\S)_(?!\w)/g, "$1<i>$2</i>");

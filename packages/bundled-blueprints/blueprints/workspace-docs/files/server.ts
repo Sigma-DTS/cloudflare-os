@@ -299,8 +299,9 @@ export class Gadget extends DurableObject<unknown, unknown> implements GadgetStu
 
   setSettings(patch: SettingsPatch): Promise<DocSettings> {
     return this.mutations.run(async () => {
-      const current = await this.getSettings();
-      const next = cleanSettings({ ...current, ...(isRecord(patch) ? patch : {}) });
+      // An invalid field keeps the stored value.
+      const current = await this.getSettings(), p = isRecord(patch) ? patch : {};
+      const next: DocSettings = { font: isFont(p.font) ? p.font : current.font, wide: typeof p.wide === "boolean" ? p.wide : current.wide };
       await this.ctx.storage.put("settings", next);
       this.broadcast({ type: "settings", senderId: isRecord(patch) ? patch.senderId : undefined, settings: next });
       return next;

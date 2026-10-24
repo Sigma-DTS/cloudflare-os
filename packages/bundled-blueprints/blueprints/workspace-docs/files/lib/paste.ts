@@ -492,9 +492,9 @@ export function parseTsv(text: string): string[][] | null {
 }
 // A quote of several Markdown blocks: a quote per paragraph, lists and code between.
 function quoteHtml(inner: string) {
-  const div = document.createElement("div");
-  div.innerHTML = inner;
-  return Array.from(div.children, (b) => b.tagName === "P" || /^H[1-3]$/.test(b.tagName) ? `<blockquote>${b.innerHTML}</blockquote>` : b.outerHTML).join("");
+  const template = document.createElement("template");
+  template.innerHTML = inner;
+  return Array.from(template.content.children, (b) => b.tagName === "P" || /^H[1-3]$/.test(b.tagName) ? `<blockquote>${b.innerHTML}</blockquote>` : b.outerHTML).join("");
 }
 export function markdownToHtml(md: string): string {
   const lines = md.replace(/\r\n?/g, "\n").split("\n");

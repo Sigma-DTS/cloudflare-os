@@ -48,7 +48,7 @@ Every write runs in the Durable Object's mutation queue, bumps the version of ea
 | `setChecked({ id, item = 0, checked = true })` | Ticks the `item`-th (0-based) top-level item of a to-do list. Throws if the block isn't a to-do list or has no such item. |
 | `deleteBlocks({ ids })` | `ids` is an id or an array. Deleting every block leaves one empty paragraph. |
 | `moveBlocks({ ids, afterId? \| beforeId? \| index? })` | Keeps the moved blocks' relative order. A block can't be positioned relative to itself. |
-| `setMarkdown({ markdown?, blocks?, title?, replace? })` | Replaces the whole document. Throws on a document with content unless `replace: true` (see rule 4). Unchanged blocks keep their ids, changed ones update in place. |
+| `setMarkdown({ markdown?, blocks?, title?, replace? })` | Replaces the whole document. Throws on a document with content unless `replace: true` (see rule 4) or the call changes nothing. Unchanged blocks keep their ids, changed ones update in place. |
 
 **Images in reads are abbreviated.** A long `data:` image appears in `listBlocks`, `getBlocks` Markdown and `getMarkdown` as `![alt](data:image/jpeg;… 57 KB #1a2b3c4d)` (type, size, hash). The full URI is in `getBlocks`' `html`. Pass the reference back unchanged in any write (`markdown`, `text`, `src` or `html`) and it stands for that same image, so editing around or copying an image keeps it. A reference to an image no longer in the document throws.
 
@@ -56,7 +56,7 @@ Every write runs in the Durable Object's mutation queue, bumps the version of ea
 
 `blocks` is an array of specs. A plain string is a paragraph; `{ markdown }` expands into several blocks.
 
-- `{ type: "p" | "h1" | "h2" | "h3" | "quote", text }` — `text` is inline Markdown: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[link](https://…)`, bare URLs. Alternatively pass inline `html` instead of `text`.
+- `{ type: "p" | "h1" | "h2" | "h3" | "quote", text }` — `text` is inline Markdown: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[link](https://…)`, bare URLs, `![alt](src)` images. Alternatively pass inline `html` instead of `text`.
 - `{ type: "code", text }` (or `code`) — plain text, line breaks kept.
 - `{ type: "divider" }`.
 - `{ type: "image", src, alt?, width? }` — `src` must be `https://` or `data:image/…`; `width` in px.
@@ -81,9 +81,9 @@ Every write runs in the Durable Object's mutation queue, bumps the version of ea
 
 - **Markdown** (server): the stored blocks, including `- [ ]` checklists and GFM tables (column alignment kept). Underline, colour, size and alignment become plain text. Full image data URIs are kept.
 - **HTML** and **PDF** (browser): the print layout, light palette, no chrome; trailing empty lines are hidden; table rows don't split across pages.
-- **Word** (`.docx`, server): converted from the block HTML to native Word: Heading 1–3 styles (usable for Word's navigation and table of contents), Quote style, native numbered/bulleted lists, clickable to-do checkboxes, code in a shaded monospace box, native tables (header row repeats across pages), palette colours, embedded images at their page width, `http(s)`/`mailto:`/`tel:` links. The document font follows the shared typeface (Arial / Georgia / Courier New) on US Letter. Remote or SVG images export as their alt text. Limits: 20,000 blocks, 400,000 elements, 400,000 table cells, 500 images (16 MB each, 96 MB total).
+- **Word** (`.docx`, server): converted from the block HTML to native Word: Heading 1–3 styles (usable for Word's navigation and table of contents), Quote style, native numbered/bulleted lists, clickable to-do checkboxes, code in a shaded monospace box, native tables (header row repeats across pages), palette colours, embedded images at their page width, `http(s)`/`mailto:`/`tel:` links. The document font follows the shared typeface (Arial / Georgia / Courier New) on US Letter. Remote or SVG images export as their alt text. Limits: 20,000 blocks, 400,000 nodes, 400,000 table cells, 500 images (16 MB each, 96 MB total).
 
 ## Limitations
 
 - No real-time cursors or presence.
-- Images added in the editor are embedded in the document (downscaled to 1600px, under about 1.4 MB each), so many large images make it heavy.
+- Images added in the editor are embedded in the document (downscaled to 1600px and under about 1.4 MB each, or 2.7 MB for a GIF), so many large images make it heavy.

@@ -281,7 +281,7 @@ describe("mergeBlockHtml: properties", () => {
       edit(mine, "M", mineAdded);
       edit(theirs, "T", theirAdded);
       const out = merge(html(base), html(theirs), html(mine));
-      expect(out).toMatch(/^<ul class="checklist">(<li( data-checked="true")?>.*?<\/li>)*<\/ul>$/);
+      expect(out).toMatch(/^<ul class="checklist">(?:<li(?: data-checked="true")?>(?:[^<]|<\/?b>|<br>)*<\/li>)*<\/ul>$/);
       const opens = out.match(/<b>/g)?.length ?? 0, closes = out.match(/<\/b>/g)?.length ?? 0;
       expect(opens).toBe(closes);
       const text = out.replace(/<[^>]*>/g, " ");
