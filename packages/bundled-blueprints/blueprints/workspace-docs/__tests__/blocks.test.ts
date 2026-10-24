@@ -212,6 +212,16 @@ describe("Markdown round trips", () => {
     expect(roundTrip('<p><a href="https://example.com/">first<br>second</a> x</p>')).toEqual(['<p><a href="https://example.com/">first<br>second</a> x</p>']);
   });
 
+  // An image in one cell must not pad every other cell in its column to the image's length.
+  it("pads table columns only so far", () => {
+    const img = `<img class="doc-image" src="data:image/png;base64,${"A".repeat(5000)}" alt="shot">`;
+    const rows = Array.from({ length: 20 }, (_, i) => `<tr><td>row ${i}</td></tr>`).join("");
+    const md = htmlToMarkdown(`<table><tbody><tr><td>${img}</td></tr>${rows}</tbody></table>`);
+    const lines = md.trim().split("\n");
+    expect(lines.filter((l) => l.includes("row ")).every((l) => l.length < 60)).toBe(true);
+    expect(lines.filter((l) => l.includes("row "))).toHaveLength(20);
+  });
+
   it("keeps a table cell's literal <br> text", () => {
     expect(htmlToMarkdown("<table><tbody><tr><td>&lt;br&gt;</td></tr></tbody></table>")).toContain("| \\<br> |");
   });

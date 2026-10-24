@@ -227,7 +227,9 @@ export function htmlToMarkdown(html: string, { abbreviateImages = false } = {}):
           const aligns = kept.map((i) => table.aligns[i] ?? []);
           if (!rows.length) break;
           const cols = Math.max(...rows.map((r) => r.length));
-          const widths = Array.from({ length: cols }, (_, i) => Math.max(3, ...rows.map((r) => (r[i] || "").length)));
+          // Columns are padded to line up, but only up to a point: a long
+          // cell (an image's data URI, say) runs on rather than padding the rest.
+          const widths = Array.from({ length: cols }, (_, i) => Math.max(3, Math.min(40, Math.max(...rows.map((r) => (r[i] || "").length)))));
           const line = (r: string[]) => "| " + widths.map((w, i) => (r[i] || "").padEnd(w)).join(" | ") + " |";
           // Markdown aligns whole columns: a column takes an alignment its cells all share.
           const delimiter = (w: number, i: number) => {
