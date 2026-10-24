@@ -565,7 +565,8 @@ interface MarkdownItem {
 export function markdownToSpecs(markdown: unknown): BlockSpec[] {
   const lines = String(markdown ?? "").replace(/\r\n?/g, "\n").replace(/\t/g, "    ").split("\n");
   const specs: BlockSpec[] = [];
-  const LIST = /^(\s*)([-*+]|\d{1,9}[.)])\s+(?:\[([ xX])\]\s+)?(.*)$/;
+  // An empty item ("-", "2.", "- [ ]") is still an item.
+  const LIST = /^(\s*)([-*+]|\d{1,9}[.)])(?:\s+|$)(?:\[([ xX])\](?:\s+|$))?(.*)$/;
   let para: string[] = [];
   const flush = () => {
     if (para.length) specs.push({ type: "p", text: para.join("\n") });

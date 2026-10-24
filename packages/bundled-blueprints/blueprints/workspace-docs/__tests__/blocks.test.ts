@@ -138,6 +138,13 @@ describe("list items through Markdown", () => {
     expect(htmlToMarkdown("<ol><li>a<ul><li>b<br>c</li></ul></li></ol>")).toBe("1. a\n  - b  \n    c\n");
   });
 
+  // An empty item reads back as an item, so editing another one keeps the list whole.
+  it("keeps empty list items", () => {
+    for (const html of ["<ul><li>First</li><li><br></li><li>Third</li></ul>", "<ol><li>a</li><li><br></li></ol>", '<ul class="checklist"><li>a</li><li><br></li></ul>']) {
+      expect(markdownToSpecs(htmlToMarkdown(html)).map(specHtml)).toEqual([html]);
+    }
+  });
+
   // Under one item, a bulleted list after a numbered one stays its own list.
   it("keeps nested lists of different kinds apart", () => {
     const html = "<ul><li>Parent<ol><li>Numbered</li></ol><ul><li>Bullet</li></ul></li></ul>";

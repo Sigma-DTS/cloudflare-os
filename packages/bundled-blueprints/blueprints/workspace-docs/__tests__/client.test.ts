@@ -253,4 +253,23 @@ describe("more edits", () => {
     send([{ id: "d1", html: "<p>bar A</p>", version: 2 }]);
     await vi.waitFor(() => expect(editor().querySelector('[data-block-id="d1"]')?.textContent).toBe("bar A"));
   });
+
+  // A deletion that arrives while a save is in flight is newer than that save's conflict reply:
+  // the stale version the reply carries must not bring the block back.
+  it("keeps a block deleted after the version a conflict reply brings", async () => {
+    send([{ id: "k1", html: "<p>foo</p>", version: 1 }]);
+    editor().querySelector('[data-block-id="k1"]')!.textContent = "foo x";
+    let reply!: () => void;
+    applyOperation().mockImplementationOnce((op) => new Promise((resolve) => {
+      reply = () => resolve({ status: "applied", revision: ++revision, conflicts: [{ id: "k1", html: "<p>bar foo</p>", version: 2 }], order: op.order });
+    }));
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.waitFor(() => expect(reply).toBeDefined());
+    editor().querySelector('[data-block-id="k1"]')!.remove();
+    send([], ["k1"]);
+    reply();
+    await vi.waitFor(() => expect(applyOperation().mock.results.at(-1)?.type).toBe("return"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(editor().querySelector('[data-block-id="k1"]')).toBeNull();
+  });
 });

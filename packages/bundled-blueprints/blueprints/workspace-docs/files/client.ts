@@ -4627,7 +4627,7 @@ function clipboardGrid(html: string, text: string) {
   if (tsv) return tsv.map((r) => r.map(escapeHtml));
   // A Markdown pipe table.
   const tpl = document.createElement("template");
-  tpl.innerHTML = textToHtml(text);
+  tpl.innerHTML = sanitizePastedHtml(textToHtml(text));
   // (`:scope` matches nothing in a fragment, so the one child is checked itself.)
   const only = tpl.content.children.length === 1 ? tpl.content.firstElementChild : null;
   const t = only instanceof HTMLTableElement ? only : null;
@@ -5773,10 +5773,21 @@ async function sendChanges(failures = 0): Promise<SaveOutcome> {
       if (pendingByBlock.get(b.id)?.type === "delete") pendingByBlock.delete(b.id);
     }
     for (const id of result.deletedIds || []) acknowledged.delete(id);
-  } finally {
+  } catch (error) {
     savingIds = null;
     applyHeldChanges();
+    throw error;
   }
+  savingIds = null;
+  // The changes held while the save was in flight are newer than the reply's
+  // conflicts, so they go on top of them.
+  try {
+    return mergeConflicts(result);
+  } finally {
+    applyHeldChanges();
+  }
+}
+function mergeConflicts(result: ApplyOperationResult): SaveOutcome {
   if (!result.conflicts?.length) return "saved";
   // A stale block is merged with the server's newer version, exactly as if
   // that version had arrived as a live event; the next send saves the merge.
