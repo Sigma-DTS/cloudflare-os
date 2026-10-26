@@ -1240,8 +1240,6 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
       nextActionId: 0,
       nextChatId: 0,
-      // Threads below this rollout cutoff predate unread tracking. New workspaces start at zero.
-      legacyUnreadChatIdLimit: 0,
       nextHookId: 0,
       nextAgentCallId: 0,
 
@@ -1269,10 +1267,12 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
     collections: {
       // Coalesced source-to-user handoff, committed with the message mutation.
-      dirtyChats: collection<{
+      dirtyChats: collection<ChatFanoutStart & {
         chatId: number;
-        /** First incoming message in this pending batch, retained across coalescing and reset. */
-        firstMessageSequence?: number;
+        /** No new broadcast remains; only failed recipients need another attempt. */
+        retryOnly?: true;
+        /** Written only after failures. Each recipient retains its own earliest pending work. */
+        failedRecipients?: (ChatFanoutStart & {userId: string})[];
       }>()({primaryKey: "chatId"}),
       // Notification candidates reference existing timeline positions, not copied message bodies.
       chatNotifications: collection<{
@@ -1486,7 +1486,14 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: "chatId"
       }),
 
-      nextChatSequences: collection<{chatId: number, nextSequence: number}>()({
+      nextChatSequences: collection<{
+        chatId: number;
+        nextSequence: number;
+        /** Dense count of messages written since visible-message tracking began; old history is not scanned. */
+        visibleThroughSequence?: number;
+        /** First newly stamped timeline position, so explicit reads never replay pre-rollout alerts. */
+        trackingStartSequence?: number;
+      }>()({
         primaryKey: "chatId"
       }),
 
@@ -1559,6 +1566,14 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     }
   });
 }
+
+/** Earliest work in a coalesced source-to-user batch, in raw and dense coordinates. */
+export type ChatFanoutStart = {
+  /** First incoming message or alert in the pending batch; absent for metadata-only changes. */
+  firstMessageSequence?: number;
+  /** Dense position of its first visible message, retained through retries and resets. */
+  firstVisibleSequence?: number;
+};
 
 /** The Overseer's typed storage. See makeOverseerStorage. */
 export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
