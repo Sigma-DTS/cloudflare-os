@@ -12,6 +12,8 @@ import { nativeApp } from "../native-app/nativeApp";
 import { isChatVisible } from "./visibleChat";
 
 const DEVICE_REGISTRATION_EVENT = "cloudflare-os:notification-device-registration";
+const NOTIFICATION_AUTHORIZATION_REQUEST_EVENT =
+  "cloudflare-os:notification-authorization-request";
 
 type LegacyNativeNotificationWindow = Window & {
   __CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__?: string;
@@ -61,6 +63,7 @@ export const NotificationBridge = ({
   const currentApi = useRef(authenticatedApi);
   currentApi.current = authenticatedApi;
   const askedNative = useRef(false);
+  const pendingAuthorization = useRef<Promise<string> | undefined>(undefined);
   const claimedRegistrations = useRef(new Set<string>());
 
   useEffect(() => {
@@ -81,7 +84,12 @@ export const NotificationBridge = ({
       requestingAuthorization = true;
       try {
         if (notifications?.authorizationRequired) {
-          const authorization = await currentApi.current.authorizeNotificationDevice();
+          const request = pendingAuthorization.current ??
+            currentApi.current.authorizeNotificationDevice();
+          pendingAuthorization.current = request;
+          const authorization = await request.finally(() => {
+            if (pendingAuthorization.current === request) pendingAuthorization.current = undefined;
+          });
           if (!cancelled) notifications.requestDeviceRegistration(authorization);
         } else if (notifications) {
           notifications.requestDeviceRegistration();
@@ -89,8 +97,10 @@ export const NotificationBridge = ({
           legacyWindow.__CLOUDFLARE_OS_REQUEST_NOTIFICATION_DEVICE_REGISTRATION__?.();
         }
       } catch (error) {
-        if (!cancelled) reportRegistration("failed");
-        logRpcFailure("Failed to authorize notification device:", error);
+        if (!cancelled) {
+          reportRegistration("failed");
+          logRpcFailure("Failed to authorize notification device:", error);
+        }
       } finally {
         requestingAuthorization = false;
       }
@@ -127,10 +137,10 @@ export const NotificationBridge = ({
     void register(injected);
     window.addEventListener(DEVICE_REGISTRATION_EVENT, onDeviceRegistration);
     const onAuthorizationRequest = () => { void requestRegistration(); };
-    window.addEventListener("cloudflare-os:notification-authorization-request", onAuthorizationRequest);
-    // Each id costs a central registration, and this Effect reruns on every reconnect: ask at most
-    // once per mount, and not at all when native already injected one.
-    if (!askedNative.current) {
+    window.addEventListener(NOTIFICATION_AUTHORIZATION_REQUEST_EVENT, onAuthorizationRequest);
+    // Each id costs a central registration. Ask at most once per authenticated mount, and not at
+    // all when native already injected one. A pending grant survives Strict Mode's effect replay.
+    if (!askedNative.current || pendingAuthorization.current) {
       askedNative.current = true;
       if (!injected) {
         void requestRegistration();
@@ -139,7 +149,7 @@ export const NotificationBridge = ({
     return () => {
       cancelled = true;
       window.removeEventListener(DEVICE_REGISTRATION_EVENT, onDeviceRegistration);
-      window.removeEventListener("cloudflare-os:notification-authorization-request", onAuthorizationRequest);
+      window.removeEventListener(NOTIFICATION_AUTHORIZATION_REQUEST_EVENT, onAuthorizationRequest);
     };
   // Enrollment belongs to this authenticated mount, not each replacement WebSocket stub.
   }, []);

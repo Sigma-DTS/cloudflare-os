@@ -67,17 +67,18 @@ const isServiceId = (value: unknown): value is string =>
 
 /**
  * Exchange the native app's one-time device registration, or a browser's Web Push subscription,
- * for an install-bound subscription, along with the install-scoped key of the device it reaches.
+ * for an install-and-user-bound subscription, along with the install-scoped key of the device it
+ * reaches.
  */
 export async function registerDevice(
-    env: Cloudflare.Env, registration: string | WebPushSubscription,
+    env: Cloudflare.Env, registration: string | WebPushSubscription, subject: string,
 ): Promise<{ deviceKey: string; subscriptionId: string }> {
   // A Web Push subscription is rebuilt field by field: RPC validation forwards extra properties,
   // and the service's schema is strict.
   let body = typeof registration === "string"
-      ? { deviceRegistrationId: registration }
+      ? { deviceRegistrationId: registration, subject }
       : { webPush: { endpoint: registration.endpoint,
-          keys: { p256dh: registration.keys.p256dh, auth: registration.keys.auth } } };
+          keys: { p256dh: registration.keys.p256dh, auth: registration.keys.auth } }, subject };
   return registrationRequest(async signal =>
     subscription(await signedPost(env, "/v1/subscriptions", body, signal)));
 }
@@ -130,11 +131,11 @@ export async function authorizeDevice(env: Cloudflare.Env, subject: string): Pro
 }
 
 /**
- * Push a notification to the device behind `subscriptionId`. Resolves to false when the service
- * reports it will never deliver to that subscription again.
+ * Push a notification to the device behind `subscriptionId` as its owning User DO subject.
+ * Resolves to false when the service reports it will never deliver to that subscription again.
  */
 export async function deliver(
-    env: Cloudflare.Env, subscriptionId: string,
+    env: Cloudflare.Env, subject: string, subscriptionId: string,
     { id, kind, workspaceId, chatId, chatTitle }: UserNotification): Promise<boolean> {
   let response = await signedPost(env, "/v1/deliveries", {
     type: kind === "taskCompleted" ? "task_completed" : "permission_requested",
@@ -143,6 +144,7 @@ export async function deliver(
     threadTitle: threadTitle(chatTitle),
     path: `/workspace/${workspaceId}?chat=${chatId}&showChat=true`,
     subscriptionId,
+    subject,
   });
   if (response.ok) return true;
   // Only the service's verdict on the subscription retires it: a 401 can also mean a bad signature,

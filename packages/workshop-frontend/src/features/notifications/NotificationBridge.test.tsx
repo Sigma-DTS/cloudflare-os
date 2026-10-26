@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import type { RpcStub } from "capnweb";
@@ -120,6 +120,28 @@ describe("NotificationBridge", () => {
     root = createRoot(container);
     await act(async () => resolve("a".repeat(64)));
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("hands a pending grant to the active Strict Mode effect", async () => {
+    let resolve!: (grant: string) => void;
+    authenticatedApi.authorizeNotificationDevice.mockReturnValue(
+        new Promise(done => { resolve = done; }));
+    const request = vi.fn<(authorization?: string) => void>();
+    Object.assign(window, { cloudflareOSNative: { version: 1, isAvailable: () => true,
+      loginReady: () => {}, returnToInstalls: () => {}, notifications: {
+        authorizationRequired: true, currentDeviceRegistration: () => undefined,
+        requestDeviceRegistration: request,
+        registrationFinished: vi.fn<(outcome: "ready" | "failed") => void>(),
+      } } });
+    await act(async () => root.render(
+      <StrictMode>
+        <NotificationBridge
+          authenticatedApi={authenticatedApi as unknown as RpcStub<AuthenticatedApi>} />
+      </StrictMode>,
+    ));
+    expect(authenticatedApi.authorizeNotificationDevice).toHaveBeenCalledOnce();
+    await act(async () => resolve("a".repeat(64)));
+    expect(request).toHaveBeenCalledExactlyOnceWith("a".repeat(64));
   });
 
   it("keeps one subscription across rerenders and declines while hidden", async () => {
