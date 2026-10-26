@@ -3093,7 +3093,7 @@ export interface Overseer extends RpcTarget {
    */
   subscribeToActions(subscriber: RpcStub<ActionsSubscriber>, startAfter?: Date): Promise<RpcStub<{}>>;
 
-  /** List past AI chats. */
+  /** List past AI chats, with each one's id and title. */
   listChats(): Promise<AiChatMetadata[]>;
 
   /**
