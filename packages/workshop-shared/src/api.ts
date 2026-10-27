@@ -2078,6 +2078,10 @@ const SUGGESTED_MODEL_CATALOG = {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
       outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
+    "@cf/moonshotai/kimi-k3": {
+      name: "Kimi K3 (Workers AI)", contextWindow: 262144,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT, hidden: true,
+    },
     "@cf/zai-org/glm-5.2": {
       name: "GLM 5.2 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
@@ -2101,6 +2105,7 @@ const SUGGESTED_MODEL_CATALOG = {
     "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000, hidden: true},
     "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000, hidden: true},
     "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
+    "claude-haiku-5-5": {name: "Claude Haiku 5.5", contextWindow: 200000, hidden: true},
   },
   "openai": {
     // pi's GPT-6 catalog reports a 272K window, but these models support 1.05M. Use 272K as the
