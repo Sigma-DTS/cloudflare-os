@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { embeddedViewHtml } from "@gadgets/workshop-shared/embedded-views";
 import { closeViewBrowser, RenderedView } from "./view-host.js";
 
 afterAll(() => closeViewBrowser());
@@ -91,6 +92,18 @@ describe("RenderedView", { timeout: 60_000 }, () => {
     await using buttons = await RenderedView.open(`
       <button onclick="show('Travel')">Travel</button> <button onclick="show('Groceries')">Groceries</button>${rows}`);
     expect(await buttons.choose("Travel", ["Groceries"], onlyTravel)).toMatchObject({ pass: true });
+  });
+
+  it("runs an embedded view whose script and data hold text that would end a script element", async () => {
+    await using view = await RenderedView.open(embeddedViewHtml({
+      title: "Notes", html: '<p id="a"></p><p id="b"></p>',
+      script: '(data => { a.textContent = data.note; b.textContent = "</script> in code"; })',
+      data: JSON.stringify({ note: "</script><!-- in data" }),
+    }));
+    const text = await view.text();
+    expect(text).toContain("</script><!-- in data");
+    expect(text).toContain("</script> in code");
+    expect(view.errors).toEqual([]);
   });
 
   it("changes a value through the control holding it, or its stepper", async () => {

@@ -117,15 +117,25 @@ import agent from "agent.js";
 // one throws in the agent's code, so the error reaches the model.
 //
 // The view's script is a function in the agent's own code, so it parses with that code and nothing
-// in it is escaped. Its source goes to the view as an expression: a method's source, such as
-// "script(data) { ... }", is not one on its own, so it is read back out of an object literal.
+// in it is escaped. Its source goes to the view as an expression. Only forms that can be rebuilt as
+// one are taken: an arrow, a function, or a method with a plain name, such as "script(data) { ... }",
+// which is read back out of an object literal. Anything else (a generator, a class, a native
+// function, a quoted or computed method name) is refused, so the model can write it again.
 function scriptSource(script) {
   const source = Function.prototype.toString.call(script);
-  if (source.includes("[native code]")) throw new TypeError("embedView's script must be a function written in your code");
-  const unprefixed = source.replace(/^async\\s+/, "");
-  const method = script.name !== "" && !/^function\\b/.test(unprefixed) &&
-      unprefixed.startsWith(script.name) && /^\\s*\\(/.test(unprefixed.slice(script.name.length));
-  return method ? "({" + source + "})[" + JSON.stringify(script.name) + "]" : "(" + source + ")";
+  const unprefixed = source.replace(/^async\\s*/, "");
+  const native = /^function\\s*[\\w$]*\\s*\\(\\)\\s*\\{\\s*\\[native code\\]\\s*\\}$/.test(source);
+  const generator = /^function\\s*\\*/.test(unprefixed) || unprefixed.startsWith("*");
+  if (!native && !generator && !/^class\\b/.test(source)) {
+    if (/^function\\b/.test(unprefixed) || unprefixed.startsWith("(") || /^[A-Za-z_$][\\w$]*\\s*=>/.test(unprefixed)) {
+      return "(" + source + ")";
+    }
+    const name = script.name;
+    if (/^[A-Za-z_$][\\w$]*$/.test(name) && unprefixed.startsWith(name) && /^\\s*\\(/.test(unprefixed.slice(name.length))) {
+      return "({" + source + "})[" + JSON.stringify(name) + "]";
+    }
+  }
+  throw new TypeError("embedView's script must be an arrow function, a function or a method written in your code, such as script: data => { ... }");
 }
 
 function viewCollector() {
@@ -9065,7 +9075,7 @@ class OverseerImpl implements AgentHooks {
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
                         worktreeTurn?: WorktreeTurnAccess)
-      : Promise<{log: string, views: EmbeddedView[]}> {
+      : Promise<{log: string, views: EmbeddedView[], failed: boolean}> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     let executionId: string = bytes.toBase64();
@@ -9163,7 +9173,7 @@ class OverseerImpl implements AgentHooks {
         log = "(function succeeded with no output)";
       }
 
-      return {log, views};
+      return {log, views, failed: error !== undefined};
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
       if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {

@@ -263,3 +263,39 @@ describe("spawned agent tools", () => {
          "requestConnection"]));
   }));
 });
+
+// embedView (plans/embed-view.md): a step that shows a view is the answer, unless a call failed.
+describe("embedView ends the turn", () => {
+  const showView = fauxToolCall("executeCode", {
+    code: `export default async function() { embedView({ title: "T", html: "<p>hi</p>" }); }`,
+  });
+  const fail = fauxToolCall("executeCode", { code: `export default async function() { throw new Error("x"); }` });
+  const chat = (impl: any) => {
+    // executeCode looks its caller up by name.
+    impl.users = { ...impl.users, idFromName: (name: string) => name };
+    impl.storage.chatMeta.put({ id: 1, title: "Chat", started: new Date(0), lastActive: new Date(0) });
+    impl.storage.chats.put({
+      chatId: 1, sequence: impl.nextChatSequence(1), timestamp: new Date(0), author: OWNER,
+      type: "message", message: "Chart it.",
+    });
+  };
+
+  it("asks the model nothing more after a step that showed a view", () => withImpl(async impl => {
+    chat(impl);
+    let offered = await runScriptedTurn(impl, 1, [
+      fauxAssistantMessage([showView], { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxText("Here it is.")),
+    ]);
+    expect(offered).toHaveLength(1);
+    expect(toolCalls(impl, 1)[0]?.views).toEqual([{ title: "T", html: "<p>hi</p>" }]);
+  }));
+
+  it("goes on after a step in which another call failed, so the agent can fix it", () => withImpl(async impl => {
+    chat(impl);
+    let offered = await runScriptedTurn(impl, 1, [
+      fauxAssistantMessage([showView, fail], { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxText("Fixed.")),
+    ]);
+    expect(offered).toHaveLength(2);
+  }));
+});

@@ -110,16 +110,26 @@ run, so it cannot draw while the model writes it, and each view needs a well-for
 
 - **`script` is a function**, `data => { ... }`, written in the `executeCode` source, so the tool
   call parses it with the rest of the code and nothing is escaped. The harness sends its source to
-  the view, which calls it with `data`. It runs in the view, so it sees only `data` and the view's
-  globals, not the variables around it.
+  the view, which calls it with `data`. Only an arrow, a function or a method with a plain name is
+  taken; anything else is refused with an error the model can act on. It runs in the view, so it
+  sees only `data` and the view's globals, not the variables around it.
+- **The view's module goes in as a `data:` URL**, so nothing in its script or data can end the
+  script element. v1 spliced its script in raw, so `"</script>"` in a string would have broken it.
 - **A step that shows a view ends the turn.** The view is the answer: the model writes any words
-  before the call, in the same step. A step whose `executeCode` failed goes on, so the model can
-  fix it.
+  before the call, in the same step. A step in which any `executeCode` call failed goes on, so the
+  model can fix it.
 - **The instructions say to call the tool**, never to paste its code.
 
 v2 also gets the task v1 was built for: a view of more data than a model can retype cheaply,
-read from a Gadget. And the harness times each view's first paint: when an inline block first has
-markup in the stream, and when the step with an `embedView` call is stored.
+read from a Gadget, and a ladder of in-chat views from simple to complex. The harness times each
+turn's first view content: when an inline block first has visible markup in the stream, and when
+the step with an `embedView` call is stored. That is when the Workshop can draw it, not when the
+browser paints it.
+
+A review of v2 found two gaps a production version must close, which no benchmark task reaches:
+the end of a turn after a view is decided in memory only, so a Durable Object reset after the step
+is stored would resume the turn; and a turn answered by a view alone gives a text-only chat gateway
+no response.
 
 ## Not in this exploration
 

@@ -4,13 +4,13 @@
 import type { EmbeddedView } from "./api";
 
 /**
- * The view's HTML, as the body of a `<gadget-ui>` block: its style, its markup, then one module
- * script that calls the view's script function with its data. The data goes in as a JSON string
- * with each `<` escaped, so text in it cannot end the script or add elements.
+ * The view's HTML, as the body of a `<gadget-ui>` block: its style, its markup, then a module that
+ * calls the view's script function with its data. The module goes in as a `data:` URL, so nothing
+ * in the script's source or its data can end the script element or add markup.
  */
 export function embeddedViewHtml(view: EmbeddedView): string {
-  const data = JSON.stringify(view.data ?? "null").replaceAll("<", "\\u003c");
   const style = view.css === undefined ? "" : `<style>${view.css}</style>\n`;
-  const call = view.script === undefined ? "" : `await ${view.script}(JSON.parse(${data}));`;
-  return `${style}${view.html}\n<script type="module">\n${call}\n</script>`;
+  if (view.script === undefined) return `${style}${view.html}`;
+  const module = `await ${view.script}(${view.data ?? "null"});`;
+  return `${style}${view.html}\n<script type="module" src="data:text/javascript;charset=utf-8,${encodeURIComponent(module)}"></script>`;
 }

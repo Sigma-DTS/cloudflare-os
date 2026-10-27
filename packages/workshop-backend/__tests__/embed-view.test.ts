@@ -58,8 +58,14 @@ describe("embedView", () => {
     let source = await run(impl, `embedView({ title: "T", html: "", script: "document.body.append('x')" });`);
     expect(source.log).toContain("TypeError: embedView's script must be a function");
 
-    let native = await run(impl, `embedView({ title: "T", html: "", script: Math.max });`);
-    expect(native.log).toContain("TypeError: embedView's script must be a function written in your code");
+    for (let script of ["Math.max", "function* (data) { yield data; }", 'class { }', '{ "script"(data) {} }.script']) {
+      let refused = await run(impl, `embedView({ title: "T", html: "", script: ${script} });`);
+      expect(refused.log, script).toContain("TypeError: embedView's script must be an arrow function, a function or a method");
+    }
+
+    let quotedNative = await run(impl,
+      `embedView({ title: "T", html: "", script: data => { document.title = "function x() { [native code] }"; } });`);
+    expect(quotedNative.views).toHaveLength(1);
 
     let fifth = await run(impl, `for (let i = 0; i < 5; i++) embedView({ title: "View " + i, html: "" });`);
     expect(fifth.log).toContain("RangeError: embedView: a run shows at most 4 views");
@@ -70,15 +76,15 @@ describe("embedView", () => {
 });
 
 describe("embeddedViewHtml", () => {
-  it("calls the script with the data, written so text in it cannot end the script", () => {
-    const note = "</script><img src=x onerror=alert(1)><!--";
+  it("loads the module from a data URL, so nothing in its script or data can end the script", () => {
     const html = embeddedViewHtml({
-      title: "T", html: "<p></p>", script: "(data => data)", data: JSON.stringify({ note }),
+      title: "T", html: "<p></p>", script: '(data => { document.title = "</script>"; })',
+      data: JSON.stringify({ note: "</script><img src=x onerror=alert(1)><!--" }),
     });
-    const script = html.slice(html.indexOf('<script type="module">'));
-    expect(script.indexOf("</script>")).toBe(script.length - "</script>".length);
+    expect(html.match(/<script\b/g)).toHaveLength(1);
     expect(html).not.toContain("<img");
-    const literal = /^await \(data => data\)\(JSON\.parse\((".*")\)\);$/m.exec(html)?.[1];
-    expect(JSON.parse(JSON.parse(literal ?? '""'))).toEqual({ note });
+    const src = /<script type="module" src="data:text\/javascript;charset=utf-8,([^"]*)"><\/script>$/.exec(html)?.[1];
+    expect(decodeURIComponent(src ?? "")).toBe(
+      'await (data => { document.title = "</script>"; })({"note":"</script><img src=x onerror=alert(1)><!--"});');
   });
 });

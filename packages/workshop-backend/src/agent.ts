@@ -536,7 +536,7 @@ export interface AgentHooks {
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void,
-                   worktreeTurn?: WorktreeTurnAccess): Promise<{log: string, views: EmbeddedView[]}>;
+                   worktreeTurn?: WorktreeTurnAccess): Promise<{log: string, views: EmbeddedView[], failed: boolean}>;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
@@ -2937,10 +2937,12 @@ async function runAgentPass(
   // thus no resume).
   let connectionRequested = false;
 
-  // Set once an executeCode call shows a view with embedView. The view is the answer, so finishTurn
-  // ends the turn after that step rather than asking the model for words under it. A failed call
-  // shows nothing and leaves this false, so the agent can fix its code in the same turn.
+  // What this step's executeCode calls did: showed a view with embedView, or failed. A view is the
+  // answer, so finishTurn ends the turn after a step that showed one, rather than asking the model
+  // for words under it; but a step in which any call failed goes on, so the agent can fix its code.
+  // finishTurn clears both for the next step.
   let viewShown = false;
+  let codeFailed = false;
 
   // Latched by finishTurn when this step submitted an awaitDecision action. The awaited turn_end
   // barrier persists the action before the loop ends and waits for approval to resume it.
@@ -3874,7 +3876,7 @@ async function runAgentPass(
                 "step ends. End this response and call executeCode again in your next step.");
           }
 
-          let {log, views} = await hooks.executeCodeMode(
+          let {log, views, failed} = await hooks.executeCodeMode(
               chatId, code, initiator, author.id, Object.fromEntries(chatBindings),
               delta => emitStreamEvent({
                 type: "toolOutputDelta",
@@ -3884,10 +3886,12 @@ async function runAgentPass(
               worktreeTurnAccess);
           // The model reads which views the user now sees; replay reads `output` back as is.
           let output = [log, ...views.map(view => `Showed the user a view: ${view.title}.`)].join("\n");
-          if (views.length > 0) viewShown = true;
+          if (failed) codeFailed = true;
+          else if (views.length > 0) viewShown = true;
           return toolResult(output,
               {output, ...views.length > 0 ? {views} : {}} as Partial<AiToolCall>);
         } catch (error) {
+          codeFailed = true;
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)
           });
@@ -4374,6 +4378,8 @@ async function runAgentPass(
         text => ({role: "user" as const, content: text, timestamp: Date.now()})),
     maxTokens: maxOutputTokens,
     finishTurn: ({message, toolResults}) => {
+      let viewAnswered = viewShown && !codeFailed;
+      viewShown = codeFailed = false;
       if (message.stopReason === "error" || message.stopReason === "aborted") return;
       capturedActionsForStep = hooks.consumeCapturedActions(chatId);
       if (capturedActionsForStep?.awaitDecision) awaitingActionDecision = true;
@@ -4396,7 +4402,7 @@ async function runAgentPass(
           // in the same turn.
           connectionRequested ||
           // A view the agent showed is its answer (see viewShown).
-          viewShown ||
+          viewAnswered ||
           // Wait for approval before continuing against state that may not reflect the action.
           awaitingActionDecision) {
         return {action: "end"};
