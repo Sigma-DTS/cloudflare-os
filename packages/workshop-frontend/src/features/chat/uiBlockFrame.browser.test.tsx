@@ -17,29 +17,25 @@ afterEach(() => {
 
 /** Runs `body` as a block in a frame, as the card does, and returns the first message it asks to send. */
 function runBlock(body: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const iframe = document.body.appendChild(document.createElement('iframe'))
-    iframe.sandbox.add('allow-scripts')
-    resources.push({ [Symbol.dispose]: () => iframe.remove() })
-    window.addEventListener('message', function handshake(event) {
-      const port = event.ports[0]
-      if (event.source !== iframe.contentWindow || port === undefined) return
-      window.removeEventListener('message', handshake)
-      const host = new UiBlockHostImpl({
-        openBinding: () => Promise.reject(new Error('This test has no bindings.')),
-        onBinding: () => {},
-        onBindingBroken: () => {},
-        onMessageRequest: resolve,
-        onResize: () => {},
-        onError: message => reject(new Error(message)),
-      })
-      const frame = newMessagePortRpcSession<UiBlockFrame>(port, host)
-      resources.push(host, frame)
-      frame.write(createUiBlockDocumentStart(THEME) + body).catch(reject)
-      frame.close().catch(reject)
-    })
-    iframe.srcdoc = createUiBlockShell(THEME)
+  const { promise, resolve, reject } = Promise.withResolvers<string>()
+  const iframe = document.body.appendChild(document.createElement('iframe'))
+  iframe.sandbox.add('allow-scripts')
+  resources.push({ [Symbol.dispose]: () => iframe.remove() })
+  window.addEventListener('message', function handshake(event) {
+    const port = event.ports[0]
+    if (event.source !== iframe.contentWindow || port === undefined) return
+    window.removeEventListener('message', handshake)
+    const frame = newMessagePortRpcSession<UiBlockFrame>(port, new UiBlockHostImpl({
+      onMessageRequest: resolve,
+      onResize: () => {},
+      onError: message => reject(new Error(message)),
+    }))
+    resources.push(frame)
+    frame.write(createUiBlockDocumentStart(THEME) + body).catch(reject)
+    frame.close().catch(reject)
   })
+  iframe.srcdoc = createUiBlockShell(THEME)
+  return promise
 }
 
 it('lets a view clear an element, but not parse a string as HTML or as a handler', async () => {

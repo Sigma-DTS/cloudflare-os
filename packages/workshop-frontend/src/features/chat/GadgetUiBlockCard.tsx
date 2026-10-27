@@ -2,7 +2,6 @@ import { type RefObject, useEffect, useEffectEvent, useLayoutEffect, useRef, use
 import { Banner, Text } from '@cloudflare/kumo'
 import { PaperPlaneRightIcon } from '@phosphor-icons/react'
 import { newMessagePortRpcSession, type RpcStub } from 'capnweb'
-import type { Overseer } from '@gadgets/workshop-shared/api'
 import type { GadgetUiSegment } from '@gadgets/workshop-shared/gadget-ui-blocks'
 import { useTheme } from '../../ThemeContext'
 import { WorkshopButton } from '../../components/WorkshopControls'
@@ -16,28 +15,15 @@ import {
 
 const MIN_HEIGHT = 40
 const MAX_HEIGHT = 720
-// A view reloads when one of its bindings breaks, as a gadget's server does on every code change.
-// One that keeps breaking within STABLE_CONNECTION_MS of its handshake waits longer each time.
-const STABLE_CONNECTION_MS = 10_000
-const MAX_RELOAD_DELAY_MS = 30_000
-const reloadDelay = (quickBreaks: number) =>
-  quickBreaks === 0 ? 0 : Math.min(1000 * 2 ** (quickBreaks - 1), MAX_RELOAD_DELAY_MS)
 
 export type GadgetUiBlockCardProps = {
-  overseer: RpcStub<Overseer>
-  chatId: number
   /** The block: closed, or still open while its answer streams, with its HTML so far. */
   block: Exclude<GadgetUiSegment, { kind: 'text' }>
-  /** The answer is still streaming: its tool calls have not run yet. */
-  streaming: boolean
   /** Sends a message as the viewer, as the composer does. Reports its own failures, then throws. */
   onSendMessage: (message: string) => Promise<void>
   /** Why the viewer cannot send now, e.g. the chat waits on an approval. */
   sendBlockedReason?: string
-  /**
-   * Runs after the view's height may have changed: its frame reported a new height, its chip came
-   * or went, or a binding's name joined the line under it.
-   */
+  /** Runs after the view's height may have changed: its frame reported a new height, or its chip came or went. */
   onHeightChange: () => void
   /** The chat's scrolling message list. It clips the view before the window does. */
   scrollRoot: RefObject<HTMLElement | null>
@@ -51,16 +37,15 @@ const clampHeight = (height: number) =>
 
 /** A live `<gadget-ui>` block of an agent answer, drawn in place in a sandboxed frame. */
 export const GadgetUiBlockCard = ({
-  overseer, chatId, block, streaming, onSendMessage, sendBlockedReason, onHeightChange, scrollRoot,
+  block, onSendMessage, sendBlockedReason, onHeightChange, scrollRoot,
 }: GadgetUiBlockCardProps) => {
   const { resolvedThemeMode } = useTheme()
   const cardRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   // The current frame load: its frame, and how much of the block it has.
   const loadRef = useRef<{ frame: RpcStub<UiBlockFrame>; written: number; closed: boolean } | null>(null)
-  const quickBreaksRef = useRef(0)
   const [nearViewport, setNearViewport] = useState(false)
-  // The viewer stopped the view: its frame and stubs are gone until they run it again.
+  // The viewer stopped the view: its frame is gone until they run it again.
   const [stopped, setStopped] = useState(false)
   const [height, setHeight] = useState(MIN_HEIGHT)
   // Why the view stopped itself, until the viewer reloads it. A block the parser refused never runs.
@@ -71,37 +56,6 @@ export const GadgetUiBlockCard = ({
   const [codeError, setCodeError] = useState<string | null>(null)
   const [frameKey, setFrameKey] = useState(0)
   const [chip, setChip] = useState<Chip | null>(null)
-  // Names the view's code opened, in the order it opened them.
-  const [names, setNames] = useState<string[]>([])
-
-  // The Overseer connection the current frame load asked for a binding on. Its stubs and lookups
-  // die with that connection, so a new one (the Workshop reconnected) needs a new load. A frame
-  // that never asked keeps running.
-  const [askedOn, setAskedOn] = useState<{ stub: RpcStub<Overseer> } | null>(null)
-  if (askedOn !== null && askedOn.stub !== overseer) {
-    setAskedOn(null)
-    setFrameKey(key => key + 1)
-  }
-
-  // A lookup failed while the answer streamed. The answer's tool calls run after its text, so they
-  // may add the binding: the view loads again once the answer is stored.
-  const [failedWhileStreaming, setFailedWhileStreaming] = useState(false)
-  if (failedWhileStreaming && !streaming) {
-    setFailedWhileStreaming(false)
-    setFrameKey(key => key + 1)
-  }
-
-  const openBinding = useEffectEvent(async (name: string) => {
-    // Marked before the lookup, so a lookup still in flight when the Workshop reconnects counts.
-    setAskedOn(current => current ?? { stub: overseer })
-    const askedWhileStreaming = streaming
-    try {
-      return await overseer.connectToChatBinding(chatId, name)
-    } catch (err) {
-      if (askedWhileStreaming) setFailedWhileStreaming(true)
-      throw err
-    }
-  })
 
   // Sends the frame what it lacks of the block: the HTML that arrived since its last write, then
   // the end of its document once the block closes. Each call is settled so that capnweb releases
@@ -136,17 +90,13 @@ export const GadgetUiBlockCard = ({
 
   useEffect(() => {
     if (!live) return
-    let closed = false
     let handshakes = 0
-    let reloading = false
-    const resources: Disposable[] = []
     const teardown = () => {
+      loadRef.current?.frame[Symbol.dispose]()
       loadRef.current = null
       // A request needs the frame that made it, and an error the document that threw it.
       setChip(null)
       setCodeError(null)
-      setAskedOn(null)
-      for (const resource of resources.splice(0).toReversed()) resource[Symbol.dispose]()
     }
 
     const handleMessage = (event: MessageEvent) => {
@@ -161,25 +111,11 @@ export const GadgetUiBlockCard = ({
         setStopReason('This view reloaded itself, so it was stopped.')
         return
       }
-      const openedAt = Date.now()
-      const host = new UiBlockHostImpl({
-        openBinding: name => openBinding(name),
-        onBinding: name => setNames(current => current.includes(name) ? current : [...current, name]),
-        onBindingBroken: () => {
-          // Disposing a stub can report it broken, and the stubs of one load often break together.
-          if (closed || reloading) return
-          reloading = true
-          if (Date.now() - openedAt > STABLE_CONNECTION_MS) quickBreaksRef.current = 0
-          const timer = setTimeout(() => setFrameKey(key => key + 1), reloadDelay(quickBreaksRef.current++))
-          resources.push({ [Symbol.dispose]: () => clearTimeout(timer) })
-        },
+      const frame = newMessagePortRpcSession<UiBlockFrame>(port, new UiBlockHostImpl({
         onMessageRequest: message => setChip({ message, sending: false }),
         onResize: reported => setHeight(clampHeight(reported)),
         onError: setCodeError,
-      })
-      resources.push(host)
-      const frame = newMessagePortRpcSession<UiBlockFrame>(port, host)
-      resources.push(frame)
+      }))
       loadRef.current = { frame, written: 0, closed: false }
       frame.write(createUiBlockDocumentStart(readUiBlockTheme())).catch(() => {})
       writeBlock()
@@ -187,7 +123,6 @@ export const GadgetUiBlockCard = ({
 
     window.addEventListener('message', handleMessage)
     return () => {
-      closed = true
       window.removeEventListener('message', handleMessage)
       teardown()
     }
@@ -198,7 +133,7 @@ export const GadgetUiBlockCard = ({
     loadRef.current?.frame.setTheme(readUiBlockTheme()).catch(() => {})
   }, [resolvedThemeMode])
 
-  useLayoutEffect(() => onHeightChange(), [height, chip, names, onHeightChange])
+  useLayoutEffect(() => onHeightChange(), [height, chip, onHeightChange])
 
   const send = async () => {
     if (!chip || chip.sending || sendBlockedReason !== undefined) return
@@ -214,7 +149,6 @@ export const GadgetUiBlockCard = ({
   }
 
   const reload = () => {
-    quickBreaksRef.current = 0
     setStopReason(null)
     setFrameKey(key => key + 1)
   }
@@ -243,18 +177,13 @@ export const GadgetUiBlockCard = ({
         </div>
       )}
       {error === null && (
-        // Workshop chrome the frame cannot draw: where the view ends, and what it reached.
+        // Workshop chrome the frame cannot draw: where the view ends.
         <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11px] leading-4 text-kumo-inactive">
           <span>{stopped ? 'View stopped' : block.kind === 'open' ? 'Drawing…' : 'Live view'}</span>
-          {!stopped && names.length > 0 && <span className="font-mono">{names.join(', ')}</span>}
           <button
             type="button"
             aria-label={stopped ? `Run ${title} again` : `Stop ${title}`}
-            onClick={() => {
-              // Run starts afresh, as Reload does.
-              if (stopped) quickBreaksRef.current = 0
-              setStopped(!stopped)
-            }}
+            onClick={() => setStopped(!stopped)}
             className={`cursor-pointer rounded px-1 font-medium transition-[color,opacity] duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none ${
               stopped ? '' : 'sm:opacity-0 sm:group-hover/view:opacity-100 sm:group-focus-within/view:opacity-100'
             }`}

@@ -3,13 +3,8 @@
 // agent-written and nobody reviews it, so the frame gets the gadget UI sandbox and only what
 // UiBlockHost offers.
 
-import { RpcTarget, type RpcPromise, type RpcStub } from 'capnweb'
-import { validateBindingName, type ViewBinding } from '@gadgets/workshop-shared/api'
+import { RpcTarget } from 'capnweb'
 import { CAPNWEB_MODULE_URL, SANDBOX_HEAD } from '../../sandboxDocument'
-import { createRateLimitedCapability, type RateLimitOptions } from '../../rateLimitedCapability'
-
-/** A chat binding, as `env.NAME` gives it to a block's code: a gadget's `{rpc}`, or a session. */
-export type UiBlockBinding = { rpc: RpcStub<any> } | RpcStub<any>
 
 /** The Workshop's theme, as a block's frame applies it. */
 export type UiBlockTheme = {
@@ -20,9 +15,6 @@ export type UiBlockTheme = {
 
 /** What a block's frame may call on the Workshop, through the session its handshake opens. */
 export interface UiBlockHost {
-  /** Opens the chat binding `name` for the block. Each name opens once per frame load. */
-  binding(name: string): Promise<UiBlockBinding>
-
   /**
    * Asks the viewer to send `message` to the chat as their own message. The Workshop shows it
    * under the block, and sends it only when the viewer clicks Send. A newer request from the same
@@ -82,26 +74,8 @@ export function readUiBlockTheme(): UiBlockTheme {
   }
 }
 
-// Block code picks the names, and each name's first use is a kernel lookup.
-const MAX_BINDINGS = 32
-
-// A block can stay on screen as long as a dashboard, so pace a flood rather than fail it.
-const BINDING_LIMITS: RateLimitOptions = {
-  maxConcurrency: 8,
-  maxCallsPerMinute: 600,
-  maxPendingCalls: 128,
-  onRateLimit: 'throttle',
-  label: 'Chat view',
-}
-
 /** What a block's host does for its card. */
 export type UiBlockHostOptions = {
-  /** Asks the kernel for the chat binding `name`. The host disposes the result when it closes. */
-  openBinding: (name: string) => Promise<Awaited<RpcPromise<ViewBinding>>>
-  /** The block's code opened `name`. */
-  onBinding: (name: string) => void
-  /** A binding's stub broke, e.g. because its gadget's server restarted. */
-  onBindingBroken: () => void
   onMessageRequest: (message: string) => void
   onResize: (height: number) => void
   onError: (message: string) => void
@@ -109,46 +83,14 @@ export type UiBlockHostOptions = {
 
 /**
  * The Workshop's end of a block's frame session. Block code runs in the bootstrap's realm and can
- * reach its port, so every limit lives here.
+ * reach its port, so the host checks what each call passes.
  */
 export class UiBlockHostImpl extends RpcTarget implements UiBlockHost {
   readonly #options: UiBlockHostOptions
-  readonly #bindings = new Map<string, Promise<UiBlockBinding>>()
-  readonly #resources: Disposable[] = []
-  #closed = false
 
   constructor(options: UiBlockHostOptions) {
     super()
     this.#options = options
-  }
-
-  binding(name: string): Promise<UiBlockBinding> {
-    if (typeof name !== 'string') throw new TypeError('A binding name is a string.')
-    validateBindingName(name)
-    let binding = this.#bindings.get(name)
-    if (binding === undefined) {
-      if (this.#bindings.size >= MAX_BINDINGS) {
-        throw new Error(`A view can use at most ${MAX_BINDINGS} bindings.`)
-      }
-      binding = this.#open(name)
-      this.#bindings.set(name, binding)
-    }
-    return binding
-  }
-
-  async #open(name: string): Promise<UiBlockBinding> {
-    const binding = await this.#options.openBinding(name)
-    if (this.#closed) {
-      binding[Symbol.dispose]()
-      throw new Error('This view has closed.')
-    }
-    this.#resources.push(binding)
-    const stub = binding.type === 'gadget' ? binding.rpc : binding.session
-    stub.onRpcBroken(() => this.#options.onBindingBroken())
-    const limited = createRateLimitedCapability(stub, BINDING_LIMITS)
-    this.#resources.push({ [Symbol.dispose]: limited.dispose })
-    this.#options.onBinding(name)
-    return binding.type === 'gadget' ? { rpc: limited.capability } : limited.capability
   }
 
   requestMessage(message: string): void {
@@ -164,11 +106,6 @@ export class UiBlockHostImpl extends RpcTarget implements UiBlockHost {
 
   reportError(message: string): void {
     this.#options.onError(String(message))
-  }
-
-  [Symbol.dispose](): void {
-    this.#closed = true
-    for (const resource of this.#resources.splice(0).toReversed()) resource[Symbol.dispose]()
   }
 }
 
@@ -228,16 +165,6 @@ const { port1, port2 } = new MessageChannel();
 window.parent.postMessage("handshake", "*", [port2]);
 const host = newMessagePortRpcSession(port1, new Frame());
 
-// The same promise for each name, so env.NAME stays one object. Nothing for "then", so that
-// awaiting env does not ask for a binding.
-const bindings = new Map();
-globalThis.env = new Proxy({}, {
-  get(_target, name) {
-    if (typeof name !== "string" || name === "then") return undefined;
-    if (!bindings.has(name)) bindings.set(name, host.binding(name));
-    return bindings.get(name);
-  },
-});
 globalThis.agent = Object.freeze({
   send: message => host.requestMessage(message),
 });
