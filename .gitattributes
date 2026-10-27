@@ -10,3 +10,6 @@
 # them in diffs.
 packages/api-schema/generated/** linguist-generated
 packages/api-cli/generated/** linguist-generated
+
+# Written by `pnpm types:generate` (`wrangler types`) and checked by `types:generate --check`.
+**/worker-configuration.d.ts linguist-generated
