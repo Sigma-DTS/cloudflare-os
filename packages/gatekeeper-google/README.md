@@ -73,9 +73,11 @@ Before creating credentials, you must configure how the consent screen appears t
 
 The scopes requested depend on what the user is doing. **Sign-in** requests only the identity
 scopes (`openid`, `userinfo.email`, `userinfo.profile`). **Connecting** Google for capabilities
-requests scopes granularly per resource type, not all at once: connecting a Gmail mailbox asks
-only for the Gmail scopes, a Google Doc only for the Docs scopes, and so on (identity is always
-included). Across all resource types, the gatekeeper can request:
+requests scopes per connect card, not all at once: connecting a Gmail mailbox asks only for the
+Gmail scopes, a calendar only for the Calendar scopes, and so on (identity is always included).
+A card asks for every type on it together, so connecting anything from the Google Drive card (all
+of Drive, a folder, a file, a Doc, a spreadsheet or a presentation) asks for all of their scopes.
+Across all resource types, the gatekeeper can request:
 
 - `openid`, `userinfo.profile`, and `userinfo.email` to identify the connected account.
 - `gmail.modify` for Gmail thread reads, organization, replies, forwards, and sending. This single scope already includes label access and sending.
@@ -621,7 +623,7 @@ Drive exposes three permanent resource URL forms:
 
 The Drive picker opens on Google Drive, whose own choice binds the whole account, above My Drive, Shared drives, Shared with me and Recent. Locations list a page at a time. Search spans My Drive, "Shared with me" and every shared drive the account is a member of (`corpora=allDrives`) and says where each result lives, and a Drive, Docs, Sheets or Slides link pasted into it answers with the one folder or file the link names. A pre-filled folder or file opens where it lives, with breadcrumbs up to My Drive or its shared drive, or with none when an ancestor is out of reach or more than 20 folders up. All of this runs on the Drive resources' own grant except listing Shared drives, which also needs the shared-drives grant above: until the account holds it, opening Shared drives offers **Allow access**, and a shared drive's folders stay reachable through search, a pasted link or a pre-filled URL. Folders whose children the account cannot list are shown but cannot be opened or bound; on a pre-filled node's breadcrumbs, where Google's [folders with limited access](https://developers.google.com/workspace/drive/api/guides/limited-expansive-access) put them above a file shared directly, they can be opened but are not offered. A shortcut stands for its target, which a listing says nothing of, so a page's shortcut targets are read in one batch: a shortcut left behind when its target was deleted, unshared or trashed is left out, and one to a folder is judged as that folder would be. A search Google reports as incomplete fails rather than presenting partial results as complete.
 
-A native Docs, Sheets or Slides file binds as its editable type (Google Doc, Spreadsheet or Slides Presentation), checked first as an Office file is, unless the Workshop accepts only Drive files, as a blueprint's Drive file binding does, when it binds read-only as a Drive file. An Office file binds as the type it converts into, once converted (see [Office files](#office-files)); any other file binds as a Drive file. Recent lists the account's files newest first, folders left out.
+A native Docs, Sheets or Slides file binds as its editable type (Google Doc, Spreadsheet or Slides Presentation), checked first as an Office file is, unless the Workshop accepts only Drive files, as a blueprint's Drive file binding does, when it binds read-only as a Drive file. An Office file binds as the type it converts into, once converted (see [Office files](#office-files)); any other file binds as a Drive file. Recent lists the files the account created, opened or had shared with it, newest first, folders left out.
 
 A folder URL carrying `?resourcekey=` is not supported: the key is dropped, and the binding then fails with a Drive 404 for anyone whose access to that folder comes from the link rather than from a direct grant. Google requires resource keys only for items shared by link before September 2021, and only for link-access users — an owner or anyone granted access directly is unaffected, even when the URL they paste happens to carry a key. Such a folder needs direct access to connect.
 

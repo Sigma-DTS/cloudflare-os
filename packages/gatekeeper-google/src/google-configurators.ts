@@ -489,8 +489,10 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
           await drive.listFiles({ ...page, sharedWithMe: true, orderBy: "folder,name" }));
       }
       if (parentId === RECENT.id) {
-        // The account's own files, newest first, as Drive's Recent shows them; folders are browsed.
-        let recent = await driveFilePage(drive, await drive.listFiles(page));
+        // Files the account created, opened or had shared with it, newest first, as Drive's Recent
+        // shows them. Folders are browsed, so Drive leaves them out before paging, where they could
+        // empty a page; a shortcut to one is dropped once resolved.
+        let recent = await driveFilePage(drive, await drive.listFiles({ ...page, excludeFolders: true }));
         return { ...recent, nodes: recent.nodes.filter(node => node.kind === "file") };
       }
       let folder = parseDriveNodeId(parentId);

@@ -207,20 +207,25 @@ describe("Google resource configurators", () => {
         ["doc:d1", "doc:d2", "sheets:s1", "sheets:s2", "slides:p1", "file:f1"]);
     });
 
-    it("lists the account's recent files, newest first, leaving folders to be browsed", async () => {
+    it("lists recent files, newest first, leaving folders to be browsed", async () => {
       const calls = stubDrive({
         "/files": {
           files: [
             { id: "d1", name: "Notes", mimeType: "application/vnd.google-apps.document" },
-            { id: "sub", name: "Plans", mimeType: FOLDER, capabilities: { canListChildren: true } },
+            {
+              id: "link", name: "Team folder", mimeType: SHORTCUT,
+              shortcutDetails: { targetId: "team", targetMimeType: FOLDER },
+            },
           ],
         },
+        "/files/team": { id: "team", mimeType: FOLDER, trashed: false, capabilities: { canListChildren: true } },
       });
 
       await expect(picker().listDriveNodes("recent", "", null)).resolves.toEqual({
         nodes: [{ id: "doc:d1", title: "Notes", kind: "file", mimeType: "application/vnd.google-apps.document" }],
       });
-      expect(calls[0].searchParams.get("q")).toBe("trashed = false");
+      // Folders before paging, so they cannot empty a page; a shortcut to one only once resolved.
+      expect(calls[0].searchParams.get("q")).toBe(`trashed = false and mimeType != '${FOLDER}'`);
       expect(calls[0].searchParams.get("corpora")).toBe("user");
       expect(calls[0].searchParams.get("orderBy")).toBe("modifiedTime desc");
     });
