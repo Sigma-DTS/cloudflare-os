@@ -687,26 +687,29 @@ Tools refer to Gadgets by their binding name in your env: the file tools (\`read
 
 # Live views
 
-You can show the user an interactive view in the chat by calling \`embedView\` in \`executeCode\`. Read or work out the data the view needs in the same code, and pass it as \`data\`: the view gets it as it is, so never retype values into the view's code. The Workshop shows the view in a sandboxed frame below this step once the step ends, so your answer after it should not repeat what it shows. Show a view when it beats prose: comparisons, choices between options, numbers over time, or a one-off demo or tool. A short answer or an explanation stays plain text.
+You can show the user an interactive view in the chat by calling \`embedView\` in code you run with the \`executeCode\` tool. Read or work out the data the view needs in the same code, and pass it as \`data\`: the view gets it as it is, so never retype values into the view's code. Call the tool; never paste its code into your answer. Show a view when it beats prose: comparisons, choices between options, numbers over time, or a one-off demo or tool. A short answer or an explanation stays plain text.
+
+The view is your answer: once the step that showed it is done, your turn ends. Write anything you want to say before the tool call, and do any other work first.
 
 \`\`\`
 export default async function(self, env) {
   embedView({
     title: "Food spending by week",
     html: '<h3>Food spending by week</h3><div id="weeks"></div>',
-    js: \`
+    data: { limit: 120, weeks: [[1, 96], [2, 132], [3, 88], [4, 141]] },
+    script: data => {
       const list = document.getElementById("weeks");
       for (const [week, total] of data.weeks) {
         const bar = list.appendChild(document.createElement("button"));
-        bar.textContent = "Week " + week + ": $" + total + " of $" + data.limit;
-        bar.onclick = () => agent.send("Show me week " + week + " in detail.");
-      }\`,
-    data: { limit: 120, weeks: [[1, 96], [2, 132], [3, 88], [4, 141]] },
+        bar.textContent = \`Week \${week}: $\${total} of $\${data.limit}\`;
+        bar.onclick = () => agent.send(\`Show me week \${week} in detail.\`);
+      }
+    },
   });
 }
 \`\`\`
 
-* \`embedView({ title, html, css, js, data })\`: \`title\` names the view but is not shown. \`html\` is the whole view, and it sits in the chat with no border or padding around it, so draw any heading or box yourself. \`css\` is its style. \`js\` runs as a module script after the markup, with the globals \`data\` and \`agent\`. \`data\` is any JSON value. Only \`title\` and \`html\` are required. One \`executeCode\` call shows at most 4 views, each up to 256 KiB.
+* \`embedView({ title, html, css, data, script })\`: \`title\` names the view but is not shown. \`html\` is the whole view, and it sits in the chat with no border or padding around it, so draw any heading or box yourself. \`css\` is its style. \`data\` is any JSON value. \`script\` is a function that runs in the view after its markup, called with \`data\`: it sees only \`data\` and the view's globals, such as \`document\` and \`agent\`, not the variables in the code around it. Only \`title\` and \`html\` are required. One \`executeCode\` call shows at most 4 views, each up to 256 KiB.
 * A view has no \`env\` and no network: it shows \`data\` and what its code draws. No \`fetch()\`, and no remote scripts, styles, fonts or images. Draw charts with inline SVG or the DOM.
 * The view's code runs again each time the view scrolls into sight, and for each person viewing the chat.
 * Show data with \`textContent\`. In a view, \`innerHTML\` (except \`= ""\` to clear), \`insertAdjacentHTML\` and the other ways to parse a string as HTML throw. Make SVG elements with \`document.createElementNS("http://www.w3.org/2000/svg", name)\` and \`setAttribute\`.
@@ -2934,6 +2937,11 @@ async function runAgentPass(
   // thus no resume).
   let connectionRequested = false;
 
+  // Set once an executeCode call shows a view with embedView. The view is the answer, so finishTurn
+  // ends the turn after that step rather than asking the model for words under it. A failed call
+  // shows nothing and leaves this false, so the agent can fix its code in the same turn.
+  let viewShown = false;
+
   // Latched by finishTurn when this step submitted an awaitDecision action. The awaited turn_end
   // barrier persists the action before the loop ends and waits for approval to resume it.
   let awaitingActionDecision = false;
@@ -3876,6 +3884,7 @@ async function runAgentPass(
               worktreeTurnAccess);
           // The model reads which views the user now sees; replay reads `output` back as is.
           let output = [log, ...views.map(view => `Showed the user a view: ${view.title}.`)].join("\n");
+          if (views.length > 0) viewShown = true;
           return toolResult(output,
               {output, ...views.length > 0 ? {views} : {}} as Partial<AiToolCall>);
         } catch (error) {
@@ -4386,6 +4395,8 @@ async function runAgentPass(
           // unresolvable resource) leaves this false so the agent can fix the request and retry
           // in the same turn.
           connectionRequested ||
+          // A view the agent showed is its answer (see viewShown).
+          viewShown ||
           // Wait for approval before continuing against state that may not reflect the action.
           awaitingActionDecision) {
         return {action: "end"};

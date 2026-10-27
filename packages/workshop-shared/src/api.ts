@@ -4566,9 +4566,12 @@ export type EmbeddedView = {
   html: string;
   /** The view's style. */
   css?: string;
-  /** The view's module script, which runs after its markup with the globals `data` and `agent`. */
-  js?: string;
-  /** The JSON text of the view's data, which its script reads as `data`. */
+  /**
+   * The source of the view's script function, as an expression. The view calls it with `data`
+   * after its markup; it also sees the global `agent`.
+   */
+  script?: string;
+  /** The JSON text of the view's data, which its script gets as its argument. */
   data?: string;
 };
 

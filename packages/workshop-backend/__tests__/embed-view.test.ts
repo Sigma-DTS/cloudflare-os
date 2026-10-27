@@ -32,16 +32,20 @@ const run = (impl: Runner, body: string) =>
   impl.executeCodeMode(1, `export default async function() {\n${body}\n}`, ALICE, "some-model", {});
 
 describe("embedView", () => {
-  it("hands back each view the code showed, with its data as JSON", () => withImpl(async impl => {
+  it("hands back each view the code showed, with its script as source and its data as JSON",
+      () => withImpl(async impl => {
     let { log, views } = await run(impl, `
-      embedView({ title: "Totals", html: "<p id=t></p>", js: "t.textContent = data.food",
+      const outside = 1;
+      embedView({ title: "Totals", html: "<p id=t></p>", script: data => { t.textContent = \`$\${data.food}\`; },
                   data: { food: 420, at: new Date(0) } });
+      embedView({ title: "Method", html: "", async script(data) { return data; } });
       embedView({ title: "Plain", html: "<p>hi</p>" });
       console.log("done");`);
     expect(log).toBe("done");
     expect(views).toEqual([
-      { title: "Totals", html: "<p id=t></p>", js: "t.textContent = data.food",
+      { title: "Totals", html: "<p id=t></p>", script: "(data => { t.textContent = `$${data.food}`; })",
         data: '{"food":420,"at":"1970-01-01T00:00:00.000Z"}' },
+      { title: "Method", html: "", script: '({async script(data) { return data; }})["script"]' },
       { title: "Plain", html: "<p>hi</p>" },
     ]);
   }));
@@ -50,6 +54,12 @@ describe("embedView", () => {
     let untitled = await run(impl, `embedView({ html: "<p>hi</p>" });`);
     expect(untitled.log).toContain("TypeError: embedView needs a title");
     expect(untitled.views).toEqual([]);
+
+    let source = await run(impl, `embedView({ title: "T", html: "", script: "document.body.append('x')" });`);
+    expect(source.log).toContain("TypeError: embedView's script must be a function");
+
+    let native = await run(impl, `embedView({ title: "T", html: "", script: Math.max });`);
+    expect(native.log).toContain("TypeError: embedView's script must be a function written in your code");
 
     let fifth = await run(impl, `for (let i = 0; i < 5; i++) embedView({ title: "View " + i, html: "" });`);
     expect(fifth.log).toContain("RangeError: embedView: a run shows at most 4 views");
@@ -60,13 +70,15 @@ describe("embedView", () => {
 });
 
 describe("embeddedViewHtml", () => {
-  it("writes the data into the view's script so text in it cannot end the script", () => {
+  it("calls the script with the data, written so text in it cannot end the script", () => {
     const note = "</script><img src=x onerror=alert(1)><!--";
-    const html = embeddedViewHtml({ title: "T", html: "<p></p>", data: JSON.stringify({ note }) });
+    const html = embeddedViewHtml({
+      title: "T", html: "<p></p>", script: "(data => data)", data: JSON.stringify({ note }),
+    });
     const script = html.slice(html.indexOf('<script type="module">'));
     expect(script.indexOf("</script>")).toBe(script.length - "</script>".length);
     expect(html).not.toContain("<img");
-    const literal = /JSON\.parse\((".*")\);/.exec(html)?.[1];
+    const literal = /^await \(data => data\)\(JSON\.parse\((".*")\)\);$/m.exec(html)?.[1];
     expect(JSON.parse(JSON.parse(literal ?? '""'))).toEqual({ note });
   });
 });

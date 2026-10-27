@@ -112,20 +112,37 @@ let CODE_MODE_HARNESS =
 `import { WorkerEntrypoint, restore } from "cloudflare:workers";
 import agent from "agent.js";
 
-// embedView(spec) shows a live view in the chat when the step ends (see plans/embed-view.md). It
-// keeps a JSON copy of each spec that passes its checks; a spec that fails one throws in the
-// agent's code, so the error reaches the model.
+// embedView(spec) shows a live view in the chat, and ends the turn once the step is done (see
+// plans/embed-view.md). It keeps a JSON copy of each spec that passes its checks; a spec that fails
+// one throws in the agent's code, so the error reaches the model.
+//
+// The view's script is a function in the agent's own code, so it parses with that code and nothing
+// in it is escaped. Its source goes to the view as an expression: a method's source, such as
+// "script(data) { ... }", is not one on its own, so it is read back out of an object literal.
+function scriptSource(script) {
+  const source = Function.prototype.toString.call(script);
+  if (source.includes("[native code]")) throw new TypeError("embedView's script must be a function written in your code");
+  const unprefixed = source.replace(/^async\\s+/, "");
+  const method = script.name !== "" && !/^function\\b/.test(unprefixed) &&
+      unprefixed.startsWith(script.name) && /^\\s*\\(/.test(unprefixed.slice(script.name.length));
+  return method ? "({" + source + "})[" + JSON.stringify(script.name) + "]" : "(" + source + ")";
+}
+
 function viewCollector() {
   const views = [];
   const embedView = spec => {
     if (views.length >= ${MAX_EMBEDDED_VIEWS}) throw new RangeError("embedView: a run shows at most ${MAX_EMBEDDED_VIEWS} views");
-    if (typeof spec !== "object" || spec === null) throw new TypeError("embedView takes { title, html, css?, js?, data? }");
-    const { title, html, css, js, data } = spec;
+    if (typeof spec !== "object" || spec === null) throw new TypeError("embedView takes { title, html, css?, script?, data? }");
+    const { title, html, css, script, data } = spec;
     if (typeof title !== "string" || title.trim() === "") throw new TypeError("embedView needs a title, a non-empty string");
     if (typeof html !== "string") throw new TypeError("embedView needs html, a string");
     if (css !== undefined && typeof css !== "string") throw new TypeError("embedView's css must be a string");
-    if (js !== undefined && typeof js !== "string") throw new TypeError("embedView's js must be a string");
-    const view = { title, html, css, js, data: data === undefined ? undefined : JSON.stringify(data) };
+    if (script !== undefined && typeof script !== "function") throw new TypeError("embedView's script must be a function, data => { ... }, which runs in the view");
+    const view = {
+      title, html, css,
+      script: script === undefined ? undefined : scriptSource(script),
+      data: data === undefined ? undefined : JSON.stringify(data),
+    };
     const size = new TextEncoder().encode(JSON.stringify(view)).length;
     if (size > ${MAX_EMBEDDED_VIEW_BYTES}) throw new RangeError("embedView: a view is at most ${MAX_EMBEDDED_VIEW_BYTES / 1024} KiB, and this one is " + Math.ceil(size / 1024) + " KiB");
     views.push(JSON.parse(JSON.stringify(view)));
