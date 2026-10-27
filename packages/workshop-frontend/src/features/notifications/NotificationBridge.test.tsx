@@ -144,6 +144,33 @@ describe("NotificationBridge", () => {
     expect(request).toHaveBeenCalledExactlyOnceWith("a".repeat(64));
   });
 
+  it("reports an injected registration from the active Strict Mode effect", async () => {
+    let resolveRegistration!: () => void;
+    authenticatedApi.registerAuthorizedNotificationDevice.mockReturnValue(
+      new Promise(done => { resolveRegistration = done; }),
+    );
+    const request = vi.fn<(authorization?: string) => void>();
+    const finished = vi.fn<(outcome: "ready" | "failed") => void>();
+    Object.assign(window, { cloudflareOSNative: { version: 1, isAvailable: () => true,
+      loginReady: () => {}, returnToInstalls: () => {}, notifications: {
+        authorizationRequired: true,
+        currentDeviceRegistration: () => "strict-mode-handle",
+        requestDeviceRegistration: request,
+        registrationFinished: finished,
+      } } });
+    await act(async () => root.render(
+      <StrictMode>
+        <NotificationBridge
+          authenticatedApi={authenticatedApi as unknown as RpcStub<AuthenticatedApi>} />
+      </StrictMode>,
+    ));
+    expect(authenticatedApi.registerAuthorizedNotificationDevice)
+        .toHaveBeenCalledExactlyOnceWith("strict-mode-handle");
+    await act(async () => resolveRegistration());
+    expect(finished).toHaveBeenCalledExactlyOnceWith("ready");
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("keeps one subscription across rerenders and declines while hidden", async () => {
     await render();
     // Kumo returns a new toast manager whenever its consumer renders; resubscribing on each one

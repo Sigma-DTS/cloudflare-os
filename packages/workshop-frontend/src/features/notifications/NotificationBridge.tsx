@@ -64,13 +64,14 @@ export const NotificationBridge = ({
   currentApi.current = authenticatedApi;
   const askedNative = useRef(false);
   const pendingAuthorization = useRef<Promise<string> | undefined>(undefined);
-  const claimedRegistrations = useRef(new Set<string>());
+  const registrationAttempts = useRef(new Map<string, Promise<"ready" | "failed">>());
 
   useEffect(() => {
     let legacyWindow = window as LegacyNativeNotificationWindow;
     let notifications = nativeApp()?.notifications;
     let cancelled = false;
     let requestingAuthorization = false;
+    const reportingRegistrations = new Set<string>();
     let reportRegistration = (outcome: "ready" | "failed") => {
       if (notifications) {
         notifications.registrationFinished(outcome);
@@ -106,25 +107,33 @@ export const NotificationBridge = ({
       }
     };
     let register = async (deviceRegistrationId: string | undefined) => {
-      if (!deviceRegistrationId || claimedRegistrations.current.has(deviceRegistrationId)) return;
-      // The native handle is single-use, including across authenticatedApi reconnects. A failed
-      // exchange may already have consumed it, so native must issue a fresh id for any retry.
-      claimedRegistrations.current.add(deviceRegistrationId);
-      if (legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__ ===
-          deviceRegistrationId) {
-        delete legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__;
-      }
-      try {
-        if (notifications?.authorizationRequired) {
-          await currentApi.current.registerAuthorizedNotificationDevice(deviceRegistrationId);
-        } else {
-          await currentApi.current.registerNotificationDevice(deviceRegistrationId);
+      if (!deviceRegistrationId || reportingRegistrations.has(deviceRegistrationId)) return;
+      reportingRegistrations.add(deviceRegistrationId);
+      let attempt = registrationAttempts.current.get(deviceRegistrationId);
+      if (!attempt) {
+        // The native handle is single-use. Retain its one exchange so Strict Mode's replacement
+        // effect can report the outcome without redeeming the handle again.
+        if (legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__ ===
+            deviceRegistrationId) {
+          delete legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__;
         }
-        if (!cancelled) reportRegistration("ready");
-      } catch (error) {
-        if (!cancelled) reportRegistration("failed");
-        logRpcFailure("Failed to register notification device:", error);
+        attempt = (async () => {
+          try {
+            if (notifications?.authorizationRequired) {
+              await currentApi.current.registerAuthorizedNotificationDevice(deviceRegistrationId);
+            } else {
+              await currentApi.current.registerNotificationDevice(deviceRegistrationId);
+            }
+            return "ready" as const;
+          } catch (error) {
+            logRpcFailure("Failed to register notification device:", error);
+            return "failed" as const;
+          }
+        })();
+        registrationAttempts.current.set(deviceRegistrationId, attempt);
       }
+      const outcome = await attempt;
+      if (!cancelled) reportRegistration(outcome);
     };
     let onDeviceRegistration = (event: Event) => {
       void register(eventDeviceRegistration(event));
