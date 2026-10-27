@@ -374,7 +374,7 @@ export type SupportedResource = {
    *
    * Each type is still granted separately: holding a grant for one does not cover the others. The
    * configurator offers only the types the account has granted, and the Workshop asks for the rest
-   * in a single consent request, so group only types that need the same authorization.
+   * in a single consent request, so a user connecting any type on the card is asked for all of them.
    */
   groupedWith?: string;
 }
