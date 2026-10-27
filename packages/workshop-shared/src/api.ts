@@ -4454,8 +4454,14 @@ export type AiToolCall = {
     code: string;
   };
 
-  /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
+  /**
+   * Output, if the code actually ran. (Otherwise, `error` should be present.) It ends with a line
+   * naming each view in `views`, as the model read it.
+   */
   output?: string;
+
+  /** The views the code showed with `embedView`, in call order (see plans/embed-view.md). */
+  views?: EmbeddedView[];
 } | {
   /**
    * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer
@@ -4546,6 +4552,20 @@ export type AiToolCall = {
   /** The new gatekeeper workpiece; replay re-binds it rather than creating again. */
   output?: {gatekeeperId: WorkpieceId};
 });
+
+/** A live view that the agent's `executeCode` showed with `embedView` (see plans/embed-view.md). */
+export type EmbeddedView = {
+  /** Names the view: its frame's accessible name. */
+  title: string;
+  /** The view's markup. */
+  html: string;
+  /** The view's style. */
+  css?: string;
+  /** The view's module script, which runs after its markup with the globals `data` and `agent`. */
+  js?: string;
+  /** The JSON text of the view's data, which its script reads as `data`. */
+  data?: string;
+};
 
 // TODO: Extend AiToolCall for code-mode tool calls.
 // - Includes inline audit logs from the action.

@@ -1,4 +1,4 @@
-import { AGENT_SPAWNER_CONNECTION_ID, AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, AlwaysAvailableResource, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, validateBindingName } from '@gadgets/workshop-shared/api';
+import { AGENT_SPAWNER_CONNECTION_ID, AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, AlwaysAvailableResource, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, type EmbeddedView, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, replaceSpanChange, validateCodeChangeSchema,
   type FileContent, type CodeContent, type CodeChange,
   type FileChange } from '@gadgets/workshop-shared/code-change';
@@ -536,7 +536,7 @@ export interface AgentHooks {
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void,
-                   worktreeTurn?: WorktreeTurnAccess): Promise<string>;
+                   worktreeTurn?: WorktreeTurnAccess): Promise<{log: string, views: EmbeddedView[]}>;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
@@ -677,7 +677,7 @@ You are a helpful assistant who helps users get things done. You can answer ques
 
 You are working within a "workspace". A workspace contains any number of Gadgets, plus connections to external resources. Each of these is available to you as a named binding in your \`env\` (used with the \`executeCode\` tool, described later). The workspace's Gadgets as of the start of this session, along with each one's files and bindings, are listed later in this prompt with the \`env\` name each one goes by.
 
-A new workspace contains no Gadgets. You can answer questions, read connected resources, and perform one-off tasks with \`executeCode\` without creating a Gadget. Create one (via the \`createGadget\` tool) only when the user's request or established context clearly calls for a new application or saved output. An empty workspace or a task that needs code is not by itself a reason to create one. A one-off interactive demo, tool or visual is a live view in your answer (see "Live views in your answers"), even when the user calls it an app. A Gadget is for something that must last: it keeps its own data, runs in the background, or is opened again later.
+A new workspace contains no Gadgets. You can answer questions, read connected resources, and perform one-off tasks with \`executeCode\` without creating a Gadget. Create one (via the \`createGadget\` tool) only when the user's request or established context clearly calls for a new application or saved output. An empty workspace or a task that needs code is not by itself a reason to create one. A one-off interactive demo, tool or visual is a live view (see "Live views"), even when the user calls it an app. A Gadget is for something that must last: it keeps its own data, runs in the background, or is opened again later.
 
 Draft requested text directly in chat; do not look up blueprints or create a Gadget unless the request or established context calls for a separate saved output or application. When the user asks for a new Gadget, ALWAYS consider starting from a blueprint. A blueprint is code for a specific type of Gadget that has already been written. The \`listBlueprints\` tool returns a list of available blueprints. If any of them match the user's request closely, and the user did not explicitly request otherwise, you should create a new gadget starting from a blueprint.
 
@@ -685,33 +685,29 @@ Note that users rarely ask for "a Gadget" in those words. They ask for a thing: 
 
 Tools refer to Gadgets by their binding name in your env: the file tools (\`readFile\`, \`writeFile\`, \`editFile\`, \`grep\`) take a \`workpiece\` parameter naming the Gadget that owns the file, and \`setGadgetBinding\` takes a \`gadget\` parameter naming the Gadget whose bindings to modify. Some older workspaces have a "default" Gadget (noted in the gadget list) which the file tools fall back to when \`workpiece\` is omitted; even so, prefer passing the name explicitly.
 
-# Live views in your answers
+# Live views
 
-You can draw an interactive view inside your answer, with no tool call, by writing HTML between \`<gadget-ui>\` tags. The Workshop draws it in place, in a sandboxed frame, as you write it, and runs its module scripts as soon as its closing tag arrives, while the rest of your answer streams. Draw a view when it beats prose: comparisons, choices between options, numbers over time, or a one-off demo or tool. A short answer or an explanation stays plain text.
+You can show the user an interactive view in the chat by calling \`embedView\` in \`executeCode\`. Read or work out the data the view needs in the same code, and pass it as \`data\`: the view gets it as it is, so never retype values into the view's code. The Workshop shows the view in a sandboxed frame below this step once the step ends, so your answer after it should not repeat what it shows. Show a view when it beats prose: comparisons, choices between options, numbers over time, or a one-off demo or tool. A short answer or an explanation stays plain text.
 
 \`\`\`
-Spending on food rose 18% in October, mostly eating out.
-
-<gadget-ui>
-<title>Food spending by week</title>
-<h3>Food spending by week</h3>
-<div id="weeks"></div>
-<script type="module">
-  const limit = 120;
-  const weeks = [[1, 96], [2, 132], [3, 88], [4, 141]];
-  const list = document.getElementById("weeks");
-  for (const [week, total] of weeks) {
-    const bar = list.appendChild(document.createElement("button"));
-    bar.textContent = \`Week \${week}: $\${total} of $\${limit}\`;
-    bar.onclick = () => agent.send(\`Show me week \${week} in detail.\`);
-  }
-</script>
-</gadget-ui>
+export default async function(self, env) {
+  embedView({
+    title: "Food spending by week",
+    html: '<h3>Food spending by week</h3><div id="weeks"></div>',
+    js: \`
+      const list = document.getElementById("weeks");
+      for (const [week, total] of data.weeks) {
+        const bar = list.appendChild(document.createElement("button"));
+        bar.textContent = "Week " + week + ": $" + total + " of $" + data.limit;
+        bar.onclick = () => agent.send("Show me week " + week + " in detail.");
+      }\`,
+    data: { limit: 120, weeks: [[1, 96], [2, 132], [3, 88], [4, 141]] },
+  });
+}
 \`\`\`
 
-* Put the opening and closing tags on lines of their own, outside code fences. The \`<title>\` names the view but is not shown. The body is the whole view, and it sits in your answer with no border or padding around it, so draw any heading or box yourself. A block with nothing but a title shows an error.
-* Put any \`<style>\` first and code in \`<script type="module">\` last, after the markup, so the view takes shape while you write it. Module scripts run once the block closes, and see all of its markup and the global \`agent\`.
-* A view shows only what you write into it: it has no \`env\` and no network. To show data from Gadgets, connections or the web, read it with \`executeCode\` first, then write the values into the view's code. No \`fetch()\`, and no remote scripts, styles, fonts or images. Draw charts with inline SVG or the DOM.
+* \`embedView({ title, html, css, js, data })\`: \`title\` names the view but is not shown. \`html\` is the whole view, and it sits in the chat with no border or padding around it, so draw any heading or box yourself. \`css\` is its style. \`js\` runs as a module script after the markup, with the globals \`data\` and \`agent\`. \`data\` is any JSON value. Only \`title\` and \`html\` are required. One \`executeCode\` call shows at most 4 views, each up to 256 KiB.
+* A view has no \`env\` and no network: it shows \`data\` and what its code draws. No \`fetch()\`, and no remote scripts, styles, fonts or images. Draw charts with inline SVG or the DOM.
 * The view's code runs again each time the view scrolls into sight, and for each person viewing the chat.
 * Show data with \`textContent\`. In a view, \`innerHTML\` (except \`= ""\` to clear), \`insertAdjacentHTML\` and the other ways to parse a string as HTML throw. Make SVG elements with \`document.createElementNS("http://www.w3.org/2000/svg", name)\` and \`setAttribute\`.
 * \`agent.send(message)\` asks the user to send you \`message\`, e.g. after they click a bar. The Workshop shows the message under the view and sends it as the user's own chat message only when they click Send. Write it in the user's words, as in the example.
@@ -1319,6 +1315,8 @@ The 'env' object contains this chat's named bindings:
 Note that this differs from the \`env\` a Gadget's own code sees: a Gadget's server.js sees only that Gadget's own bindings (listed in the system prompt's gadget list), which are wired up separately with \`setGadgetBinding\`. Your bindings and a Gadget's bindings may point at the same resource under the same or different names.
 
 When the user asks you to just do a task that can be done with these bindings, you should use executeCode to perform the task, instead of adding code to a gadget to do it.
+
+The code can also call the global \`embedView(spec)\` to show the user a live view, with data it read or worked out (see "Live views").
 
 ${EXECUTE_CODE_SELF_PARAM}
 `.trim();
@@ -3868,7 +3866,7 @@ async function runAgentPass(
                 "step ends. End this response and call executeCode again in your next step.");
           }
 
-          let output = await hooks.executeCodeMode(
+          let {log, views} = await hooks.executeCodeMode(
               chatId, code, initiator, author.id, Object.fromEntries(chatBindings),
               delta => emitStreamEvent({
                 type: "toolOutputDelta",
@@ -3876,7 +3874,10 @@ async function runAgentPass(
                 delta,
               }),
               worktreeTurnAccess);
-          return toolResult(`${output}`, {output: `${output}`} as Partial<AiToolCall>);
+          // The model reads which views the user now sees; replay reads `output` back as is.
+          let output = [log, ...views.map(view => `Showed the user a view: ${view.title}.`)].join("\n");
+          return toolResult(output,
+              {output, ...views.length > 0 ? {views} : {}} as Partial<AiToolCall>);
         } catch (error) {
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)

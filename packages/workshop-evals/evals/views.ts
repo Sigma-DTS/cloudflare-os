@@ -1,4 +1,5 @@
 import type { AiChatMessage } from "@gadgets/workshop-shared/api";
+import { embeddedViewHtml } from "@gadgets/workshop-shared/embedded-views";
 import { parseGadgetUiBlocks } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import { asEvidence } from "../src/task.js";
 import type { EvalVerifier } from "../src/verifier.js";
@@ -20,7 +21,11 @@ function turnToolCalls(messages: readonly AiChatMessage[]) {
   return agentMessages(messages).flatMap(message => message.toolCalls ?? []);
 }
 
-/** This turn's closed views, oldest first, and the start of each view it never closed. */
+/**
+ * This turn's views, oldest first: closed `<gadget-ui>` blocks and the views its `executeCode`
+ * calls showed with `embedView`, as their frames run them. Also the start of each block it never
+ * closed.
+ */
 function turnViews(verifier: EvalVerifier): { views: TurnView[]; open: string[] } {
   const views: TurnView[] = [];
   const open: string[] = [];
@@ -28,6 +33,10 @@ function turnViews(verifier: EvalVerifier): { views: TurnView[]; open: string[] 
     for (const segment of parseGadgetUiBlocks(message.message)) {
       if (segment.kind === "block") views.push({ sequence: message.sequence, html: segment.html });
       else if (segment.kind === "open") open.push(segment.text.slice(0, 200));
+    }
+    for (const call of message.toolCalls ?? []) {
+      if (call.toolName !== "executeCode") continue;
+      for (const view of call.views ?? []) views.push({ sequence: message.sequence, html: embeddedViewHtml(view) });
     }
   }
   return { views, open };

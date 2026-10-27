@@ -83,7 +83,7 @@ import { createWorkshopLogger, obsContext } from "./observability";
 import { traceAgentTurn, traceToolApproval } from "./agent-tracing";
 import { isLoopLimitError, retryOnDoReset, shouldRetryAfterReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
-import type { CreationApproval, GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import type { CreationApproval, EmbeddedView, GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import { gadgetUiAnswerAsText } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import {
   assertChatAttachmentSize,
@@ -103,9 +103,35 @@ import {
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
 
+// A run shows at most this many views. Each is stored in the step's message record, and a Durable
+// Object storage value holds at most 2 MiB, shared with the rest of the step.
+const MAX_EMBEDDED_VIEWS = 4;
+const MAX_EMBEDDED_VIEW_BYTES = 256 * 1024;
+
 let CODE_MODE_HARNESS =
 `import { WorkerEntrypoint, restore } from "cloudflare:workers";
 import agent from "agent.js";
+
+// embedView(spec) shows a live view in the chat when the step ends (see plans/embed-view.md). It
+// keeps a JSON copy of each spec that passes its checks; a spec that fails one throws in the
+// agent's code, so the error reaches the model.
+function viewCollector() {
+  const views = [];
+  const embedView = spec => {
+    if (views.length >= ${MAX_EMBEDDED_VIEWS}) throw new RangeError("embedView: a run shows at most ${MAX_EMBEDDED_VIEWS} views");
+    if (typeof spec !== "object" || spec === null) throw new TypeError("embedView takes { title, html, css?, js?, data? }");
+    const { title, html, css, js, data } = spec;
+    if (typeof title !== "string" || title.trim() === "") throw new TypeError("embedView needs a title, a non-empty string");
+    if (typeof html !== "string") throw new TypeError("embedView needs html, a string");
+    if (css !== undefined && typeof css !== "string") throw new TypeError("embedView's css must be a string");
+    if (js !== undefined && typeof js !== "string") throw new TypeError("embedView's js must be a string");
+    const view = { title, html, css, js, data: data === undefined ? undefined : JSON.stringify(data) };
+    const size = new TextEncoder().encode(JSON.stringify(view)).length;
+    if (size > ${MAX_EMBEDDED_VIEW_BYTES}) throw new RangeError("embedView: a view is at most ${MAX_EMBEDDED_VIEW_BYTES / 1024} KiB, and this one is " + Math.ceil(size / 1024) + " KiB");
+    views.push(JSON.parse(JSON.stringify(view)));
+  };
+  return { views, embedView };
+}
 
 export default class extends WorkerEntrypoint {
   verify() {}
@@ -130,8 +156,11 @@ export default class extends WorkerEntrypoint {
         }
       }
     }
+    const { views, embedView } = viewCollector();
+    globalThis.embedView = embedView;
     let result = await agent(self, env, this.ctx);
     if (result !== undefined) console.log("Return value:", result);
+    return { views };
   }
 }
 `;
@@ -203,7 +232,7 @@ let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
 
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
-  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<{views: EmbeddedView[]}>;
 }
 
 interface RestoreForgerEntrypoint extends WorkerEntrypoint {
@@ -9019,7 +9048,7 @@ class OverseerImpl implements AgentHooks {
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
                         worktreeTurn?: WorktreeTurnAccess)
-      : Promise<string> {
+      : Promise<{log: string, views: EmbeddedView[]}> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     let executionId: string = bytes.toBase64();
@@ -9082,10 +9111,11 @@ class OverseerImpl implements AgentHooks {
       }});
 
       let error: string | undefined;
+      let views: EmbeddedView[] = [];
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        ({views} = await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings)));
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -9116,7 +9146,7 @@ class OverseerImpl implements AgentHooks {
         log = "(function succeeded with no output)";
       }
 
-      return log;
+      return {log, views};
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
       if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {
