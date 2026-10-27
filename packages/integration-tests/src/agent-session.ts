@@ -5,6 +5,7 @@ import type {
   Overseer, PublicApi, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber,
 } from "@gadgets/workshop-shared/api";
 import type { CodeChange } from "@gadgets/workshop-shared/code-change";
+import { parseGadgetUiBlocks } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import type { GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import {
   type ConnectedAccount, connect, listConnectedAccounts, logIn, nextUsernames, signUp, stubFor,
@@ -83,6 +84,11 @@ export type AgentTurnResult = {
     /** Every model step of the chat so far, oldest first. */
     steps?: StepUsage[];
   };
+  /**
+   * Milliseconds from the prompt's dispatch to the first view the Workshop could draw: an inline
+   * block once its markup starts streaming, or an embedded view once its step is stored.
+   */
+  firstViewMs?: number;
 };
 
 /** Filters accepted by the public action-history API. */
@@ -148,6 +154,10 @@ class TurnObserver {
   #endSequence: number | undefined;
   #outcome: AgentTurnOutcome | undefined;
   #timer: ReturnType<typeof setTimeout>;
+  readonly #startedAt = Date.now();
+  // The agent's streamed text since the last stored step, and when a view could first draw.
+  #streamedText = "";
+  #firstViewAt: number | undefined;
   readonly #signal: AbortSignal | undefined;
   readonly #onAbort = () => {
     const message = "Agent activation was cancelled";
@@ -198,6 +208,32 @@ class TurnObserver {
     return this.#signal?.aborted ?? false;
   }
 
+  get firstViewMs(): number | undefined {
+    return this.#firstViewAt === undefined ? undefined : this.#firstViewAt - this.#startedAt;
+  }
+
+  stream(chatId: number, event: AiChatStreamEvent): void {
+    if (this.#firstViewAt !== undefined || (this.#chatId !== undefined && chatId !== this.#chatId)) return;
+    if (event.type === "streamReset") this.#streamedText = "";
+    if (event.type !== "textDelta") return;
+    this.#streamedText += event.delta;
+    if (this.#streamedText.includes("<gadget-ui") && parseGadgetUiBlocks(this.#streamedText)
+        .some(segment => segment.kind !== "text" && segment.html.trim() !== "")) {
+      this.#firstViewAt = Date.now();
+    }
+  }
+
+  #noteStoredView(entry: AiChatMessage): void {
+    if (entry.type !== "message" || entry.author.type !== "agent") return;
+    this.#streamedText = "";
+    if (this.#firstViewAt !== undefined) return;
+    // Embedded views exist only on the embedView branch; this harness runs on both.
+    const embedded = (entry.toolCalls ?? []).some(call => call.toolName === "executeCode" &&
+      "views" in call && Array.isArray(call.views) && call.views.length > 0);
+    const inline = parseGadgetUiBlocks(entry.message).some(segment => segment.kind === "block");
+    if (embedded || inline) this.#firstViewAt = Date.now();
+  }
+
   admit(startSequence?: number): void {
     if (this.#promptSeen) return;
     this.#promptSeen = true;
@@ -239,6 +275,7 @@ class TurnObserver {
       return;
     }
     if (entry.chatId !== this.#chatId) return;
+    if (entry.sequence > this.#startSequence && this.#promptSeen) this.#noteStoredView(entry);
     if (!this.#promptSeen && entry.type === "message" && entry.author.type === "user" &&
         entry.message === this.#expectedPrompt && entry.sequence > this.#dispatchedAfter) {
       this.admit(entry.sequence);
@@ -361,7 +398,9 @@ class ChatSubscriber extends RpcTarget implements AiChatSubscriber {
   changeApplied(
       _chatId: number, _generation: number, _revision: number, _author: AiChatAuthorInfo,
       _change: CodeChange, _submission?: { clientId: string; seq: number }): void {}
-  stream(_chatId: number, _event: AiChatStreamEvent): void {}
+  stream(chatId: number, event: AiChatStreamEvent): void {
+    this.observer?.stream(chatId, event);
+  }
 
   latestSequence(chatId: number): number {
     return this.#latestSequence.get(chatId) ?? -1;
@@ -840,8 +879,10 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
           await this.#stopAndWaitForIdle(this.#chatId, cancellationDeadline);
         }
       }
-      const takeSnapshot = () => this.#snapshot(
-          outcome, observer.startSequence, observer.endSequence, cancellationDeadline);
+      const takeSnapshot = async () => ({
+        ...await this.#snapshot(outcome, observer.startSequence, observer.endSequence, cancellationDeadline),
+        firstViewMs: observer.firstViewMs,
+      });
       if (outcome.status === "timedOut" || outcome.status === "cancelled") return await takeSnapshot();
       try {
         return await observer.race(takeSnapshot());

@@ -71,6 +71,28 @@ describe("RenderedView", { timeout: 60_000 }, () => {
     expect(view.messages).toEqual(["Read Piranesi"]);
   });
 
+  it("picks a filter through its select option or its button, until the view changes", async () => {
+    const rows = `<ul id="rows"></ul>
+      <script type="module">
+        const all = [["Lyft", "Travel"], ["Safeway", "Groceries"]];
+        globalThis.show = category => {
+          const list = document.getElementById("rows");
+          list.replaceChildren(...all.filter(([, c]) => category === "All" || c === category)
+            .map(([name]) => Object.assign(document.createElement("li"), { textContent: name })));
+        };
+        show("All");
+      </script>`;
+    const onlyTravel = (text: string) => text.includes("Lyft") && !text.includes("Safeway");
+
+    await using select = await RenderedView.open(`
+      <select onchange="show(this.value)"><option>All</option><option>Travel</option><option>Groceries</option></select>${rows}`);
+    expect(await select.choose("Travel", ["Groceries"], onlyTravel)).toMatchObject({ pass: true, tried: ["picked Travel in a select"] });
+
+    await using buttons = await RenderedView.open(`
+      <button onclick="show('Travel')">Travel</button> <button onclick="show('Groceries')">Groceries</button>${rows}`);
+    expect(await buttons.choose("Travel", ["Groceries"], onlyTravel)).toMatchObject({ pass: true });
+  });
+
   it("changes a value through the control holding it, or its stepper", async () => {
     await using input = await RenderedView.open(`
       <label>People <input id="people" type="number" value="4"></label>

@@ -14,7 +14,7 @@ export type VerifierSession =
   Pick<WorkshopAgentSession, "openGadget" | "connectionDrops">;
 
 /** The chat as the Workshop recorded it when the turn ended. */
-export type VerifierChat = Pick<AgentTurnResult, "history" | "compactions" | "usage">;
+export type VerifierChat = Pick<AgentTurnResult, "history" | "compactions" | "usage" | "firstViewMs">;
 
 function truncate(value: string): string {
   return value.length > EVIDENCE_LIMIT ? `${value.slice(0, EVIDENCE_LIMIT)}...` : value;

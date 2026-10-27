@@ -169,6 +169,18 @@ const FRAME_SCRIPT = String.raw`(() => {
       control.dispatchEvent(new Event("change", { bubbles: true }));
       return register(control, "control").id;
     },
+    // Picks the option named "text" in the first select that has one, as a user would.
+    select: text => {
+      for (const control of document.body.querySelectorAll("select")) {
+        const option = [...control.options].find(option => sameValue(option.text, text) || sameValue(option.value, text));
+        if (control.disabled || option === undefined) continue;
+        control.value = option.value;
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }
+      return false;
+    },
     // The button beside an element showing "from" alone that moves it toward "to".
     stepper: (from, to) => {
       const raise = Number(to) > Number(from);
@@ -410,6 +422,36 @@ export class RenderedView implements AsyncDisposable {
         }
       }
       return tried;
+    });
+  }
+
+  /**
+   * Picks the item `label` names, as a user would, until the view's text passes `until`: the option
+   * of that name in a select, else the element that names it and then the controls beside it, as
+   * `click` finds them. For a filter, tab or toggle, which change the view rather than ask the agent.
+   */
+  choose(label: string, others: readonly string[], until: (text: string) => boolean):
+      Promise<TextWait & { tried: string[] }> {
+    return this.#guard(async () => {
+      const tried: string[] = [];
+      if (z.boolean().parse(await this.#frameCall("select", label))) {
+        tried.push(`picked ${label} in a select`);
+        const wait = await this.#waitForText(until, COMMIT_MS);
+        if (wait.pass) return { ...wait, tried };
+      }
+      for (const target of TargetsSchema.parse(await this.#frameCall("targets", label, [...others]))) {
+        const aim = AimSchema.parse(await this.#frameCall("aim", target.id));
+        if (target.stage === "label" || aim.hits) {
+          await this.#mouseClick(aim.x, aim.y);
+          tried.push(`clicked ${target.description}`);
+        } else {
+          await this.#frameCall("dispatch", target.id);
+          tried.push(`dispatched a click on ${target.description}`);
+        }
+        const wait = await this.#waitForText(until, COMMIT_MS);
+        if (wait.pass) return { ...wait, tried };
+      }
+      return { pass: false, text: await this.#text(), tried };
     });
   }
 
