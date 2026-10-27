@@ -188,6 +188,7 @@ const FRAME_SCRIPT = String.raw`(() => {
       .filter(el => visible(el) && /calc|split|update|apply|compute|total|\bgo\b|=/i.test(label(el) || el.value || ""))
       .slice(0, 3).map(el => register(el, "control")),
     overflow: () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    height: () => Math.ceil(document.body.getBoundingClientRect().height),
     viewportHeights: () => {
       const found = [];
       const check = (where, style) => {
@@ -452,6 +453,21 @@ export class RenderedView implements AsyncDisposable {
           `document.querySelector("iframe").style.width = "${PHONE_WIDTH}px"`);
       await this.#frameCall("frames", 2);
       return z.number().parse(await this.#frameCall("overflow"));
+    });
+  }
+
+  /** Saves a PNG of the view at the chat column's width, as tall as its content up to the frame's. */
+  screenshot(path: string): Promise<void> {
+    return this.#guard(async () => {
+      const page = this.#requirePage();
+      await page.evaluate(`document.querySelector("iframe").style.width = "${FRAME_WIDTH}px"`);
+      await this.#frameCall("frames", 2);
+      const height = z.number().parse(await this.#frameCall("height"));
+      const box = await page.locator("iframe").boundingBox();
+      if (box === null) throw new Error("The view's frame has no box");
+      await page.screenshot({
+        path, clip: { x: box.x, y: box.y, width: FRAME_WIDTH, height: Math.min(Math.max(height, 40), FRAME_HEIGHT) },
+      });
     });
   }
 
