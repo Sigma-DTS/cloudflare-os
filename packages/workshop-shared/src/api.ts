@@ -273,8 +273,8 @@ const RESERVED_WORDS = new Set([
  * since binding maps are used as plain objects where such names would collide with inherited
  * members -- or worse, mutate the prototype chain.
  *
- * ALL_CAPS_WITH_UNDERSCORES is style guidance only (recommended in tool descriptions and used by
- * generated names), not enforced here.
+ * ALL_CAPS_WITH_UNDERSCORES is not enforced here, since a user may pick any name. Generated names
+ * use it, and the agent's tools require it of the names the agent picks.
  */
 export function validateBindingName(name: string): void {
   if (!IDENTIFIER_REGEX.test(name)) {

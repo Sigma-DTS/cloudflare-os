@@ -1377,6 +1377,17 @@ function jsonToolResultText(value: unknown): string {
   return JSON.stringify(value);
 }
 
+// The tools ask the agent for ALL_CAPS_WITH_UNDERSCORES names. A name in another style is easy to
+// get wrong later, when the agent's code reads `env.NAME`, so a tool refuses it while the agent
+// can still pick another. Names the agent did not pick, a user's or a source's, keep any style.
+function validateAgentBindingName(name: string): void {
+  validateBindingName(name);
+  if (!/^[A-Z][A-Z0-9_]*$/.test(name)) {
+    throw new Error(`Invalid binding name "${name}": the names you pick must be ` +
+        `ALL_CAPS_WITH_UNDERSCORES.`);
+  }
+}
+
 /** The line window a readFile call asked for (see AiToolCall's readFile input). */
 export type ReadFileWindow = {startLine?: number, lineCount?: number};
 
@@ -3576,7 +3587,8 @@ async function runAgentPass(
         name: Type.Optional(Type.String({
           description:
               "Name to bind the resource under within the gadget (`env.<name>` in the gadget's " +
-              "own code). Defaults to the same name as `source`. Style: ALL_CAPS_WITH_UNDERSCORES.",
+              "own code). Defaults to the same name as `source`; a name you give must be " +
+              "ALL_CAPS_WITH_UNDERSCORES.",
         })),
       }),
       execute: async (toolCallId, {gadget, source, name}) => {
@@ -3597,6 +3609,7 @@ async function runAgentPass(
             throw new Error(`env.${source} holds agent callback arguments; it cannot be bound ` +
                 `into a gadget.`);
           }
+          if (name !== undefined) validateAgentBindingName(name);
           let bindingName = name ?? source;
 
           // The addition rides the step's "changes" message (via the barrier's
@@ -3636,8 +3649,8 @@ async function runAgentPass(
         bindingName: Type.String({
           description:
               "Name under which the new gadget appears in your env, and how other tools refer " +
-              "to it (e.g. the file tools' `workpiece` parameter). Must be a JavaScript " +
-              "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+              "to it (e.g. the file tools' `workpiece` parameter). Must be an " +
+              "ALL_CAPS_WITH_UNDERSCORES identifier not already in use.",
         }),
         blueprintId: Type.Optional(Type.String({
           description:
@@ -3647,7 +3660,7 @@ async function runAgentPass(
       }),
       execute: async (toolCallId, {title, bindingName, blueprintId}) => {
         try {
-          validateBindingName(bindingName);
+          validateAgentBindingName(bindingName);
           if (isNameInScope(bindingName)) {
             throw new Error(`There is already a binding named "${bindingName}" in your env. ` +
                 `Choose a different name.`);
@@ -3738,8 +3751,8 @@ async function runAgentPass(
         bindingName: Type.String({
           description:
               "Name under which the new worktree appears in your env, and how the file tools " +
-              "refer to it (their `workpiece` parameter). Must be a JavaScript identifier not " +
-              "already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+              "refer to it (their `workpiece` parameter). Must be an ALL_CAPS_WITH_UNDERSCORES " +
+              "identifier not already in use.",
         }),
         commitId: Type.String({
           description:
@@ -3749,7 +3762,7 @@ async function runAgentPass(
       }),
       execute: async (toolCallId, {title, bindingName, commitId}) => {
         try {
-          validateBindingName(bindingName);
+          validateAgentBindingName(bindingName);
           if (isNameInScope(bindingName)) {
             throw new Error(`There is already a binding named "${bindingName}" in your env. ` +
                 `Choose a different name.`);
@@ -3893,8 +3906,8 @@ async function runAgentPass(
         bindingName: Type.String({
           description:
               "Name under which the resource will appear in your env once the user accepts. " +
-              "Must be a JavaScript identifier not already in use; pick a name reflecting why " +
-              "you want the resource. Style: ALL_CAPS_WITH_UNDERSCORES.",
+              "Must be an ALL_CAPS_WITH_UNDERSCORES identifier not already in use; pick a name " +
+              "reflecting why you want the resource.",
         }),
       }),
       execute: async (toolCallId, input) => {
@@ -3904,7 +3917,7 @@ async function runAgentPass(
           // within the same turn.
           let nameProblem: string | undefined;
           try {
-            validateBindingName(input.bindingName);
+            validateAgentBindingName(input.bindingName);
           } catch (err) {
             nameProblem = `${err instanceof Error ? err.message : err}`;
           }
@@ -3950,13 +3963,13 @@ async function runAgentPass(
         }),
         bindingName: Type.String({
           description:
-              "Name under which the new resource appears in your env. Must be a JavaScript " +
-              "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+              "Name under which the new resource appears in your env. Must be an " +
+              "ALL_CAPS_WITH_UNDERSCORES identifier not already in use.",
         }),
       }),
       execute: async (toolCallId, input) => {
         try {
-          validateBindingName(input.bindingName);
+          validateAgentBindingName(input.bindingName);
           if (isNameInScope(input.bindingName)) {
             throw new Error(`There is already a binding named "${input.bindingName}" in your ` +
                 `env. Choose a different name.`);

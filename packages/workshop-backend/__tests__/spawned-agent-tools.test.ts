@@ -234,6 +234,25 @@ describe("spawned agent tools", () => {
         .toEqual([]);
   }));
 
+  it("refuses a name it picks in another style than ALL_CAPS, and takes the retry",
+      () => withImpl(async impl => {
+    let commit = await commitFiles(impl, { "README.md": "hello\n" });
+    let chatId = await spawnChat(impl, { displayName: "Spawner", modelId: "m", env: {} });
+    let create = (bindingName: string) => fauxAssistantMessage([
+      fauxToolCall("createWorktree", { title: "Repo", bindingName, commitId: commit }),
+    ], { stopReason: "toolUse" });
+
+    await runScriptedTurn(impl, chatId, [
+      create("My_Repo"), create("MY_REPO"), fauxAssistantMessage(fauxText("Done.")),
+    ]);
+
+    let [refused, created] = toolCalls(impl, chatId);
+    expect(refused.error).toMatch(/must be ALL_CAPS_WITH_UNDERSCORES/);
+    expect(created.error).toBeUndefined();
+    expect([...impl.storage.gadgets.list()].filter((record: any) => record.type === "worktree"))
+        .toHaveLength(1);
+  }));
+
   it("attributes the spawned turn to the gadget, with the creator's commit email",
       () => withImpl(async impl => {
     let creator = { ...OWNER, commitEmail: "owner@commits.example" };
