@@ -124,6 +124,7 @@ export const NotificationBridge = ({
       previous?.[Symbol.dispose]();
 
       let live = false;
+      let released = false;
       let subscriber = new NotificationSubscriberImpl(notification => {
         let { id, kind, workspaceId, chatId, chatTitle } = notification;
         if (isChatVisible(workspaceId, chatId)) return;
@@ -142,6 +143,7 @@ export const NotificationBridge = ({
           }],
         });
       }, () => {
+        released = true;
         // Released while still ours, after it took: the User DO reset and forgot it. (A failed
         // subscribe releases it too, so `live` keeps that from retrying in a loop.)
         if (live && subscription === nextSubscription) updateSubscription();
@@ -152,6 +154,7 @@ export const NotificationBridge = ({
         if (subscription !== nextSubscription) return;
         live = true;
         retryDelay = 1_000;
+        if (released) updateSubscription();
       }, error => {
         if (subscription !== nextSubscription) return;
         logRpcFailure("Notification subscription failed:", error);
