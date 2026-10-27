@@ -129,6 +129,11 @@ type PendingTurnEvent =
   | { type: "metadata"; chat: AiChatMetadata; latestSequence: number }
   | { type: "message"; entry: AiChatMessage };
 
+/** Whether a view's HTML so far has markup a reader sees: more than a title, style or script. */
+function hasVisibleMarkup(html: string): boolean {
+  return html.replace(/<(title|style|script)\b[\s\S]*?(?:<\/\1>|$)/gi, "").trim() !== "";
+}
+
 class TurnObserver {
   readonly result: Promise<AgentTurnOutcome>;
   readonly timeoutFailure: Promise<never>;
@@ -218,7 +223,7 @@ class TurnObserver {
     if (event.type !== "textDelta") return;
     this.#streamedText += event.delta;
     if (this.#streamedText.includes("<gadget-ui") && parseGadgetUiBlocks(this.#streamedText)
-        .some(segment => segment.kind !== "text" && segment.html.trim() !== "")) {
+        .some(segment => segment.kind !== "text" && hasVisibleMarkup(segment.html))) {
       this.#firstViewAt = Date.now();
     }
   }
