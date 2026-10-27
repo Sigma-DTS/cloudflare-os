@@ -15,14 +15,19 @@ const ACCOUNT_PATTERN = "https://drive.google.com/drive/my-drive";
 const FOLDER_PATTERN = "https://drive.google.com/drive/folders/:folderId";
 const FILE_PATTERN = "https://drive.google.com/file/d/:fileId/view";
 
-/** Per editor kind: the type it binds, its editor's URL path, and its product's name. */
-const EDITORS: Record<OfficeKind, { pattern: string; path: string; title: string }> = {
-  doc: { pattern: "https://docs.google.com/document/d/:docId/*", path: "document", title: "Docs" },
+/** Per editor kind: the type it binds, its editor's URL path, its product's name and its files' type. */
+const EDITORS: Record<OfficeKind, { pattern: string; path: string; title: string; mimeType: string }> = {
+  doc: {
+    pattern: "https://docs.google.com/document/d/:docId/*", path: "document", title: "Docs",
+    mimeType: "application/vnd.google-apps.document",
+  },
   sheets: {
     pattern: "https://docs.google.com/spreadsheets/d/:spreadsheetId/*", path: "spreadsheets", title: "Sheets",
+    mimeType: "application/vnd.google-apps.spreadsheet",
   },
   slides: {
     pattern: "https://docs.google.com/presentation/d/:presentationId/*", path: "presentation", title: "Slides",
+    mimeType: "application/vnd.google-apps.presentation",
   },
 };
 
@@ -37,8 +42,8 @@ const ROOT_ID = "drive";
 const fileIdOf = (id: string) => id.slice(id.indexOf(":") + 1);
 
 const editorOf = (id: string): OfficeKind | undefined => {
-  const prefix = id.slice(0, id.indexOf(":"));
-  return Object.hasOwn(EDITORS, prefix) ? prefix as OfficeKind : undefined;
+  const prefix = /^(\w+):/.exec(id)?.[1];
+  return prefix && Object.hasOwn(EDITORS, prefix) ? prefix as OfficeKind : undefined;
 };
 
 const allows = (accepted: readonly string[] | undefined, pattern: string) =>
@@ -247,6 +252,15 @@ const begin = (next: Flow): number => {
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
+ * The copy just made, shown as it is when the picker's lookup of it comes too soon for Drive or
+ * fails, so that lookup does not let go of a copy that exists.
+ */
+const convertedNode = (id: string): DriveNode | undefined =>
+  flow.step === "converted" && id === `${flow.kind}:${flow.copy.fileId}`
+    ? { id, title: flow.copy.title, kind: "file", mimeType: EDITORS[flow.kind].mimeType }
+    : undefined;
+
+/**
  * What `target` needs before it can be connected. `idle` means nothing: it is native, or Drive could
  * not say, in which case it is connected as it is and the gatekeeper's describe() decides.
  */
@@ -363,8 +377,18 @@ function convertedText({ kind, copy }: Extract<Flow, { step: "converted" }>): st
     "The original is unchanged, and later edits to it won't sync.";
 }
 
+/** Says a Docs, Sheets or Slides file the Workshop takes only as a Drive file connects read-only. */
+function readOnlyNotice({ values: { target }, acceptedResourceUrlPatterns: accepted }: Context) {
+  const editor = editorOf(target ?? "");
+  return editor && patternOf(target!, accepted) === FILE_PATTERN
+    ? <Notice>
+      {`This connects as a read-only Drive file: it can be read, but not edited as a Google ${EDITORS[editor].title} file.`}
+    </Notice>
+    : null;
+}
+
 function officeNotices(context: Context) {
-  if (flow.step === "idle") return null;
+  if (flow.step === "idle") return readOnlyNotice(context);
   if (flow.step === "converted") return <Notice>{convertedText(flow)}</Notice>;
   // A notice describes the file chosen now; a choice the picker let go of takes its notice with it.
   if (flow.target !== context.values.target) return null;
@@ -417,8 +441,6 @@ function officeNotices(context: Context) {
   </Fragment>;
 }
 
-const EDITOR_BY_PATH: Record<string, OfficeKind> = { document: "doc", spreadsheets: "sheets", presentation: "slides" };
-
 export default {
   initial: { target: null },
   async initialValuesFromResourceUrl({ resourceUrl, ui, acceptedResourceUrlPatterns }) {
@@ -432,7 +454,7 @@ export default {
     // An editor's URL, read as `parseDocsUrl` does, but only with an ID in Drive's alphabet, which
     // `inspectFile` requires.
     const [, path, d, id] = pathname.split("/");
-    const kind = Object.hasOwn(EDITOR_BY_PATH, path) ? EDITOR_BY_PATH[path] : undefined;
+    const kind = (Object.keys(EDITORS) as OfficeKind[]).find(kind => EDITORS[kind].path === path);
     if (!kind || d !== "d" || id === undefined || !/^[A-Za-z0-9_-]{1,256}$/.test(id)) return {};
     const target = `${kind}:${id}`;
     if (!editing(target, acceptedResourceUrlPatterns)) return { target };
@@ -480,8 +502,9 @@ export default {
               : { items: page.nodes.map(node => toItem(node, accepted)), nextCursor: page.nextCursor };
           }}
           loadItem={async id => {
-            const node = await ui.getDriveNode(id);
-            return node && toItem(node, accepted);
+            const copy = convertedNode(id);
+            const node = await ui.getDriveNode(id).then(found => found ?? copy, error => copy ?? Promise.reject(error));
+            return node ? toItem(node, accepted) : null;
           }}
           onChange={next => void choose(context, next)}
           icons={ICONS}

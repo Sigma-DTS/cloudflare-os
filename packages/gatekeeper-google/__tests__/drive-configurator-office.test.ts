@@ -43,6 +43,7 @@ async function open(accepted?: string[]) {
   let values: Values = { ...spec.initial };
   const ui = {
     inspectFile: vi.fn(async (_kind: string, _fileId: string): Promise<unknown> => ({ type: "native" })),
+    getDriveNode: vi.fn(async (_id: string): Promise<unknown> => null),
     hasConversionAccess: vi.fn(async () => false),
     convertFile: vi.fn(async (_kind: string, _fileId: string, _opts?: { reuse?: string }): Promise<unknown> =>
       ({ type: "needsAccess" })),
@@ -68,6 +69,7 @@ async function open(accepted?: string[]) {
     ready: () => spec.isReady({ values, acceptedResourceUrlPatterns: accepted }),
     url: () => spec.resourceUrl({ values, acceptedResourceUrlPatterns: accepted }),
     choose: (target: string | null) => find("HierarchyPicker")[0].props.onChange(target),
+    loadItem: (id: string) => find("HierarchyPicker")[0].props.loadItem(id),
     notices: () => find("Notice").map(node => ({ tone: node.props.tone, text: text(node) })),
     button: (label: string | RegExp) => find("Button").find(node =>
       typeof label === "string" ? text(node) === label : label.test(text(node)))?.props,
@@ -118,12 +120,18 @@ describe.each([
     editable.choose(`${kind}:native-1`);
     await settle();
     expect(editable.ready()).toBe(true);
+    expect(editable.notices()).toEqual([]);
 
     const readOnly = await open([GOOGLE_DRIVE_FILE_RESOURCE.urlPattern]);
     readOnly.choose(`${kind}:native-1`);
     expect(readOnly.ui.inspectFile).not.toHaveBeenCalled();
     expect(readOnly.ready()).toBe(true);
     expect(parseResourceUrl(readOnly.url())).toEqual({ kind: "driveFile", fileId: "native-1" });
+    expect(readOnly.notices()).toEqual([{
+      tone: undefined,
+      text: "This connects as a read-only Drive file: it can be read, but not edited as a Google " +
+        `${{ doc: "Docs", sheets: "Sheets", slides: "Slides" }[kind]} file.`,
+    }]);
   });
 
   it("is read back from its editor's URL", async () => {
@@ -261,6 +269,22 @@ describe("the Drive picker's Office flow", () => {
       text: 'Made the Google Sheets copy "Report" next to the original. The original is ' +
         "unchanged, and later edits to it won't sync.",
     }]);
+  });
+
+  it("keeps the copy chosen while Drive cannot find it yet", async () => {
+    const frame = await chooseOffice();
+    frame.ui.convertFile.mockResolvedValue(converted());
+    frame.button("Convert")!.onClick();
+    await settle();
+
+    frame.ui.getDriveNode.mockRejectedValueOnce(new Error("Drive is unavailable"));
+    await expect(frame.loadItem("sheets:copy-1"))
+      .resolves.toMatchObject({ id: "sheets:copy-1", title: "Report", kind: "leaf", icon: "sheet", selectable: true });
+    await expect(frame.loadItem("sheets:copy-1")).resolves.toMatchObject({ id: "sheets:copy-1" });
+    // Any other lookup is left to fail as it does.
+    frame.ui.getDriveNode.mockRejectedValueOnce(new Error("Drive is unavailable"));
+    await expect(frame.loadItem("file:other")).rejects.toThrow("Drive is unavailable");
+    await expect(frame.loadItem("file:other")).resolves.toBeNull();
   });
 
   it("waits for the pop-up's grant, polling, and says when the copy is in My Drive", async () => {
