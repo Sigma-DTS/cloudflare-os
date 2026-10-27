@@ -26,6 +26,9 @@ const GADGET_ASK = "\n\nBuild it as a Gadget.";
 /** Whether `text` shows `amount`, exactly or rounded to a whole number. */
 const showsAbout = (text: string, amount: number) => showsAmount(text, amount) || showsAmount(text, Math.round(amount));
 const money = (amount: number) => amount.toFixed(2);
+/** How many times `text` names any of `words`, ignoring case. */
+const timesNamed = (text: string, words: readonly string[]) =>
+  words.reduce((count, word) => count + text.toLowerCase().split(word.toLowerCase()).length - 1, 0);
 
 // L4: a month of card transactions.
 const MERCHANTS = {
@@ -151,9 +154,12 @@ of the transactions that I can filter by category.`,
       return { pass: shown.pass, evidence: asEvidence({ total: STATEMENT_TOTAL, text: shown.text }) };
     });
     await verifier.check("filters-by-category", async () => {
+      // Chart labels may name every merchant whatever the filter, so the table's rows are counted:
+      // grocery merchants must be named fewer times once the view shows only Travel.
+      const before = timesNamed(await rendered.text(), groceryOnly);
       const chose = await rendered.choose("Travel", CATEGORIES.filter(category => category !== "Travel"), text =>
-        travelOnly.every(merchant => mentions(text, merchant)) && !groceryOnly.some(merchant => mentions(text, merchant)));
-      return { pass: chose.pass, evidence: asEvidence({ tried: chose.tried, text: chose.text }) };
+        travelOnly.every(merchant => mentions(text, merchant)) && timesNamed(text, groceryOnly) < before);
+      return { pass: chose.pass, evidence: asEvidence({ tried: chose.tried, before, text: chose.text }) };
     });
   },
 }, {
@@ -291,8 +297,10 @@ with this server RPC taking and returning plain data:
           return { pass: shown.pass, evidence: asEvidence({ largest, rows: all.length, text: shown.text.slice(0, 2000) }) };
         });
         await verifier.check("searches-by-customer", async () => {
-          const changed = await rendered.setValue("", "Hooli", text => mentions(text, "Hooli") && !mentions(text, "Globex"));
-          return { pass: changed.pass, evidence: asEvidence({ how: changed.how, text: changed.text.slice(0, 2000) }) };
+          const before = timesNamed(await rendered.text(), ["Globex"]);
+          const changed = await rendered.setValue("", "Hooli", text =>
+            mentions(text, "Hooli") && timesNamed(text, ["Globex"]) < before);
+          return { pass: changed.pass, evidence: asEvidence({ how: changed.how, before, text: changed.text.slice(0, 2000) }) };
         });
       }, `${id}-2`)],
   }));
