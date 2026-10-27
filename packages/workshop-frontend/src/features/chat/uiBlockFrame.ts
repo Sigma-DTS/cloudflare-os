@@ -177,6 +177,12 @@ export class UiBlockHostImpl extends RpcTarget implements UiBlockHost {
 const BOOTSTRAP_URL = `data:text/javascript;charset=utf-8,${encodeURIComponent(String.raw`//# sourceURL=gadget-ui-bootstrap.js
 import { RpcTarget, newMessagePortRpcSession } from "${CAPNWEB_MODULE_URL}";
 
+// TRUSTED_TYPES_CSP allows only these two policies, and the bootstrap takes both names before the
+// block's code runs. The block's own document goes through the first. The default one lets code
+// clear an element with "" and refuses any other string. Browsers without Trusted Types ignore it.
+const blockHtml = globalThis.trustedTypes?.createPolicy("gadget-ui", { createHTML: html => html });
+globalThis.trustedTypes?.createPolicy("default", { createHTML: html => html === "" ? html : null });
+
 const applyTheme = ({ scheme, tokens }) => {
   const root = document.documentElement.style;
   root.colorScheme = scheme;
@@ -210,7 +216,7 @@ class Frame extends RpcTarget {
       window.addEventListener("unhandledrejection",
           event => reportError(event.reason?.message ?? event.reason));
     }
-    document.write(html);
+    document.write(blockHtml?.createHTML(html) ?? html);
     if (first) new ResizeObserver(reportHeight).observe(document.body);
   }
   close() { document.close(); }
@@ -240,9 +246,15 @@ globalThis.agent = Object.freeze({
 const themeStyle = ({ scheme, tokens }: UiBlockTheme) =>
   `:root { color-scheme: ${scheme}; ${Object.entries(tokens).map(([name, value]) => `${name}: ${value};`).join(' ')} }`
 
-// The head of the frame's shell and of the block's document: the gadget UI sandbox head, the theme,
-// and the style that fits the block into the answer.
+// Block code that parses a string as HTML or as an event handler (innerHTML,
+// setAttribute("onclick", ...) and the like) throws, so data a view shows cannot run as code in it.
+// Views only: gadget UIs use innerHTML.
+const TRUSTED_TYPES_CSP = `<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'; trusted-types gadget-ui default">`
+
+// The head of the frame's shell and of the block's document: the gadget UI sandbox head, the
+// Trusted Types CSP, the theme, and the style that fits the block into the answer.
 const frameHead = (theme: UiBlockTheme) => `${SANDBOX_HEAD}
+  ${TRUSTED_TYPES_CSP}
   <style>
     ${themeStyle(theme)}
     html, body { margin: 0; height: auto; background: transparent; }

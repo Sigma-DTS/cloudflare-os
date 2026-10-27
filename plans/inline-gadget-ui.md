@@ -74,6 +74,19 @@ Acceptance criteria:
   the gadget UI CSP. A block's HTML never goes into the Workshop document, and `MarkdownMessage`
   keeps `skipHtml`. The block frame is stricter than a gadget frame in one way: its sandbox is
   `allow-scripts` only, with no popups (see "What a block can reach").
+- **A view cannot parse a string as HTML.** The block frame adds a second CSP,
+  `require-trusted-types-for 'script'; trusted-types gadget-ui default`, so `innerHTML`,
+  `insertAdjacentHTML`, `setAttribute("onclick", ...)` and the like throw in block code. Data a
+  view shows, from a shared gadget or from a web page the agent read, then cannot run as code with
+  the view's bindings through the common mistake of showing it as HTML. The bootstrap takes both
+  policy names before block code runs: `gadget-ui` passes the block's own document to
+  `document.write()`, and `default` lets `innerHTML = ""` clear an element and refuses any other
+  string. A view that breaks the rule fails with its error under it, and the evals see the same
+  error. Browsers without Trusted Types (before Chrome 83, Safari 26 and Firefox 148) ignore the
+  CSP. Gadget frames do not get it, since gadget UIs use `innerHTML`. It does not cover untrusted
+  text that the agent copies into the block's own HTML, which the browser parses as the block's
+  markup, nor a dynamic `import()` of a `data:` URL, which Trusted Types does not check and the
+  CSP allows; code does that only on purpose.
 - **The answer's text is the source.** The frontend draws a block from its copy of the answer:
   the streamed text while the answer streams, and the stored message after that. A block's markup
   draws as it streams, and its module scripts run once it closes, because no later text can change
@@ -87,10 +100,9 @@ Acceptance criteria:
   rules for duplicate names.
 - **A block declares nothing.** `env.NAME` asks the kernel for `NAME` the first time block code
   reads it. A declaration would not limit the agent, which writes the declaration and the code
-  together. It would limit only code injected into a view by data the view shows unsafely, and
-  the instructions tell the agent to show data with `textContent` instead. Without one, the agent
-  writes view code exactly as it writes `executeCode`, and the Workshop can list the names a view
-  actually used.
+  together. It would limit only code injected into a view by data the view shows unsafely, which
+  the frame's Trusted Types CSP stops. Without one, the agent writes view code exactly as it
+  writes `executeCode`, and the Workshop can list the names a view actually used.
 - **A view is its own caller.** The kernel opens a connection's session with the caller
   `{from: "view", chatId}`, through `openGatekeeperSession`, the chokepoint for every session. A
   view is agent-written code that runs whenever someone views the chat. It is not the agent, whose
@@ -288,6 +300,7 @@ session.
 | `env.NAME` | A session on a connection the user made, with the view as caller | Reads go to the action log; each write waits for a person's decision in the chat. |
 | `agent.send` | A message shown under the block | Only the viewer's click on Send calls the kernel, through `sendChatMessage`, as the viewer's own message. |
 | Popups, other frames, the network | Nothing | `sandbox="allow-scripts"`, CSP `connect-src 'none'`, and the Workshop's `frame-src srcdoc:`. |
+| HTML or code from a string | Nothing | The Trusted Types CSP, whose two policies the bootstrap takes before block code runs. |
 
 A view can still write to a gadget through its methods with no approval, as a gadget's own UI
 can. Gadget methods declare no read-only flag to limit a stub to.
@@ -359,29 +372,32 @@ restricted data. This plan does not change gadget frames.
   having asked when `binding` is first called, before the lookup runs, so a lookup in flight across
   a reconnect counts. A frame that never asked keeps running. Lookups use the current Overseer
   stub.
-- **Shell.** A frame loads a shell: the sandbox head, the frame's style in the theme of that
-  moment, and one bootstrap module, whose URL is built once per page, since it embeds all of Cap'n
-  Web. The bootstrap waits for the shell's `load` event, so that the event cannot fire in the
-  block's document once `write` opens it. It then sets up the Cap'n Web session, and defines
-  `globalThis.env` and `globalThis.agent`. `env` is a proxy: reading a string property other than
-  `then` asks the host for that binding once and returns the same promise after that, so
-  `env.NAME.rpc.method()` pipelines. `agent` has one method, `send(message)`. The bootstrap's
-  cache only keeps `env.NAME` stable; the host enforces every limit.
+- **Shell.** A frame loads a shell: the sandbox head, the Trusted Types CSP, the frame's style in
+  the theme of that moment, and one bootstrap module, whose URL is built once per page, since it
+  embeds all of Cap'n Web. The bootstrap creates the two Trusted Types policies, then waits for the
+  shell's `load` event, so that the event cannot fire in the block's document once `write` opens
+  it. It then sets up the Cap'n Web session, and defines `globalThis.env` and `globalThis.agent`.
+  `env` is a proxy: reading a string property other than `then` asks the host for that binding
+  once and returns the same promise after that, so `env.NAME.rpc.method()` pipelines. `agent` has
+  one method, `send(message)`. The bootstrap's cache only keeps `env.NAME` stable; the host
+  enforces every limit.
 - **Writing the block.** After the handshake the host calls `write` with the start of the block
   document (its doctype, and a head with the frame's style in the theme of that moment), then with
   the block's HTML so far, then with each new part as the answer streams, and calls `close` once
   the block closes. A stored block takes the same path, with all of its HTML in one `write`. The
   host settles each call, and the bootstrap each of its own calls to the host, so that Cap'n Web
   releases it: a block streams in many parts, and its view resizes as it grows. The first `write`
-  calls `document.open()`, and each one calls `document.write()`, so the browser's own HTML parser
-  adds the markup as it arrives, as it does for a page that loads slowly. A tag or a text that one
-  part cuts in two joins up with the next part. Classic scripts and `async` module scripts run, and
-  inline event handlers listen, as soon as they are parsed. Other module scripts wait until
-  `close` ends the document, then run in document order, so a block's `<script type="module">`
-  sees all of its markup, `env` and `agent`. Checked in Chromium 150, Firefox 157 and Safari's
-  WebKit:
+  calls `document.open()`, and each one calls `document.write()` through the `gadget-ui` policy,
+  so the browser's own HTML parser adds the markup as it arrives, as it does for a page that loads
+  slowly. A tag or a text that one part cuts in two joins up with the next part. Classic scripts
+  and `async` module scripts run, and inline event handlers listen, as soon as they are parsed.
+  Other module scripts wait until `close` ends the document, then run in document order, so a
+  block's `<script type="module">` sees all of its markup, `env` and `agent`. Checked in Chromium
+  150, Firefox 157 and Safari's WebKit:
   - The CSP that the shell's `<meta>` set stays after `document.open()`, because the document
     keeps its policy container. Code in the new document still has no network.
+  - The Trusted Types policies stay as well, since they belong to the window. Checked in Chromium
+    156 and Firefox 157 only.
   - `document.open()` keeps the window, its globals and the Cap'n Web port. It removes every node,
     and every event listener on the document and the window, so the bootstrap adds its error
     listeners and its `ResizeObserver` after the first `write`.
@@ -448,10 +464,10 @@ restricted data. This plan does not change gadget frames.
   `<title>` is not shown and the view sits in the answer with no border or padding around it,
   module scripts, `env` as in `executeCode` and what it lacks, that each write waits for a
   person's decision in the chat, that code on load must only read and no code may poll or loop
-  over calls, `textContent` rather than `innerHTML` for data, `agent.send` in the user's words, no
-  network, the Kumo colour tokens, the height rules, and that a view keeps no state. The example
-  draws its heading and a loading line as markup, and its script fills in the bars, since models
-  copy the example more than they follow the rules.
+  over calls, `textContent` for data since parsing a string as HTML throws, `agent.send` in the
+  user's words, no network, the Kumo colour tokens, the height rules, and that a view keeps no
+  state. The example draws its heading and a loading line as markup, and its script fills in the
+  bars, since models copy the example more than they follow the rules.
 
 ## Rejected alternatives
 
