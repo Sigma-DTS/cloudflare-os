@@ -76,6 +76,7 @@ describe("NotificationBridge", () => {
     await act(async () => root.unmount());
     container.remove();
     Reflect.deleteProperty(window, "cloudflareOSNative");
+    Reflect.deleteProperty(window, "__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__");
   });
 
   it("obtains a CFOS-authorized grant before asking new native apps to enroll", async () => {
@@ -169,6 +170,29 @@ describe("NotificationBridge", () => {
     await act(async () => resolveRegistration());
     expect(finished).toHaveBeenCalledExactlyOnceWith("ready");
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("reports a legacy-global registration through Strict Mode effect replay", async () => {
+    let resolveRegistration!: () => void;
+    authenticatedApi.registerNotificationDevice.mockReturnValue(
+      new Promise(done => { resolveRegistration = done; }),
+    );
+    const finished = vi.fn<(message: { type: "ready" | "failed" }) => void>();
+    Object.assign(window, {
+      __CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__: "legacy-handle",
+      webkit: { messageHandlers: { cloudflareOSNotificationReady: { postMessage: finished } } },
+    });
+    await act(async () => root.render(
+      <StrictMode>
+        <NotificationBridge
+          authenticatedApi={authenticatedApi as unknown as RpcStub<AuthenticatedApi>} />
+      </StrictMode>,
+    ));
+    expect(authenticatedApi.registerNotificationDevice)
+        .toHaveBeenCalledExactlyOnceWith("legacy-handle");
+    await act(async () => resolveRegistration());
+    expect(finished).toHaveBeenCalledExactlyOnceWith({ type: "ready" });
+    Reflect.deleteProperty(window, "webkit");
   });
 
   it("keeps one subscription across rerenders and declines while hidden", async () => {

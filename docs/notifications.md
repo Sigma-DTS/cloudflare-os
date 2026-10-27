@@ -147,9 +147,10 @@ flowchart LR
 ```
 
 Only the event id, event type, task id (`<workspaceId>:<chatId>`), bounded chat title, opaque
-subscription id, and same-origin deep-link path cross the central boundary during a send, plus the
-headers every signed request carries: install id, key id, timestamp, nonce, body digest, and
-signature. Permission details, chat content, gatekeeper grants, and provider credentials do not. A
+subscription id, opaque User DO subject, and same-origin deep-link path cross the central boundary
+during a send, plus the headers every signed request carries: install id, key id, timestamp, nonce,
+body digest, and signature. Permission details, chat content, gatekeeper grants, and provider
+credentials do not. A
 visible browser tab is offered the notification first, and push is sent to every registered device
 only if no tab acknowledges it within three seconds. A tab subscribes while visible, and again if a
 User DO reset drops its subscription. When the service answers `device_gone` or

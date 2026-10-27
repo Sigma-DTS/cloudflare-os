@@ -63,16 +63,15 @@ export const NotificationBridge = ({
   const currentApi = useRef(authenticatedApi);
   currentApi.current = authenticatedApi;
   const askedNative = useRef(false);
-  const pendingAuthorization = useRef<Promise<string> | undefined>(undefined);
-  const registrationAttempts = useRef(new Map<string, Promise<"ready" | "failed">>());
+  const mounted = useRef(false);
+  const requestingAuthorization = useRef(false);
+  const claimedRegistrations = useRef(new Set<string>());
 
   useEffect(() => {
     let legacyWindow = window as LegacyNativeNotificationWindow;
     let notifications = nativeApp()?.notifications;
-    let cancelled = false;
-    let requestingAuthorization = false;
-    const reportingRegistrations = new Set<string>();
-    let reportRegistration = (outcome: "ready" | "failed") => {
+    mounted.current = true;
+    const reportRegistration = (outcome: "ready" | "failed") => {
       if (notifications) {
         notifications.registrationFinished(outcome);
       } else {
@@ -81,61 +80,48 @@ export const NotificationBridge = ({
       }
     };
     const requestRegistration = async () => {
-      if (requestingAuthorization) return;
-      requestingAuthorization = true;
+      if (!notifications?.authorizationRequired) {
+        if (notifications) notifications.requestDeviceRegistration();
+        else legacyWindow.__CLOUDFLARE_OS_REQUEST_NOTIFICATION_DEVICE_REGISTRATION__?.();
+        return;
+      }
+      if (requestingAuthorization.current) return;
+      requestingAuthorization.current = true;
       try {
-        if (notifications?.authorizationRequired) {
-          const request = pendingAuthorization.current ??
-            currentApi.current.authorizeNotificationDevice();
-          pendingAuthorization.current = request;
-          const authorization = await request.finally(() => {
-            if (pendingAuthorization.current === request) pendingAuthorization.current = undefined;
-          });
-          if (!cancelled) notifications.requestDeviceRegistration(authorization);
-        } else if (notifications) {
-          notifications.requestDeviceRegistration();
-        } else {
-          legacyWindow.__CLOUDFLARE_OS_REQUEST_NOTIFICATION_DEVICE_REGISTRATION__?.();
-        }
+        const authorization = await currentApi.current.authorizeNotificationDevice();
+        if (mounted.current) notifications.requestDeviceRegistration(authorization);
       } catch (error) {
-        if (!cancelled) {
+        if (mounted.current) {
           reportRegistration("failed");
           logRpcFailure("Failed to authorize notification device:", error);
         }
       } finally {
-        requestingAuthorization = false;
+        requestingAuthorization.current = false;
       }
     };
-    let register = async (deviceRegistrationId: string | undefined) => {
-      if (!deviceRegistrationId || reportingRegistrations.has(deviceRegistrationId)) return;
-      reportingRegistrations.add(deviceRegistrationId);
-      let attempt = registrationAttempts.current.get(deviceRegistrationId);
-      if (!attempt) {
-        // The native handle is single-use. Retain its one exchange so Strict Mode's replacement
-        // effect can report the outcome without redeeming the handle again.
-        if (legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__ ===
-            deviceRegistrationId) {
-          delete legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__;
+    const register = async (deviceRegistrationId: string | undefined) => {
+      if (!deviceRegistrationId || claimedRegistrations.current.has(deviceRegistrationId)) return;
+      // Native handles are single-use. The mounted ref lets the original exchange report through
+      // Strict Mode's effect replay without redeeming the handle again.
+      claimedRegistrations.current.add(deviceRegistrationId);
+      if (legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__ ===
+          deviceRegistrationId) {
+        delete legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__;
+      }
+      let outcome: "ready" | "failed" = "ready";
+      try {
+        if (notifications?.authorizationRequired) {
+          await currentApi.current.registerAuthorizedNotificationDevice(deviceRegistrationId);
+        } else {
+          await currentApi.current.registerNotificationDevice(deviceRegistrationId);
         }
-        attempt = (async () => {
-          try {
-            if (notifications?.authorizationRequired) {
-              await currentApi.current.registerAuthorizedNotificationDevice(deviceRegistrationId);
-            } else {
-              await currentApi.current.registerNotificationDevice(deviceRegistrationId);
-            }
-            return "ready" as const;
-          } catch (error) {
-            logRpcFailure("Failed to register notification device:", error);
-            return "failed" as const;
-          }
-        })();
-        registrationAttempts.current.set(deviceRegistrationId, attempt);
+      } catch (error) {
+        outcome = "failed";
+        logRpcFailure("Failed to register notification device:", error);
       }
-      const outcome = await attempt;
-      if (!cancelled) reportRegistration(outcome);
+      if (mounted.current) reportRegistration(outcome);
     };
-    let onDeviceRegistration = (event: Event) => {
+    const onDeviceRegistration = (event: Event) => {
       void register(eventDeviceRegistration(event));
     };
 
@@ -148,15 +134,15 @@ export const NotificationBridge = ({
     const onAuthorizationRequest = () => { void requestRegistration(); };
     window.addEventListener(NOTIFICATION_AUTHORIZATION_REQUEST_EVENT, onAuthorizationRequest);
     // Each id costs a central registration. Ask at most once per authenticated mount, and not at
-    // all when native already injected one. A pending grant survives Strict Mode's effect replay.
-    if (!askedNative.current || pendingAuthorization.current) {
+    // all when native already injected one.
+    if (!askedNative.current) {
       askedNative.current = true;
       if (!injected) {
         void requestRegistration();
       }
     }
     return () => {
-      cancelled = true;
+      mounted.current = false;
       window.removeEventListener(DEVICE_REGISTRATION_EVENT, onDeviceRegistration);
       window.removeEventListener(NOTIFICATION_AUTHORIZATION_REQUEST_EVENT, onAuthorizationRequest);
     };

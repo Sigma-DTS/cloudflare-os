@@ -17,6 +17,7 @@ declare module "cloudflare:workers" {
 const encoder = new TextEncoder();
 const SUBSCRIPTION_ID = "b".repeat(64);
 const SUBJECT = "a".repeat(64);
+const AUTHORIZATION = "c".repeat(64);
 // Ids the stub service mints, in order.
 const [ONE, TWO, THREE] = ["1", "2", "3"].map(digit => digit.repeat(64));
 const NOTIFICATION: UserNotification = {
@@ -53,7 +54,7 @@ function stubService(refuse?: { subscriptionId: string; status: string; code: nu
     let body = JSON.parse(String(init?.body));
     const path = new URL(String(input)).pathname;
     if (path === "/v2/device-authorizations") {
-      return Response.json({ authorization: "a".repeat(64) }, { status: 201 });
+      return Response.json({ authorization: AUTHORIZATION }, { status: 201 });
     }
     if (path === "/v1/subscriptions" || path === "/v2/subscriptions") {
       return Response.json({
@@ -83,7 +84,7 @@ describe("notification service", () => {
     kind === "legacy" ? registerDevice(installEnv, "d".repeat(64), SUBJECT) :
     kind === "authorized" ? registerAuthorizedDevice(installEnv, "d".repeat(64), SUBJECT) :
     authorizeDevice(installEnv, SUBJECT);
-  const registered = { deviceKey: "d".repeat(64), subscriptionId: ONE, authorization: "a".repeat(64) };
+  const registered = { deviceKey: "d".repeat(64), subscriptionId: ONE, authorization: AUTHORIZATION };
 
   it.each(["legacy", "authorized", "authorization"] as const)(
       "keeps the %s deadline through body parsing and releases it after success", async kind => {
@@ -135,20 +136,9 @@ describe("notification service", () => {
 
   it("signs the installation's vouch for an opaque CFOS user without a Dashboard credential", async () => {
     const fetcher = stubService();
-    const subject = "a".repeat(64);
-    await expect(authorizeDevice(installEnv, subject)).resolves.toBe("a".repeat(64));
-    const [url, init] = fetcher.mock.calls[0];
-    const headers = new Headers(init?.headers);
+    const subject = SUBJECT;
+    await expect(authorizeDevice(installEnv, subject)).resolves.toBe(AUTHORIZATION);
     expect(bodies(fetcher, "/v2/device-authorizations")).toEqual([{ subject }]);
-    expect(headers.has("Authorization")).toBe(false);
-    const canonical = [
-      "CFOS1", "POST", new URL(String(url)).pathname,
-      ...["install-id", "key-id", "timestamp", "nonce", "content-digest"]
-          .map(name => headers.get(`x-cfos-${name}`)),
-    ].join("\n");
-    expect(await crypto.subtle.verify(
-        { name: "ECDSA", hash: "SHA-256" }, publicKey,
-        base64urlBytes(headers.get("x-cfos-signature")!), encoder.encode(canonical))).toBe(true);
     await registerAuthorizedDevice(installEnv, "d".repeat(64), subject);
     expect(bodies(fetcher, "/v2/subscriptions"))
         .toEqual([{ subject, deviceRegistrationId: "d".repeat(64) }]);

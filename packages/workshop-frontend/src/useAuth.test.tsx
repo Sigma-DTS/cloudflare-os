@@ -169,6 +169,26 @@ describe('useAuth error reporting identity', () => {
     }
   })
 
+  it('finishes local logout when the native notification bridge throws', async () => {
+    using _ = vi.spyOn(console, 'error').mockImplementation(() => {})
+    localStorage.setItem('authToken', 'stored-token')
+    Object.assign(window, { cloudflareOSNative: { version: 1, isAvailable: () => true,
+      loginReady: () => {}, returnToInstalls: () => {}, notifications: {
+        currentDeviceRegistration: () => undefined,
+        requestDeviceRegistration: () => {},
+        registrationFinished: () => {},
+        disconnect: () => { throw new Error('native bridge unavailable') },
+      } } })
+    try {
+      const { controls } = await mount(stubPublicApi(person))
+      act(() => controls.logout())
+      expect(localStorage.getItem('authToken')).toBeNull()
+      expect(setReportedUserId).toHaveBeenLastCalledWith(undefined)
+    } finally {
+      Reflect.deleteProperty(window, 'cloudflareOSNative')
+    }
+  })
+
   it('ignores a lookup that resolves after logout', async () => {
     localStorage.setItem('authToken', 'stored-token')
     const { api, release } = deferredPublicApi()

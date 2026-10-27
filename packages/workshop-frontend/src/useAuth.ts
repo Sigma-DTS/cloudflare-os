@@ -129,7 +129,11 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   }
 
   const logout = () => {
-    nativeApp()?.notifications?.disconnect?.()
+    try {
+      nativeApp()?.notifications?.disconnect?.()
+    } catch (error) {
+      console.error('Failed to disconnect native notifications:', error)
+    }
     setReportedUserId(undefined)
     // On a shared computer, signing out is how the user stops this browser showing their chats.
     const releasePush = browserPushSupport() === 'supported'
