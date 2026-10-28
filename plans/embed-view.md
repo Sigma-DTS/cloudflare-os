@@ -179,11 +179,38 @@ it draws while the model writes, with no tool call. `embedView`'s advantage is j
 goes from code to the view without the model reading, retyping or adding it up. The crossing point
 depends on where the data comes from. For data the user pasted, it is around L4, the first view
 that needs computed totals over a few dozen rows. For data read from a Gadget or another tool, it
-is at the first rung. Bindings in inline views, deferred in #874, would let an inline view read
-that data itself, which would take away most of `embedView`'s lead; they were not measured here.
-So the next comparison worth running is inline views with bindings against `embedView`.
+is at the first rung.
+
+## Inline views with bindings (2026-10-28)
+
+The Gadget-data rungs again, on #874 before bindings were deferred (commit `7cff53a9e`), where a
+view reads the chat's Gadgets through `env`. 18 trials; 13 reached each view turn (5 rate-limited
+or failed Gadget setups left out).
+
+| All 300 sales | Inline | Inline + bindings | `embedView` |
+|---|---|---|---|
+| First draw s (median) | 24.2 | 9.5 | 29.0 |
+| Done s (median) | 54 | 19 | 30 |
+| Model steps | 2.9 | 1.1 | 1.1 |
+| Prompt tokens | 76.4K | 19.3K | 18.6K |
+| Context added (median) | 19.5K | 2.7K | 2.7K |
+| Passed | 11/11 | 11/13 | 12/15 |
+
+- With bindings the view reads the Gadget itself: about one step, no tool call, and `embedView`'s
+  tokens and context. It draws 2–3× sooner, since it streams.
+- Cost per answer is about the same as `embedView` (Luna 0.17¢ both; Haiku 0.38¢ against 0.34¢;
+  Kimi K3 7.8¢ against 6.8¢). Its grand totals were right 10 times in 10.
+
+**Context usage**, the chat's prompt before an answer against the last step's prompt plus its
+reply: with data in the prompt, inline and `embedView` add about the same (1–11K, growing with the
+view); a Gadget adds 1.3–3.2× more. For the 300-sale view, inline without bindings adds 19.5K,
+because the rows pass through the chat; bindings and `embedView` add 2.7K.
+
+**Verdict, with bindings.** Inline views with bindings take away `embedView`'s lead on Gadget data
+and keep inline's lead on everything else. [INFERENCE, untested] `embedView` would still win on a
+view of data no binding reaches, such as values computed or fetched in code (web search, a
+connection), which an inline view would have to retype.
 
 ## Not in this exploration
 
-Bindings in inline views (deferred in #874), live data, and a migration between the two
-approaches.
+Live data, and a migration between the two approaches.
