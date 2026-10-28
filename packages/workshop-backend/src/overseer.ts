@@ -52,7 +52,7 @@ import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
-import { chatChangeStatuses, foldCompactedCode, isTurnPrompt } from "./agent-compaction";
+import { chatChangeStatuses, foldChatBindings, foldCompactedCode, isTurnPrompt } from "./agent-compaction";
 import type { CachedRequest } from "./ai-models";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { ambientGatekeeperMode } from "./provisioning-policy";
@@ -83,7 +83,7 @@ import { createWorkshopLogger, obsContext } from "./observability";
 import { traceAgentTurn, traceToolApproval } from "./agent-tracing";
 import { isLoopLimitError, retryOnDoReset, shouldRetryAfterReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
-import type { CreationApproval, GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import type { CreationApproval, GadgetExportFormat, ViewBinding } from "@gadgets/workshop-shared/api";
 import { gadgetUiAnswerAsText } from "@gadgets/workshop-shared/gadget-ui-blocks";
 import {
   assertChatAttachmentSize,
@@ -2693,11 +2693,20 @@ class OverseerImpl implements AgentHooks {
   // with no entry has never had its facet loaded this session.
   #runningChatIds = new Map<WorkpieceId, number | null>();
 
+  // How many times each gadget's facet has been restarted this session. A facet stub dies with
+  // the facet it came from, so getGadgetFacet's proxy compares this count to fetch a fresh one.
+  #gadgetRestarts = new Map<WorkpieceId, number>();
+
+  // Every restart of a gadget's facet goes through here, so getGadgetFacet's stubs see it.
+  #restartGadgetFacet(gadgetId: WorkpieceId, reason: string) {
+    this.ctx.facets.abort(this.gadgetFacetName(gadgetId), new Error(reason));
+    this.#gadgetRestarts.set(gadgetId, (this.#gadgetRestarts.get(gadgetId) ?? 0) + 1);
+  }
+
   proposedChangesChanged(chatId: number) {
     for (let [gadgetId, runningChatId] of this.#runningChatIds) {
       if (runningChatId === chatId) {
-        this.ctx.facets.abort(this.gadgetFacetName(gadgetId), new Error(
-            "Gadget restarted because the proposed changes changed."));
+        this.#restartGadgetFacet(gadgetId, "Gadget restarted because the proposed changes changed.");
       }
     }
   }
@@ -4644,16 +4653,16 @@ class OverseerImpl implements AgentHooks {
     //
     // If/when we support hiberation of the overseer, we'll need to do something more
     // sophisticated.
-    let facetName = this.gadgetFacetName(gadgetId);
     let oldChat = this.#runningChatIds.get(gadgetId);
     let newChat = chatId ?? null;
     if (newChat !== oldChat) {
-      this.ctx.facets.abort(facetName, new Error(
-          newChat === null
-            ? "Gadget restarted to switch back to main version."
-            : "Gadget restarted to test proposed changes."));
+      this.#restartGadgetFacet(gadgetId, newChat === null
+          ? "Gadget restarted to switch back to main version."
+          : "Gadget restarted to test proposed changes.");
       this.#runningChatIds.set(gadgetId, newChat);
     }
+
+    let facetName = this.gadgetFacetName(gadgetId);
 
     return this.ctx.facets.get<DurableObject>(facetName, () => {
       let stub = this.loadGadgetWorker(gadgetId, chatId);
@@ -4682,6 +4691,27 @@ class OverseerImpl implements AgentHooks {
     let facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
     let leaveSession = joinAs ? this.joinSession(joinAs) : undefined;
 
+    // A facet stub dies with the facet it came from (see #restartGadgetFacet). A call that
+    // starts after a restart fetches the facet again, so a stub held across a code change, such
+    // as a view's, reaches the gadget's current code. Calls already running when it restarts
+    // still fail: they may have reached the old code.
+    let restarts = this.#gadgetRestarts.get(gadgetId) ?? 0;
+    let refreshing: Promise<void> | undefined;
+    let disposed = false;
+    let disposeFacet = (stub: Fetcher<DurableObject>) => {
+      let dispose = Reflect.get(stub, Symbol.dispose, stub);
+      if (typeof dispose === "function") Reflect.apply(dispose, stub, []);
+    };
+    let refresh = () => refreshing ??= (async () => {
+      let stale = facet;
+      facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
+      // Read after the fetch, which itself restarts the facet if it switches between a chat's
+      // proposed changes and main.
+      restarts = this.#gadgetRestarts.get(gadgetId) ?? 0;
+      disposeFacet(stale);
+      if (disposed) disposeFacet(facet);
+    })().finally(() => { refreshing = undefined; });
+
     let self = this;
 
     // TODO: Make possible to return facet stub over RPC. This Proxy is a hack.
@@ -4690,11 +4720,11 @@ class OverseerImpl implements AgentHooks {
         // The lease ends when the client disposes the stub. (The DO reset that severs sessions
         // releases it implicitly, by discarding this object -- and joinSession's leave is
         // idempotent, so a double dispose is harmless.)
-        if (prop === Symbol.dispose && leaveSession) {
-          let inner = Reflect.get(target, prop, target);
+        if (prop === Symbol.dispose) {
           return () => {
-            leaveSession!();
-            if (typeof inner === "function") Reflect.apply(inner, target, []);
+            disposed = true;
+            leaveSession?.();
+            disposeFacet(facet);
           };
         }
 
@@ -4715,7 +4745,10 @@ class OverseerImpl implements AgentHooks {
         //   possibly a runtime bug which needs investigation.
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
-          let result: Promise<any> = Reflect.apply(method, target, args);
+          let call = (stub: Fetcher<DurableObject>): Promise<any> =>
+              Reflect.apply(Reflect.get(stub, prop, stub), stub, args);
+          let result = (self.#gadgetRestarts.get(gadgetId) ?? 0) === restarts
+              ? call(facet) : refresh().then(() => call(facet));
           return result.catch((err: any) => {
             let msg = err;
             if (err instanceof Error) {
@@ -5344,7 +5377,8 @@ class OverseerImpl implements AgentHooks {
     };
 
     this.storage.actions.put(record);
-    this.#associateAction(caller, actionId);
+    // A view reads on every mount, for every viewer, so its reads stay out of the chat.
+    if (caller.from !== "view") this.#associateAction(caller, actionId);
 
     if (sharing && baseline) {
       let affected = sharing.computeAffectedByOwnerInvitesOnly(baseline);
@@ -5908,6 +5942,10 @@ class OverseerImpl implements AgentHooks {
       this.gitCache.verifyPushAncestry(gatekeeperId, description.pushedCommits);
     }
 
+    // A view's code runs again on every mount and for every viewer, so no rule may apply its
+    // actions. Storing that verdict keeps the card, the action log and the drainer in agreement.
+    if (caller.from === "view") description = {...description, autoApprovable: false};
+
     let actionId = this.storage.nextActionId.get();
     this.storage.nextActionId.put(actionId + 1);
 
@@ -6219,8 +6257,7 @@ class OverseerImpl implements AgentHooks {
         .filter(record => record.type === "gadget")  // worktrees have no facet to restart
         .map(gadget => gadget.id);
     for (let id of ids) {
-      this.ctx.facets.abort(this.gadgetFacetName(id),
-          new Error("Gadget restarted due to code update."));
+      this.#restartGadgetFacet(id, "Gadget restarted due to code update.");
     }
     this.bumpLastActive();
     return codeVersion;
@@ -7657,6 +7694,70 @@ class OverseerImpl implements AgentHooks {
       // The set of pending calls changed (or a turn started): recompute the alarm.
       this.#updateAlarm();
     }
+  }
+
+  // The chat binding `name` as a `<gadget-ui>` view reaches it (see Overseer.connectToChatBinding):
+  // a gadget's facet at the chat's version, or a session on a connection the user made, with the
+  // view as caller. `joinAs` counts what it returns toward the holder's session.
+  async openViewBinding(chatId: number, name: string, joinAs?: SessionKind): Promise<ViewBinding> {
+    let entry = this.resolveChatBinding(chatId, name);
+    if (entry === undefined) throw new Error(`"${name}" is not a binding in this chat.`);
+    let id = entry.type === "workpiece" ? entry.id : undefined;
+    if (id !== undefined && this.storage.gadgets.get(id)?.type === "gadget") {
+      // A gadget pane gets this from getUiBundle(); the worker loads only materialized changes.
+      this.checkChatExistsAndMaterializeChanges(chatId);
+      return {type: "gadget", rpc: await this.getGadgetFacet(id, chatId, joinAs)};
+    }
+    // Only a connection the user made. A view never reaches a model, whose spend isn't recorded, a
+    // spawner, which starts agent turns, or an auto-provided service, which may spend credits or
+    // register lasting callbacks.
+    if (id !== undefined && this.storage.gatekeepers.get(id)?.creationSpec?.type === "gatekeeper") {
+      let session = await this.openGatekeeperSession(
+          id, await this.getGatekeeperFacet(id), {from: "view", chatId});
+      return {type: "connection", session: joinAs ? this.#leasedSession(session, joinAs) : session};
+    }
+    throw new Error(`"${name}" can't be used in a view.`);
+  }
+
+  // `session`, counted toward `joinAs` until its holder disposes it. One proxy holds both, so a
+  // holder can't keep the session and drop the count (compare getGadgetFacet).
+  #leasedSession(session: RpcStub<any>, joinAs: SessionKind): RpcStub<any> {
+    let leaveSession = this.joinSession(joinAs);
+    let proxy = new Proxy(session, {
+      get(target, prop) {
+        if (prop === Symbol.dispose) {
+          return () => {
+            leaveSession();
+            target[Symbol.dispose]();
+          };
+        }
+        // `target` as the receiver, as in getGadgetFacet, where the proxy as receiver throws.
+        return Reflect.get(target, prop, target);
+      },
+      getPrototypeOf() {
+        return RpcTarget.prototype;
+      },
+    });
+    // As in getGadgetFacet: workerd doesn't detect a proxy RpcTarget that it serializes.
+    // @ts-expect-error NativeRpcStub still has infinite recursion problems, fixed in Cap'n Web.
+    return new NativeRpcStub(proxy) as RpcStub<any>;
+  }
+
+  // What `name` resolves to in the chat's binding scope, as the agent's `env` resolves it. Reads
+  // only, unlike prepareChatBindings: the seed layer exists once the agent has run, which it has
+  // for any chat with an agent answer.
+  resolveChatBinding(chatId: number, name: string): ChatBindingEntry | undefined {
+    let checkpoint = this.getActiveChatCompaction(chatId);
+    let seed = Object.entries(this.getChatAgentContext(chatId).bindings ?? {});
+    let bindings = new Map<string, ChatBindingEntry>([
+      ...seed.map<[string, ChatBindingEntry]>(([seedName, id]) => [seedName, {type: "workpiece", id}]),
+      ...checkpoint?.chatBindings ?? [],
+    ]);
+    foldChatBindings(this.storage.chats.list({
+      prefix: chatKeyPrefix(chatId),
+      start: chatKey(chatId, checkpoint?.compactedTo ?? 0),
+    }), bindings);
+    return bindings.get(name);
   }
 
   getChatAgentContext(chatId: number): AiChatAgentContext {
@@ -12050,6 +12151,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return msg && this.#getChatMessageForClient(msg);
   }
 
+  async connectToChatBinding(chatId: number, name: string): Promise<ViewBinding> {
+    // Counted toward the caller's session for as long as it lives, as the stub
+    // GadgetClient.connectToGadget returns is.
+    return this.impl.openViewBinding(chatId, name, this.#mintedCapabilityKind());
+  }
+
   #getChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
     if (msg.type === "action") {
       let record = this.impl.storage.actions.get(msg.actionId);
@@ -12836,6 +12943,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async getChatMessage(_chatId: number, _sequence: number): Promise<AiChatMessage | undefined> { this.#deny(); }
+  async connectToChatBinding(_chatId: number, _name: string): Promise<ViewBinding> { this.#deny(); }
   async listSlashCommands(): Promise<SlashCommandChoice[]> { this.#deny(); }
   async subscribeToChat(
       _subscriber: RpcStub<AiChatSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {

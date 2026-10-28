@@ -6,7 +6,7 @@ import type { RenderedView } from "../src/view-host.js";
 
 // Checks for the tasks that test how the agent answers: with a `<gadget-ui>` view, a Gadget, or
 // prose (agent.ts, "Workspaces" and "Live views in your answers"), and whether its views keep the
-// rules there.
+// rules there and work against the chat's real bindings.
 
 /** A closed view the agent wrote this turn, and the sequence of the message it is in. */
 export type TurnView = { sequence: number; html: string };
@@ -17,7 +17,8 @@ function agentMessages(messages: readonly AiChatMessage[]) {
 }
 
 function turnToolCalls(messages: readonly AiChatMessage[]) {
-  return agentMessages(messages).flatMap(message => message.toolCalls ?? []);
+  return agentMessages(messages).flatMap(message =>
+    (message.toolCalls ?? []).map(call => ({ sequence: message.sequence, call })));
 }
 
 /** This turn's closed views, oldest first, and the start of each view it never closed. */
@@ -37,10 +38,19 @@ function lastReply(verifier: EvalVerifier): string {
   return (verifier.replies.at(-1) ?? "").slice(0, 1_000);
 }
 
+function fileName(path: string): string {
+  return path.replace(/^\.?\//, "");
+}
+
 /** The Gadgets this turn created, as createGadget took them. */
 function createdGadgets(messages: readonly AiChatMessage[]) {
-  return turnToolCalls(messages).flatMap(call =>
+  return turnToolCalls(messages).flatMap(({ call }) =>
     call.toolName === "createGadget" && call.error === undefined ? [call.input] : []);
+}
+
+/** The binding name of the Gadget titled `title` that the agent created in this chat. */
+export function gadgetBinding(verifier: EvalVerifier, title: string): string | undefined {
+  return createdGadgets(verifier.chat.history).find(gadget => gadget.title === title)?.bindingName;
 }
 
 /** The turn answers with a view and closes every view it opens. Returns its last view. */
@@ -75,9 +85,9 @@ export async function checkMakesNoGadget(
 /** The turn creates a Gadget and gives it code: a server.js and a client.js, or a blueprint's. */
 export async function checkBuildsGadget(verifier: EvalVerifier): Promise<void> {
   await verifier.check("builds-a-gadget", async () => {
-    const writes = turnToolCalls(verifier.messages).flatMap(call =>
+    const writes = turnToolCalls(verifier.messages).flatMap(({ call }) =>
       (call.toolName === "writeFile" || call.toolName === "editFile") && call.error === undefined
-        ? [{ gadget: call.input.workpiece, file: call.input.filename.replace(/^\.?\//, "") }] : []);
+        ? [{ gadget: call.input.workpiece, file: fileName(call.input.filename) }] : []);
     const wrote = (gadget: string, file: string) =>
       writes.some(write => write.gadget === gadget && write.file === file);
     const gadgets = createdGadgets(verifier.messages).map(gadget => ({
@@ -100,13 +110,53 @@ export async function checkLastView(
   if (view !== undefined) await run(view);
 }
 
-/** Runs `view`: `body`'s checks, then the checks every view must pass. The page closes when they finish. */
+/**
+ * Runs `view` with the chat's bindings: `body`'s checks, then the checks every view must pass.
+ * The page closes when they finish.
+ */
 export async function checkView(
     verifier: EvalVerifier, view: TurnView,
     body: (rendered: RenderedView) => Promise<void> = async () => {}): Promise<void> {
   await using rendered = await verifier.openView(view.html);
   await body(rendered);
+  await checkViewComesAfterItsGadgets(verifier, view, rendered);
   await checkViewRules(verifier, view, rendered);
+}
+
+/** The bindings a view reaches: those it opened when it ran, and those its code names. */
+function viewBindings(view: TurnView, rendered: RenderedView): Set<string> {
+  const names = new Set(rendered.calls.map(call => call.call.split(".")[0] ?? ""));
+  for (const match of view.html.matchAll(
+      /\benv\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/g)) {
+    names.add(match[1] ?? match[2] ?? "");
+  }
+  names.delete("");
+  return names;
+}
+
+// The Workshop runs a view as soon as its block closes, before any tool call in the same answer,
+// so nothing the view reaches may be created or changed from its own message on.
+async function checkViewComesAfterItsGadgets(
+    verifier: EvalVerifier, view: TurnView, rendered: RenderedView): Promise<void> {
+  await verifier.check("view-comes-after-its-gadgets", async () => {
+    const bindings = viewBindings(view, rendered);
+    const late = turnToolCalls(verifier.messages).flatMap((
+        { sequence, call }): { sequence: number; tool: string; gadget: string; file: string | null }[] => {
+      if (sequence < view.sequence || call.error !== undefined) return [];
+      if (call.toolName === "createGadget" && bindings.has(call.input.bindingName)) {
+        return [{ sequence, tool: call.toolName, gadget: call.input.bindingName, file: null }];
+      }
+      if ((call.toolName === "writeFile" || call.toolName === "editFile") &&
+          bindings.has(call.input.workpiece ?? "") && fileName(call.input.filename) !== "client.js") {
+        return [{ sequence, tool: call.toolName, gadget: call.input.workpiece ?? "", file: call.input.filename }];
+      }
+      return [];
+    });
+    return {
+      pass: late.length === 0,
+      evidence: asEvidence({ viewSequence: view.sequence, bindings: [...bindings], late }),
+    };
+  });
 }
 
 const JAVASCRIPT_TYPE = /^(?:(?:text|application)\/(?:x-)?(?:javascript|ecmascript))?$/i;
@@ -119,8 +169,8 @@ function classicScripts(html: string): string[] {
   });
 }
 
-// The rules a view must keep, from agent.ts. The check that narrows its frame goes first, so that
-// "view-runs" also counts any error it causes.
+// The rules a view must keep, from agent.ts. The checks that run the view's timers or narrow its
+// frame go first, so that "view-runs" also counts any error those cause.
 async function checkViewRules(
     verifier: EvalVerifier, view: TurnView, rendered: RenderedView): Promise<void> {
   await verifier.check("view-code-is-in-module-scripts", async () => {
@@ -131,6 +181,10 @@ async function checkViewRules(
     const found = await rendered.viewportHeights();
     return { pass: found.length === 0, evidence: asEvidence(found) };
   });
+  await verifier.check("view-does-not-poll", async () => {
+    const calls = await rendered.callsWhenLeftOpen();
+    return { pass: calls.length === 0, evidence: asEvidence(calls.slice(0, 10)) };
+  });
   await verifier.check("view-fits-a-phone", async () => {
     const overflow = await rendered.overflowAtPhoneWidth();
     return { pass: overflow <= 1, evidence: asEvidence({ pixelsTooWide: overflow }) };
@@ -139,7 +193,10 @@ async function checkViewRules(
     const visible = await rendered.visible();
     return {
       pass: rendered.unsettled === undefined && rendered.errors.length === 0 && visible,
-      evidence: asEvidence({ unsettled: rendered.unsettled ?? null, errors: rendered.errors, visible }),
+      evidence: asEvidence({
+        unsettled: rendered.unsettled ?? null, errors: rendered.errors, visible,
+        calls: rendered.calls.slice(0, 20),
+      }),
     };
   });
   await verifier.check("view-uses-no-network", async () => ({

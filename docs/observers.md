@@ -367,8 +367,9 @@ top-level interfaces — anything that escaped it would let a widening find no s
 Capabilities a *gadget* mints (an `RpcTarget` returned by a gadget method through the facet
 proxy's method wrapper, re-exported to the client as an independently owned stub the overseer
 never sees disposed) are structurally outside the count and are covered only by the facet abort
-`bumpVersion` performs, which destroys the facet actor and every stub into it — root and
-gadget-minted children alike:
+`bumpVersion` performs, which destroys the facet actor and every gadget-minted stub into it. The
+root stub `getGadgetFacet` minted is counted instead: it outlives the abort, fetching the facet
+again for its next call, so a view keeps working while the agent changes the gadget's code:
 
 - **Capabilities minted into a session** (`GadgetClientImpl`, `UseGadgetClientInterface`,
   `GatekeeperClientImpl`) each count for their own lifetime, since a client can dispose the parent

@@ -11,7 +11,7 @@ const EVIDENCE_LIMIT = 2_000;
 const VERIFIER_THREW = "verifier.threw";
 
 export type VerifierSession =
-  Pick<WorkshopAgentSession, "openGadget" | "connectionDrops">;
+  Pick<WorkshopAgentSession, "openGadget" | "connectToChatBinding" | "connectionDrops">;
 
 /** The chat as the Workshop recorded it when the turn ended. */
 export type VerifierChat = Pick<AgentTurnResult, "history" | "compactions" | "usage">;
@@ -95,7 +95,7 @@ export class EvalVerifier {
 
   /** Runs `html`, a `<gadget-ui>` view of this chat, as the Workshop runs it (see RenderedView). */
   openView(html: string): Promise<RenderedView> {
-    return RenderedView.open(html);
+    return RenderedView.open(html, name => this.#session.connectToChatBinding(name));
   }
 
   /**

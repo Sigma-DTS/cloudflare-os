@@ -5,6 +5,9 @@ import type { EvalCheck } from "./task.js";
 
 const unusedSession: VerifierSession = {
   openGadget: async () => { throw new Error("openGadget is not used by this test"); },
+  connectToChatBinding: async () => {
+    throw new Error("connectToChatBinding is not used by this test");
+  },
   connectionDrops: 0,
 };
 

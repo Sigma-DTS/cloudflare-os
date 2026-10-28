@@ -666,6 +666,27 @@ it.concurrent("draft and mainline code run separately across merge and revert", 
   });
 });
 
+// A <gadget-ui> view holds its gadget's stub for as long as it is on screen, while the agent may
+// change the gadget's code.
+it.concurrent("a gadget stub held across a code change reaches the new code", async () => {
+  await withOwner(async client => {
+    const { ws } = client;
+    const { gadgetId, head } = await seedGadget(client, "server.js", server("v1"));
+    using gadget = await ws.getGadget(gadgetId);
+    using held = await gadget.connectToGadget() as VersionedGadget;
+    expect(await held.version()).toBe("v1");
+
+    const chatId = await ws.newChat("Edit", null);
+    await ws.submitCodeChange(chatId, {
+      generation: 0, revision: 0, clientId: "editor", seq: 1, pins: [{ gadgetId, baseCommit: head }],
+      change: edit(gadgetId, "server.js", server("v1"), server("v2")),
+    });
+    expect(await ws.mergeChanges(chatId)).toEqual({ outcome: "merged" });
+
+    expect(await held.version()).toBe("v2");
+  });
+});
+
 type StatefulGadget = RpcStub<{
   version(): string;
   put(key: string, value: string): void;

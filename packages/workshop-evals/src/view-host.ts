@@ -1,11 +1,26 @@
 import { setTimeout as delay } from "node:timers/promises";
+import type { RpcPromise } from "capnweb";
 import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright";
+import type { ViewBinding } from "@gadgets/workshop-shared/api";
 import { z } from "zod";
 
 // Runs a `<gadget-ui>` view as the Workshop does, so an eval can see what it does: in an
 // opaque-origin srcdoc frame with `sandbox="allow-scripts"` (GadgetUiBlockCard.tsx), in headless
-// Chromium. A view is model-written code, so it runs only there, never in this process. Every
-// request it makes is blocked and recorded, as the Workshop's frame has no network.
+// Chromium, with the chat's real bindings. A view is model-written code, so it runs only there,
+// never in this process. Every request it makes is blocked and recorded, as the Workshop's frame
+// has no network.
+
+/** Opens a chat binding for a view, as the Workshop's frame host asks the kernel for one. */
+export type ViewBinder = (name: string) => Promise<Awaited<RpcPromise<ViewBinding>>>;
+
+/** One call a view made through `env`, in the order it made them. */
+export type ViewCall = {
+  /** `NAME` when it opened the binding, then `NAME.rpc.method` or `NAME.method`. */
+  call: string;
+  /** The arguments as JSON, cut short. */
+  args: string;
+  error?: string;
+};
 
 /** The view's text, and whether it showed what a check waited for before the wait ran out. */
 export type TextWait = { pass: boolean; text: string };
@@ -21,17 +36,18 @@ const PHONE_WIDTH = 360;
 const FRAME_HEIGHT = 1_000;
 const VIEWPORT = { width: FRAME_WIDTH + 40, height: FRAME_HEIGHT + 40 };
 
-// How long a view gets to load, to show what a check expects, and to react to one interaction. A
-// frame call that takes longer means the view's code holds the page.
+// How long a view gets to load and finish its calls, to show what a check expects, and to react
+// to one interaction. A frame call that takes longer means the view's code holds the page.
 const SETTLE_MS = 15_000;
 const WAIT_MS = 10_000;
 const COMMIT_MS = 2_000;
 const FRAME_CALL_MS = 15_000;
 const POLL_MS = 100;
+const ARGS_PREVIEW = 300;
 
-// Runs in the view's frame before any of its code: `agent` shaped as the Workshop's bootstrap
-// makes it (uiBlockFrame.ts), the records the checks read, and `__evalView`, the host's helpers.
-// The view can reach all of it, so the host trusts nothing it returns.
+// Runs in the view's frame before any of its code: `env` and `agent` shaped as the Workshop's
+// bootstrap makes them (uiBlockFrame.ts), the records the checks read, and `__evalView`, the
+// host's helpers. The view can reach all of it, so the host trusts nothing it returns.
 const FRAME_SCRIPT = String.raw`(() => {
   if (location.href !== "about:srcdoc") return;
   // The Workshop's default Trusted Types policy (uiBlockFrame.ts), which TRUSTED_TYPES_CSP makes
@@ -84,6 +100,32 @@ const FRAME_SCRIPT = String.raw`(() => {
     promise.then(done, done);
     return promise;
   };
+  const methods = (name, member) => new Proxy({}, {
+    get: (_, method) => typeof method !== "string" || method === "then" ? undefined
+      : (...args) => track(bridge("call", name, member, method, args)),
+  });
+  const binding = name => {
+    let opened;
+    return new Proxy({}, {
+      get(_, key) {
+        if (key === "then") {
+          return (resolve, reject) => (opened ??= track(bridge("open", name)))
+            .then(type => type === "gadget" ? { rpc: methods(name, "rpc") } : methods(name, null))
+            .then(resolve, reject);
+        }
+        if (typeof key !== "string") return undefined;
+        return key === "rpc" ? methods(name, "rpc") : (...args) => track(bridge("call", name, null, key, args));
+      },
+    });
+  };
+  const bindings = new Map();
+  globalThis.env = new Proxy({}, {
+    get(_, name) {
+      if (typeof name !== "string" || name === "then") return undefined;
+      if (!bindings.has(name)) bindings.set(name, binding(name));
+      return bindings.get(name);
+    },
+  });
   globalThis.agent = Object.freeze({ send: message => track(bridge("send", message)) });
 
   const norm = text => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -231,6 +273,34 @@ async function within<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED
   }
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function preview(value: unknown): string {
+  try {
+    return (JSON.stringify(value) ?? "undefined").slice(0, ARGS_PREVIEW);
+  } catch {
+    return String(value).slice(0, ARGS_PREVIEW);
+  }
+}
+
+// A view gets plain data back, as only plain data crosses into its frame here.
+function plainData(value: unknown): unknown {
+  try {
+    return structuredClone(value);
+  } catch {
+    throw new TypeError("The binding returned a capability, which this eval's views cannot use");
+  }
+}
+
+// Every awaited capnweb result owns what it imported.
+function disposeResult(value: unknown): void {
+  if (typeof value !== "object" || value === null || !(Symbol.dispose in value)) return;
+  const dispose: unknown = Reflect.get(value, Symbol.dispose);
+  if (typeof dispose === "function") dispose.call(value);
+}
+
 // The view's document, with the Workshop's Trusted Types CSP (uiBlockFrame.ts). It leaves out the
 // rest of the Workshop's CSP, which would stop the view's requests before they are recorded.
 const TRUSTED_TYPES_CSP = `<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'; trusted-types gadget-ui default">`;
@@ -287,7 +357,7 @@ export async function closeViewBrowser(): Promise<void> {
   await (await running?.catch(() => undefined))?.close();
 }
 
-/** A view running in its own browser context. Dispose it to close the page. */
+/** A view running in its own browser context. Dispose it to close the page and its bindings. */
 export class RenderedView implements AsyncDisposable {
   /** Uncaught errors and rejections in the view's code, as the Workshop would show them. */
   readonly errors: string[] = [];
@@ -295,31 +365,37 @@ export class RenderedView implements AsyncDisposable {
   readonly requests: string[] = [];
   /** HTML the view parsed from strings, through innerHTML and the like. */
   readonly markup: string[] = [];
+  readonly calls: ViewCall[] = [];
   /** What the view asked the user to send, through agent.send. */
   readonly messages: unknown[] = [];
   /** Why the view never settled, if it did not. */
   unsettled: string | undefined;
 
   readonly #context: BrowserContext;
+  readonly #binder: ViewBinder;
+  readonly #bindings = new Map<string, Promise<Awaited<RpcPromise<ViewBinding>>>>();
+  readonly #opened: Disposable[] = [];
+  readonly #inFlight = new Set<ViewCall>();
   #page: Page | undefined;
   #frame: Frame | undefined;
   #crash: string | undefined;
   #stuck: string | undefined;
   #closed = false;
 
-  private constructor(context: BrowserContext) {
+  private constructor(context: BrowserContext, binder: ViewBinder) {
     this.#context = context;
+    this.#binder = binder;
   }
 
   /**
    * Runs `html`, the HTML of a `<gadget-ui>` block, and waits until it settles: loaded, with no
-   * `agent.send` pending. A view that never settles still opens, with `unsettled` set.
+   * call on its bindings pending. A view that never settles still opens, with `unsettled` set.
    */
-  static async open(html: string): Promise<RenderedView> {
+  static async open(html: string, binder: ViewBinder): Promise<RenderedView> {
     const launched = await launchBrowser();
     let view: RenderedView | undefined;
     try {
-      view = new RenderedView(await launched.newContext({ viewport: VIEWPORT }));
+      view = new RenderedView(await launched.newContext({ viewport: VIEWPORT }), binder);
       await view.#start();
     } catch (error) {
       await view?.[Symbol.asyncDispose]();
@@ -349,6 +425,8 @@ export class RenderedView implements AsyncDisposable {
     });
     const page = await context.newPage();
     page.on("crash", () => { this.#crash = "The view's page crashed"; });
+    // Lets a check run a minute of the view's timers at once, to see whether it polls.
+    await page.clock.install();
     await page.setContent(SHELL);
     this.#page = page;
   }
@@ -386,8 +464,8 @@ export class RenderedView implements AsyncDisposable {
 
   /**
    * Clicks the item `label` names, as a user would: the element that names it first, then the
-   * controls beside it, until a click makes the view call `agent.send`. `others` names the other
-   * items, so "beside it" stops short of them. Returns what it tried.
+   * controls beside it, until a click makes the view call a binding or `agent.send`. `others`
+   * names the other items, so "beside it" stops short of them. Returns what it tried.
    */
   click(label: string, others: readonly string[]): Promise<string[]> {
     return this.#guard(async () => {
@@ -445,6 +523,19 @@ export class RenderedView implements AsyncDisposable {
     });
   }
 
+  /**
+   * Runs the view's timers for a minute, as if left open, and returns the calls it made in that
+   * minute. Calls in the first five seconds, such as a debounced reload, do not count.
+   */
+  callsWhenLeftOpen(): Promise<ViewCall[]> {
+    return this.#guard(async () => {
+      await this.#runClock(5_000);
+      const before = this.calls.length;
+      await this.#runClock(60_000);
+      return this.calls.slice(before);
+    });
+  }
+
   /** How many CSS pixels wider than a phone the view is, at a phone's width. */
   overflowAtPhoneWidth(): Promise<number> {
     return this.#guard(async () => {
@@ -464,6 +555,7 @@ export class RenderedView implements AsyncDisposable {
     if (this.#closed) return;
     this.#closed = true;
     await this.#context.close().catch(() => {});
+    for (const binding of this.#opened.splice(0).toReversed()) binding[Symbol.dispose]();
   }
 
   async #bridge([op, ...args]: unknown[]): Promise<unknown> {
@@ -477,8 +569,80 @@ export class RenderedView implements AsyncDisposable {
       case "send":
         this.messages.push(args[0]);
         return undefined;
+      case "open": {
+        const [name] = args;
+        return this.#recorded({ call: String(name), args: "" },
+            async () => (await this.#binding(name)).type);
+      }
+      case "call":
+        return this.#call(args);
       default:
         throw new TypeError("The view called the eval host incorrectly");
+    }
+  }
+
+  #binding(name: unknown): Promise<Awaited<RpcPromise<ViewBinding>>> {
+    if (typeof name !== "string") throw new TypeError("A binding name is a string.");
+    let binding = this.#bindings.get(name);
+    if (binding === undefined) {
+      binding = this.#open(name);
+      this.#bindings.set(name, binding);
+    }
+    return binding;
+  }
+
+  async #open(name: string): Promise<Awaited<RpcPromise<ViewBinding>>> {
+    const binding = await this.#binder(name);
+    if (this.#closed) {
+      binding[Symbol.dispose]();
+      throw new Error("This view has closed.");
+    }
+    this.#opened.push(binding);
+    return binding;
+  }
+
+  // The Workshop's frame reaches a Gadget as `env.NAME.rpc.method(...)` and a connection as
+  // `env.NAME.method(...)`, and nothing else.
+  async #call([name, member, method, args]: unknown[]): Promise<unknown> {
+    if (typeof name !== "string" || (member !== "rpc" && member !== null) ||
+        typeof method !== "string" || !Array.isArray(args)) {
+      throw new TypeError("A view calls env.NAME.rpc.method() or env.NAME.method()");
+    }
+    const call = member === "rpc" ? `${name}.rpc.${method}` : `${name}.${method}`;
+    return this.#recorded({ call, args: preview(args) }, async () => {
+      const binding = await this.#binding(name);
+      const stub = binding.type === "gadget"
+        ? member === "rpc" ? binding.rpc : undefined
+        : member === null ? binding.session : undefined;
+      if (stub === undefined) {
+        throw new TypeError(binding.type === "gadget"
+          ? `env.${name} is a Gadget: call env.${name}.rpc.${method}()`
+          : `env.${name} is a connection: call env.${name}.${method}()`);
+      }
+      // A stub keeps some members to itself (dup, onRpcBroken, constructor, ...): calling one
+      // would run it here, in this process, rather than on the binding.
+      const local: object = Object.getPrototypeOf(stub);
+      const target: unknown = method in local ? undefined : Reflect.get(stub, method);
+      if (typeof target !== "function") throw new TypeError(`${method} is not a method of env.${name}`);
+      const result: unknown = await Reflect.apply(target, stub, args);
+      try {
+        return plainData(result);
+      } finally {
+        disposeResult(result);
+      }
+    });
+  }
+
+  async #recorded<T>(entry: ViewCall, work: () => Promise<T>): Promise<T> {
+    this.calls.push(entry);
+    this.#inFlight.add(entry);
+    try {
+      return await work();
+    } catch (error) {
+      entry.error = errorMessage(error);
+      throw error;
+    } finally {
+      this.#inFlight.delete(entry);
     }
   }
 
@@ -517,7 +681,7 @@ export class RenderedView implements AsyncDisposable {
     }
   }
 
-  // Loaded, then two animation frames in a row with no `agent.send` pending.
+  // Loaded, then two animation frames in a row with no call pending.
   async #settle(): Promise<void> {
     if (this.unsettled !== undefined) return;
     const deadline = Date.now() + SETTLE_MS;
@@ -526,10 +690,20 @@ export class RenderedView implements AsyncDisposable {
       const state = StateSchema.parse(await this.#frameCall("frames", 1));
       quiet = state.loaded && state.pending === 0 ? quiet + 1 : 0;
       if (quiet < 2 && Date.now() >= deadline) {
-        this.unsettled = `After ${SETTLE_MS / 1_000} s the view had not finished loading`;
+        this.unsettled = `After ${SETTLE_MS / 1_000} s the view still waited on ` +
+          [...this.#inFlight].map(entry => entry.call).join(", ");
         return;
       }
     }
+  }
+
+  async #runClock(ms: number): Promise<void> {
+    const ran = await within(this.#requirePage().clock.runFor(ms), FRAME_CALL_MS);
+    if (ran === TIMED_OUT) {
+      this.#stuck = "The view's timers held the page";
+      throw new Error(this.#stuck);
+    }
+    await this.#settle();
   }
 
   async #mouseClick(x: number, y: number): Promise<void> {
