@@ -44,6 +44,8 @@ const COMMIT_MS = 2_000;
 const FRAME_CALL_MS = 15_000;
 const POLL_MS = 100;
 const ARGS_PREVIEW = 300;
+// The key under which a result names a capability the eval host holds for the frame.
+const HANDLE_KEY = "__evalHandle";
 
 // Runs in the view's frame before any of its code: `env` and `agent` shaped as the Workshop's
 // bootstrap makes them (uiBlockFrame.ts), the records the checks read, and `__evalView`, the
@@ -100,9 +102,30 @@ const FRAME_SCRIPT = String.raw`(() => {
     promise.then(done, done);
     return promise;
   };
+  // A capability a binding returned, which stays in the eval host: its methods call it there.
+  const HANDLE = "${HANDLE_KEY}";
+  const handle = id => new Proxy({}, {
+    get: (_, method) => typeof method !== "string" || method === "then" ? undefined
+      : (...args) => pipelined(track(bridge("handle", id, method, args)).then(wrap)),
+  });
+  const wrap = value => {
+    if (Array.isArray(value)) return value.map(wrap);
+    if (value === null || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return value;
+    if (typeof value[HANDLE] === "number") return handle(value[HANDLE]);
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, wrap(item)]));
+  };
+  // A call's result as Cap'n Web gives it: awaitable, and callable before it settles. "result"
+  // settles to a value already wrapped.
+  const pipelined = result => new Proxy({}, {
+    get(_, key) {
+      if (key === "then" || key === "catch" || key === "finally") return result[key].bind(result);
+      if (typeof key !== "string") return undefined;
+      return (...args) => pipelined(result.then(value => value[key](...args)));
+    },
+  });
   const methods = (name, member) => new Proxy({}, {
     get: (_, method) => typeof method !== "string" || method === "then" ? undefined
-      : (...args) => track(bridge("call", name, member, method, args)),
+      : (...args) => pipelined(track(bridge("call", name, member, method, args)).then(wrap)),
   });
   const binding = name => {
     let opened;
@@ -114,7 +137,7 @@ const FRAME_SCRIPT = String.raw`(() => {
             .then(resolve, reject);
         }
         if (typeof key !== "string") return undefined;
-        return key === "rpc" ? methods(name, "rpc") : (...args) => track(bridge("call", name, null, key, args));
+        return key === "rpc" ? methods(name, "rpc") : methods(name, null)[key];
       },
     });
   };
@@ -285,20 +308,20 @@ function preview(value: unknown): string {
   }
 }
 
-// A view gets plain data back, as only plain data crosses into its frame here.
-function plainData(value: unknown): unknown {
-  try {
-    return structuredClone(value);
-  } catch {
-    throw new TypeError("The binding returned a capability, which this eval's views cannot use");
-  }
-}
-
-// Every awaited capnweb result owns what it imported.
+// Every awaited capnweb result owns what it imported. A stub is a callable proxy.
 function disposeResult(value: unknown): void {
-  if (typeof value !== "object" || value === null || !(Symbol.dispose in value)) return;
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return;
   const dispose: unknown = Reflect.get(value, Symbol.dispose);
   if (typeof dispose === "function") dispose.call(value);
+}
+
+// A stub keeps some members to itself (dup, onRpcBroken, constructor, ...): calling one would run
+// it here, in this process, rather than on the binding.
+async function invoke(stub: object, method: string, args: unknown[], owner: string): Promise<unknown> {
+  const local: object = Object.getPrototypeOf(stub);
+  const target: unknown = method in local ? undefined : Reflect.get(stub, method);
+  if (typeof target !== "function") throw new TypeError(`${method} is not a method of ${owner}`);
+  return await Reflect.apply(target, stub, args);
 }
 
 // The view's document, with the Workshop's Trusted Types CSP (uiBlockFrame.ts). It leaves out the
@@ -375,6 +398,10 @@ export class RenderedView implements AsyncDisposable {
   readonly #binder: ViewBinder;
   readonly #bindings = new Map<string, Promise<Awaited<RpcPromise<ViewBinding>>>>();
   readonly #opened: Disposable[] = [];
+  // Capabilities that bindings returned, by the handle the frame names them with, and the results
+  // that own them, until the view closes.
+  readonly #handles = new Map<number, { stub: object; label: string }>();
+  readonly #held: unknown[] = [];
   readonly #inFlight = new Set<ViewCall>();
   #page: Page | undefined;
   #frame: Frame | undefined;
@@ -555,6 +582,8 @@ export class RenderedView implements AsyncDisposable {
     if (this.#closed) return;
     this.#closed = true;
     await this.#context.close().catch(() => {});
+    for (const result of this.#held.splice(0).toReversed()) disposeResult(result);
+    this.#handles.clear();
     for (const binding of this.#opened.splice(0).toReversed()) binding[Symbol.dispose]();
   }
 
@@ -576,6 +605,8 @@ export class RenderedView implements AsyncDisposable {
       }
       case "call":
         return this.#call(args);
+      case "handle":
+        return this.#callHandle(args);
       default:
         throw new TypeError("The view called the eval host incorrectly");
     }
@@ -619,18 +650,46 @@ export class RenderedView implements AsyncDisposable {
           ? `env.${name} is a Gadget: call env.${name}.rpc.${method}()`
           : `env.${name} is a connection: call env.${name}.${method}()`);
       }
-      // A stub keeps some members to itself (dup, onRpcBroken, constructor, ...): calling one
-      // would run it here, in this process, rather than on the binding.
-      const local: object = Object.getPrototypeOf(stub);
-      const target: unknown = method in local ? undefined : Reflect.get(stub, method);
-      if (typeof target !== "function") throw new TypeError(`${method} is not a method of env.${name}`);
-      const result: unknown = await Reflect.apply(target, stub, args);
-      try {
-        return plainData(result);
-      } finally {
-        disposeResult(result);
-      }
+      return this.#toFrame(await invoke(stub, method, args, `env.${name}`), `${call}()`);
     });
+  }
+
+  async #callHandle([id, method, args]: unknown[]): Promise<unknown> {
+    const handle = typeof id === "number" ? this.#handles.get(id) : undefined;
+    if (handle === undefined || typeof method !== "string" || !Array.isArray(args)) {
+      throw new TypeError("The view called a capability incorrectly");
+    }
+    const call = `${handle.label}.${method}`;
+    return this.#recorded({ call, args: preview(args) }, async () =>
+        this.#toFrame(await invoke(handle.stub, method, args, handle.label), `${call}()`));
+  }
+
+  // A result crosses into the frame as plain data, each capability in it replaced by a handle that
+  // the frame's calls name, as Cap'n Web's stubs let the Workshop's frame call them.
+  #toFrame(result: unknown, label: string): unknown {
+    let holds = false;
+    const map = (value: unknown): unknown => {
+      if (typeof value === "function") {
+        holds = true;
+        const id = this.#handles.size + 1;
+        this.#handles.set(id, { stub: value, label });
+        return { [HANDLE_KEY]: id };
+      }
+      if (Array.isArray(value)) return value.map(map);
+      if (value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, map(item)]));
+      }
+      return value;
+    };
+    try {
+      return structuredClone(map(result));
+    } catch (error) {
+      throw new TypeError("The binding returned a value this eval cannot pass to a view", { cause: error });
+    } finally {
+      // A result that hands the frame a capability keeps it until the view closes.
+      if (holds) this.#held.push(result);
+      else disposeResult(result);
+    }
   }
 
   async #recorded<T>(entry: ViewCall, work: () => Promise<T>): Promise<T> {

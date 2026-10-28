@@ -162,4 +162,37 @@ describe("RenderedView", { timeout: 60_000 }, () => {
       { call: "MISSING.rpc.totals", error: "No binding named MISSING" },
     ]);
   });
+
+  it("lets a view use a capability a binding returns, awaited or pipelined, until it closes", async () => {
+    let disposed = 0;
+    class Cursor extends RpcTarget {
+      next() { return [{ title: "Fix the chart" }]; }
+      [Symbol.dispose]() { disposed++; }
+    }
+    class Issues extends RpcTarget {
+      listIssues() { return new Cursor(); }
+    }
+    const connection: ViewBinder = async () => {
+      const session = new RpcStub(new Issues());
+      return { type: "connection", session, [Symbol.dispose]: () => session[Symbol.dispose]() };
+    };
+    const view = await RenderedView.open(`
+      <p id="out"></p>
+      <script type="module">
+        const cursor = await env.GITHUB.listIssues();
+        const [awaited] = await cursor.next();
+        const [pipelined] = await env.GITHUB.listIssues().next();
+        document.getElementById("out").textContent = awaited.title + " / " + pipelined.title;
+      </script>`, connection);
+    try {
+      expect(await view.text()).toContain("Fix the chart / Fix the chart");
+      expect(view.calls.map(({ call }) => call)).toEqual([
+        "GITHUB.listIssues", "GITHUB.listIssues().next", "GITHUB.listIssues", "GITHUB.listIssues().next",
+      ]);
+      expect(disposed).toBe(0);
+    } finally {
+      await view[Symbol.asyncDispose]();
+    }
+    await expect.poll(() => disposed).toBe(2);
+  });
 });

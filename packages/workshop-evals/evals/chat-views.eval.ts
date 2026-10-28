@@ -4,14 +4,13 @@ import { asEvidence, defineEvalTask } from "../src/task.js";
 import type { EvalVerifier } from "../src/verifier.js";
 import {
   checkAnswersInProse, checkAnswersWithView, checkBuildsGadget, checkMakesNoGadget, checkView,
-  mentions, showsAmount,
+  gadgetBinding, mentions, showsAmount,
 } from "./views.js";
 
 // How the agent answers in one chat (agent.ts, "Workspaces" and "Live views in your answers"): an
 // explanation is prose; a chart, a choice and a one-off tool are views in the answer; data that
-// must last is a Gadget; and a look at that Gadget's data is a view whose values the agent read
-// with `executeCode` first, since a view has no `env`. Each view must also run, keep the view
-// rules, and do what the user asked of it.
+// must last is a Gadget; and a look at that Gadget's data is a view that reads it live through the
+// chat's `env`. Each view must also run, keep the view rules, and do what the user asked of it.
 
 const USAGE = [
   ["Jan", 410], ["Feb", 380], ["Mar", 340], ["Apr", 300], ["May", 290], ["Jun", 360],
@@ -139,6 +138,14 @@ async function verifySpendingView(verifier: EvalVerifier): Promise<void> {
       const shown = await rendered.waitForText(text => CATEGORIES.every(category =>
         mentions(text, category) && showsAmount(text, expected[category] ?? Number.NaN)));
       return { pass: shown.pass, evidence: asEvidence({ expected, text: shown.text }) };
+    });
+    await verifier.check("reads-the-gadget-live", async () => {
+      const binding = gadgetBinding(verifier, LOG);
+      const calls = rendered.calls.map(call => call.call);
+      return {
+        pass: binding !== undefined && calls.some(call => call.startsWith(`${binding}.`)),
+        evidence: asEvidence({ binding: binding ?? null, calls: calls.slice(0, 10) }),
+      };
     });
     await verifier.check("asks-about-a-category", async () => {
       const tried = await rendered.click("Travel", ["Food", "Books"]);
