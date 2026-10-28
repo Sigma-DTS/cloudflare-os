@@ -15,6 +15,10 @@ declare module "cloudflare:workers" {
   }
 }
 
+type ObserverImpl = OverseerDurableObject["impl"];
+type ObserverClientUser = Parameters<ObserverImpl["ensureObserver"]>[1];
+type ObserverConfigureCallback = NonNullable<Parameters<ObserverImpl["ensureObserver"]>[3]>;
+
 // Seed the owner profile id, so the sharing manager needs no User DO round trip.
 function seedOwner(impl: any): void {
   impl.ownerProfileId = "owner";
@@ -41,6 +45,32 @@ const fakeClientUser = {
   getVerifier: async () => ({}),
   describeConnectedAccount: async () => null,
 } as any;
+
+// Facets for every seeded connection, registering through `hooks`.
+function setObserverFacets(impl: ObserverImpl, hooks: {
+  addObserver?(id: number, observerId: string): Promise<void>;
+  removeObserver?(id: number): Promise<void>;
+} = {}): void {
+  const getFacet = async (id: number) => ({
+    addObserver: async (observerId: string) => { await hooks.addObserver?.(id, observerId); },
+    removeObserver: async () => { await hooks.removeObserver?.(id); },
+  });
+  // Admission calls only these two methods, not the full RPC facet.
+  impl.getGatekeeperFacet = getFacet as unknown as ObserverImpl["getGatekeeperFacet"];
+}
+
+// Chooses account `gatekeeperId * 10` for every binding it is asked about.
+function chooseAll(needs: {gatekeeperId: number}[]): {gatekeeperId: number, accountId: number}[] {
+  return needs.map(need => ({ gatekeeperId: need.gatekeeperId, accountId: need.gatekeeperId * 10 }));
+}
+
+// A local stand-in for the client's RPC callback, on which admission calls only `configure()`.
+function configCallback(configure: (needs: {gatekeeperId: number}[]) =>
+    Promise<{gatekeeperId: number, accountId: number}[]>): ObserverConfigureCallback {
+  return { configure } as unknown as ObserverConfigureCallback;
+}
+
+const configureAll = configCallback(async needs => chooseAll(needs));
 
 describe("a binding that fails verification", () => {
   it("reports a verifier rejection as a denial, not as the raw RPC error", async () => {
@@ -118,74 +148,74 @@ describe("a binding that fails verification", () => {
           .rejects.toThrow(/could not confirm/);
 
       // Gatekeeper 1's registration predates this call and survives, so it keeps naming her in
-      // `excludeObservers`. Gatekeeper 2's was created by this call -- but her persisted
-      // observerId is shared with any concurrent open, which may have registered (and persisted)
-      // the very same gatekeeper, so it is kept too: de-registering is the fail-open direction,
-      // a spurious registration only blocks fail-closed until a later open re-verifies it.
+      // `excludeObservers`. Gatekeeper 2's was created by this call, but Alice's persisted
+      // observerId remains resolvable to exclusion checks too: de-registering is the fail-open
+      // direction, and a spurious registration only blocks fail-closed until a later open
+      // re-verifies it.
       expect(removed).toEqual([]);
     });
   });
 
-  it("a failed open does not roll back registrations a concurrent open persisted", async () => {
+  it("queues a successful open after a failed one without blocking another profile", async () => {
     let stub = env.TEST_OVERSEER.getByName("observer-verify-concurrent");
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
-      let impl = (instance as unknown as { impl: any }).impl;
+      let impl = instance["impl"];
       seedOwner(impl);
       seedGatekeepers(impl, [1, 2, 3]);
-      // Alice's record predates connections 2 and 3, so both opens must register her with both --
-      // under the one persisted observerId they share.
       impl.storage.observers.put(
           { profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10 } });
 
       let removed: number[] = [];
-      // Call A parks on connection 3's *verifier* -- deliberately outside the per-(observer,
-      // gatekeeper) serialization of the addObserver RPCs themselves, which would otherwise queue
-      // call B's registration behind a parked one. Connection 3 then admits only call B's
-      // registration (the 1st): call A's attempts (the 2nd, and the 3rd after its repair
-      // re-prompt) are refused.
       let releaseVerifier!: () => void;
       let verifierParked = new Promise<void>(resolve => { releaseVerifier = resolve; });
       let reached!: () => void;
       let verifierReached = new Promise<void>(resolve => { reached = resolve; });
-      let gk3Verifiers = 0;
+      let firstAttempt = true;
+      // A local stand-in for the client's User DO, supplying only the methods admission calls.
       let parkingClientUser = {
         getVerifier: async (accountId: number) => {
-          if (accountId === 30 && ++gk3Verifiers === 1) { reached(); await verifierParked; }
+          if (accountId === 30) {
+            if (firstAttempt) {
+              firstAttempt = false;
+              reached();
+              await verifierParked;
+            }
+            throw new Error("no access");
+          }
           return {};
         },
         describeConnectedAccount: async () => null,
-      } as any;
-      let gk3Adds = 0;
-      impl.getGatekeeperFacet = (id: number) => ({
-        addObserver: async () => {
-          if (id === 3 && ++gk3Adds > 1) throw new Error("no access");
-        },
-        removeObserver: async () => { removed.push(id); },
-      });
-      let configureCb = { configure: async (needs: {gatekeeperId: number}[]) =>
-          needs.map(need => ({ gatekeeperId: need.gatekeeperId, accountId: need.gatekeeperId * 10 }))
-      } as any;
+      } as unknown as ObserverClientUser;
+      setObserverFacets(impl, { removeObserver: async id => { removed.push(id); } });
 
-      // Call A registers her with connection 2, then parks before registering with connection 3.
-      let callA = impl.ensureObserver("alice", parkingClientUser, "build", configureCb);
-      callA.catch(() => {});  // asserted below; not unhandled in the meantime
+      let callA = impl.ensureObserver("alice", parkingClientUser, "build", configureAll);
+      callA.catch(() => {});  // asserted below; not unhandled while its verifier is parked
       await verifierReached;
 
-      // Call B -- the same returning observer opening concurrently -- verifies everything and
-      // persists the record asserting all three registrations.
-      await impl.ensureObserver("alice", fakeClientUser, "build", configureCb);
-      expect(impl.storage.observers.get("alice").accountChoices).toEqual({ 1: 10, 2: 20, 3: 30 });
+      let queuedPrompts = 0;
+      let queuedConfig = configCallback(async needs => {
+        queuedPrompts++;
+        return chooseAll(needs);
+      });
+      let callB = impl.ensureObserver("alice", fakeClientUser, "build", queuedConfig);
 
-      // Now connection 3 refuses call A terminally.
+      // Bob can finish while Alice's first open is parked, but her second open cannot prompt yet.
+      await impl.ensureObserver("bob", fakeClientUser, "build", configureAll);
+      let queuedPromptsBeforeRelease = queuedPrompts;
+      let choicesBeforeRelease = impl.storage.observers.get("alice")?.accountChoices;
+
       releaseVerifier();
       await expect(callA).rejects.toThrow(/could not confirm/);
+      await callB;
 
-      // Call A also registered her with connection 2 before failing on 3, but must not roll that
-      // back: the registration is keyed by the shared observerId, so removing it would delete the
-      // one call B just made -- while B's persisted record asserts it exists, breaking every
-      // future exclusion that names her.
+      expect(impl.storage.observers.get("bob")).toBeDefined();
+      expect(queuedPromptsBeforeRelease).toBe(0);
+      expect(choicesBeforeRelease).toEqual({ 1: 10 });
+      expect(queuedPrompts).toBe(1);
       expect(removed).toEqual([]);
-      expect(impl.storage.observers.get("alice").accountChoices).toEqual({ 1: 10, 2: 20, 3: 30 });
+      expect(impl.storage.observers.get("alice")).toEqual({
+        profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10, 2: 20, 3: 30 },
+      });
     });
   });
 
@@ -215,6 +245,89 @@ describe("a binding that fails verification", () => {
       // persisted.
       expect(removed.toSorted()).toEqual([1, 2]);
       expect(impl.storage.observers.get("alice")).toBeUndefined();
+    });
+  });
+
+  it("reuses one observer identity for first-ever concurrent successful opens", async () => {
+    let stub = env.TEST_OVERSEER.getByName("observer-verify-first-concurrent");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = instance["impl"];
+      seedOwner(impl);
+      seedGatekeepers(impl);
+      let registrations: {id: number, observerId: string}[] = [];
+      setObserverFacets(impl, {
+        addObserver: async (id, observerId) => { registrations.push({id, observerId}); },
+      });
+      let release!: () => void;
+      let reached!: () => void;
+      let parked = new Promise<void>(resolve => { release = resolve; });
+      let prompted = new Promise<void>(resolve => { reached = resolve; });
+      let firstPrompts = 0;
+      let firstConfig = configCallback(async needs => {
+        firstPrompts++;
+        reached();
+        await parked;
+        return chooseAll(needs);
+      });
+      let secondPrompts = 0;
+      let secondConfig = configCallback(async needs => {
+        secondPrompts++;
+        return chooseAll(needs);
+      });
+
+      let callA = impl.ensureObserver("alice", fakeClientUser, "build", firstConfig);
+      await prompted;
+      let callB = impl.ensureObserver("alice", fakeClientUser, "build", secondConfig);
+
+      // Another profile makes progress while Alice chooses, without opening her second prompt.
+      await impl.ensureObserver("bob", fakeClientUser, "build", configureAll);
+      let secondPromptsBeforeRelease = secondPrompts;
+      let observerBeforeRelease = impl.storage.observers.get("alice");
+
+      release();
+      await Promise.all([callA, callB]);
+
+      let alice = impl.storage.observers.get("alice")!;
+      let bob = impl.storage.observers.get("bob")!;
+      let aliceRegistrations = registrations.filter(entry => entry.observerId !== bob.observerId);
+      expect(secondPromptsBeforeRelease).toBe(0);
+      expect(observerBeforeRelease).toBeUndefined();
+      expect(firstPrompts).toBe(1);
+      expect(secondPrompts).toBe(0);
+      expect(alice.accountChoices).toEqual({ 1: 10, 2: 20 });
+      // Both opens register both connections, under the one id the first persisted.
+      expect(aliceRegistrations).toHaveLength(4);
+      expect(aliceRegistrations.every(entry => entry.observerId === alice.observerId)).toBe(true);
+    });
+  });
+
+  it("releases the profile queue when account selection is refused", async () => {
+    let stub = env.TEST_OVERSEER.getByName("observer-verify-queue-refusal");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = instance["impl"];
+      seedOwner(impl);
+      seedGatekeepers(impl);
+      setObserverFacets(impl);
+      let release!: () => void;
+      let reached!: () => void;
+      let parked = new Promise<void>(resolve => { release = resolve; });
+      let prompted = new Promise<void>(resolve => { reached = resolve; });
+      // A rejected client RPC must release the same queue as a verifier refusal.
+      let refusingConfig = configCallback(async () => {
+        reached();
+        await parked;
+        throw new Error("account selection refused");
+      });
+
+      let refused = impl.ensureObserver("alice", fakeClientUser, "build", refusingConfig);
+      refused.catch(() => {});
+      await prompted;
+      let admitted = impl.ensureObserver("alice", fakeClientUser, "build", configureAll);
+      release();
+
+      await expect(refused).rejects.toThrow("account selection refused");
+      await admitted;
+      expect(impl.storage.observers.get("alice")?.accountChoices).toEqual({ 1: 10, 2: 20 });
     });
   });
 });

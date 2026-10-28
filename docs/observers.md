@@ -313,11 +313,12 @@ Logic:
    - Only a *first-ever* verification rolls anything back (fully — nothing referenced its
      registrations before the call, and the minted id would otherwise linger unresolvable). A
      returning observer's registrations are **all** kept, including ones this call added: their
-     persisted `observerId` is shared with concurrent opens, so a rollback could delete a
-     registration a concurrent successful open just made and persisted. De-registering is the
-     fail-open direction (the gatekeeper stops naming them in `excludeObservers`); a spurious
-     registration only blocks fail-closed until the lazy cleanup at exclusion time or a later
-     open re-verifies it, and the next successful `addObserver` overwrites its verifier.
+     persisted `observerId` stays resolvable, and sessions their earlier opens admitted may still
+     depend on those registrations (opens by one profile are serialized, so none is concurrent).
+     De-registering is the fail-open direction (the gatekeeper stops naming them in
+     `excludeObservers`); a spurious registration only blocks fail-closed until the lazy cleanup
+     at exclusion time or a later open re-verifies it, and the next successful `addObserver`
+     overwrites its verifier.
    - A denial ends only this open. Sessions the collaborator already holds are untouched, and keep
      the access their own opens verified until they next re-open — the lazy-revocation residual
      described under "Known gaps" below.
@@ -588,7 +589,7 @@ For each id in `description.excludeObservers`:
    classified before anything is torn down, so a blocked observation leaves no teardown behind it;
    the removals are then all issued together and awaited with a single `Promise.all`. A fresh
    open's `addObserver` racing one of those `removeObserver` RPCs on the same (observer,
-   gatekeeper) pair is ordered behind it (`#withObserverGatekeeperLock`; the overseer is the only
+   gatekeeper) pair is ordered behind it (`#serialized`, keyed by the pair; the overseer is the only
    caller of either, so ordering its own calls is sufficient), so a fresh registration is never
    silently undone. An observer put back in scope while the teardown is in flight — a bind plus a
    fresh open landing inside a removal's window — is admitted for this one observation; that is
@@ -900,8 +901,6 @@ place here only if its failure mode is *persistent* wrong state that outlives th
 The observer-side deferrals are ledgered in `plans/restricted-data-sharing.md`, each marked at
 its site in the code by a matching `TODO` comment:
 
-- Observer verification is not serialized per profile, so concurrent opens by one collaborator
-  can overwrite each other's records.
 - A mid-registration observer named in `excludeObservers` is read as unknown and the observation
   admitted; persistent, since it lands in chat history (Step 5, item 1). Fix: a pending-id map,
   `observer-verification-fixes`.
