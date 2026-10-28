@@ -267,10 +267,12 @@ describe("loadItems", () => {
     route(/^\/wiki\/api\/v2\/spaces\?keys=MFS/, { results: [MFS] });
     const page = await ui().loadItems({ site: `site:${CLOUD}`, query: "https://slew.atlassian.net/wiki/spaces/MFS/overview" });
     expect(page.items).toEqual([expect.objectContaining({ ref: `space:${CLOUD}/MFS`, kind: "space" })]);
-    // One without its scheme is a link too, as the frame shows it.
+    // One without its scheme is a link too, as the frame shows it, and one longer than a search may be is still a link.
     const bare = await ui().loadItems({ site: `site:${CLOUD}`, query: "www.slew.atlassian.net/wiki/spaces/MFS" });
     expect(bare.items).toEqual([]);
     expect(requests.some(request => request.url.pathname.endsWith("/search"))).toBe(false);
+    const shared = await ui().loadItems({ site: `site:${CLOUD}`, query: `https://slew.atlassian.net/wiki/spaces/MFS/overview?atlOrigin=${"e".repeat(220)}` });
+    expect(shared.items).toEqual([expect.objectContaining({ ref: `space:${CLOUD}/MFS` })]);
 
     const elsewhere = await ui().loadItems({ site: `site:${CLOUD}`, query: "https://other.atlassian.net/wiki/spaces/MFS" });
     expect(elsewhere).toEqual({ items: [], notice: expect.stringContaining("isn't to a Confluence page") });
@@ -306,6 +308,17 @@ describe("locate", () => {
     expect(await ui().locate("https://slew.atlassian.net/wiki/spaces/MFS/pages/360470")).toMatchObject({
       ref: `blogpost:${CLOUD}/360470`, kind: "blogpost", path: [{ kind: "space" }, { kind: "blogs", title: "Blog" }],
     });
+    expect(await ui().locate("https://slew.atlassian.net/wiki/spaces/MFS/blog/2026/10/26/360470/Post")).toMatchObject({ ref: `blogpost:${CLOUD}/360470` });
+  });
+
+  it("names only what a link names, never the space or site around it", async () => {
+    for (const path of ["/wiki/not-a-resource", "/wiki/spaces", "/wiki/spaces/MFS/whiteboard/123", "/wiki/spaces/MFS/folder/600003", "/wiki/spaces/MFS/pages/edit-v2/524289", "/wiki/pages/viewpage.action?pageId=x"]) {
+      expect(await ui().locate(`https://slew.atlassian.net${path}`), path).toBeNull();
+    }
+    expect(requests).toEqual([]);
+    expect(await ui().locate("https://slew.atlassian.net/wiki/home")).toMatchObject({ kind: "site" });
+    expect(await ui().locate("https://slew.atlassian.net/wiki/spaces/MFS/pages")).toMatchObject({ ref: `space:${CLOUD}/MFS` });
+    expect(await ui().locate("https://slew.atlassian.net/wiki/pages/viewpage.action?pageId=524289")).toMatchObject({ ref: `page:${CLOUD}/524289` });
   });
 
   it("finds a site and a space", async () => {

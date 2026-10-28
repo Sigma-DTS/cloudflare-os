@@ -598,7 +598,8 @@ function browser({ values, setValues, ui, acceptedResourceUrlPatterns: accepted 
   function open(row: Row) {
     const nextPath = [...pathOf(row), { ...row.node, path: undefined, titleMatches: undefined }];
     clearSearch();
-    navigate(nextPath, "first");
+    // A pasted link may name another of the connection's sites; the row opens under that site's tab.
+    navigate(nextPath, "first", siteRefOf(row.node.ref));
   }
 
   function goUp() {
@@ -619,7 +620,7 @@ function browser({ values, setValues, ui, acceptedResourceUrlPatterns: accepted 
       return;
     }
     missing = null;
-    picker.chosenAt = { site: site.ref, path: choicePath };
+    picker.chosenAt = { site: siteRefOf(node.ref), path: choicePath };
     announce(`Chose ${node.kind === "site" ? `all of ${node.title}` : node.title}`);
     setValues({ ref: node.ref, title: node.title, kind: node.kind, path: JSON.stringify(crumbsOf(choicePath)) });
   }
@@ -1056,7 +1057,7 @@ function browser({ values, setValues, ui, acceptedResourceUrlPatterns: accepted 
       {glyph(chosenRefusal ? "information" : "shield", 14, "browser-summary-icon")}
       <p className="browser-summary-text">
         <strong>{chosenKind === "site" ? `All of ${values.title ?? site.name}` : values.title ?? "This choice"}</strong>
-        {chosenRefusal ? `: ${chosenRefusal}` : `${covers(chosenKind, site.name)} Agents can read it and propose changes, and every change waits for your approval.`}
+        {chosenRefusal ? `: ${chosenRefusal}` : `${covers(chosenKind, values.title ?? site.name)} Agents can read it and propose changes, and every change waits for your approval.`}
       </p>
     </div>
     : null;

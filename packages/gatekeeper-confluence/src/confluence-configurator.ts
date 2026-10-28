@@ -11,7 +11,6 @@ import {
   ConfluenceApi,
   ConfluenceApiError,
   HIERARCHY_SCOPE,
-  classifyConfluenceUrl,
   contentIdFromShortLink,
   escapeCqlString,
   spaceKeyFromWebui,
@@ -120,6 +119,39 @@ function shortDate(iso: string | undefined, now = new Date()): string | undefine
 }
 
 const invalid = () => new Error("That can't be opened.");
+
+type LinkTarget = { kind: "site" } | { kind: "space"; key: string } | { kind: "content"; id: string };
+
+/**
+ * What a Confluence link names, by the shapes Confluence writes: the site (`/wiki`, `/wiki/home`),
+ * a space (`/wiki/spaces/KEY`, its overview, pages or blog list), a page (`/pages/<id>/…`, a short
+ * link, `viewpage.action?pageId=`) or a blog post (`/blog/<y>/<m>/<d>/<id>/…`). Any other link is
+ * null: one to a folder, a whiteboard or an unknown path must not fall back to its space or site,
+ * which would offer far more than the link names.
+ */
+function linkTarget(url: URL): LinkTarget | null {
+  const shortLinkId = contentIdFromShortLink(url.href);
+  if (shortLinkId) return { kind: "content", id: shortLinkId };
+  let segments: string[];
+  try {
+    segments = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    return null;
+  }
+  if (segments.shift() !== "wiki") return null;
+  const numeric = (value: string | undefined): value is string => value !== undefined && /^\d{1,20}$/.test(value);
+  if (segments.length === 0 || (segments.length === 1 && segments[0] === "home")) return { kind: "site" };
+  if (segments.length === 2 && segments[0] === "pages" && segments[1] === "viewpage.action") {
+    const id = url.searchParams.get("pageId") ?? undefined;
+    return numeric(id) ? { kind: "content", id } : null;
+  }
+  const [spaces, key, ...rest] = segments;
+  if (spaces !== "spaces" || !key) return null;
+  if (rest.length === 0 || (rest.length === 1 && ["overview", "pages", "blog"].includes(rest[0]!))) return { kind: "space", key };
+  if (rest[0] === "pages" && numeric(rest[1])) return { kind: "content", id: rest[1] };
+  if (rest[0] === "blog" && numeric(rest[4])) return { kind: "content", id: rest[4] };
+  return null;
+}
 const expired = () => new Error("That page has expired. Try again.");
 
 /**
@@ -509,8 +541,8 @@ export class ConfluenceConfiguratorUI extends RpcTarget implements ConfluenceCon
   async #search(site: AccessibleResource, raw: string, cursor: string | undefined): Promise<ConfluenceBrowsePage> {
     const query = raw.trim();
     if (!query) return { items: [] };
-    if (query.length > MAX_QUERY_LENGTH) throw new Error("That search is too long.");
-    // The frame reads `www.` as a link too, so it is looked up as one.
+    // The frame reads `www.` as a link too, so it is looked up as one. A link has `locate`'s own
+    // length limit, since a page URL with a long title and a share origin outgrows a search's.
     const link = /^www\./i.test(query) ? `https://${query}` : query;
     if (/^https?:\/\//i.test(link)) {
       const node = await this.locate(link);
@@ -518,6 +550,7 @@ export class ConfluenceConfiguratorUI extends RpcTarget implements ConfluenceCon
         ? { items: [node] }
         : { items: [], notice: "This link isn't to a Confluence page, blog post or space this connection can open." };
     }
+    if (query.length > MAX_QUERY_LENGTH) throw new Error("That search is too long.");
     if (/[\p{Cc}]/u.test(query)) throw new Error("A search can't contain line breaks or control characters.");
     const cql = `type in (space, page, blogpost) AND siteSearch ~ ${escapeCqlString(query)}`;
     const hits = await this.#api(site).searchWithContext(cql, { cursor, limit: SEARCH_PAGE_SIZE });
@@ -572,27 +605,24 @@ export class ConfluenceConfiguratorUI extends RpcTarget implements ConfluenceCon
     };
   }
 
-  async #locate(url: string): Promise<ConfluenceNode | null> {
-    let host: string;
+  async #locate(raw: string): Promise<ConfluenceNode | null> {
+    let url: URL;
     try {
-      host = new URL(url).hostname;
+      url = new URL(raw);
     } catch {
       return null;
     }
-    const site = (await this.#allSites()).find(candidate => hostOf(candidate) === host);
+    const site = (await this.#allSites()).find(candidate => hostOf(candidate) === url.hostname);
     if (!site) return null;
-    const shortLinkId = contentIdFromShortLink(url);
-    const classified = shortLinkId
-      ? { kind: "content" as const, contentId: shortLinkId }
-      : (() => { try { return classifyConfluenceUrl(url); } catch { return null; } })();
-    if (!classified) return null;
-    if (classified.kind === "site") return siteNode(site);
-    if (classified.kind === "space") {
-      const space = await this.#space(site, classified.spaceKey);
+    const target = linkTarget(url);
+    if (!target) return null;
+    if (target.kind === "site") return siteNode(site);
+    if (target.kind === "space") {
+      const space = await this.#space(site, target.key);
       return space.status === "archived" ? null : { ...spaceNode(site.id, space), path: [] };
     }
     const api = this.#api(site);
-    const content = await api.getContentById(classified.contentId, { body: false });
+    const content = await api.getContentById(target.id, { body: false });
     if ((content.status ?? "current") !== "current") return null;
     // Search knows the ancestors (folders included) and the space's home page in one read.
     const hit = await api.searchWithContext(`id = ${content.id}`, { limit: 1 })
