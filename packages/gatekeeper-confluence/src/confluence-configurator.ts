@@ -64,6 +64,9 @@ type Ref =
 const TREE_PARENT: Record<string, TreeParent | undefined> = {
   page: "pages", folder: "folders", whiteboard: "whiteboards", database: "databases", embed: "embeds",
 };
+/** Whether `type` names a kind of tree node, by its own keys only: `constructor` is not one. */
+const isTreeKind = (type: string | undefined): type is keyof typeof TREE_PARENT & ConfluenceNodeKind =>
+  type !== undefined && Object.hasOwn(TREE_PARENT, type);
 
 const GONE = "What you chose no longer exists, or you can no longer open it. Choose again.";
 const UNSELECTABLE: Partial<Record<ConfluenceNodeKind, string>> = {
@@ -148,7 +151,7 @@ function parseRef(ref: string): Ref {
     if (!/^~?[A-Za-z0-9_]{1,255}$/.test(rest)) throw invalid();
     return { kind, cloudId, key: rest };
   }
-  if (kind === "page" || kind === "blogpost" || kind in TREE_PARENT) {
+  if (kind === "page" || kind === "blogpost" || isTreeKind(kind)) {
     if (!/^\d{1,20}$/.test(rest)) throw invalid();
     return { kind: kind as "page", cloudId, id: rest };
   }
@@ -281,9 +284,11 @@ export class ConfluenceConfiguratorUI extends RpcTarget implements ConfluenceCon
     const found = await mapLimit(wanted, ICON_CONCURRENCY, async ref => {
       const site = await this.#site(ref.cloudId);
       const space = await this.#space(site, ref.key).catch(() => undefined);
-      return [`space:${ref.cloudId}/${ref.key}`, space && await this.#avatar(site, space)] as const;
+      return { ref: `space:${ref.cloudId}/${ref.key}`, avatar: space && await this.#avatar(site, space) };
     });
-    return Object.fromEntries(found.filter((entry): entry is readonly [string, string] => entry[1] !== undefined));
+    const avatars: Record<string, string> = {};
+    for (const { ref, avatar } of found) if (avatar !== undefined) avatars[ref] = avatar;
+    return avatars;
   }
 
   // -- the connection ---------------------------------------------------------------------------
@@ -549,8 +554,8 @@ export class ConfluenceConfiguratorUI extends RpcTarget implements ConfluenceCon
     const path: ConfluenceCrumb[] = content.type === "blogpost"
       ? [spaceCrumb, { ref: `blogs:${site.id}/${spaceKey}`, kind: "blogs", title: "Blog" }]
       : [spaceCrumb, ...(content.ancestors ?? []).filter(ancestor => ancestor.id !== homepageId).map(ancestor => ({
-        ref: `${ancestor.type && ancestor.type in TREE_PARENT ? ancestor.type : "page"}:${site.id}/${ancestor.id}`,
-        kind: (ancestor.type && ancestor.type in TREE_PARENT ? ancestor.type : "page") as ConfluenceNodeKind,
+        ref: `${isTreeKind(ancestor.type) ? ancestor.type : "page"}:${site.id}/${ancestor.id}`,
+        kind: isTreeKind(ancestor.type) ? ancestor.type : "page",
         title: displayText(ancestor.title) || "Untitled",
       }))];
     return {
@@ -663,7 +668,7 @@ function contentNode(
  * page and when it last changed, which the tree endpoints don't say.
  */
 function treeNode(cloudId: string, node: TreeNodeResponse, hasChildren: boolean, details?: ContentResponse): ConfluenceNode {
-  const kind: ConfluenceNodeKind = node.type && node.type in TREE_PARENT ? node.type as ConfluenceNodeKind : "page";
+  const kind: ConfluenceNodeKind = isTreeKind(node.type) ? node.type : "page";
   const reason = UNSELECTABLE[kind];
   const meta = details && updated(details);
   return {
