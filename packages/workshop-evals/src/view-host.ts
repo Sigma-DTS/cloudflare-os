@@ -181,6 +181,19 @@ const FRAME_SCRIPT = String.raw`(() => {
       }
       return false;
     },
+    // The controls a user would pick to choose "text": a button, tab, radio label, link or element
+    // with a click handler whose own label is that word, then those whose label starts with it,
+    // such as "Pace (min/km)".
+    controlsNamed: text => {
+      const wanted = norm(text);
+      const candidates = new Set([...document.body.querySelectorAll(CONTROLS + ", [role=tab], label, summary")]);
+      for (const el of listening) if (el.isConnected) candidates.add(el);
+      const usable = [...candidates].filter(el => visible(el) && !el.disabled);
+      const exact = usable.filter(el => norm(label(el)) === wanted);
+      const starts = usable.filter(el => !exact.includes(el) && norm(label(el)).startsWith(wanted) &&
+        norm(label(el)).length <= wanted.length + 20);
+      return [...exact, ...starts].slice(0, 4).map(el => register(el, "control"));
+    },
     // The button beside an element showing "from" alone that moves it toward "to".
     stepper: (from, to) => {
       const raise = Number(to) > Number(from);
@@ -427,8 +440,9 @@ export class RenderedView implements AsyncDisposable {
 
   /**
    * Picks the item `label` names, as a user would, until the view's text passes `until`: the option
-   * of that name in a select, else the element that names it and then the controls beside it, as
-   * `click` finds them. For a filter, tab or toggle, which change the view rather than ask the agent.
+   * of that name in a select, then a control named `label`, then the element that names it and the
+   * controls beside it, as `click` finds them. For a filter, tab or toggle, which change the view
+   * rather than ask the agent.
    */
   choose(label: string, others: readonly string[], until: (text: string) => boolean):
       Promise<TextWait & { tried: string[] }> {
@@ -439,7 +453,8 @@ export class RenderedView implements AsyncDisposable {
         const wait = await this.#waitForText(until, COMMIT_MS);
         if (wait.pass) return { ...wait, tried };
       }
-      for (const target of TargetsSchema.parse(await this.#frameCall("targets", label, [...others]))) {
+      const controls = TargetsSchema.parse(await this.#frameCall("controlsNamed", label));
+      for (const target of [...controls, ...TargetsSchema.parse(await this.#frameCall("targets", label, [...others]))]) {
         const aim = AimSchema.parse(await this.#frameCall("aim", target.id));
         if (target.stage === "label" || aim.hits) {
           await this.#mouseClick(aim.x, aim.y);

@@ -94,6 +94,16 @@ describe("RenderedView", { timeout: 60_000 }, () => {
     expect(await buttons.choose("Travel", ["Groceries"], onlyTravel)).toMatchObject({ pass: true });
   });
 
+  it("picks the control named for a choice before text that only mentions it", async () => {
+    await using view = await RenderedView.open(`
+      <div>Average pace 5:10 /km</div><div>Pace trend: faster</div>
+      <button>Distance</button> <button id="pace">Pace</button>
+      <p id="axis">Distance (km)</p>
+      <script type="module">document.getElementById("pace").onclick = () => { axis.textContent = "Pace (min/km)"; };</script>`);
+    const chose = await view.choose("Pace", ["Distance"], text => text.includes("Pace (min/km)"));
+    expect(chose).toMatchObject({ pass: true, tried: ['clicked button#pace "pace"'] });
+  });
+
   it("runs an embedded view whose script and data hold text that would end a script element", async () => {
     await using view = await RenderedView.open(embeddedViewHtml({
       title: "Notes", html: '<p id="a"></p><p id="b"></p>',

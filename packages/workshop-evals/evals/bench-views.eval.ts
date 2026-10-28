@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
@@ -219,6 +219,8 @@ function viewTurn(prompt: string, check: Rung["check"], taskId: string): EvalTur
           const dir = join(SHOTS, taskId);
           mkdirSync(dir, { recursive: true });
           const path = join(dir, `${randomUUID()}.png`);
+          // The HTML lets a check be run again on the same view, with no model call.
+          writeFileSync(path.replace(/\.png$/, ".html"), view.html);
           await rendered.screenshot(path);
           return { pass: true, evidence: path };
         });
