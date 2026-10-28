@@ -1354,6 +1354,11 @@ export class GitCacheImpl extends RpcTarget implements GitCache {
     super();
   }
 
+  /** Native workspace-local scope; reporting it does not validate access or delegate authority. */
+  async getBindingId(): Promise<WorkpieceId> {
+    return this.gatekeeperId;
+  }
+
   async get(id: GitOid, hints?: GitPullHints)
       : Promise<{ type: GitObjectType, content: Uint8Array } | null> {
     let object = await this.cache.readForGatekeeper(this.gatekeeperId, id, hints);

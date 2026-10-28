@@ -1807,6 +1807,14 @@ export type GitObjectType = "commit" | "tree" | "blob" | "tag";
  */
 export interface GitCache extends RpcTarget {
   /**
+   * Optional native continuity metadata for this cache's gatekeeper binding, local to its
+   * workspace. Session and action caches for the same binding return the same value. It may
+   * be zero and grants no authority or caller identity; consumers needing it must refuse
+   * when unavailable rather than infer an id from aliases or caller fields.
+   */
+  getBindingId?(): Promise<number>;
+
+  /**
    * Read the given git object from the cache. Returns null if the object is not in this
    * gatekeeper's view (see the interface doc for the view rules).
    *
