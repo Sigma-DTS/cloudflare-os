@@ -1310,7 +1310,8 @@ button.browser-crumb:hover { background: var(--color-kumo-tint); color: var(--te
 const valuesOf = (node: Node): Values => ({ ref: node.ref, title: node.title, kind: node.kind, path: JSON.stringify(node.path ?? []) });
 
 /** What became of a pre-filled resource URL the picker isn't showing as a choice. */
-function prefillNotice({ ui, setValues }: Context, { url, failed }: NonNullable<typeof missing>) {
+function prefillNotice({ ui, setValues }: Context, attempt: NonNullable<typeof missing>) {
+  const { url, failed } = attempt;
   if (failed === undefined) {
     return <Notice>{`Couldn't find ${url} in a Confluence site this connection can open. Choose what to connect.`}</Notice>;
   }
@@ -1319,6 +1320,8 @@ function prefillNotice({ ui, setValues }: Context, { url, failed }: NonNullable<
     <div>
       <Button variant="secondary" onClick={() => {
         ui.locate(url).then(located => {
+          // A choice made while the lookup ran (which cleared `missing`) stands; the late answer is dropped.
+          if (missing !== attempt) return;
           if (located === null) {
             missing = { url };
             rerender();
@@ -1329,6 +1332,7 @@ function prefillNotice({ ui, setValues }: Context, { url, failed }: NonNullable<
           picker.initialApplied = false;
           setValues(valuesOf(located));
         }, error => {
+          if (missing !== attempt) return;
           missing = { url, failed: errorMessage(error, "Couldn't reach Confluence.") };
           rerender();
         });

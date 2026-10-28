@@ -225,6 +225,24 @@ describe("a resource URL that came with the frame", () => {
     expect((await picker.state()).ready).not.toBe(true);
   });
 
+  it("keeps a choice made while a retried lookup was still running", async () => {
+    // The first lookup fails; the retry is answered only once the user has chosen a page.
+    const retry = Promise.withResolvers<ConfluenceNode>();
+    let lookups = 0;
+    const picker = await start({
+      initialResource: "https://slew.atlassian.net/wiki",
+      answers: { locate: () => { if (lookups++ === 0) throw new Error("Confluence is down."); return retry.promise; } },
+    });
+    await poll(picker.text).toContain("Couldn't look up https://slew.atlassian.net/wiki.");
+    await picker.frame().getByRole("button", { name: "Try again" }).click();
+    await picker.radio("Q4 planning").click();
+    await poll(picker.summary).toContain("Q4 planning");
+    retry.resolve({ ref: SITE_REF, kind: "site", title: "Slew", expandable: false, selectable: true, path: [] });
+    await picker.page.waitForTimeout(300);
+    expect(await picker.summary()).toContain("Q4 planning");
+    expect(await picker.collected()).toBe("page:5c121664-a643-497d-99b3-25e02a81f02f/589825");
+  });
+
   it("tells a failed lookup from a missing page, and tries again on request", async () => {
     const located: ConfluenceNode = { ...ENGINEERING.items[1]!, path: [{ ref: MFS.ref, title: MFS.title, kind: "space" }, { ref: "page:5c121664-a643-497d-99b3-25e02a81f02f/458753", title: "Engineering", kind: "page" }] };
     let failing = true;
