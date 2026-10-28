@@ -211,6 +211,25 @@ and keep inline's lead on everything else. [INFERENCE, untested] `embedView` wou
 view of data no binding reaches, such as values computed or fetched in code (web search, a
 connection), which an inline view would have to retype.
 
+## By difficulty level (2026-10-28)
+
+All nine tasks, grouped into five levels, with all four approaches at every level. Inline +
+bindings also ran the prompt-data tasks, and a Gadget also built the stored-data views. 471
+trials, $26.49. Each level is the mean over its tasks of each task's median (times, context) or
+mean (the rest); cost is relative to the inline view, as a geometric mean over the three models.
+
+| Level | Tasks | First result s (inline · +bindings · embed · Gadget) | Prompt tokens | Cost vs inline (+bindings · embed · Gadget) |
+|---|---|---|---|---|
+| 1 | 5-number chart | 4.8 · 6.1 · 8.7 · 24.0 | 12.4K · 11.0K · 10.9K · 50.3K | 1.38 · 0.95 · 3.33 |
+| 2 | 12-month chart, plan picker | 6.6 · 7.8 · 18.4 · 34.0 | 10.8K · 11.0K · 10.9K · 57.6K | 1.00 · 1.10 · 3.27 |
+| 3 | mortgage, stepper, region totals (stored) | 10.4 · 7.7 · 16.1 · 52.2 | 21.5K · 14.7K · 12.8K · 119.8K | 0.87 · 0.83 · 3.67 |
+| 4 | 30-row statement, 40-row log | 26.6 · 27.8 · 32.6 · 67.7 | 25.6K · 24.0K · 18.3K · 93.8K | 1.04 · 0.97 · 2.03 |
+| 5 | 300 stored rows | 24.2 · 9.5 · 29.0 · 56.3 | 76.4K · 19.3K · 18.6K · 145.6K | 0.28 · 0.25 · 0.79 |
+
+On data in the prompt, bindings change nothing: inline + bindings tracks the inline view at
+levels 1–4, because there is nothing to bind. Checks passed at level 4: inline 72%, + bindings
+78%, `embedView` 89%. The report with charts is `views-by-difficulty.pdf` (linked from #914).
+
 ## Not in this exploration
 
 Live data, and a migration between the two approaches.
