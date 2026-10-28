@@ -1288,7 +1288,7 @@ function asCodeBlock(text: string): string {
   return `${fence}html\n${text}\n${fence}`;
 }
 
-type AnswerBlocks = Omit<GadgetUiBlockCardProps, "block">;
+type AnswerBlocks = Omit<GadgetUiBlockCardProps, "block" | "streaming">;
 
 /**
  * An agent answer: Markdown prose, with each `<gadget-ui>` block drawn as a live view. A block
@@ -1320,7 +1320,7 @@ const AgentAnswer = (
         // An open block's view stays the closed block's: the same component, at the same place.
         return part.kind === "open" && !streaming
           ? <MarkdownMessage key={i} message={asCodeBlock(part.text)} />
-          : <GadgetUiBlockCard key={i} {...blocks} block={part} />;
+          : <GadgetUiBlockCard key={i} {...blocks} block={part} streaming={streaming} />;
     }
   });
 };
@@ -6211,12 +6211,12 @@ function ChatInterface({
 
                               {hasMessageText && (
                                 <div className={`text-[14px] leading-[22px] tracking-[-0.25px] text-kumo-default ${styles.markdownContent}`}>
-                                  {msg.author.type === "agent" ? (
+                                  {msg.author.type === "agent" && selectedChatId !== null ? (
                                     <AgentAnswer
                                       message={msg.message}
                                       capsules={msg.capsules}
                                       formats={msg.formats}
-                                      blocks={{ onSendMessage: handleSend, sendBlockedReason, onHeightChange: keepAtBottom, scrollRoot: messagesContainerRef }}
+                                      blocks={{ overseer, chatId: selectedChatId, onSendMessage: handleSend, sendBlockedReason, onHeightChange: keepAtBottom, scrollRoot: messagesContainerRef }}
                                       streaming={entry.streaming === true}
                                     />
                                   ) : (
