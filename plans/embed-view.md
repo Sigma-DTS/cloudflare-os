@@ -99,9 +99,10 @@ idea:
   view. The one script error was this: gpt-6-luna escaped a nested backtick and wrote NUL bytes
   in its place.
 - **Every view costs a second model step.** The turn goes on after `executeCode` returns, so the
-  model reads the whole context again to write a line under the view. That step is the 1.7×.
-- **The instructions never say to call the tool.** Kimi K3 pasted the `executeCode` code into its
-  answer once.
+  model reads the whole context again to write a line under the view. That step was the 1.7×:
+  v2, which drops it, matched inline's prompt tokens up to L3 (10.9K against 10.8K).
+- **The instructions never say not to paste the code.** They name `executeCode`, but Kimi K3
+  pasted the code into its answer once.
 
 Two losses come from the idea and no design removes them: the view exists only once its code has
 run, so it cannot draw while the model writes it, and each view needs a well-formed tool call.
@@ -131,7 +132,58 @@ the end of a turn after a view is decided in memory only, so a Durable Object re
 is stored would resume the turn; and a turn answered by a view alone gives a text-only chat gateway
 no response.
 
+## Results of v2 (2026-10-28)
+
+`evals/bench-views.eval.ts`, inline views (#874) against `embedView` v2, 3 trials each on
+gpt-6-luna, claude-haiku-5-5 and Kimi K3. Rungs L1–L5 are views of data in the prompt, from five
+numbers to a ten-week running log; D1–D2 read a Gadget of 300 sales (region totals, then every
+sale). Medians for time, means for the rest; 354 trials, $20.46. Rate-limited trials (10) and
+failed Gadget builds in the setup turn (4) are left out. Haiku was rerun after its output limit
+was found at pi's 4096 default.
+
+| Rung | Passed (inline / embed) | First view s | Done s | Model steps | Prompt tokens |
+|---|---|---|---|---|---|
+| L1 five numbers | 9/9 · 9/9 | 4.8 · 8.7 | 8 · 11 | 1.1 · 1.0 | 12.4K · 10.9K |
+| L2 chart | 9/9 · 9/9 | 7.7 · 17.3 | 14 · 18 | 1.0 · 1.0 | 10.8K · 10.9K |
+| L2 plans + toggle | 9/9 · 9/9 | 5.6 · 19.5 | 13 · 20 | 1.0 · 1.0 | 10.8K · 10.9K |
+| L3 mortgage | 9/9 · 9/9 | 6.7 · 17.0 | 14 · 18 | 1.0 · 1.0 | 10.8K · 10.9K |
+| L3 stepper | 9/9 · 9/9 | 14.1 · 18.6 | 18 · 19 | 1.0 · 1.0 | 10.8K · 10.9K |
+| L4 statement, 30 rows + filter | 9/9 · 9/9 | 18.2 · 26.3 | 28 · 27 | 1.6 · 1.1 | 17.7K · 13.2K |
+| L5 running log, 40 rows + toggle | 4/9 · 7/9 | 35.1 · 38.9 | 46 · 40 | 2.4 · 1.6 | 33.5K · 23.4K |
+| D1 region totals | 11/12 · 15/15 | 10.3 · 12.7 | 14 · 14 | 2.4 · 1.1 | 42.9K · 16.6K |
+| D2 300 rows + search | 11/11 · 12/15 | 24.2 · 29.0 | 54 · 30 | 2.9 · 1.1 | 76.4K · 18.6K |
+
+- **Inline draws first at every rung.** It is 1.3–3.5× sooner up to L3; the gap closes to 1.1×
+  by L5.
+- **Up to L3 the two are level** on passing, a screenshot judge's scores (4.3–4.9 of 5 both
+  ways), prompt tokens and cost.
+- **From L4, inline agents run code first.** They compute the totals with `executeCode`, then
+  write the view, which costs an extra step. At L5 they left out stats the user asked for (total
+  distance, longest run) in 3 of 9 trials, against 1 of 9 for `embedView`, which stays at about
+  one step.
+- **On Gadget data, `embedView` wins from the first rung.** It takes one step instead of 2.4–2.9,
+  and 2.6× (D1) to 4.1× (D2) fewer prompt tokens. At D2 it costs 3.6–4.3× less on every model.
+  When the view showed a grand total, inline was wrong 2 times in 10 (Luna retyped region totals
+  and summed them off by 1,000 and 10,000); `embedView` was right 10 times in 10.
+- **Cost on data in the prompt depends on the model.** Luna is cheaper with `embedView` from L4
+  (0.14¢ against 0.20¢, then 0.21¢ against 0.40¢). Haiku costs about the same either way. Kimi K3
+  is cheaper inline: it writes an `executeCode` call far more slowly than an answer of the same
+  size (L5 first view 340 s against 143 s).
+- **`embedView` failures:** views too wide for a phone (3 at D2), two views showing "NaN:NaN",
+  and, once in all v2 runs, Kimi K3 pasting the code into its answer instead of calling the tool.
+- **A Gadget built the same views in 4–6 steps** with 4.3–7.0 tool calls, 1.8–3× the time and
+  1.4–6× the cost of either view.
+
+**Verdict.** Neither design wins outright. Inline's advantage is real and comes from the design:
+it draws while the model writes, with no tool call. `embedView`'s advantage is just as real: data
+goes from code to the view without the model reading, retyping or adding it up. The crossing point
+depends on where the data comes from. For data the user pasted, it is around L4, the first view
+that needs computed totals over a few dozen rows. For data read from a Gadget or another tool, it
+is at the first rung. Bindings in inline views, deferred in #874, would let an inline view read
+that data itself, which would take away most of `embedView`'s lead; they were not measured here.
+So the next comparison worth running is inline views with bindings against `embedView`.
+
 ## Not in this exploration
 
-Bindings in views (deferred in #874), live data, and a migration between the two approaches. If
-`embedView` wins, its design gets its own reviewed plan.
+Bindings in inline views (deferred in #874), live data, and a migration between the two
+approaches.
