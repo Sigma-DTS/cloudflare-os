@@ -70,6 +70,8 @@ import {
   type TreeDiffSource,
 } from "@gadgets/gatekeeper-kit/git-diff";
 import { SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
+import { PUSH_SCOPE_CHANGED, PushNotSentError, pushHash, pushPayload, pushReceipt, pushRequestKey, samePushContinuity, type PushOperationRecord } from "./push-operations";
+import type { GitHubPushCommand, GitHubPushContinuity, GitHubPushReceipt } from "./types";
 import {
   commitIdsOfSummary,
   isCommitOid,
@@ -339,6 +341,7 @@ type PushAction = BaseAction & {
   expectedOldSha: string;
   newSha: string;
   force: boolean;
+  operationKey?: string;
 };
 
 type GitHubAction =
@@ -1531,9 +1534,18 @@ export class UserAccount extends DurableObject<Env> {
    * @throws `CredentialsExpiredError` when the account is disconnected or its grant is dead, after
    * notifying the Workshop of a death.
    */
-  async getAccessToken(): Promise<string> {
-    const { creds } = await this.#creds.snapshot(this.#recovery.refresh, this.#recovery);
+  async getAccessToken(expectedGeneration?: string): Promise<string> {
+    if (expectedGeneration !== undefined && this.#creds.connectionGeneration() !== expectedGeneration) throw new Error(PUSH_SCOPE_CHANGED);
+    const { creds, generation } = await this.#creds.snapshot(this.#recovery.refresh, this.#recovery);
+    if (expectedGeneration !== undefined && (generation !== expectedGeneration || this.#creds.connectionGeneration() !== expectedGeneration)) throw new Error(PUSH_SCOPE_CHANGED);
     return creds.accessToken;
+  }
+
+  /** Native connection fence: unlike token identity it survives a normal refresh. */
+  async getConnectionGeneration(): Promise<string> {
+    await this.getAccessToken();
+    if (!this.#creds.stored()) throw new Error(CREDENTIALS_EXPIRED_MESSAGE);
+    return this.#creds.connectionGeneration();
   }
 
   getScopes(): string[] {
@@ -1795,6 +1807,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   implements Gatekeeper<GitHubRepoSession | GitHubIssue | GitHubPullRequest> {
 
   #pendingActionsCache?: GitHubAction[];
+  #preparingPushes = new Set<string>();
+  #applyingPushes = new Set<string>();
 
   /**
    * Commit ids this instance has served from the workspace git cache as part of simulating
@@ -1842,8 +1856,120 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     })();
   }
 
-  async #withApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
-    return await withAccountApi(this.#userAccount(), fn, { repo: await this.#pinnedRepo() });
+  async #withApi<T>(fn: (api: GitHubApi) => Promise<T>, expectedGeneration?: string): Promise<T> {
+    return await withAccountApi(this.#userAccount(), fn, { repo: await this.#pinnedRepo(), expectedGeneration });
+  }
+
+  #pushRecord(key: string): PushOperationRecord | undefined {
+    return this.ctx.storage.kv.get<PushOperationRecord>(`push-operation:${key}`);
+  }
+
+  #putPush(record: PushOperationRecord): void {
+    this.ctx.storage.kv.put(`push-operation:${record.requestKey}`, record);
+  }
+
+  async #pushContext(cache: RpcStub<GitCache>): Promise<{ continuity: GitHubPushContinuity; generation: string }> {
+    if (typeof cache.getBindingId !== "function") throw new Error("Native GitHub binding continuity is unavailable.");
+    const bindingId = await cache.getBindingId();
+    if (bindingId === undefined || !Number.isSafeInteger(bindingId) || bindingId < 0) throw new Error("Native GitHub binding continuity is unavailable.");
+    const generation = await this.#userAccount().getConnectionGeneration();
+    const pin = await this.#pinnedRepo();
+    if (!pin || !Number.isSafeInteger(pin.id) || pin.id <= 0) throw new Error(PUSH_SCOPE_CHANGED);
+    const repo = await this.#withApi(api => api.getRepo(this.ctx.props.owner, this.ctx.props.repo), generation);
+    if (repo.id !== pin.id) throw new Error(PUSH_SCOPE_CHANGED);
+    let nonce = this.ctx.storage.kv.get<string>("push-operation:facet");
+    if (!nonce) { nonce = crypto.randomUUID(); this.ctx.storage.kv.put("push-operation:facet", nonce); }
+    const facet = await pushHash(`${this.ctx.id.toString()}:${bindingId}:${this.ctx.props.userObjectId}:${nonce}`);
+    const grant = await pushHash(generation);
+    await this.#userAccount().getAccessToken(generation);
+    return { continuity: { version: 1, facet, grant, repositoryId: pin.id }, generation };
+  }
+
+  /** Operational continuity from the current native facet and account, not caller identity. */
+  async pushContinuity(queue: RpcStub<ApprovalQueue>): Promise<GitHubPushContinuity> {
+    using cache = await queue.getGitCache();
+    return (await this.#pushContext(cache)).continuity;
+  }
+
+  /** Reads a keyed native operation without replaying its queue submission or effect. */
+  async pushOperation(queue: RpcStub<ApprovalQueue>, requestKey: string): Promise<GitHubPushReceipt | null> {
+    using cache = await queue.getGitCache();
+    const key = pushRequestKey(requestKey), context = await this.#pushContext(cache);
+    const record = this.#pushRecord(key);
+    if (!record) return null;
+    if (record.expected.facet !== context.continuity.facet || record.expected.repositoryId !== context.continuity.repositoryId) throw new Error(PUSH_SCOPE_CHANGED);
+    if (record.state === "preparing" && !this.#preparingPushes.has(record.id)) record.state = "failed";
+    if (record.state === "submitting" && !this.#preparingPushes.has(record.id)) record.state = "uncertain";
+    if (record.state === "applying" && !this.#applyingPushes.has(record.id)) record.state = "uncertain";
+    this.#putPush(record);
+    // Only an original native apply fence permits this read-only recovery. A pending action
+    // must not acquire approval merely because someone else published byte-identical content.
+    if (record.state === "uncertain" && record.effectStarted && record.actionId !== undefined) {
+      const action = this.#getActionRecord(record.actionId)?.action;
+      if (action?.type === "push" && action.operationKey === key) {
+        try {
+          const head = await this.#withApi(api => api.getBranchHead(action.owner, action.repo, action.branch), context.generation);
+          const current = this.#pushRecord(key)!;
+          if (head === action.newSha && current.state === "uncertain" && !this.#applyingPushes.has(record.id)) {
+            this.#markActionApproved(action); this.#clearCaches();
+          }
+        } catch { /* Failure to observe the real remote leaves the original uncertainty intact. */ }
+      }
+    }
+    return pushReceipt(this.#pushRecord(key)!);
+  }
+
+  /** Stages only the existing native action; lost acknowledgements never create a replacement. */
+  async submitPush(queue: RpcStub<ApprovalQueue>, requestKey: string, command: GitHubPushCommand, expected: GitHubPushContinuity): Promise<GitHubPushReceipt> {
+    const key = pushRequestKey(requestKey), payload = pushPayload(command);
+    const existing = this.#pushRecord(key);
+    if (existing) {
+      if (existing.payload !== payload || !samePushContinuity(existing.expected, expected)) throw new Error("Push operation key reused with changed arguments or continuity.");
+      return (await this.pushOperation(queue, key))!;
+    }
+    const normalized: Required<GitHubPushCommand> = JSON.parse(payload);
+    const record: PushOperationRecord = { version: 1, id: crypto.randomUUID(), requestKey: key, state: "preparing", payload,
+      expected: { version: 1, facet: expected.facet, grant: expected.grant, repositoryId: expected.repositoryId } };
+    this.#putPush(record); this.#preparingPushes.add(record.id);
+    try {
+      record.digest = await pushHash(payload); this.#putPush(record);
+      using gitCache = await queue.getGitCache();
+      const context = await this.#pushContext(gitCache);
+      if (!samePushContinuity(record.expected, context.continuity)) {
+        record.state = "failed"; record.failure = "scope-changed"; this.#putPush(record); return pushReceipt(record);
+      }
+      record.generation = context.generation;
+      const action = await this.#preparePush(normalized.branch, normalized.commitId, normalized.force, gitCache, false, context.generation);
+      await this.#userAccount().getAccessToken(context.generation);
+      if (action === null) {
+        record.state = "applied"; this.#putPush(record); return pushReceipt(record);
+      }
+      action.operationKey = key;
+      record.actionId = action.approvalId; record.state = "submitting";
+      this.ctx.storage.transactionSync(() => { this.#stageAction(action); this.#putPush(record); });
+      try {
+        const description = describeGitHubAction(action);
+        await queue.submitAction(action.approvalId, { title: `Push ${normalized.commitId.slice(0, 12)} to ${normalized.branch}`,
+          pushedCommits: [normalized.commitId], implementsRevert: true, ...description, ...autoApprovalOf(action), fields: [...(description.fields ?? []), { kind: "inline", label: "Operation", value: record.id }] });
+      } catch {
+        const current = this.#pushRecord(key)!;
+        if (current.state === "submitting") { current.state = "uncertain"; this.#putPush(current); }
+        return pushReceipt(current);
+      }
+      const current = this.#pushRecord(key)!;
+      if (current.state === "submitting") {
+        this.ctx.storage.transactionSync(() => { this.#markActionPending(action); current.state = "pending"; this.#putPush(current); });
+      }
+      this.#clearCaches(); return pushReceipt(this.#pushRecord(key)!);
+    } catch (error) {
+      const current = this.#pushRecord(key)!;
+      if (current.state === "preparing") {
+        current.state = "failed";
+        if (error instanceof Error && error.message === PUSH_SCOPE_CHANGED) current.failure = "scope-changed";
+        this.#putPush(current);
+      }
+      return pushReceipt(current);
+    } finally { this.#preparingPushes.delete(record.id); }
   }
 
   /**
@@ -2410,15 +2536,36 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     if (revertInfo) {
       record.revertInfo = revertInfo;
     }
-    this.#retireActionRecord(action.approvalId, record);
+    this.ctx.storage.transactionSync(() => {
+      this.#retireActionRecord(action.approvalId, record);
+      if (action.type === "push" && action.operationKey) {
+        const operation = this.#pushRecord(action.operationKey)!;
+        operation.state = "applied"; delete operation.failure; this.#putPush(operation);
+      }
+    });
     this.#pendingActionsCache = undefined;
   }
 
+  #assertPushDiscardable(action: GitHubAction): void {
+    if (action.type !== "push" || !action.operationKey) return;
+    const operation = this.#pushRecord(action.operationKey);
+    if (operation?.effectStarted && ["applying", "uncertain", "applied"].includes(operation.state)) throw new Error("An in-flight or uncertain push cannot be discarded as unapplied.");
+  }
+
   #markActionRejected(action: GitHubAction): void {
+    // Every rejection path reaches this synchronous check, including one whose branch read
+    // yielded before an application began.
+    this.#assertPushDiscardable(action);
     const record = this.#requireActionRecord(action.approvalId);
     record.state = "rejected";
     record.rejectedAt = Date.now();
-    this.#retireActionRecord(action.approvalId, record);
+    this.ctx.storage.transactionSync(() => {
+      this.#retireActionRecord(action.approvalId, record);
+      if (action.type === "push" && action.operationKey) {
+        const operation = this.#pushRecord(action.operationKey)!;
+        operation.state = "rejected"; delete operation.failure; this.#putPush(operation);
+      }
+    });
     this.#pendingActionsCache = undefined;
   }
 
@@ -4172,34 +4319,69 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return;
       }
       case "push": {
-        // No gatekeeper-side object walk: the overseer composes the pack from the action's
-        // pending-push marks (`cache.buildPack()` on the action-scoped stub), and this side
-        // contributes only send-pack framing plus the ref-update command. The command's old-sha
-        // is the queue-time `expectedOldSha` -- receive-pack's compare-and-swap applies to every
-        // update, force or not (fast-forward policy was already enforced at queue time), so a
-        // branch that moved between approval and apply fails cleanly instead of being clobbered.
-        try {
-          const pack = await cache.buildPack();
-          await this.#withApi(api => pushGitRefUpdate(
-            body => api.fetchGitReceivePack(action.owner, action.repo, body),
-            { branch: action.branch, oldSha: action.expectedOldSha, newSha: action.newSha },
-            pack));
-        } catch (error) {
-          if (!(error instanceof GitRefUpdateRejectedError)) throw error;
-          // Desired-state semantics: apply succeeds iff the branch ends up at newSha -- by our
-          // CAS'd push, or by finding it already there (a retried apply whose first attempt
-          // landed but crashed before this record was persisted, or a third party's
-          // byte-identical push -- indistinguishable, and the approved end state holds either
-          // way).
-          const head = await this.#withApi(api =>
-            api.getBranchHead(action.owner, action.repo, action.branch));
-          if (head !== action.newSha) throw this.#pushRefusal(action, head, error);
-        }
+        if (action.operationKey) return this.#applyPushOperation(action, cache);
+        await this.#applyPush(action, cache);
         this.#markActionApproved(action);
         this.#clearCaches();
         return;
       }
     }
+  }
+
+  async #applyPush(action: PushAction, cache: RpcStub<GitCache>, generation?: string): Promise<void> {
+    try {
+      let pack: ReadableStream<Uint8Array>;
+      try { pack = await cache.buildPack(); }
+      catch (error) {
+        if (generation !== undefined) throw new PushNotSentError(undefined, { cause: error });
+        throw error;
+      }
+      await this.#withApi(api => pushGitRefUpdate(
+        body => api.fetchGitReceivePack(action.owner, action.repo, body),
+        { branch: action.branch, oldSha: action.expectedOldSha, newSha: action.newSha },
+        pack), generation);
+    } catch (error) {
+      if (!(error instanceof GitRefUpdateRejectedError)) throw error;
+      // Desired-state semantics: apply succeeds iff the branch ends up at newSha -- by our
+      // CAS'd push, or by finding it already there (a retried apply whose first attempt
+      // landed but crashed before this record was persisted, or a third party's
+      // byte-identical push -- indistinguishable, and the approved end state holds either
+      // way).
+      const head = await this.#withApi(api =>
+        api.getBranchHead(action.owner, action.repo, action.branch), generation);
+      if (head !== action.newSha) throw this.#pushRefusal(action, head, error);
+    }
+  }
+  async #applyPushOperation(action: PushAction, cache: RpcStub<GitCache>): Promise<void> {
+    const operation = this.#pushRecord(action.operationKey!);
+    if (!operation || operation.actionId !== action.approvalId) throw new Error("Push operation is unavailable.");
+    if (operation.state === "applied") return;
+    if (operation.effectStarted || operation.state === "failed" || operation.state === "rejected") throw new Error("Push operation is not replayable.");
+    // This durable fence precedes every asynchronous boundary, not merely the provider mutation.
+    operation.state = "applying"; operation.effectStarted = true; this.#putPush(operation);
+    this.#applyingPushes.add(operation.id);
+    try {
+      let context;
+      try { context = await this.#pushContext(cache); }
+      catch { operation.state = "failed"; this.#putPush(operation); throw new Error("Push scope unavailable before application."); }
+      if (!samePushContinuity(context.continuity, operation.expected) || context.generation !== operation.generation) {
+        operation.state = "failed"; operation.failure = "scope-changed"; this.#putPush(operation); throw new Error(PUSH_SCOPE_CHANGED);
+      }
+      try { await this.#applyPush(action, cache, operation.generation); }
+      catch (error) {
+        if (error instanceof PushNotSentError || (error instanceof Error && error.cause instanceof GitRefUpdateRejectedError)) {
+          operation.state = "failed";
+          if (error instanceof PushNotSentError && error.failure) operation.failure = error.failure;
+          this.#putPush(operation);
+          // oxlint-disable-next-line eslint/preserve-caught-error -- provider errors must not escape the operational projection.
+          throw new Error("Push publication failed before changing the remote ref.");
+        }
+        operation.state = "uncertain"; this.#putPush(operation);
+        // oxlint-disable-next-line eslint/preserve-caught-error -- provider errors must not escape the operational projection.
+        throw new Error("Push publication is uncertain; reconcile the original operation.");
+      }
+      this.#markActionApproved(action); this.#clearCaches();
+    } finally { this.#applyingPushes.delete(operation.id); }
   }
 
   /** `PUT …/merge` at the bound head, translating GitHub's refusals into agent-actionable reasons. */
@@ -4319,6 +4501,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
     const record = this.#requireActionRecord(actionId);
     const action = record.action;
+    this.#assertPushDiscardable(action);
     // Discarded already: a cascade retires actions the Workshop still shows as pending, and the
     // user's discard of one must then succeed rather than strand it.
     if (record.state === "rejected") return;
@@ -5572,9 +5755,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    */
   async preparePush(branch: string, commitId: string, force: boolean,
                     gitCache: RpcStub<GitCache>): Promise<PushAction | null> {
+    return this.#preparePush(branch, commitId, force, gitCache, true);
+  }
+
+  async #preparePush(branch: string, commitId: string, force: boolean, gitCache: RpcStub<GitCache>, simulated: boolean, generation?: string): Promise<PushAction | null> {
     const realHead = await this.#withApi(api =>
-      api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, branch));
-    const expectedOldSha = this.#simulateBranchHead(branch, realHead) ?? ZERO_OID;
+      api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, branch), generation);
+    const expectedOldSha = (simulated ? this.#simulateBranchHead(branch, realHead) : realHead) ?? ZERO_OID;
     if (expectedOldSha === commitId) return null;
     if (!force && expectedOldSha !== ZERO_OID &&
         !(await gitCache.isAncestor(expectedOldSha, commitId))) {
@@ -5646,6 +5833,23 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
     this.#gatekeeper = gatekeeper;
     this.#approvalQueue = approvalQueue;
     this.#gitCache = new SessionGitCache(approvalQueue, { withhold: id => gatekeeper.isSimulatedCommitId(id) });
+  }
+
+  async pushContinuity(): Promise<GitHubPushContinuity> {
+    await this.#approvalQueue.authorizeObservation({ title: "Inspect GitHub push continuity", description: "Read only native connection and repository continuity metadata." });
+    try { return await this.#gatekeeper.pushContinuity(this.#approvalQueue); }
+    catch { throw new Error("GitHub push continuity is unavailable."); }
+  }
+
+  async submitPush(requestKey: string, command: GitHubPushCommand, expected: GitHubPushContinuity): Promise<GitHubPushReceipt> {
+    await this.#approvalQueue.authorizeObservation({ title: "Reconcile a native GitHub push", description: "Inspect only the submission and publication state of the requested native push." });
+    return this.#gatekeeper.submitPush(this.#approvalQueue, requestKey, command, expected);
+  }
+
+  async pushOperation(requestKey: string): Promise<GitHubPushReceipt | null> {
+    await this.#approvalQueue.authorizeObservation({ title: "Inspect a native GitHub push", description: "Read only the approval and publication state of this native operation." });
+    try { return await this.#gatekeeper.pushOperation(this.#approvalQueue, requestKey); }
+    catch { throw new Error("GitHub push operation is unavailable."); }
   }
 
   [Symbol.dispose](): void {

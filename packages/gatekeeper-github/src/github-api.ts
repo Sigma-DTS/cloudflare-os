@@ -4,6 +4,7 @@ import {
   isInvalidGrant, mergeOAuthTokens, OAuthClient, oauthRefresh,
 } from "@gadgets/gatekeeper-kit/oauth-client";
 import type { UserAccount } from "./github";
+import { PUSH_SCOPE_CHANGED, PushNotSentError } from "./push-operations";
 
 /**
  * A GitHub OAuth grant. An expiring grant -- the default for OAuth apps registered since August
@@ -1597,15 +1598,22 @@ export const CREDENTIALS_EXPIRED_MESSAGE =
  */
 export async function withAccountApi<T>(
   account: DurableObjectStub<UserAccount>, fn: (api: GitHubApi) => Promise<T>,
-  options: { replayable?: true; repo?: PinnedRepo } = {},
+  options: { replayable?: true; repo?: PinnedRepo; expectedGeneration?: string } = {},
 ): Promise<T> {
   for (let replays = options.replayable ? 1 : 0; ; replays--) {
     let presented: string | undefined;
-    const api = new GitHubApi(async () => (presented = await account.getAccessToken()),
+    const api = new GitHubApi(async () => {
+      if (options.expectedGeneration === undefined) return presented = await account.getAccessToken();
+      try { return presented = await account.getAccessToken(options.expectedGeneration); }
+      catch (error) {
+        throw new PushNotSentError(error instanceof Error && error.message === PUSH_SCOPE_CHANGED ? "scope-changed" : undefined, { cause: error });
+      }
+    },
       { repo: options.repo });
     try {
       return await fn(api);
     } catch (error) {
+      if (error instanceof PushNotSentError) throw error;
       if (isCredentialsExpired(error)) {
         throw new Error(CREDENTIALS_EXPIRED_MESSAGE, { cause: error });
       }

@@ -11,6 +11,19 @@ import type { RpcStub } from "cloudflare:workers";
  * repository's file *content* is not readable through this interface directly.
  */
 export interface GitHubRepo {
+  /** Observe this native connection's facet, authorization revision and pinned repository.
+   * Persist the result with an intent; these values are preconditions, never authority tokens. */
+  pushContinuity(): Promise<GitHubPushContinuity>;
+
+  /** Submit one keyed native push action. Persist a UUID key and normalized arguments first.
+   * Same key/payload/precondition reconciles; a changed payload or precondition is refused.
+   * Pending approval and simulated refs never prove publication. */
+  submitPush(requestKey: string, command: GitHubPushCommand, expected: GitHubPushContinuity): Promise<GitHubPushReceipt>;
+
+  /** Observe the original operation in this native facet. Null is not permission to replay an
+   * uncertain submission. Applied proves a past publication, not the branch's current head. */
+  pushOperation(requestKey: string): Promise<GitHubPushReceipt | null>;
+
   /** Returns basic metadata about the repository. */
   getMetadata(): Promise<GitHubRepoMetadata>;
 
@@ -197,6 +210,42 @@ export interface GitHubRepo {
    * await env.GITHUB_REPO.subscribe(hook, { events: ["issue"] });
    */
   subscribe(hook: RpcStub<GitHubEventHook>, options?: GitHubSubscribeOptions): Promise<void>;
+}
+
+/** A normalized push intent; the native producer still owns CAS and approval. */
+export interface GitHubPushCommand {
+  /** Branch name, passed literally below refs/heads/. */
+  branch: string;
+  /** Full commit id whose object history is available to the native Git cache. */
+  commitId: string;
+  /** Defaults to false; true retains the separate native force-push approval policy. */
+  force?: boolean;
+}
+
+/** Operational metadata minted by this producer; no field grants access or caller identity. */
+export interface GitHubPushContinuity {
+  /** Contract version. */
+  version: 1;
+  /** Opaque native facet identity, stable across reconstruction but not storage cloning. */
+  facet: string;
+  /** Opaque native connection generation; refresh preserves it, confirmed reconnect changes it. */
+  grant: string;
+  /** Repository id pinned by the producer, never supplied as the source of authority. */
+  repositoryId: number;
+}
+
+/** Limited operational projection; no command, branch, credential or raw provider error. */
+export interface GitHubPushReceipt {
+  /** Contract version. */
+  version: 1;
+  /** Producer-generated operation id; not an Overseer action id or an authority token. */
+  id: string;
+  /** Caller-persisted deduplication key. */
+  requestKey: string;
+  /** Native approval/application progress, distinct from simulated repository observations. */
+  state: "preparing" | "submitting" | "pending" | "rejected" | "applying" | "applied" | "failed" | "uncertain";
+  /** Fixed, known pre-effect refusal; uncertain failures have no such assertion. */
+  failure?: "scope-changed";
 }
 
 /** A single GitHub issue. */

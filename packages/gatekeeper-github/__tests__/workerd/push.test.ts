@@ -16,8 +16,10 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActionDescription, GitObjectType, GitOid }
   from "@gadgets/workshop-shared/gatekeeper";
+import { stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { FLUSH_PKT, ZERO_OID, encodePktLine, pktText } from "@gadgets/gatekeeper-kit/git-transport";
-import type { GatekeeperProps, Outcome, PushActionData } from "./worker";
+import type { GitHubCreatePullRequestOptions, GitHubPushCommand, GitHubPushContinuity } from "../../src/types";
+import type { CreatePullRequestActionData, GatekeeperProps, Outcome, PushActionData, UserAccount } from "./worker";
 
 const OWNER = "acme";
 const REPO = "widgets";
@@ -50,6 +52,9 @@ function commitPayload(parents: string[], message: string): Uint8Array {
  * returns stand-in bytes the receive-pack capture can assert on.
  */
 class TestGitCache extends RpcTarget {
+  constructor(readonly bindingId = 0) { super(); }
+  async getBindingId(): Promise<number> { return this.bindingId; }
+  onBuildPack: (() => Promise<void>) | undefined;
   readonly commits = new Map<GitOid, Uint8Array>();
   readonly ancestries = new Set<string>();
 
@@ -79,6 +84,7 @@ class TestGitCache extends RpcTarget {
   }
 
   async buildPack(): Promise<ReadableStream<Uint8Array>> {
+    await this.onBuildPack?.();
     return new ReadableStream({
       start(controller) {
         controller.enqueue(PACK_BYTES);
@@ -103,6 +109,12 @@ class FakeGitHub {
   readonly receivePackExchanges: ReceivePackExchange[] = [];
   readonly receivePackResponses: Uint8Array[] = [];
   defaultBranch = "main";
+  repositoryId = 12345;
+  applyRefUpdates = false;
+  refReadUnavailable = false;
+  mutations = 0;
+  onMutation: (() => Promise<void>) | undefined;
+  oauthResponse: Record<string, unknown> = { access_token: "test-token-refreshed", refresh_token: "test-refresh-next", expires_in: 28_800, refresh_token_expires_in: 15_897_600, scope: "repo", token_type: "bearer" };
 
   install(): void {
     vi.stubGlobal("fetch", this.#handle.bind(this));
@@ -123,9 +135,18 @@ class FakeGitHub {
     const url = new URL(typeof input === "string" ? input : (input as Request).url ?? String(input));
     const path = url.origin + url.pathname;
 
+    if (path === "https://github.com/login/oauth/access_token") return Response.json(this.oauthResponse);
+    if (path === "https://api.github.com/user") return Response.json({ id: 1, login: "fixture-user" });
     if (path === RECEIVE_PACK_URL) {
       const body = new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer());
       this.receivePackExchanges.push({ body });
+      if (this.applyRefUpdates) {
+        const command = splitPushRequest(body).commands[0].split("\0")[0];
+        const [oldSha, newSha, ref] = command.split(" "); const branch = ref.slice("refs/heads/".length);
+        const accepted = (this.branches.get(branch) ?? ZERO_OID) === oldSha;
+        if (accepted) { this.branches.set(branch, newSha); this.mutations++; await this.onMutation?.(); }
+        return new Response(new Uint8Array([...encodePktLine("unpack ok"), ...encodePktLine(accepted ? `ok ${ref}` : `ng ${ref} old sha mismatch`), ...FLUSH_PKT]));
+      }
       const response = this.receivePackResponses.shift();
       if (!response) throw new Error("test: unexpected receive-pack request");
       return new Response(response, {
@@ -134,6 +155,7 @@ class FakeGitHub {
     }
 
     if (path.startsWith(`${API_BASE}/git/ref/heads/`)) {
+      if (this.refReadUnavailable) return Response.json({ message: "fixture unavailable" }, { status: 503 });
       const name = decodeURIComponent(path.slice(`${API_BASE}/git/ref/heads/`.length));
       const head = this.branches.get(name);
       if (head === undefined) {
@@ -178,6 +200,7 @@ class FakeGitHub {
 
     if (path === API_BASE) {
       return Response.json({
+        id: this.repositoryId,
         name: REPO,
         full_name: `${OWNER}/${REPO}`,
         html_url: `https://github.com/${OWNER}/${REPO}`,
@@ -194,15 +217,23 @@ class FakeGitHub {
 
 /** Records what the gatekeeper submits, standing in for the overseer's approval queue. */
 class TestApprovalQueue extends RpcTarget {
+  constructor(readonly cache: RpcTarget = new TestGitCache()) { super(); }
+  async getGitCache(): Promise<RpcTarget> { return this.cache; }
   readonly observations: string[] = [];
+  denyObservation = false;
+  loseAcknowledgement = false;
+  onSubmit: ((action: number) => Promise<void>) | undefined;
   readonly submitted: { action: number, description: ActionDescription }[] = [];
 
   async authorizeObservation(description: { title: string }): Promise<void> {
+    if (this.denyObservation) throw new Error("Fixture observation denied");
     this.observations.push(description.title);
   }
 
   async submitAction(action: number, description: ActionDescription): Promise<void> {
     this.submitted.push({ action, description });
+    await this.onSubmit?.(action);
+    if (this.loseAcknowledgement) throw new Error("Fixture native queue acknowledgement lost");
   }
 }
 
@@ -225,10 +256,10 @@ async function unwrap<T>(pending: Promise<Outcome<T>>): Promise<T> {
  * TestHooks (a facet stub cannot ride back to the test, so every call forwards through the hook
  * DO). Methods mirror the gatekeeper's, with the test's fakes wrapped into stubs per call.
  */
-async function repoGatekeeper() {
+async function repoGatekeeper(existingAccount?: DurableObjectId) {
   const scenario = `push-${nextScenario++}`;
-  const accountId = env.USER_ACCOUNT.newUniqueId();
-  await runInDurableObject(env.USER_ACCOUNT.get(accountId), async (_instance, state) => {
+  const accountId = existingAccount ?? env.USER_ACCOUNT.newUniqueId();
+  if (!existingAccount) await runInDurableObject(env.USER_ACCOUNT.get(accountId), async (_instance, state) => {
     state.storage.kv.put("accessToken", "test-token");
   });
   const props: GatekeeperProps = {
@@ -239,10 +270,23 @@ async function repoGatekeeper() {
   };
   const hooks = env.TEST_HOOKS.getByName(scenario);
   return {
+    accountId,
+    copyFacet: () => unwrap(hooks.copyPublicationFacet(scenario, `${scenario}-clone`, props)),
+    copiedContinuity: (queue: TestApprovalQueue) => unwrap(hooks.publicationContinuity(`${scenario}-clone`, props, stubOf(queue))),
+    copiedOperation: (queue: TestApprovalQueue, key: string) => unwrap(hooks.publicationStatus(`${scenario}-clone`, props, stubOf(queue), key)),
+    copiedApply: (action: number, cache: TestGitCache) => unwrap(hooks.applyAction(`${scenario}-clone`, props, action, stubOf(cache))),
+    restart: () => hooks.restartGatekeeper(scenario),
+    continuity: (queue: TestApprovalQueue) => unwrap(hooks.publicationContinuity(scenario, props, stubOf(queue))),
+    submit: (queue: TestApprovalQueue, key: string, command: GitHubPushCommand, expected: GitHubPushContinuity) => unwrap(hooks.publicationSubmit(scenario, props, stubOf(queue), key, command, expected)),
+    operation: (queue: TestApprovalQueue, key: string) => unwrap(hooks.publicationStatus(scenario, props, stubOf(queue), key)),
     preparePush: (branch: string, commitId: string, force: boolean, cache: TestGitCache) =>
       unwrap(hooks.preparePush(scenario, props, branch, commitId, force, stubOf(cache))),
     submitPush: (queue: TestApprovalQueue, action: PushActionData, description: ActionDescription) =>
       unwrap(hooks.submitPush(scenario, props, stubOf(queue), action, description)),
+    prepareCreatePullRequest: (options: GitHubCreatePullRequestOptions) =>
+      unwrap(hooks.prepareCreatePullRequest(scenario, props, options)),
+    submitCreatePullRequest: (queue: TestApprovalQueue, action: CreatePullRequestActionData) =>
+      unwrap(hooks.submitCreatePullRequest(scenario, props, stubOf(queue), action, { title: "Create dependent pull request", description: "Test dependent action", implementsRevert: false })),
     applyAction: (actionId: number, cache: TestGitCache) =>
       unwrap(hooks.applyAction(scenario, props, actionId, stubOf(cache))),
     rejectAction: (actionId: number) => unwrap(hooks.rejectAction(scenario, props, actionId)),
@@ -299,6 +343,7 @@ function splitPushRequest(body: Uint8Array): { commands: string[], pack: Uint8Ar
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -713,4 +758,270 @@ describe("revert", () => {
     expect(result).toMatchObject({ canRetry: false });
     expect((result as { message: string }).message).toMatch(/no longer at the pushed commit/);
   });
+});
+
+
+describe("keyed native push publication", () => {
+  it("keeps publication pending while legacy reads simulate it, then confirms the real native apply", async () => {
+    const github = new FakeGitHub(); github.applyRefUpdates = true; github.branches.set("main", BASE); github.install();
+    const cache = new TestGitCache().withAncestry(BASE, HEAD1);
+    const queue = new TestApprovalQueue(cache), gk = await repoGatekeeper();
+    const continuity = await gk.continuity(queue), key = crypto.randomUUID();
+    expect(continuity).toMatchObject({ version: 1, repositoryId: 12345, facet: expect.stringMatching(/^[a-f0-9]{64}$/), grant: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    const command = { branch: "main", commitId: HEAD1 };
+    const pending = await gk.submit(queue, key, command, continuity);
+    expect(pending).toMatchObject({ state: "pending", requestKey: key });
+    expect(github.receivePackExchanges).toHaveLength(0);
+    expect(await gk.resolveRef("main", cache)).toEqual({ id: HEAD1, fromCache: true });
+    expect(await gk.operation(queue, key)).toEqual(pending);
+    expect(await gk.submit(queue, key, { ...command, force: false }, continuity)).toEqual(pending);
+    expect(queue.submitted).toHaveLength(1);
+    await gk.applyAction(queue.submitted[0].action, cache);
+    expect(await gk.operation(queue, key)).toMatchObject({ state: "applied", id: pending.id });
+    await gk.applyAction(queue.submitted[0].action, cache);
+    expect(github.receivePackExchanges).toHaveLength(1); expect(github.mutations).toBe(1);
+  });
+});
+
+
+async function publicationFixture() {
+  const github = new FakeGitHub(); github.applyRefUpdates = true; github.branches.set("main", BASE); github.install();
+  const cache = new TestGitCache().withAncestry(BASE, HEAD1).withAncestry(HEAD1, HEAD2);
+  const queue = new TestApprovalQueue(cache), gk = await repoGatekeeper(), expected = await gk.continuity(queue);
+  return { github, cache, queue, gk, expected, command: { branch: "main", commitId: HEAD1 } };
+}
+
+/** OAuth completion is an explicit fixture boundary; stage consumption and reconnect are native. */
+async function replaceGrant(accountId: DurableObjectId, expiresAt?: number) {
+  const account = env.USER_ACCOUNT.get(accountId);
+  const stage = await runInDurableObject(account, (_instance, state) => stageCredentials(state.storage.kv,
+    { accessToken: "test-token-reconnected", scopes: ["repo"], ...(expiresAt === undefined ? {} : { expiresAt, refreshToken: "test-refresh" }) }, Date.now()));
+  await account.commitReconnect(stage);
+  return { account, stage };
+}
+
+describe("native publication recovery and scope", () => {
+  it("keeps an unapproved keyed action pending when another actor publishes its desired commit", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    const pending = await f.gk.submit(f.queue, key, f.command, f.expected);
+    // Matching external state cannot supply the native approval this action has not received.
+    f.github.branches.set("main", HEAD1);
+    expect(await f.gk.operation(f.queue, key)).toEqual(pending);
+    expect(await f.gk.submit(f.queue, key, f.command, f.expected)).toEqual(pending);
+    expect(f.queue.submitted).toHaveLength(1);
+    expect(f.github.receivePackExchanges).toHaveLength(0); expect(f.github.mutations).toBe(0);
+    // A native action already marked approved refuses discard, independently of the receipt.
+    await f.gk.rejectAction(f.queue.submitted[0].action);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "rejected" });
+    expect(f.github.branches.get("main")).toBe(HEAD1);
+    expect(f.github.receivePackExchanges).toHaveLength(0); expect(f.github.mutations).toBe(0);
+  });
+
+  it("rechecks the in-flight fence after a dependent-PR rejection read", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    await f.gk.submit(f.queue, key, f.command, f.expected);
+    const pull = await f.gk.prepareCreatePullRequest({ title: "Dependent pull request", head: "main", base: "main" });
+    await f.gk.submitCreatePullRequest(f.queue, pull);
+    const account = env.USER_ACCOUNT.get(f.gk.accountId) as DurableObjectStub<UserAccount>;
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const acknowledgement = new Promise<void>(resolve => { release = resolve; });
+    f.cache.onBuildPack = async () => { enter(); await acknowledgement; };
+    await account.holdNextAccessToken();
+    const rejecting = f.gk.rejectAction(f.queue.submitted[0].action).then(
+      () => ({ error: undefined }), error => ({ error: error instanceof Error ? error.message : String(error) }));
+    await account.waitForHeldAccessToken();
+    const applying = f.gk.applyAction(f.queue.submitted[0].action, f.cache);
+    try {
+      await entered;
+      await account.releaseAccessToken();
+      expect.soft((await rejecting).error).toEqual(expect.stringContaining("in-flight"));
+      expect.soft(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applying" });
+    } finally {
+      await account.releaseAccessToken();
+      release(); await applying; await rejecting;
+    }
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applied" });
+    expect(f.github.mutations).toBe(1);
+  });
+
+  it("reports a reconnect during pack construction as a known pre-send scope failure", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    await f.gk.submit(f.queue, key, f.command, f.expected);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const acknowledgement = new Promise<void>(resolve => { release = resolve; });
+    f.cache.onBuildPack = async () => { enter(); await acknowledgement; };
+    const applying = f.gk.applyAction(f.queue.submitted[0].action, f.cache).then(
+      () => ({ error: undefined }), error => ({ error: error instanceof Error ? error.message : String(error) }));
+    try { await entered; await replaceGrant(f.gk.accountId); }
+    finally { release(); }
+    expect((await applying).error).toBeDefined();
+    expect(f.github.receivePackExchanges).toHaveLength(0); expect(f.github.mutations).toBe(0);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "failed", failure: "scope-changed" });
+    await f.gk.rejectAction(f.queue.submitted[0].action);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "rejected" });
+  });
+
+  it("keeps an explicit CAS rejection discardable instead of permanently uncertain", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    await f.gk.submit(f.queue, key, f.command, f.expected);
+    f.github.branches.set("main", OTHER);
+    const result = await f.gk.applyAction(f.queue.submitted[0].action, f.cache).then(
+      () => ({ error: undefined }), error => ({ error: error instanceof Error ? error.message : String(error) }));
+    expect(result.error).toBeDefined();
+    expect(f.github.receivePackExchanges).toHaveLength(1); expect(f.github.mutations).toBe(0);
+    expect(f.github.branches.get("main")).toBe(OTHER);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "failed" });
+    await f.gk.rejectAction(f.queue.submitted[0].action);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "rejected" });
+  });
+
+  it("preserves a pending keyed rejection across reconciliation without publishing", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    await f.gk.submit(f.queue, key, f.command, f.expected);
+    await f.gk.rejectAction(f.queue.submitted[0].action);
+    const rejected = await f.gk.operation(f.queue, key);
+    expect(rejected).toMatchObject({ state: "rejected" });
+    await f.gk.restart();
+    expect(await f.gk.submit(f.queue, key, f.command, f.expected)).toEqual(rejected);
+    expect(f.queue.submitted).toHaveLength(1);
+    expect(f.github.receivePackExchanges).toHaveLength(0); expect(f.github.mutations).toBe(0);
+  });
+
+  it("deduplicates concurrent submissions and reconstructs the same facet without accepting changed payload", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    const receipts = await Promise.all([f.gk.submit(f.queue, key, f.command, f.expected), f.gk.submit(f.queue, key, f.command, f.expected)]);
+    expect(receipts[0].id).toBe(receipts[1].id); expect(f.queue.submitted).toHaveLength(1);
+    await expect(f.gk.submit(f.queue, key, { ...f.command, commitId: HEAD2 }, f.expected)).rejects.toThrow("key reused");
+    await f.gk.restart(); expect(await f.gk.continuity(f.queue)).toEqual(f.expected);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "pending", id: receipts[0].id });
+    expect(f.github.mutations).toBe(0);
+  });
+
+  it("refuses another native facet, account, revision or repository without queueing", async () => {
+    const f = await publicationFixture(), other = await repoGatekeeper(f.gk.accountId), foreign = await repoGatekeeper();
+    expect((await other.continuity(f.queue)).facet).not.toBe(f.expected.facet);
+    for (const target of [other, foreign]) expect(await target.submit(f.queue, crypto.randomUUID(), f.command, f.expected)).toMatchObject({ state: "failed", failure: "scope-changed" });
+    for (const expected of [{ ...f.expected, grant: "f".repeat(64) }, { ...f.expected, repositoryId: 98765 }]) {
+      expect(await f.gk.submit(f.queue, crypto.randomUUID(), f.command, expected)).toMatchObject({ state: "failed", failure: "scope-changed" });
+    }
+    f.github.repositoryId = 98765;
+    expect(await f.gk.submit(f.queue, crypto.randomUUID(), f.command, f.expected)).toMatchObject({ state: "failed", failure: "scope-changed" });
+    expect(f.queue.submitted).toHaveLength(0); expect(f.github.mutations).toBe(0);
+  });
+
+  it("authorizes operational reads and does not disclose a receipt when observation is denied", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID(); await f.gk.submit(f.queue, key, f.command, f.expected);
+    f.queue.denyObservation = true;
+    await expect(f.gk.continuity(f.queue)).rejects.toThrow("observation denied");
+    await expect(f.gk.operation(f.queue, key)).rejects.toThrow("observation denied");
+    expect(f.github.mutations).toBe(0);
+  });
+
+  it("never mistakes a legacy simulated no-op for a published keyed push", async () => {
+    const f = await publicationFixture();
+    const legacy = await queuePush(f.gk, f.cache, f.queue, "main", HEAD1);
+    expect(legacy).not.toBeNull(); expect(await f.gk.resolveRef("main", f.cache)).toEqual({ id: HEAD1, fromCache: true });
+    expect(await f.gk.submit(f.queue, crypto.randomUUID(), f.command, f.expected)).toMatchObject({ state: "pending" });
+    expect(f.queue.submitted).toHaveLength(2); expect(f.github.mutations).toBe(0);
+  });
+
+  it("confirms an already-published no-op without inventing another action or mutation", async () => {
+    const f = await publicationFixture(); f.github.branches.set("main", HEAD1);
+    expect(await f.gk.submit(f.queue, crypto.randomUUID(), f.command, f.expected)).toMatchObject({ state: "applied" });
+    expect(f.queue.submitted).toHaveLength(0); expect(f.github.mutations).toBe(0);
+  });
+
+  it("keeps a lost submission acknowledgement and resumes its original native action after restart", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID(); f.queue.loseAcknowledgement = true;
+    const receipt = await f.gk.submit(f.queue, key, f.command, f.expected);
+    expect(receipt.state).toBe("uncertain"); await f.gk.restart();
+    expect(await f.gk.submit(f.queue, key, f.command, f.expected)).toEqual(receipt);
+    expect(f.queue.submitted).toHaveLength(1); expect(f.github.mutations).toBe(0);
+    await f.gk.applyAction(f.queue.submitted[0].action, f.cache);
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applied", id: receipt.id });
+    expect(f.github.mutations).toBe(1);
+  });
+
+  it("does not overwrite an apply that completes before the native queue acknowledgement is lost", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    f.queue.onSubmit = action => f.gk.applyAction(action, f.cache); f.queue.loseAcknowledgement = true;
+    expect(await f.gk.submit(f.queue, key, f.command, f.expected)).toMatchObject({ state: "applied" });
+    expect(f.queue.submitted).toHaveLength(1); expect(f.github.mutations).toBe(1);
+  });
+
+  it("reconciles a lost effect acknowledgement by an actual remote read without replaying the push", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID();
+    await f.gk.submit(f.queue, key, f.command, f.expected);
+    f.github.onMutation = async () => { throw new Error("Fixture reply lost after ref update"); };
+    await expect(f.gk.applyAction(f.queue.submitted[0].action, f.cache)).rejects.toThrow("uncertain");
+    expect(f.github.mutations).toBe(1); f.github.refReadUnavailable = true; await f.gk.restart();
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "uncertain" });
+    await expect(f.gk.applyAction(f.queue.submitted[0].action, f.cache)).rejects.toThrow("not replayable");
+    f.github.refReadUnavailable = false;
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applied" });
+    await f.gk.applyAction(f.queue.submitted[0].action, f.cache);
+    expect(f.github.receivePackExchanges).toHaveLength(1); expect(f.github.mutations).toBe(1);
+  });
+
+  it("serializes original native application and refuses to discard an in-flight effect as unapplied", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID(); await f.gk.submit(f.queue, key, f.command, f.expected);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; }), acknowledgement = new Promise<void>(resolve => { release = resolve; });
+    f.cache.onBuildPack = async () => { enter(); await acknowledgement; };
+    const applying = f.gk.applyAction(f.queue.submitted[0].action, f.cache); await entered;
+    try {
+      expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applying" });
+      await expect(f.gk.applyAction(f.queue.submitted[0].action, f.cache)).rejects.toThrow("not replayable");
+      await expect(f.gk.rejectAction(f.queue.submitted[0].action)).rejects.toThrow("in-flight");
+    } finally { release(); await applying; }
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applied" }); expect(f.github.mutations).toBe(1);
+  });
+
+  it("keeps confirmed reconnect distinct from refresh and refuses the previous pending authorization", async () => {
+    const f = await publicationFixture(), key = crypto.randomUUID(); await f.gk.submit(f.queue, key, f.command, f.expected);
+    const replacement = await replaceGrant(f.gk.accountId);
+    const current = await f.gk.continuity(f.queue);
+    expect(current.facet).toBe(f.expected.facet); expect(current.grant).not.toBe(f.expected.grant);
+    await expect(f.gk.applyAction(f.queue.submitted[0].action, f.cache)).rejects.toThrow("authorization changed");
+    expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "failed", failure: "scope-changed" });
+    expect(await runInDurableObject(replacement.account, async instance => {
+      try { await instance.commitReconnect(replacement.stage); return "unexpected commit"; }
+      catch (error) { return error instanceof Error ? error.message : String(error); }
+    })).toContain("No reconnect");
+    expect(await f.gk.continuity(f.queue)).toEqual(current); expect(f.github.mutations).toBe(0);
+    await expect(f.gk.submit(f.queue, key, f.command, current)).rejects.toThrow("key reused");
+  });
+
+  it("preserves the connection witness across the real credential coordinator's refresh", async () => {
+    const f = await publicationFixture(); const now = Date.now();
+    await replaceGrant(f.gk.accountId, now + 300_000); const before = await f.gk.continuity(f.queue);
+    vi.spyOn(Date, "now").mockReturnValue(now + 240_001);
+    expect(await env.USER_ACCOUNT.get(f.gk.accountId).getAccessToken()).toBe("test-token-refreshed");
+    expect(await f.gk.continuity(f.queue)).toEqual(before);
+  });
+});
+
+
+it("cannot apply copied operation storage under a different native facet or retire its origin", async () => {
+  const f = await publicationFixture(), key = crypto.randomUUID();
+  const pending = await f.gk.submit(f.queue, key, f.command, f.expected);
+  const copiedCache = new TestGitCache(1).withAncestry(BASE, HEAD1), copiedQueue = new TestApprovalQueue(copiedCache);
+  await f.gk.copyFacet(); expect((await f.gk.copiedContinuity(copiedQueue)).facet).not.toBe(f.expected.facet);
+  await expect(f.gk.copiedOperation(copiedQueue, key)).rejects.toThrow("unavailable");
+  await expect(f.gk.copiedApply(f.queue.submitted[0].action, copiedCache)).rejects.toThrow("authorization changed");
+  expect(f.github.mutations).toBe(0);
+  expect(await f.gk.operation(f.queue, key)).toEqual(pending);
+  await f.gk.applyAction(f.queue.submitted[0].action, f.cache);
+  expect(await f.gk.operation(f.queue, key)).toMatchObject({ state: "applied" }); expect(f.github.mutations).toBe(1);
+});
+
+
+it("refuses missing native binding metadata without falling back to nonce or caller fields", async () => {
+  class LegacyCache extends RpcTarget {}
+  const f = await publicationFixture(), legacyQueue = new TestApprovalQueue(new LegacyCache());
+  await expect(f.gk.continuity(legacyQueue)).rejects.toThrow("unavailable");
+  expect(await f.gk.submit(legacyQueue, crypto.randomUUID(), f.command, f.expected)).toMatchObject({ state: "failed" });
+  expect(legacyQueue.submitted).toHaveLength(0); expect(f.github.mutations).toBe(0);
 });

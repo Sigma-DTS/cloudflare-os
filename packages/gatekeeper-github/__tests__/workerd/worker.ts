@@ -10,10 +10,10 @@
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
 import type {
-  AccountDescription, ActionDescription, ActionKind, ConnectHandoff, GatekeeperUser, GitCache, HookController,
+  AccountDescription, ActionDescription, ActionKind, ApprovalQueue, ConnectHandoff, GatekeeperUser, GitCache, HookController,
   HookDescription, GitPullHints, GitPullTransfer,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { GitHubGatekeeperImpl, GitHubHookDriver as GitHubHookDriverImpl, type GitHubVerifierApi } from "../../src/github.js";
+import { GitHubGatekeeperImpl, GitHubHookDriver as GitHubHookDriverImpl, UserAccount as UserAccountImpl, type GitHubVerifierApi } from "../../src/github.js";
 import type { GitHubHookParams } from "../../src/github-hooks.js";
 import type {
   Cursor,
@@ -32,6 +32,7 @@ import type {
   GitHubRepo,
   GitHubRepoMetadata,
   GitHubSubscribeOptions,
+  GitHubPushCommand, GitHubPushContinuity, GitHubPushReceipt,
 } from "../../src/types.js";
 
 export { default } from "../../src/github.js";
@@ -41,6 +42,38 @@ export * from "../../src/github.js";
 export {
   GatekeeperUserImpl, GitHubHookController, GitHubVerifier,
 } from "../../src/github.js";
+
+/** Keeps the rejection barrier inside its DO's I/O context rather than a fake-fetch callback. */
+export class UserAccount extends UserAccountImpl {
+  #tokenHold?: { claimed: boolean; entered: Promise<void>; enter: () => void; released: Promise<void>; release: () => void };
+
+  holdNextAccessToken(): void {
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    this.#tokenHold = { claimed: false, entered, enter, released, release };
+  }
+
+  async waitForHeldAccessToken(): Promise<void> {
+    if (!this.#tokenHold) throw new Error("No test token hold is armed.");
+    await this.#tokenHold.entered;
+  }
+
+  releaseAccessToken(): void {
+    this.#tokenHold?.release();
+    this.#tokenHold = undefined;
+  }
+
+  override async getAccessToken(expectedGeneration?: string): Promise<string> {
+    const hold = this.#tokenHold;
+    if (hold && !hold.claimed) {
+      hold.claimed = true;
+      hold.enter();
+      await hold.released;
+    }
+    return super.getAccessToken(expectedGeneration);
+  }
+}
 
 /**
  * The account's hook driver, whose revoke() fails while its storage has `test:unreachable`, as when
@@ -166,7 +199,7 @@ type SeedFacet = { seed(entries: Record<string, unknown>): Promise<void> };
 // The facet methods TestHooks forwards to, spelled structurally: workers-types' `Fetcher<T>`
 // return-type inference collapses several of these returns to `never` (its `Serializable`
 // heuristic gives up on them), while the runtime objects are exactly the production ones.
-type GatekeeperFacet = Pick<GitHubGatekeeperImpl, "gitPull"> & {
+type GatekeeperFacet = Pick<GitHubGatekeeperImpl, "gitPull" | "startSession"> & {
   preparePush(branch: string, commitId: string, force: boolean, cache: RpcStub<GitCache>)
     : Promise<PushActionData | null>;
   prepareCreatePullRequest(options: GitHubCreatePullRequestOptions)
@@ -235,6 +268,36 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     return this.ctx.facets.get<GitHubGatekeeperImpl>(facetName, () => ({
       class: (this.ctx.exports as unknown as TestExports).GitHubGatekeeperImpl({ props }),
     })) as unknown as GatekeeperFacet;
+  }
+
+  async copyPublicationFacet(source: string, target: string, props: GatekeeperProps): Promise<Outcome<void>> {
+    return outcome(async () => {
+      const from = this.#gatekeeper(source, props) as unknown as RpcStub<RpcTarget & PublicationStorageFixture>;
+      const to = this.#gatekeeper(target, props) as unknown as RpcStub<RpcTarget & PublicationStorageFixture>;
+      const records = await from.testPublicationRecords();
+      await to.testPublicationSeed(records);
+    });
+  }
+
+  async publicationContinuity(facetName: string, props: GatekeeperProps, queue: unknown): Promise<Outcome<GitHubPushContinuity>> {
+    return outcome(async () => {
+      using session = await this.#gatekeeper(facetName, props).startSession(queue as RpcStub<ApprovalQueue>) as unknown as GitHubRepo & Disposable;
+      return session.pushContinuity();
+    });
+  }
+
+  async publicationSubmit(facetName: string, props: GatekeeperProps, queue: unknown, key: string, command: GitHubPushCommand, expected: GitHubPushContinuity): Promise<Outcome<GitHubPushReceipt>> {
+    return outcome(async () => {
+      using session = await this.#gatekeeper(facetName, props).startSession(queue as RpcStub<ApprovalQueue>) as unknown as GitHubRepo & Disposable;
+      return session.submitPush(key, command, expected);
+    });
+  }
+
+  async publicationStatus(facetName: string, props: GatekeeperProps, queue: unknown, key: string): Promise<Outcome<GitHubPushReceipt | null>> {
+    return outcome(async () => {
+      using session = await this.#gatekeeper(facetName, props).startSession(queue as RpcStub<ApprovalQueue>) as unknown as GitHubRepo & Disposable;
+      return session.pushOperation(key);
+    });
   }
 
   /** `GatekeeperUser.describe()` for the account with id `userObjectId`. */
@@ -748,8 +811,22 @@ class RecordingHook extends RpcTarget {
   }
 }
 
-type TestGitHub = GitHubGatekeeperImpl & HookFacet;
+type PublicationStorageFixture = {
+  testPublicationRecords(): Record<string, unknown>;
+  testPublicationSeed(records: Record<string, unknown>): void;
+};
+type TestGitHub = GitHubGatekeeperImpl & HookFacet & PublicationStorageFixture;
 const testPrototype = GitHubGatekeeperImpl.prototype as TestGitHub;
+
+// Test-only adversarial storage copy: the native context id itself cannot be copied.
+testPrototype.testPublicationRecords = function() {
+  const { ctx } = this as unknown as { ctx: DurableObjectState };
+  return Object.fromEntries(ctx.storage.kv.list());
+};
+testPrototype.testPublicationSeed = function(records) {
+  const { ctx } = this as unknown as { ctx: DurableObjectState };
+  for (const [key, value] of Object.entries(records)) ctx.storage.kv.put(key, value);
+};
 
 /**
  * Make this facet's ctx.restore() mint TestHookDelivery stubs that route back to `[restore]`,

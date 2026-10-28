@@ -68,6 +68,21 @@ Stored action variants:
 
 Pending records are the source of truth for simulation.
 
+### Keyed push operations
+
+- `push-operation:facet` -> persisted random nonce, bound to native root and binding ids
+  when computing the public facet witness; copying KV does not copy the cache's native binding.
+- `push-operation:<requestKey>` -> versioned operation id, canonical payload, SHA-256 digest,
+  expected continuity, private native connection-generation fence, approval/application state,
+  optional action id and effect-started fence. Only the limited receipt is public.
+- Keyed `push` action payloads add an optional `operationKey` reference. Existing action
+  variants and legacy push fields retain their shape.
+
+Action staging/receipt submission and action retirement/receipt completion use synchronous
+native storage transactions. Lost queue acknowledgements retain staged action records;
+possibly sent effects are never reconstructed as fresh submissions. These records and
+deduplication history are not automatically deleted. See [the operation contract](push-operations.md).
+
 ### Provisional resource mapping
 
 - `provisional:<provisionalId>` -> `{ kind: "issue" | "pull", realId?: string }`.

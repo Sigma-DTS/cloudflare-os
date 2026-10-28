@@ -30,6 +30,14 @@ enabling ordinary pushes does not let history be rewritten. Excluded actions are
 by hand as before. Each binding advertises through `getAutoApprovableActions()` only the eligible
 kinds its session can submit (an issue binding, for example, never lists pushes).
 
+## Durable push publication
+
+Repository sessions additionally expose `pushContinuity()`,
+`submitPush(requestKey, command, expectedContinuity)` and `pushOperation(requestKey)`.
+These are operational receipts for the existing native approval/action path; legacy `push`
+and simulated repository reads retain their behavior. See [the publication contract](push-operations.md)
+for native scope, uncertain outcomes, compatibility and rollback constraints.
+
 ## Setting Up GitHub OAuth Credentials
 
 If you're running this project locally and want to use GitHub integrations, you'll need to create
