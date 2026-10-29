@@ -13,11 +13,114 @@ env:
   NODE_VERSION: "24.19.0"
 
 jobs:
+  scope:
+    name: Determine validation scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      native-only: ${{ steps.paths.outputs.native_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: paths
+        name: Route actual changed paths and assert negative boundaries
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          const nativeOnly = paths => paths.length > 0 && paths.every(path =>
+            /^packages\/(gatekeeper-github|mcp-shared)\/.+/.test(path));
+          assert.equal(nativeOnly(['packages/gatekeeper-github/src/github.ts']), true);
+          assert.equal(nativeOnly(['packages/mcp-shared/src/facet.ts', 'packages/gatekeeper-github/src/types.d.ts']), true);
+          assert.equal(nativeOnly([]), false);
+          for (const outside of ['packages/workshop-backend/src/git-cache.ts', 'packages/workshop-shared/src/gatekeeper.ts',
+            'packages/gatekeeper-kit/src/index.ts', 'packages/gatekeeper-mcp/src/mcp.ts', 'packages/gatekeeper-mcp-portal/src/portal.ts',
+            'packages/workshop-frontend/src/app.tsx', 'pnpm-lock.yaml', 'package.json', '.github/workflows/ci.yml',
+            'scripts/release/build-release.ts', 'packages/gatekeeper-github-other/src/index.ts']) {
+            assert.equal(nativeOnly([outside]), false);
+            assert.equal(nativeOnly(['packages/mcp-shared/src/facet.ts', outside]), false);
+          }
+          let selected = false;
+          const { EVENT, BASE, HEAD, GITHUB_OUTPUT } = process.env;
+          if (EVENT === 'pull_request' && /^[a-f0-9]{40}$/.test(BASE ?? '') && /^[a-f0-9]{40}$/.test(HEAD ?? '')) {
+            try {
+              const paths = execFileSync('git', ['diff', '--name-only', '-z', BASE, HEAD, '--'], { encoding: 'utf8' })
+                .split('\0').filter(Boolean);
+              selected = nativeOnly(paths);
+              console.log(JSON.stringify({ base: BASE, head: HEAD, paths, nativeOnly: selected }));
+            } catch (error) {
+              console.error('Changed paths could not be verified; full validation is required.');
+            }
+          }
+          appendFileSync(GITHUB_OUTPUT, `native_only=${selected}\n`);
+          NODE
+
+  native-delivery:
+    name: Native delivery producers
+    needs: scope
+    if: needs.scope.outputs.native-only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Set up Vite+ and Node.js
+        uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1.21.1
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: false
+          run-install: false
+      - name: Install only affected producers and native consumer dependencies
+        run: >-
+          pnpm install --frozen-lockfile --ignore-scripts
+          --filter @gadgets/github-gatekeeper...
+          --filter @gadgets/mcp-shared...
+          --filter @gadgets/mcp-gatekeeper...
+          --filter @gadgets/mcp-portal-gatekeeper...
+      - name: Prepare scoped native prerequisites
+        run: |
+          pnpm --filter @gadgets/typed-storage exec tsc
+          pnpm --filter @gadgets/github-gatekeeper exec gadgets-build-configurator .
+      - name: Typecheck and lint affected contracts and consumers
+        run: |
+          pnpm --filter @gadgets/github-gatekeeper exec tsc --noEmit
+          pnpm --filter @gadgets/github-gatekeeper exec tsc -p tsconfig.contract.json
+          pnpm --filter @gadgets/mcp-shared build
+          pnpm --filter @gadgets/mcp-gatekeeper exec tsc --noEmit
+          pnpm --filter @gadgets/mcp-portal-gatekeeper exec tsc --noEmit
+          pnpm exec vp lint packages/gatekeeper-github packages/mcp-shared packages/gatekeeper-mcp packages/gatekeeper-mcp-portal
+      - name: Exercise original native actions with fake I/O
+        run: |
+          pnpm --filter @gadgets/github-gatekeeper exec vitest run
+          pnpm --filter @gadgets/github-gatekeeper exec vitest run -c vitest.worker.config.ts
+          pnpm --filter @gadgets/mcp-shared exec vitest run
+          pnpm --filter @gadgets/mcp-gatekeeper exec vitest run
+          pnpm --filter @gadgets/mcp-portal-gatekeeper exec vitest run
+      - name: Generate concrete producer RPC validators outside test roots
+        run: |
+          pnpm --filter @gadgets/github-gatekeeper exec capnweb-validate build --out "$RUNNER_TEMP/native-delivery/github"
+          pnpm --filter @gadgets/mcp-gatekeeper exec capnweb-validate build --out "$RUNNER_TEMP/native-delivery/mcp"
+          pnpm --filter @gadgets/mcp-portal-gatekeeper exec capnweb-validate build --out "$RUNNER_TEMP/native-delivery/mcp-portal"
+
   # Parallel to `test` so lint, type and test failures surface on the same run. The package type
   # check (`pnpm build`) runs here rather than ahead of the tests, which do not need it: each test
   # task declares the codegen it reads. `scripts/` has its own type check, kept off `pnpm build`'s
   # hot path (see docs/build-system.md).
   lint:
+    needs: scope
+    if: needs.scope.outputs.native-only != 'true'
     name: Lint
     runs-on: ubuntu-latest
     # A wedged build would otherwise burn the 6-hour default, as `test` notes below.
@@ -64,6 +167,8 @@ jobs:
   # The three slowest test tasks each get a runner, and every other package shares one. Each leg runs
   # the root `test` script's command (package.json) with its own filters; keep the two in step.
   test:
+    needs: scope
+    if: needs.scope.outputs.native-only != 'true'
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
     # Without an explicit cap a wedged test process (a spawned child that outlives its reap keeps
@@ -144,11 +249,20 @@ jobs:
   # passed, and without it a failed or cancelled leg would skip this job.
   build-and-test:
     name: Build and test
-    needs: test
+    needs: [scope, test, native-delivery]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Require every test leg to pass
         env:
-          RESULT: ${{ needs.test.result }}
-        run: test "$RESULT" = success
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          NATIVE_ONLY: ${{ needs.scope.outputs.native-only }}
+          NATIVE_RESULT: ${{ needs.native-delivery.result }}
+          FULL_RESULT: ${{ needs.test.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          if [ "$NATIVE_ONLY" = true ]; then
+            test "$NATIVE_RESULT" = success
+          else
+            test "$FULL_RESULT" = success
+          fi
