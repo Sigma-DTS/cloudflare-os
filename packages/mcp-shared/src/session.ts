@@ -4,6 +4,7 @@
 // What differs per connector is which server and how to reach it, which is what `McpSessionHost`
 // supplies. The base never touches the Durable Object, the account, or the endpoint's credentials.
 
+import { toolPayload } from "./tool-operations.js";
 import { RpcTarget, type RpcStub } from "cloudflare:workers";
 import type { ActionDescription, ActionKind, ApprovalQueue }
   from "@gadgets/workshop-shared/gatekeeper";
@@ -26,6 +27,7 @@ import {
 } from "./tools.js";
 import type {
   McpCallResult,
+  McpToolContinuity, McpToolReceipt, McpToolResult,
   McpToolInfo,
   McpToolListOptions,
   McpToolSummary,
@@ -85,6 +87,14 @@ export interface McpSessionHost {
 
   /** The approval-kind tag for one tool, namespaced so pre-approvals cannot cross servers. */
   actionKindFor(toolName: string): ActionKind;
+
+  /** Additive producer contracts; absent on historical hosts. */
+  readTool?(queue: RpcStub<ApprovalQueue>, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>>;
+  toolContinuity?(queue: RpcStub<ApprovalQueue>): Promise<McpToolContinuity>;
+  prepareToolOperation?(queue: RpcStub<ApprovalQueue>, key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<{ receipt: McpToolReceipt; created: boolean }>;
+  finishToolSubmission?(key: string, acknowledged: boolean): McpToolReceipt;
+  toolOperation?(queue: RpcStub<ApprovalQueue>, key: string, expected: McpToolContinuity): Promise<McpToolReceipt | null>;
+  toolResult?(queue: RpcStub<ApprovalQueue>, key: string, expected: McpToolContinuity): Promise<McpToolResult>;
 
   stageAction(toolName: string, args: Record<string, unknown>): StoredAction;
   discardStagedAction(id: number): void;
@@ -242,6 +252,59 @@ export class McpSessionBase extends RpcTarget {
         `agent's executeCode call, return from this executeCode call now so the approval can ` +
         `appear in chat. After approval, call getActionResult(${staged.id}) for the outcome.`,
     };
+  }
+
+  /** Read intent cannot enter the native action branch, even after catalog reclassification. */
+  async readTool(name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>> {
+    requireToolName("readTool", name);
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw Error("readTool() arguments must be an object.");
+    if (!this.#host.readTool) throw Error("Native read-only MCP tools are unavailable.");
+    const snapshot: { args: Record<string, unknown> } = JSON.parse(toolPayload(name, args));
+    const witness = { ...expected };
+    try { return await this.#host.readTool(this.#queue, name, snapshot.args, witness); }
+    catch { throw Error("Native read-only MCP tool result is unavailable for this continuity."); }
+  }
+
+  /** Observes only producer-derived operational scope metadata. */
+  async continuity(): Promise<McpToolContinuity> {
+    if (!this.#host.toolContinuity) throw Error("Native MCP tool continuity is unavailable.");
+    await this.#queue.authorizeObservation({ title: "Inspect MCP tool continuity", description: "Read native binding, grant and resource continuity metadata." });
+    try { return await this.#host.toolContinuity(this.#queue); }
+    catch { throw Error("Native MCP tool continuity is unavailable."); }
+  }
+
+  /** Queues one original native write; read tools remain native observations through callTool. */
+  async submitTool(key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<McpToolReceipt> {
+    requireToolName("submitTool", name);
+    const host = this.#host;
+    if (!host.prepareToolOperation || !host.finishToolSubmission) throw Error("Native keyed MCP tools are unavailable.");
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw Error("submitTool() arguments must be an object.");
+    const entry = await host.findTool(name);
+    if (!entry) throw Error(this.#noSuchToolMessage(name));
+    if (entry.mode === "read") throw Error("Read-only MCP tools must use callTool().");
+    const prepared = await host.prepareToolOperation(this.#queue, key, name, args, expected);
+    if (!prepared.created) return prepared.receipt;
+    const { title, description, fields, descriptionIsComplete } = describeCall({ serverName: host.serverName, endpoint: host.endpoint, tool: entry.tool, toolArgs: args, mode: entry.mode, classifiedBy: entry.classifiedBy });
+    try {
+      await this.#queue.submitAction(prepared.receipt.actionId, { title, description, ...(fields ? { fields } : {}), ...(descriptionIsComplete ? { descriptionIsComplete } : {}), implementsRevert: false, awaitDecision: true, autoApprovable: entry.autoApprovable, actionKind: host.actionKindFor(name) });
+    } catch { return host.finishToolSubmission(key, false); }
+    return host.finishToolSubmission(key, true);
+  }
+
+  /** Reconciles through the current witnessed facet without submitting or applying an action. */
+  async toolOperation(key: string, expected: McpToolContinuity): Promise<McpToolReceipt | null> {
+    if (!this.#host.toolOperation) throw Error("Native keyed MCP tools are unavailable.");
+    await this.#queue.authorizeObservation({ title: "Inspect MCP tool operation", description: "Read original native tool approval and application progress." });
+    try { return await this.#host.toolOperation(this.#queue, key, expected); }
+    catch { throw Error("Native MCP tool operation is unavailable for this continuity."); }
+  }
+
+  /** Reads retained original data as a restricted observation, never through an alias-local id. */
+  async toolResult(key: string, expected: McpToolContinuity): Promise<McpToolResult> {
+    if (!this.#host.toolResult) throw Error("Native keyed MCP tool results are unavailable.");
+    await this.#queue.authorizeObservation({ title: "Read original MCP tool result", description: "Read private data returned by the original approved MCP operation.", containsRestrictedData: true });
+    try { return await this.#host.toolResult(this.#queue, key, expected); }
+    catch { throw Error("The original MCP result is unavailable for this continuity; its effect must not be replayed."); }
   }
 
   async getActionResult(actionId: number): Promise<McpCallResult> {

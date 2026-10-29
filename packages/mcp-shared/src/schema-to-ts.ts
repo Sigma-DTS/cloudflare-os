@@ -358,6 +358,16 @@ export function generateSessionTypes(args: {
   lines.push(" * publish it as a blueprint so they connect their own account.");
   lines.push(" */");
   lines.push(`export interface ${typeName} {`);
+  lines.push("  /** Observe the current producer binding, grant and resource witness. */");
+  lines.push("  continuity(): Promise<McpToolContinuity>;");
+  lines.push("  /** Restricted read intent under the current witness; refuses native actions before any queue allocation. */");
+  lines.push('  readTool(name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>>;');
+  lines.push("  /** Queue one original native write under a persisted UUID key and witness. */");
+  lines.push("  submitTool(key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<McpToolReceipt>;");
+  lines.push("  /** Reconcile without replay; null is not permission to allocate another key. */");
+  lines.push("  toolOperation(key: string, expected: McpToolContinuity): Promise<McpToolReceipt | null>;");
+  lines.push("  /** Restricted original result; unavailable or truncated results never imply no effect. */");
+  lines.push('  toolResult(key: string, expected: McpToolContinuity): Promise<McpToolResult>;');
   lines.push("  /** Lists currently described tools. */");
   lines.push("  listTools(): Promise<McpToolInfo[]>;");
   lines.push(`  /** Searches for up to ${MAX_SEARCH_RESULTS} matching tool summaries. */`);

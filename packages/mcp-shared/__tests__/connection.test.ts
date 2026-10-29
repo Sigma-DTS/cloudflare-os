@@ -235,3 +235,18 @@ it("gives a retried listing a fresh discovery budget after session recovery", as
   expect(initialPages).toBe(50);
   expect(retryPages).toBe(2);
 });
+
+it("refuses an original keyed action before any request through a replacement generation", async () => {
+  let requests = 0;
+  vi.stubGlobal("fetch", async () => { requests++; return new Response("{}"); });
+  const account: ConnectionAccount = {
+    async getConnection() { return { authorization: "replacement-token", sessionId: "session", generation: 2 }; },
+    async assertConnectionCurrent() {},
+    async setMcpSessionId() { return true; },
+    async noteCredentialsExpired() {},
+  };
+  const error = await withClient({}, account, "https://mcp.example.com", client => client.callTool("send", {}), { retryOnExpiry: false, expectedGeneration: 1 }).catch(error => error);
+  expect(error).toBeInstanceOf(McpCallNotDispatchedError);
+  expect(callMayHaveTakenEffect(error)).toBe(false);
+  expect(requests).toBe(0);
+});

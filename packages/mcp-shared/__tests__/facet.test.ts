@@ -20,6 +20,7 @@ class TestSession extends McpSessionBase {}
 
 class TestFacet extends McpFacetBase<object, {
   endpoint: string;
+  accountObjectId: string;
   scope: ToolScope;
 }, TestSession> {
   catalogResult: Promise<ScopedCatalog> = Promise.resolve({
@@ -72,7 +73,7 @@ class TestFacet extends McpFacetBase<object, {
 
 function facet(scope: ToolScope = {}) {
   const ctx = {
-    props: { endpoint: "https://example.com/mcp", scope },
+    props: { endpoint: "https://example.com/mcp", accountObjectId: "fixture-account", scope },
     storage: { kv: {} },
   };
   return new TestFacet(ctx as never, {});

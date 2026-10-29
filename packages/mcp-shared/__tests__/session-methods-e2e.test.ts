@@ -26,7 +26,7 @@ it("every method the .d.ts promises is really installed, and routes to the right
   const promised = [...dts.matchAll(/^ {2}([a-z]\w*)\(/gm)].map(match => match[1])
     .filter(name => ![
       "listTools", "callTool",
-      "getActionResult",
+      "getActionResult", "readTool", "continuity", "submitTool", "toolOperation", "toolResult",
     ].includes(name));
 
   class Base {

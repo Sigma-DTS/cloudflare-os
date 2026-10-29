@@ -4,6 +4,8 @@
 import { callMayHaveTakenEffect, type McpClient, type McpToolCallResult } from "./client.js";
 import type { McpLog } from "./log.js";
 import type { StoredAction } from "./session.js";
+import { sameToolContinuity, toolHash, toolPayload, toolRequestKey, type ToolOperation } from "./tool-operations.js";
+import type { McpToolContinuity } from "./types.js";
 import { toCallResult } from "./tools.js";
 
 const MAX_RESULT_BYTES = 128 * 1024;
@@ -48,9 +50,11 @@ export const APPLY_OUTCOME_UNKNOWN_MESSAGE =
 /** Stores queued MCP actions in one facet-local SQLite table. */
 export class ActionStore {
   #sql: SqlStorage;
+  #transaction: <T>(fn: () => T) => T;
 
-  constructor(sql: SqlStorage) {
+  constructor(sql: SqlStorage, transaction: <T>(fn: () => T) => T = fn => fn()) {
     this.#sql = sql;
+    this.#transaction = transaction;
     sql.exec(`CREATE TABLE IF NOT EXISTS mcp_actions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       tool_name TEXT NOT NULL,
@@ -62,6 +66,14 @@ export class ActionStore {
       result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
       error TEXT
     ) STRICT`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS mcp_tool_operations (
+      request_key TEXT PRIMARY KEY, action_id INTEGER NOT NULL UNIQUE,
+      record TEXT NOT NULL CHECK (json_valid(record))
+    ) STRICT`);
+    sql.exec(`UPDATE mcp_tool_operations
+      SET record = json_set(record, '$.state', CASE json_extract(record, '$.state')
+        WHEN 'preparing' THEN 'failed' ELSE 'uncertain' END)
+      WHERE json_extract(record, '$.state') IN ('preparing', 'submitting', 'applying')`);
     // A fresh store means a fresh Durable Object activation. Any persisted claim belonged to an
     // interrupted prior activation and must never be replayed because the write may have landed.
     sql.exec(
@@ -72,6 +84,39 @@ export class ActionStore {
     this.#prune();
   }
 
+  /** Original-action index, retained after private results expire. */
+  toolOperation(key: string): ToolOperation | undefined {
+    const row = this.#sql.exec<{ record: string }>("SELECT record FROM mcp_tool_operations WHERE request_key = ?", toolRequestKey(key)).toArray()[0];
+    return row ? JSON.parse(row.record) as ToolOperation : undefined;
+  }
+
+  /** Resolves only this facet's original native action, never a rebound alias. */
+  operationForAction(id: number): ToolOperation | undefined {
+    const row = this.#sql.exec<{ record: string }>("SELECT record FROM mcp_tool_operations WHERE action_id = ?", id).toArray()[0];
+    return row ? JSON.parse(row.record) as ToolOperation : undefined;
+  }
+
+  /** Called synchronously in the owning facet's storage transaction. */
+  putToolOperation(operation: ToolOperation): void {
+    this.#sql.exec("INSERT OR REPLACE INTO mcp_tool_operations (request_key, action_id, record) VALUES (?, ?, ?)", operation.requestKey, operation.actionId, JSON.stringify(operation));
+  }
+
+  /** Binds a key once; a retained receipt can never allocate another native action. */
+  stageTool(key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity, generation: number, digest: string): ToolOperation {
+    toolRequestKey(key);
+    const payload = toolPayload(name, args), existing = this.toolOperation(key);
+    if (existing) {
+      if (existing.payload !== payload || !sameToolContinuity(existing.expected, expected)) throw Error("Tool operation key reused with changed arguments or continuity.");
+      return existing;
+    }
+    const { count } = this.#sql.exec<{ count: number }>("SELECT count(*) AS count FROM mcp_tool_operations").one();
+    if (count >= 4096) throw Error("MCP operation receipt capacity reached.");
+    const action = this.stage(name, args);
+    const operation: ToolOperation = { version: 1, id: crypto.randomUUID(), requestKey: key, actionId: action.id, digest, payload, expected, generation, state: "preparing" };
+    this.putToolOperation(operation);
+    return operation;
+  }
+
   get(id: number): StoredAction | undefined {
     const row = this.#sql.exec<ActionRow>(
       "SELECT * FROM mcp_actions WHERE id = ?", id).toArray()[0];
@@ -79,6 +124,16 @@ export class ActionStore {
   }
 
   #save(action: StoredAction): void {
+    this.#transaction(() => this.#saveTransaction(action));
+  }
+
+  #saveTransaction(action: StoredAction): void {
+    const operation = this.operationForAction(action.id);
+    if (operation) {
+      if (action.state === "applying") operation.effectStarted = true;
+      operation.state = action.state === "failed" && action.retryable === false ? "uncertain" : action.state;
+      this.putToolOperation(operation);
+    }
     this.#sql.exec(
       `UPDATE mcp_actions SET state = ?, claimed_at = ?, retryable = ?, result_json = ?, error = ?
        WHERE id = ?`,
@@ -133,6 +188,8 @@ export class ActionStore {
     log: McpLog,
   ): Promise<void> {
     const stored = this.get(id);
+    const operation = this.operationForAction(id);
+    if (operation?.state === "uncertain" && operation.effectStarted) throw Error("The original MCP call outcome is uncertain and cannot be replayed.");
     if (!stored) throw new Error(`MCP action ${id} is unknown.`);
     if (stored.state === "applied") return;
     if (stored.state === "rejected") throw new Error(`MCP action ${id} was already rejected.`);
@@ -175,6 +232,12 @@ export class ActionStore {
       const flattened = toCallResult(result);
       const encoded = JSON.stringify(flattened);
       const bytes = encoder.encode(encoded).byteLength;
+      const completedOperation = this.operationForAction(id);
+      if (completedOperation) {
+        completedOperation.resultRetained = bytes <= MAX_RESULT_BYTES;
+        completedOperation.resultDigest = completedOperation.resultRetained ? await toolHash(encoded) : undefined;
+        this.putToolOperation(completedOperation);
+      }
       stored.result = bytes > MAX_RESULT_BYTES
         ? {
             status: "ok",
@@ -213,7 +276,11 @@ export class ActionStore {
         ? `MCP action ${id} is already being applied.`
         : `MCP action ${id} is already ${stored.state}.`);
     }
-    this.#sql.exec("UPDATE mcp_actions SET state = 'rejected' WHERE id = ?", id);
+    this.#transaction(() => {
+      this.#sql.exec("UPDATE mcp_actions SET state = 'rejected' WHERE id = ?", id);
+      const operation = this.operationForAction(id);
+      if (operation) { operation.state = "rejected"; this.putToolOperation(operation); }
+    });
     this.#prune();
   }
 

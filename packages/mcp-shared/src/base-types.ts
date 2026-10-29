@@ -92,4 +92,39 @@ export type McpToolSummary = Omit<McpToolInfo, "inputSchema">;
 export type McpToolListOptions =
   | { search: string; name?: never }
   | { name: string; search?: never };
+
+/** Native binding, account generation and resource witness; none of its fields grants access. */
+export interface McpToolContinuity {
+  version: 1;
+  facet: string;
+  grant: string;
+  resource: string;
+}
+
+/** Bounded progress of one original native queued write, excluding private results and errors. */
+export interface McpToolReceipt {
+  version: 1;
+  id: string;
+  requestKey: string;
+  digest: string;
+  /** Facet-local original action id; use only with this operation's current witness. */
+  actionId: number;
+  /** Present once applied; false means response unavailable, never that the effect did not occur. */
+  resultAvailable?: boolean;
+  state: "preparing" | "submitting" | "pending" | "applying" | "applied" | "rejected" | "failed" | "uncertain";
+}
+
+/** Restricted original-result envelope. Digest metadata is private with the response it describes. */
+export interface McpToolResult {
+  version: 1;
+  operationId: string;
+  requestKey: string;
+  actionId: number;
+  /** SHA-256 of the normalized tool name and arguments, identical to the operation receipt. */
+  digest: string;
+  /** SHA-256 of UTF-8 JSON.stringify(result), before this envelope is added. */
+  resultDigest: string;
+  /** At most 128 KiB UTF-8 JSON; isError reports a tool/business refusal, independently of applied. */
+  result: Extract<McpCallResult, { status: "ok" }>;
+}
 `;

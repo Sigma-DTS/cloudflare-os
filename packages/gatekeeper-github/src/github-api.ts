@@ -74,6 +74,7 @@ export type GitHubPullRequestBranchResponse = {
 };
 
 export type GitHubPullRequestResponse = {
+  node_id?: string;
   number: number;
   html_url: string;
   title: string;
@@ -391,6 +392,7 @@ async function request<T>(
   options: RequestOptions = {},
   getToken?: () => Promise<string>,
   pin?: PinnedRepo,
+  beforeMutation?: () => void,
 ): Promise<RequestResult<T>> {
   const url = new URL(path, API_BASE_URL);
 
@@ -435,6 +437,7 @@ async function request<T>(
   }
 
   const init: RequestInit = { method, headers, body, redirect: "manual" };
+  if (method !== "GET" && method !== "HEAD") beforeMutation?.();
   let response = await fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (isRedirect(response.status)) {
     const target = redirectTarget(url, response.headers.get("location"), pin);
@@ -553,10 +556,12 @@ export async function revokeOAuthToken(
 export class GitHubApi {
   #getToken: () => Promise<string>;
   #repo?: PinnedRepo;
+  #beforeMutation?: () => void;
 
-  constructor(getToken: () => Promise<string>, options: { repo?: PinnedRepo } = {}) {
+  constructor(getToken: () => Promise<string>, options: { repo?: PinnedRepo; beforeMutation?: () => void } = {}) {
     this.#getToken = getToken;
     this.#repo = options.repo;
+    this.#beforeMutation = options.beforeMutation;
   }
 
   async #request<T>(
@@ -564,7 +569,12 @@ export class GitHubApi {
     path: string,
     options: RequestOptions = {},
   ): Promise<RequestResult<T>> {
-    return await request<T>(method, path, options, this.#getToken, this.#repo);
+    if (this.#beforeMutation && this.#repo) {
+      const prefix = `/repos/${encodeURIComponent(this.#repo.owner)}/${encodeURIComponent(this.#repo.repo)}`;
+      // An owner/name can be reused between continuity and send; the pinned id cannot.
+      if (path === prefix || path.startsWith(`${prefix}/`)) path = `/repositories/${this.#repo.id}${path.slice(prefix.length)}`;
+    }
+    return await request<T>(method, path, options, this.#getToken, this.#repo, this.#beforeMutation);
   }
 
   async #conditionalGet<T>(
@@ -1157,6 +1167,18 @@ export class GitHubApi {
     );
   }
 
+  /** Uses GitHub's supported promotion mutation for the provider-resolved pull request node. */
+  async markPullRequestReady(owner: string, repo: string, pullNumber: number): Promise<string> {
+    const pull = await this.getPullRequest(owner, repo, pullNumber);
+    if (typeof pull.node_id !== "string" || !pull.node_id || pull.node_id.length > 256 || pull.number !== pullNumber) throw Error("GitHub pull request identity is unavailable.");
+    const response = (await this.#request<{ errors?: unknown; data?: { markPullRequestReadyForReview?: { pullRequest?: { id?: unknown; number?: unknown; isDraft?: unknown } } } }>("POST", "/graphql", {
+      body: { query: "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id number isDraft}}}", variables: { id: pull.node_id } },
+    })).data;
+    const ready = response.data?.markPullRequestReadyForReview?.pullRequest;
+    if (response.errors || ready?.id !== pull.node_id || ready.number !== pullNumber || ready.isDraft !== false) throw Error("GitHub did not confirm pull request promotion.");
+    return pull.node_id;
+  }
+
   async createPullRequestReview(
     owner: string,
     repo: string,
@@ -1598,7 +1620,7 @@ export const CREDENTIALS_EXPIRED_MESSAGE =
  */
 export async function withAccountApi<T>(
   account: DurableObjectStub<UserAccount>, fn: (api: GitHubApi) => Promise<T>,
-  options: { replayable?: true; repo?: PinnedRepo; expectedGeneration?: string } = {},
+  options: { replayable?: true; repo?: PinnedRepo; expectedGeneration?: string; beforeMutation?: () => void } = {},
 ): Promise<T> {
   for (let replays = options.replayable ? 1 : 0; ; replays--) {
     let presented: string | undefined;
@@ -1609,7 +1631,7 @@ export async function withAccountApi<T>(
         throw new PushNotSentError(error instanceof Error && error.message === PUSH_SCOPE_CHANGED ? "scope-changed" : undefined, { cause: error });
       }
     },
-      { repo: options.repo });
+      { repo: options.repo, beforeMutation: options.beforeMutation });
     try {
       return await fn(api);
     } catch (error) {

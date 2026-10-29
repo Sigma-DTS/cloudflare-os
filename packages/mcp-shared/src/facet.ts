@@ -7,9 +7,12 @@ import type {
   ApprovalQueue,
   Gatekeeper,
   GatekeeperUserVerifier,
+  GitCache,
   ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
+import { toolHash, toolPayload, sameToolContinuity, toolReceipt, type ToolOperation } from "./tool-operations.js";
+import type { McpToolContinuity, McpToolReceipt, McpToolResult, McpCallResult } from "./types.js";
 import { ActionStore, REVERT_UNSUPPORTED_MESSAGE } from "./action-store.js";
 import {
   CATALOG_TTL_MS,
@@ -17,7 +20,7 @@ import {
   scopedCatalog,
   type ScopedCatalog,
 } from "./catalog.js";
-import type { McpClient } from "./client.js";
+import { McpCallNotDispatchedError, type McpClient } from "./client.js";
 import {
   withClient,
   type ConnectionAccount,
@@ -34,6 +37,7 @@ import { observerRefusalMessage } from "./sharing-policy.js";
 import {
   actionKindFor,
   classifyTool,
+  toCallResult,
   type ClassifiedTool,
   type ServerTrust,
 } from "./tools.js";
@@ -41,6 +45,7 @@ import {
 type FacetProps = {
   endpoint: string;
   scope: ToolScope;
+  accountObjectId: string;
 };
 
 type SessionConstructor<Session extends McpSessionBase> = new (
@@ -66,7 +71,7 @@ export abstract class McpFacetBase<
   #waitingDiscoveries: Array<() => void> = [];
 
   #actions(): ActionStore {
-    return this.#actionStore ??= new ActionStore(this.ctx.storage.sql);
+    return this.#actionStore ??= new ActionStore(this.ctx.storage.sql, fn => this.ctx.storage.transactionSync(fn));
   }
 
   /** Connector-owned logger carrying the facet's safe identifying fields. */
@@ -243,6 +248,98 @@ export abstract class McpFacetBase<
   /** Removes no observer state because observers are never admitted. */
   async removeObserver(_id: string): Promise<void> {}
 
+  /** Derives continuity from the actual native binding and account, never server labels. */
+  async toolContext(queue: RpcStub<ApprovalQueue>): Promise<{ continuity: McpToolContinuity; generation: number }> {
+    using cache = await queue.getGitCache();
+    return await this.#toolContext(cache);
+  }
+
+  async #toolContext(cache: RpcStub<GitCache>): Promise<{ continuity: McpToolContinuity; generation: number }> {
+    if (typeof cache.getBindingId !== "function") throw Error("Native MCP binding continuity is unavailable.");
+    const binding = await cache.getBindingId();
+    if (!Number.isSafeInteger(binding) || binding! < 0) throw Error("Native MCP binding continuity is unavailable.");
+    const connection = await this.account().getConnection(this.endpoint);
+    let nonce = this.ctx.storage.kv.get<string>("tool-operation:facet");
+    if (!nonce) { nonce = crypto.randomUUID(); this.ctx.storage.kv.put("tool-operation:facet", nonce); }
+    const facet = await toolHash(`${this.ctx.id.toString()}:${binding}:${this.ctx.props.accountObjectId}:${nonce}`);
+    const grant = await toolHash(`${this.ctx.props.accountObjectId}:${connection.generation}`);
+    const resource = await toolHash(this.resourceUrl);
+    await this.account().assertConnectionCurrent(this.endpoint, connection.generation);
+    return { continuity: { version: 1, facet, grant, resource }, generation: connection.generation };
+  }
+
+  /** Current operational witness; access is still supplied only by this native capability. */
+  async toolContinuity(queue: RpcStub<ApprovalQueue>): Promise<McpToolContinuity> {
+    return (await this.toolContext(queue)).continuity;
+  }
+
+  /** Native read purpose never allocates or submits an action, regardless of catalog changes. */
+  async readTool(queue: RpcStub<ApprovalQueue>, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>> {
+    const before = await this.toolContext(queue);
+    if (!sameToolContinuity(before.continuity, expected)) throw Error("MCP tool authorization changed.");
+    await queue.authorizeObservation({ title: "Read native MCP tool result", description: "Read private data from a tool classified as a native read-only observation.", containsRestrictedData: true });
+    const entry = await this.findTool(name);
+    if (!entry || entry.mode !== "read") throw Error("This MCP tool is not granted as a read-only observation.");
+    const ready = await this.toolContext(queue);
+    if (!sameToolContinuity(ready.continuity, expected)) throw Error("MCP tool authorization changed.");
+    // A transport retry would bypass this method's current classification and continuity checks.
+    const raw = await this.call(client => client.callTool(name, args), { expectedGeneration: ready.generation, retryOnExpiry: false });
+    const result = toCallResult(raw), encoded = JSON.stringify(result);
+    if (new TextEncoder().encode(encoded).length > 128 * 1024) throw Error("The native MCP read result is unavailable within its byte bound.");
+    const after = await this.toolContext(queue);
+    if (!sameToolContinuity(after.continuity, expected)) throw Error("MCP tool authorization changed.");
+    return JSON.parse(encoded) as Extract<McpCallResult, { status: "ok" }>;
+  }
+
+  /** Persists the argument binding and original native action in one synchronous transaction. */
+  async prepareToolOperation(queue: RpcStub<ApprovalQueue>, key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<{ receipt: McpToolReceipt; created: boolean }> {
+    const context = await this.toolContext(queue);
+    if (!sameToolContinuity(context.continuity, expected)) throw Error("MCP tool authorization changed.");
+    const digest = await toolHash(toolPayload(name, args));
+    await this.account().assertConnectionCurrent(this.endpoint, context.generation);
+    const store = this.#actions();
+    return this.ctx.storage.transactionSync(() => {
+      const existing = store.toolOperation(key);
+      const operation = store.stageTool(key, name, args, expected, context.generation, digest);
+      if (!existing) { operation.state = "submitting"; store.putToolOperation(operation); }
+      return { receipt: this.#toolReceipt(operation), created: !existing };
+    });
+  }
+
+  #toolReceipt(operation: ToolOperation): McpToolReceipt {
+    const action = this.#actions().get(operation.actionId);
+    const resultRetained = operation.resultRetained === true && action?.state === "applied" && action.result !== undefined;
+    return toolReceipt({ ...operation, resultRetained });
+  }
+
+  /** Records queue acknowledgement without replacing an action whose acknowledgement was lost. */
+  finishToolSubmission(key: string, acknowledged: boolean): McpToolReceipt {
+    const operation = this.#actions().toolOperation(key);
+    if (!operation) throw Error("MCP tool operation is unavailable.");
+    if (operation.state === "submitting") {
+      operation.state = acknowledged ? "pending" : "uncertain";
+      this.#actions().putToolOperation(operation);
+    }
+    return this.#toolReceipt(operation);
+  }
+
+  /** Reads the original receipt only after checking the current native connection. */
+  async toolOperation(queue: RpcStub<ApprovalQueue>, key: string, expected: McpToolContinuity): Promise<McpToolReceipt | null> {
+    const context = await this.toolContext(queue), operation = this.#actions().toolOperation(key);
+    if (!sameToolContinuity(context.continuity, expected) || operation && !sameToolContinuity(operation.expected, expected)) throw Error("MCP tool authorization changed.");
+    return operation ? this.#toolReceipt(operation) : null;
+  }
+
+  /** Returns retained private data only for this witnessed original applied operation. */
+  async toolResult(queue: RpcStub<ApprovalQueue>, key: string, expected: McpToolContinuity): Promise<McpToolResult> {
+    const receipt = await this.toolOperation(queue, key, expected);
+    if (receipt?.state !== "applied") throw Error("The original MCP operation is not applied.");
+    const operation = this.#actions().toolOperation(key)!;
+    const action = this.#actions().get(operation.actionId);
+    if (!operation.resultRetained || !operation.resultDigest || action?.state !== "applied" || !action.result) throw Error("The original MCP result is unavailable; its effect must not be replayed.");
+    return { version: 1, operationId: operation.id, requestKey: key, actionId: operation.actionId, digest: operation.digest, resultDigest: operation.resultDigest, result: action.result };
+  }
+
   /** Stages an MCP action for approval. */
   stageAction(toolName: string, args: Record<string, unknown>): StoredAction {
     return this.#actions().stage(toolName, args);
@@ -259,9 +356,21 @@ export abstract class McpFacetBase<
   }
 
   /** Applies an approved action without retrying an outcome-unknown write. */
-  async applyAction(action: number): Promise<void> {
+  async applyAction(action: number, cache?: RpcStub<GitCache>): Promise<void> {
+    const operation = this.#actions().operationForAction(action);
+    if (operation) {
+      if (!cache) throw Error("Native MCP binding continuity is unavailable.");
+      const context = await this.#toolContext(cache);
+      if (!sameToolContinuity(context.continuity, operation.expected) || context.generation !== operation.generation) throw Error("MCP tool authorization changed.");
+    }
     await this.#actions().apply(
-      action, fn => this.call(fn, { retryOnExpiry: false }), this.log);
+      action, async fn => {
+        if (!operation) return this.call(fn, { retryOnExpiry: false });
+        const stored = this.#actions().get(action)!;
+        const tool = await this.findTool(stored.toolName);
+        if (!tool || tool.mode === "read") throw new McpCallNotDispatchedError("The approved MCP write tool is no longer granted.");
+        return this.call(fn, { retryOnExpiry: false, expectedGeneration: operation?.generation });
+      }, this.log);
   }
 
   /** Rejects a pending action. */

@@ -26,6 +26,8 @@ export type ConnectionEnv = InsecureEnv & {
 };
 
 export type WithClientOptions = {
+  /** Original keyed action generation; a replacement connection cannot execute it. */
+  expectedGeneration?: number;
   /** False for a call that may have taken effect, so a dropped session is not retried. See above. */
   retryOnExpiry?: boolean;
   /** Absolute deadline shared with time spent waiting for a discovery slot. */
@@ -100,6 +102,7 @@ export async function withClient<T>(
     throw notDispatched(err);
   }
   const { authorization, sessionId, generation } = connection;
+  if (options.expectedGeneration !== undefined && generation !== options.expectedGeneration) throw new McpCallNotDispatchedError("MCP tool authorization changed.");
   const client = new McpClient(
     endpoint, async method => {
       if (method === "tools/call") {
