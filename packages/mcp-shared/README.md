@@ -146,7 +146,7 @@ pnpm --filter @gadgets/mcp-shared test:run    # vitest
 
 Durable clients persist a lowercase UUID request key, arguments and the result of `continuity()`
 before calling `submitTool(key, name, args, expected)`. This additive API queues only native write
-tools; read tools continue through `callTool`. The current native catalog, grant, observation rules
+tools; durable readers use `readTool(name, args, expected)` to enforce read intent inside the native producer. The current native catalog, grant, observation rules
 and approval queue remain authoritative. Existing `callTool` and `getActionResult` are unchanged.
 
 The witness contains opaque `facet`, `grant` and `resource` SHA-256 values, with `version: 1`.
@@ -193,3 +193,31 @@ all make the keyed reader fail with a fixed unavailable message. The receipt rem
 missing response data never proves that the effect did not occur. Up to 50 actions may await a
 decision. Original-operation tombstones are retained, with a fixed capacity of 4096 per facet;
 capacity exhaustion refuses new operations rather than forgetting deduplication evidence.
+
+
+### Witnessed read intent
+
+`readTool(name, args, expected)` returns a bounded `McpCallResult` with `status: "ok"` only;
+`isError` still reports an upstream tool/business refusal. Arguments and the expected witness are
+copied before the first asynchronous boundary. The method checks the actual native binding,
+account generation and resource, authorizes a restricted observation, then resolves and classifies
+the tool inside the producer. A missing tool or current native action classification refuses
+without allocating or queueing any original action. It never delegates to the legacy `callTool`
+action branch and needs no operation key or facet-local action ID.
+
+The witness is rechecked after classification and after the response, and the transport pins the
+observed account generation immediately before `tools/call`. A replacement connection during
+observation authorization, classification, transport or response collection cannot deliver a
+result under the old witness. The additive method disables automatic transport-expiry retries;
+a caller retry must re-enter the native purpose/classification and continuity checks. A denied
+observation prevents tool transport. The JSON response is bounded to 128 KiB UTF-8 and copied
+before the final asynchronous scope check; unavailable or oversized responses produce a fixed
+refusal, not a pending action.
+
+This preserves the native classifier and its existing annotation/trust policy. It guarantees the
+requested native read-only path never changes into an approval action; it does not invent a server
+transaction or assert that external tool behavior is stronger than the native annotations.
+Checking `listTools` and later calling legacy `callTool` is still not a durable read-intent contract:
+classification may change between those calls. Such legacy calls retain their existing action
+behavior for compatibility. Tools whose names collide with `readTool` remain callable by exact
+wire name through `callTool`; generated named methods cannot shadow the additive API.

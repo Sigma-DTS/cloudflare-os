@@ -360,6 +360,8 @@ export function generateSessionTypes(args: {
   lines.push(`export interface ${typeName} {`);
   lines.push("  /** Observe the current producer binding, grant and resource witness. */");
   lines.push("  continuity(): Promise<McpToolContinuity>;");
+  lines.push("  /** Restricted read intent under the current witness; refuses native actions before any queue allocation. */");
+  lines.push('  readTool(name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>>;');
   lines.push("  /** Queue one original native write under a persisted UUID key and witness. */");
   lines.push("  submitTool(key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<McpToolReceipt>;");
   lines.push("  /** Reconcile without replay; null is not permission to allocate another key. */");

@@ -12,7 +12,7 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 
 import { toolHash, toolPayload, sameToolContinuity, toolReceipt, type ToolOperation } from "./tool-operations.js";
-import type { McpToolContinuity, McpToolReceipt, McpToolResult } from "./types.js";
+import type { McpToolContinuity, McpToolReceipt, McpToolResult, McpCallResult } from "./types.js";
 import { ActionStore, REVERT_UNSUPPORTED_MESSAGE } from "./action-store.js";
 import {
   CATALOG_TTL_MS,
@@ -37,6 +37,7 @@ import { observerRefusalMessage } from "./sharing-policy.js";
 import {
   actionKindFor,
   classifyTool,
+  toCallResult,
   type ClassifiedTool,
   type ServerTrust,
 } from "./tools.js";
@@ -270,6 +271,24 @@ export abstract class McpFacetBase<
   /** Current operational witness; access is still supplied only by this native capability. */
   async toolContinuity(queue: RpcStub<ApprovalQueue>): Promise<McpToolContinuity> {
     return (await this.toolContext(queue)).continuity;
+  }
+
+  /** Native read purpose never allocates or submits an action, regardless of catalog changes. */
+  async readTool(queue: RpcStub<ApprovalQueue>, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>> {
+    const before = await this.toolContext(queue);
+    if (!sameToolContinuity(before.continuity, expected)) throw Error("MCP tool authorization changed.");
+    await queue.authorizeObservation({ title: "Read native MCP tool result", description: "Read private data from a tool classified as a native read-only observation.", containsRestrictedData: true });
+    const entry = await this.findTool(name);
+    if (!entry || entry.mode !== "read") throw Error("This MCP tool is not granted as a read-only observation.");
+    const ready = await this.toolContext(queue);
+    if (!sameToolContinuity(ready.continuity, expected)) throw Error("MCP tool authorization changed.");
+    // A transport retry would bypass this method's current classification and continuity checks.
+    const raw = await this.call(client => client.callTool(name, args), { expectedGeneration: ready.generation, retryOnExpiry: false });
+    const result = toCallResult(raw), encoded = JSON.stringify(result);
+    if (new TextEncoder().encode(encoded).length > 128 * 1024) throw Error("The native MCP read result is unavailable within its byte bound.");
+    const after = await this.toolContext(queue);
+    if (!sameToolContinuity(after.continuity, expected)) throw Error("MCP tool authorization changed.");
+    return JSON.parse(encoded) as Extract<McpCallResult, { status: "ok" }>;
   }
 
   /** Persists the argument binding and original native action in one synchronous transaction. */

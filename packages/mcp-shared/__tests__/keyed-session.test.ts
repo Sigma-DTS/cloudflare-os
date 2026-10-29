@@ -63,7 +63,12 @@ class Facet extends McpFacetBase<
 > {
   generation = 1;
   allowedNames = ["send"];
-  writes = 0;
+  providerCalls = 0;
+  readNames: string[] = [];
+  afterFind?: () => void;
+  afterCall?: () => void;
+  lastOptions?: WithClientOptions;
+  lastArguments?: Record<string, unknown>;
   response = { content: [{ type: "text", text: "private result" }], isError: true };
   protected get log() {
     return log;
@@ -104,17 +109,30 @@ class Facet extends McpFacetBase<
     };
   }
   override async findTool(name: string) {
-    return this.allowedNames.includes(name) ? classifyTool({ name }, "byo") : undefined;
+    const entry = this.allowedNames.includes(name)
+      ? classifyTool(
+          {
+            name,
+            ...(this.readNames.includes(name) ? { annotations: { readOnlyHint: true } } : {}),
+          },
+          "byo",
+        )
+      : undefined;
+    this.afterFind?.();
+    return entry;
   }
   override async call<T>(
     fn: (client: McpClient) => Promise<T>,
     options?: WithClientOptions,
   ): Promise<T> {
-    if (options?.expectedGeneration !== this.generation)
+    this.lastOptions = options;
+    if (options?.expectedGeneration !== undefined && options.expectedGeneration !== this.generation)
       throw new McpCallNotDispatchedError("Fixture connection replaced");
     return fn({
-      callTool: async () => {
-        this.writes++;
+      callTool: async (_name: string, args: Record<string, unknown>) => {
+        this.lastArguments = args;
+        this.providerCalls++;
+        this.afterCall?.();
         return this.response;
       },
     } as unknown as McpClient);
@@ -140,11 +158,13 @@ function fixture(
     observations: { containsRestrictedData?: boolean }[] = [];
   let loseAck = false,
     denyObservation = false;
+  let beforeObservation: (() => void) | undefined;
   const queue = {
     async getGitCache() {
       return cache;
     },
     async authorizeObservation(value: { containsRestrictedData?: boolean }) {
+      beforeObservation?.();
       if (denyObservation) throw Error("Observation denied");
       observations.push(value);
     },
@@ -162,6 +182,9 @@ function fixture(
     session,
     submissions,
     observations,
+    beforeObservation(fn: () => void) {
+      beforeObservation = fn;
+    },
     loseAck() {
       loseAck = true;
     },
@@ -189,14 +212,14 @@ it("reconstructs one pending original action, then reads only its witnessed rest
     .join("");
   expect(receipts[0].digest).toBe(expectedDigest);
   expect(first.submissions).toHaveLength(1);
-  expect(first.facet.writes).toBe(0);
+  expect(first.facet.providerCalls).toBe(0);
   const restored = fixture(first.storage);
   const receipt = await restored.session.submitTool(key, "send", { a: 1, b: 2 }, witness);
   expect(receipt.state).toBe("pending");
   expect(restored.submissions).toEqual([]);
   await restored.facet.applyAction(receipt.actionId, restored.cache as never);
   await restored.facet.applyAction(receipt.actionId, restored.cache as never);
-  expect(restored.facet.writes).toBe(1);
+  expect(restored.facet.providerCalls).toBe(1);
   expect(await restored.session.toolResult(key, witness)).toMatchObject({
     operationId: receipt.id,
     result: { status: "ok", text: "private result", isError: true },
@@ -224,7 +247,7 @@ it("refuses same-parent sibling bindings, two accounts and reconnects even with 
     await expect(other.facet.applyAction(receipt.actionId, other.cache as never)).rejects.toThrow(
       "authorization changed",
     );
-    expect(other.facet.writes).toBe(0);
+    expect(other.facet.providerCalls).toBe(0);
   }
   first.facet.generation++;
   await expect(first.session.toolResult(key, witness)).rejects.toThrow(
@@ -304,7 +327,7 @@ it("rolls back receipt and action together when persisting the application claim
   );
   expect((await subject.session.toolOperation(key, witness))?.state).toBe("pending");
   expect(subject.facet.lookupAction(receipt.actionId)?.state).toBe("pending");
-  expect(subject.facet.writes).toBe(0);
+  expect(subject.facet.providerCalls).toBe(0);
 });
 
 it("reports a retained result digest and preserves applied evidence after the private result expires", async () => {
@@ -355,7 +378,7 @@ it("withholds an oversized result without treating its missing response as a mis
   await expect(subject.session.toolResult(key, witness)).rejects.toThrow(
     "effect must not be replayed",
   );
-  expect(subject.facet.writes).toBe(1);
+  expect(subject.facet.providerCalls).toBe(1);
 });
 
 it("keeps rejection final and refuses a changed payload without queueing a replacement", async () => {
@@ -370,17 +393,23 @@ it("keeps rejection final and refuses a changed payload without queueing a repla
     subject.session.submitTool(key, "send", { target: "changed" }, witness),
   ).rejects.toThrow("reused");
   expect(subject.submissions).toHaveLength(1);
-  expect(subject.facet.writes).toBe(0);
+  expect(subject.facet.providerCalls).toBe(0);
 });
 
 it("keeps reserved producer method names reachable as ordinary tools through callTool", async () => {
   const subject = fixture();
-  subject.facet.allowedNames = ["continuity", "submit_tool", "tool_operation", "tool_result"];
+  subject.facet.allowedNames = [
+    "continuity",
+    "submit_tool",
+    "tool_operation",
+    "tool_result",
+    "read_tool",
+  ];
   for (const name of subject.facet.allowedNames) {
     expect(await subject.session.callTool(name, {})).toMatchObject({ status: "pending" });
   }
-  expect(subject.submissions).toHaveLength(4);
-  expect(subject.facet.writes).toBe(0);
+  expect(subject.submissions).toHaveLength(5);
+  expect(subject.facet.providerCalls).toBe(0);
 });
 
 it("keeps an unreadable original response applied while withholding its private reader", async () => {
@@ -400,5 +429,133 @@ it("keeps an unreadable original response applied while withholding its private 
   await expect(subject.session.toolResult(key, witness)).rejects.toThrow(
     "effect must not be replayed",
   );
-  expect(subject.facet.writes).toBe(1);
+  expect(subject.facet.providerCalls).toBe(1);
+});
+
+it("reproduces the legacy catalog/read race allocating two original actions across reconstruction", async () => {
+  const original = fixture();
+  original.facet.readNames = ["send"];
+  expect(await original.session.listTools({ name: "send" })).toMatchObject([{ mode: "read" }]);
+  original.facet.readNames = [];
+  expect(await original.session.callTool("send", {})).toMatchObject({
+    status: "pending",
+    actionId: 1,
+  });
+  const restored = fixture(original.storage);
+  expect(await restored.session.callTool("send", {})).toMatchObject({
+    status: "pending",
+    actionId: 2,
+  });
+  expect(restored.storage.sql.exec("SELECT count(*) AS count FROM mcp_actions").one()).toEqual({
+    count: 2,
+  });
+  expect(original.facet.providerCalls + restored.facet.providerCalls).toBe(0);
+  await original.facet.applyAction(1, original.cache as never);
+  await restored.facet.applyAction(2, restored.cache as never);
+  expect(original.facet.providerCalls + restored.facet.providerCalls).toBe(2);
+});
+
+it("refuses reclassified read intent without staging or queueing across reconstruction", async () => {
+  const original = fixture(),
+    witness = await original.session.continuity();
+  original.facet.readNames = ["send"];
+  expect(await original.session.listTools({ name: "send" })).toMatchObject([{ mode: "read" }]);
+  original.facet.readNames = [];
+  for (const subject of [original, fixture(original.storage)]) {
+    await expect(subject.session.readTool("send", {}, witness)).rejects.toThrow("read-only MCP");
+    expect(subject.facet.lookupAction(1)).toBeUndefined();
+    expect(subject.storage.sql.exec("SELECT count(*) AS count FROM mcp_actions").one()).toEqual({
+      count: 0,
+    });
+    expect(subject.submissions).toHaveLength(0);
+    expect(subject.facet.providerCalls).toBe(0);
+  }
+});
+
+it("returns a bounded native read as restricted data under the original witness", async () => {
+  const subject = fixture(),
+    witness = await subject.session.continuity();
+  subject.facet.readNames = ["send"];
+  expect(await subject.session.readTool("send", {}, witness)).toMatchObject({
+    status: "ok",
+    text: "private result",
+    isError: true,
+  });
+  expect(subject.observations.at(-1)?.containsRestrictedData).toBe(true);
+  expect(subject.facet.lastOptions).toMatchObject({ expectedGeneration: 1, retryOnExpiry: false });
+  expect(subject.submissions).toHaveLength(0);
+  expect(subject.facet.lookupAction(1)).toBeUndefined();
+});
+
+it("refuses a rebind during classification before the native read transport", async () => {
+  const subject = fixture(),
+    witness = await subject.session.continuity();
+  subject.facet.readNames = ["send"];
+  subject.facet.afterFind = () => {
+    subject.facet.generation++;
+  };
+  await expect(subject.session.readTool("send", {}, witness)).rejects.toThrow("read-only MCP");
+  expect(subject.facet.providerCalls).toBe(0);
+  expect(subject.submissions).toHaveLength(0);
+});
+
+it.each(["provider", "observation"] as const)(
+  "withholds private read data after a rebind during %s",
+  async (boundary) => {
+    const subject = fixture(),
+      witness = await subject.session.continuity();
+    subject.facet.readNames = ["send"];
+    if (boundary === "provider")
+      subject.facet.afterCall = () => {
+        subject.facet.generation++;
+      };
+    else
+      subject.beforeObservation(() => {
+        subject.facet.generation++;
+      });
+    await expect(subject.session.readTool("send", {}, witness)).rejects.toThrow("read-only MCP");
+    expect(subject.facet.providerCalls).toBe(boundary === "provider" ? 1 : 0);
+    expect(subject.submissions).toHaveLength(0);
+  },
+);
+
+it("snapshots read arguments and expected continuity before asynchronous catalog lookup", async () => {
+  const subject = fixture(),
+    witness = await subject.session.continuity();
+  const args = { nested: { issue: "original" } };
+  subject.facet.readNames = ["send"];
+  subject.facet.afterFind = () => {
+    args.nested.issue = "replacement";
+    witness.grant = "caller mutation";
+  };
+  expect(await subject.session.readTool("send", args, witness)).toMatchObject({ status: "ok" });
+  expect(subject.facet.lastArguments).toEqual({ nested: { issue: "original" } });
+  expect(subject.submissions).toHaveLength(0);
+});
+
+it("refuses stale or sibling read continuity and denied observations before tool transport", async () => {
+  const subject = fixture(),
+    witness = await subject.session.continuity();
+  subject.facet.readNames = ["send"];
+  const sibling = fixture(subject.storage, "native-account", "native-parent", 6);
+  sibling.facet.readNames = ["send"];
+  await expect(sibling.session.readTool("send", {}, witness)).rejects.toThrow("read-only MCP");
+  expect(sibling.facet.providerCalls).toBe(0);
+  subject.denyObservation();
+  await expect(subject.session.readTool("send", {}, witness)).rejects.toThrow("read-only MCP");
+  expect(subject.facet.providerCalls).toBe(0);
+  expect(subject.submissions).toHaveLength(0);
+});
+
+it("withholds oversized read results without leaving any original native action", async () => {
+  const subject = fixture(),
+    witness = await subject.session.continuity();
+  subject.facet.readNames = ["send"];
+  subject.facet.response = {
+    content: [{ type: "text", text: "large".repeat(30_000) }],
+    isError: false,
+  };
+  await expect(subject.session.readTool("send", {}, witness)).rejects.toThrow("read-only MCP");
+  expect(subject.facet.lookupAction(1)).toBeUndefined();
+  expect(subject.submissions).toHaveLength(0);
 });

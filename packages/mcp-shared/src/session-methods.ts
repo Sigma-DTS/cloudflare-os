@@ -18,7 +18,7 @@ export const RESERVED_METHOD_NAMES: ReadonlySet<string> = new Set([
   "then", "catch", "finally", "dup", "onRpcBroken", "constructor", "toString", "valueOf",
   "hasOwnProperty", "__proto__", "map",
   // The session's own methods.
-  "callTool", "getActionResult", "listTools", "continuity", "submitTool", "toolOperation", "toolResult",
+  "callTool", "readTool", "getActionResult", "listTools", "continuity", "submitTool", "toolOperation", "toolResult",
 ]);
 
 /**

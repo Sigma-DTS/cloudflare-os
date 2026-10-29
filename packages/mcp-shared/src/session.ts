@@ -4,6 +4,7 @@
 // What differs per connector is which server and how to reach it, which is what `McpSessionHost`
 // supplies. The base never touches the Durable Object, the account, or the endpoint's credentials.
 
+import { toolPayload } from "./tool-operations.js";
 import { RpcTarget, type RpcStub } from "cloudflare:workers";
 import type { ActionDescription, ActionKind, ApprovalQueue }
   from "@gadgets/workshop-shared/gatekeeper";
@@ -88,6 +89,7 @@ export interface McpSessionHost {
   actionKindFor(toolName: string): ActionKind;
 
   /** Additive producer contracts; absent on historical hosts. */
+  readTool?(queue: RpcStub<ApprovalQueue>, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>>;
   toolContinuity?(queue: RpcStub<ApprovalQueue>): Promise<McpToolContinuity>;
   prepareToolOperation?(queue: RpcStub<ApprovalQueue>, key: string, name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<{ receipt: McpToolReceipt; created: boolean }>;
   finishToolSubmission?(key: string, acknowledged: boolean): McpToolReceipt;
@@ -250,6 +252,17 @@ export class McpSessionBase extends RpcTarget {
         `agent's executeCode call, return from this executeCode call now so the approval can ` +
         `appear in chat. After approval, call getActionResult(${staged.id}) for the outcome.`,
     };
+  }
+
+  /** Read intent cannot enter the native action branch, even after catalog reclassification. */
+  async readTool(name: string, args: Record<string, unknown>, expected: McpToolContinuity): Promise<Extract<McpCallResult, { status: "ok" }>> {
+    requireToolName("readTool", name);
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw Error("readTool() arguments must be an object.");
+    if (!this.#host.readTool) throw Error("Native read-only MCP tools are unavailable.");
+    const snapshot: { args: Record<string, unknown> } = JSON.parse(toolPayload(name, args));
+    const witness = { ...expected };
+    try { return await this.#host.readTool(this.#queue, name, snapshot.args, witness); }
+    catch { throw Error("Native read-only MCP tool result is unavailable for this continuity."); }
   }
 
   /** Observes only producer-derived operational scope metadata. */
