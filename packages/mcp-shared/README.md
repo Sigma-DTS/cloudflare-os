@@ -98,8 +98,8 @@ already have been carried out. The classification (`callMayHaveTakenEffect`) fai
 cannot positively identify as declined counts as possibly performed.
 
 The same rule covers an activation dying between sending the call and recording the reply. The claim
-is not released for another attempt: after `APPLY_CLAIM_TIMEOUT_MS` the action is closed the same
-way, saying it may or may not have taken effect.
+is not released for another attempt: the next ActionStore activation closes it with an unknown
+outcome instead of replaying it.
 
 So the cost of a network blip is a call someone has to stage again, deliberately. That is the trade
 this module makes everywhere: an approval is never spent twice without a person saying so.
@@ -141,3 +141,55 @@ Fixed rather than configurable.
 pnpm --filter @gadgets/mcp-shared build   # tsc
 pnpm --filter @gadgets/mcp-shared test:run    # vitest
 ```
+
+## Keyed native tool operations
+
+Durable clients persist a lowercase UUID request key, arguments and the result of `continuity()`
+before calling `submitTool(key, name, args, expected)`. This additive API queues only native write
+tools; read tools continue through `callTool`. The current native catalog, grant, observation rules
+and approval queue remain authoritative. Existing `callTool` and `getActionResult` are unchanged.
+
+The witness contains opaque `facet`, `grant` and `resource` SHA-256 values, with `version: 1`.
+They come from the actual parent DO, kernel-provided binding ID, account ID, a durable facet nonce,
+connection generation and canonical native resource URL. Display names, endpoint labels and
+caller-supplied fields never supply authority. Siblings in the same parent are distinguished by
+kernel-minted binding IDs; copying storage while fabricating that same trusted ID is outside this
+contract. Every submission, status/result read and original application checks the current native
+witness. Writes additionally pin the account generation immediately before sending the tool request.
+
+A key identifies one original native action. Equal normalized arguments and witness reconcile it;
+a changed tool, payload or scope is refused. Queue acknowledgement loss retains that action without
+resubmitting. Only the original native approval may apply it. A persisted application claim is made
+before I/O; an interrupted or possibly dispatched application becomes `uncertain` and cannot be
+replayed. A known pre-dispatch failure is `failed` and can only be retried as the original action by
+the native approval flow. Operational reads never spend an approval or resubmit work.
+
+`toolOperation(key, expected)` returns a bounded receipt with `version`, operation UUID `id`,
+`requestKey`, argument `digest`, facet-local original `actionId` and one of `preparing`, `submitting`,
+`pending`, `applying`, `applied`, `rejected`, `failed`, `uncertain`. An applied receipt additionally
+reports `resultAvailable`. The integer action ID is useful only within that witnessed operation;
+it must never be looked up through a rebound alias. Receipts contain no arguments, response content,
+response digest, provider errors or credentials. A missing record does not authorize a new key.
+
+Argument `digest` is SHA-256 of the UTF-8 canonical JSON payload. Build `{name, args}` using the exact
+wire tool name, JSON.stringify/JSON.parse it, recursively sort object entries using JavaScript
+UTF-16 code-unit key order, preserve array order, rebuild objects with Object.fromEntries, and
+JSON.stringify the result. JavaScript's integer-index property enumeration still applies. JSON
+serialization defines omitted values and numeric normalization; no locale-sensitive ordering is used.
+The serialized `{name,args}` payload is bounded to 64 KiB UTF-8 before hashing or action allocation.
+
+`toolResult(key, expected)` is a restricted native observation (`containsRestrictedData: true`). It
+returns `{version:1, operationId, requestKey, actionId, digest, resultDigest, result}` only for the
+same original applied action with a retained response. `result` is the native `McpCallResult` with
+`status: "ok"`, bounded to 128 KiB of UTF-8 JSON; `isError: true` still means the tool/business action
+reported failure. `applied` proves transport/application completion, not business success.
+`resultDigest` is SHA-256 of UTF-8 `JSON.stringify(result)` as retained, before adding this envelope;
+it is returned only with that private response. Clients correlate all envelope identifiers and the
+argument digest before considering the content. They must not place private result digests into
+shared operational logs.
+
+Native response truncation, unreadable data and expiry after the most recent 100 terminal actions
+all make the keyed reader fail with a fixed unavailable message. The receipt remains `applied`;
+missing response data never proves that the effect did not occur. Up to 50 actions may await a
+decision. Original-operation tombstones are retained, with a fixed capacity of 4096 per facet;
+capacity exhaustion refuses new operations rather than forgetting deduplication evidence.
