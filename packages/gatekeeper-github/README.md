@@ -22,13 +22,21 @@ This package provides GitHub OAuth integration for Gadgets. It serves two purpos
 
 Every queued action carries a stable kind (`github.<action>`, e.g. `github.push`), and the user may
 opt in to approving a kind automatically on a connection. Every action is eligible, including
-closing and reopening, `requestChanges` reviews and force pushes, except two that always wait for a
-person: **merging a pull request** and **an approving review**. An approval shares the
+closing and reopening, `requestChanges` reviews and force pushes, except actions that always wait for a
+person: **merging a pull request**, **an approving review**, and **marking a pull request ready for review**. An approval shares the
 `github.postReview` kind with comment and request-changes reviews, but is never auto-approvable,
 so enabling that kind does not cover it. A force push has its own kind (`github.forcePush`), so
 enabling ordinary pushes does not let history be rewritten. Excluded actions are still approved
 by hand as before. Each binding advertises through `getAutoApprovableActions()` only the eligible
 kinds its session can submit (an issue binding, for example, never lists pushes).
+
+## Keyed delivery
+
+Repository sessions additionally expose `submitDelivery()` and `deliveryOperation()` for original
+PR creation, comments, reviews, and manual ready-for-review promotion. Receipts report native
+approval/application progress and real qualified resource IDs; they exclude private bodies and
+provider diagnostics. See [the delivery contract](delivery-operations.md) for argument binding,
+continuity, uncertain effects, and retention limits.
 
 ## Durable push publication
 

@@ -32,7 +32,7 @@ import type {
   GitHubRepo,
   GitHubRepoMetadata,
   GitHubSubscribeOptions,
-  GitHubPushCommand, GitHubPushContinuity, GitHubPushReceipt,
+  GitHubPushCommand, GitHubPushContinuity, GitHubPushReceipt, GitHubDeliveryCommand, GitHubDeliveryReceipt,
 } from "../../src/types.js";
 
 export { default } from "../../src/github.js";
@@ -297,6 +297,20 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     return outcome(async () => {
       using session = await this.#gatekeeper(facetName, props).startSession(queue as RpcStub<ApprovalQueue>) as unknown as GitHubRepo & Disposable;
       return session.pushOperation(key);
+    });
+  }
+
+  async deliverySubmit(facetName: string, props: GatekeeperProps, queue: unknown, key: string, command: GitHubDeliveryCommand, expected: GitHubPushContinuity): Promise<Outcome<GitHubDeliveryReceipt>> {
+    return outcome(async () => {
+      using session = await this.#gatekeeper(facetName, props).startSession(queue as RpcStub<ApprovalQueue>) as unknown as GitHubRepo & Disposable;
+      return session.submitDelivery(key, command, expected);
+    });
+  }
+
+  async deliveryStatus(facetName: string, props: GatekeeperProps, queue: unknown, key: string): Promise<Outcome<GitHubDeliveryReceipt | null>> {
+    return outcome(async () => {
+      using session = await this.#gatekeeper(facetName, props).startSession(queue as RpcStub<ApprovalQueue>) as unknown as GitHubRepo & Disposable;
+      return session.deliveryOperation(key);
     });
   }
 

@@ -11,6 +11,11 @@ import type { RpcStub } from "cloudflare:workers";
  * repository's file *content* is not readable through this interface directly.
  */
 export interface GitHubRepo {
+  /** Submit one keyed original native delivery action under the current business repository witness. */
+  submitDelivery(requestKey: string, command: GitHubDeliveryCommand, expected: GitHubPushContinuity): Promise<GitHubDeliveryReceipt>;
+  /** Observe the original action; never approves, requeues or infers success from simulated content. */
+  deliveryOperation(requestKey: string): Promise<GitHubDeliveryReceipt | null>;
+
   /** Observe this native connection's facet, authorization revision and pinned repository.
    * Persist the result with an intent; these values are preconditions, never authority tokens. */
   pushContinuity(): Promise<GitHubPushContinuity>;
@@ -915,4 +920,33 @@ export type GitHubEventReview = {
   commitId?: string;
   submittedAt?: Date;
   url: string;
+}
+
+/** Approved delivery operations; merge and repository administration are excluded. */
+export type GitHubDeliveryCommand =
+  | { kind: "createPullRequest"; options: GitHubCreatePullRequestOptions }
+  | { kind: "postComment"; pullRequestId: string; bodyMarkdown: string }
+  | { kind: "postReview"; pullRequestId: string; review: GitHubPullRequestReviewDraft }
+  | { kind: "markReady"; pullRequestId: string };
+
+/** Qualified identifiers returned by the original provider mutation, never a simulated parent URL. */
+export interface GitHubDeliveryResource {
+  repositoryId: number;
+  pullRequestId: string;
+  commentId?: string;
+  reviewId?: string;
+  /** Provider node id for the pull request marked ready by the original mutation. */
+  readyNodeId?: string;
+}
+
+/** Bounded progress of the original native approval action; no payload or provider diagnostics. */
+export interface GitHubDeliveryReceipt {
+  version: 1;
+  id: string;
+  requestKey: string;
+  digest: string;
+  actionId?: number;
+  state: "preparing" | "submitting" | "pending" | "applying" | "applied" | "rejected" | "failed" | "uncertain";
+  failure?: "scope-changed";
+  resource?: GitHubDeliveryResource;
 }

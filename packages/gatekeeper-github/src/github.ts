@@ -140,6 +140,8 @@ import type {
   GitHubSubscribeOptions,
   GitHubTagSummary,
 } from "./types";
+import { deliveryPayload, deliveryReceipt, type DeliveryOperationRecord } from "./delivery-operations";
+import type { GitHubDeliveryCommand, GitHubDeliveryReceipt, GitHubDeliveryResource } from "./types";
 import TYPES_CODE from "./types.txt";
 import {
   GitHubIssueConfiguratorUI,
@@ -232,6 +234,7 @@ type GitHubRevertInfo =
     };
 
 type BaseAction = {
+  deliveryKey?: string;
   approvalId: number;
   submittedAt: number;
   owner: string;
@@ -344,7 +347,10 @@ type PushAction = BaseAction & {
   operationKey?: string;
 };
 
+type MarkReadyAction = BaseAction & { type: "markReady"; pullId: string };
+
 type GitHubAction =
+  | MarkReadyAction
   | CreateIssueAction
   | CreatePullRequestAction
   | SetTitleAction
@@ -474,6 +480,8 @@ function describeGitHubAction(action: GitHubAction): RenderedDescription {
           .inline("Provisional ID", action.provisionalCommentId)
           .verbatim("Reply", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
         .finish();
+    case "markReady":
+      return buildDescription(`Mark pull request #${action.pullId} ready for review.`).finish();
     case "mergePullRequest": {
       const options = action.options ?? {};
       const builder = buildDescription(`Merge pull request #${action.pullId}.`)
@@ -504,6 +512,7 @@ function describeGitHubAction(action: GitHubAction): RenderedDescription {
  * force push has a kind of its own: enabling ordinary pushes does not let history be rewritten.
  */
 const ACTION_KINDS = {
+  markReady: { tag: "github.markReady", label: "Mark pull requests ready for review" },
   createIssue: { tag: "github.createIssue", label: "Create issues" },
   createPullRequest: { tag: "github.createPullRequest", label: "Create pull requests" },
   setTitle: { tag: "github.setTitle", label: "Rename issues and pull requests" },
@@ -541,7 +550,7 @@ function autoApprovalOf(action: GitHubAction): Pick<ActionDescription, "actionKi
   const kind: AutoApprovalKind = action.type === "push" && action.force ? "forcePush" : action.type;
   return {
     actionKind: ACTION_KINDS[kind],
-    autoApprovable: action.type !== "mergePullRequest" &&
+    autoApprovable: action.type !== "markReady" && action.type !== "mergePullRequest" &&
       !(action.type === "postReview" && action.review.decision === "approve"),
   };
 }
@@ -1807,6 +1816,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   implements Gatekeeper<GitHubRepoSession | GitHubIssue | GitHubPullRequest> {
 
   #pendingActionsCache?: GitHubAction[];
+  #preparingDeliveries = new Set<string>();
+  #applyingDeliveries = new Set<string>();
   #preparingPushes = new Set<string>();
   #applyingPushes = new Set<string>();
 
@@ -1856,8 +1867,123 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     })();
   }
 
-  async #withApi<T>(fn: (api: GitHubApi) => Promise<T>, expectedGeneration?: string): Promise<T> {
-    return await withAccountApi(this.#userAccount(), fn, { repo: await this.#pinnedRepo(), expectedGeneration });
+  async #withApi<T>(fn: (api: GitHubApi) => Promise<T>, expectedGeneration?: string, beforeMutation?: () => void): Promise<T> {
+    return await withAccountApi(this.#userAccount(), fn, { repo: await this.#pinnedRepo(), expectedGeneration, beforeMutation });
+  }
+
+  #deliveryRecord(key: string): DeliveryOperationRecord | undefined {
+    return this.ctx.storage.kv.get<DeliveryOperationRecord>(`delivery-operation:${key}`);
+  }
+
+  #putDelivery(record: DeliveryOperationRecord): void {
+    this.ctx.storage.kv.put(`delivery-operation:${record.requestKey}`, record);
+  }
+
+  /** Reads only original producer progress, qualified by the current native business binding. */
+  async deliveryOperation(queue: RpcStub<ApprovalQueue>, requestKey: string): Promise<GitHubDeliveryReceipt | null> {
+    using cache = await queue.getGitCache();
+    const key = pushRequestKey(requestKey);
+    let record = this.#deliveryRecord(key);
+    if (record && !record.digest) { const digest = await pushHash(record.payload); record = this.#deliveryRecord(key)!; record.digest = digest; this.#putDelivery(record); }
+    const context = await this.#pushContext(cache);
+    record = this.#deliveryRecord(key);
+    if (!record) return null;
+    if (!samePushContinuity(record.expected, context.continuity)) throw Error(PUSH_SCOPE_CHANGED);
+    if (record.state === "preparing" && !this.#preparingDeliveries.has(record.id)) record.state = "failed";
+    if (record.state === "submitting" && !this.#preparingDeliveries.has(record.id) || record.state === "applying" && !this.#applyingDeliveries.has(record.id)) record.state = "uncertain";
+    this.#putDelivery(record);
+    return deliveryReceipt(record);
+  }
+
+  /** Binds a persisted key to one action in the existing native approval/application path. */
+  async submitDelivery(queue: RpcStub<ApprovalQueue>, requestKey: string, command: GitHubDeliveryCommand, expected: GitHubPushContinuity): Promise<GitHubDeliveryReceipt> {
+    if (this.ctx.props.resourceKind !== "repo") throw Error("Delivery requires a repository capability.");
+    const key = pushRequestKey(requestKey), payload = deliveryPayload(command), existing = this.#deliveryRecord(key);
+    if (existing) {
+      if (existing.payload !== payload || !samePushContinuity(existing.expected, expected)) throw Error("Delivery operation key reused with changed arguments or continuity.");
+      try { return (await this.deliveryOperation(queue, key))!; }
+      catch { throw Error("GitHub delivery operation is unavailable for this continuity."); }
+    }
+    const count = this.ctx.storage.kv.get<number>("delivery-operation-count") ?? 0;
+    if (count >= 4096) throw Error("GitHub delivery receipt capacity reached.");
+    const record: DeliveryOperationRecord = { version: 1, id: crypto.randomUUID(), requestKey: key, digest: "", state: "preparing", payload, expected: { ...expected } };
+    this.ctx.storage.transactionSync(() => { this.#putDelivery(record); this.ctx.storage.kv.put("delivery-operation-count", count + 1); });
+    this.#preparingDeliveries.add(record.id);
+    try {
+      record.digest = await pushHash(payload); this.#putDelivery(record);
+      using cache = await queue.getGitCache();
+      const context = await this.#pushContext(cache);
+      if (!samePushContinuity(expected, context.continuity)) {
+        record.state = "failed"; record.failure = "scope-changed"; this.#putDelivery(record); return deliveryReceipt(record);
+      }
+      record.generation = context.generation;
+      const normalized: GitHubDeliveryCommand = JSON.parse(payload);
+      let action: GitHubAction;
+      switch (normalized.kind) {
+        case "createPullRequest": action = await this.prepareCreatePullRequest(normalized.options); break;
+        case "postComment": action = await this.preparePostComment("pull", normalized.pullRequestId, normalized.bodyMarkdown); break;
+        case "postReview": action = await this.preparePostReview(normalized.pullRequestId, normalized.review); break;
+        case "markReady": action = { type: "markReady", approvalId: this.#nextActionId(), submittedAt: Date.now(), owner: this.ctx.props.owner, repo: this.ctx.props.repo, pullId: normalized.pullRequestId }; break;
+      }
+      await this.#userAccount().getAccessToken(context.generation);
+      action.deliveryKey = key; record.actionId = action.approvalId; record.state = "submitting";
+      this.ctx.storage.transactionSync(() => { this.#stageAction(action); this.#putDelivery(record); });
+      try {
+        await queue.submitAction(action.approvalId, { title: `GitHub ${normalized.kind}`, implementsRevert: action.type === "postComment", ...describeGitHubAction(action), ...autoApprovalOf(action) });
+      } catch {
+        const current = this.#deliveryRecord(key)!;
+        if (current.state === "submitting") { current.state = "uncertain"; this.#putDelivery(current); }
+        return deliveryReceipt(current);
+      }
+      const current = this.#deliveryRecord(key)!;
+      if (current.state === "submitting") this.ctx.storage.transactionSync(() => { this.#markActionPending(action); current.state = "pending"; this.#putDelivery(current); });
+      this.#clearCaches(); return deliveryReceipt(this.#deliveryRecord(key)!);
+    } catch {
+      const current = this.#deliveryRecord(key)!;
+      if (current.state === "preparing") { current.state = "failed"; this.#putDelivery(current); }
+      return deliveryReceipt(current);
+    } finally { this.#preparingDeliveries.delete(record.id); }
+  }
+
+  async #withDeliveryApi<T>(action: GitHubAction, fn: (api: GitHubApi) => Promise<T>): Promise<T> {
+    if (!action.deliveryKey) return this.#withApi(fn);
+    const record = this.#deliveryRecord(action.deliveryKey)!;
+    return this.#withApi(fn, record.generation, () => {
+      const current = this.#deliveryRecord(action.deliveryKey!)!;
+      current.effectStarted = true; this.#putDelivery(current);
+    });
+  }
+
+  #deliveryResource(action: GitHubAction, resource: Omit<GitHubDeliveryResource, "repositoryId">): void {
+    if (!action.deliveryKey) return;
+    for (const id of [resource.pullRequestId, resource.commentId, resource.reviewId]) if (id !== undefined && (!/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id)))) throw Error("GitHub did not return a qualified delivery identity.");
+    const record = this.#deliveryRecord(action.deliveryKey)!;
+    record.resource = { repositoryId: record.expected.repositoryId, ...resource }; this.#putDelivery(record);
+  }
+
+  async #applyDelivery(action: GitHubAction, cache: RpcStub<GitCache>): Promise<void> {
+    const record = this.#deliveryRecord(action.deliveryKey!);
+    if (!record || record.actionId !== action.approvalId) throw Error("Delivery operation is unavailable.");
+    if (record.state === "applied") return;
+    if (record.effectStarted || this.#applyingDeliveries.has(record.id) || record.state === "failed" || record.state === "rejected") throw Error("Delivery operation is not replayable.");
+    record.state = "applying"; this.#putDelivery(record); this.#applyingDeliveries.add(record.id);
+    try {
+      let context;
+      try { context = await this.#pushContext(cache); }
+      catch { record.state = "failed"; this.#putDelivery(record); throw Error("Delivery scope is unavailable before application."); }
+      if (!samePushContinuity(context.continuity, record.expected) || context.generation !== record.generation) {
+        record.state = "failed"; record.failure = "scope-changed"; this.#putDelivery(record); throw Error(PUSH_SCOPE_CHANGED);
+      }
+      try { await this.#performAction(action, cache); }
+      catch (error) {
+        const current = this.#deliveryRecord(record.requestKey)!;
+        current.state = current.effectStarted ? "uncertain" : "failed";
+        if (!current.effectStarted && error instanceof PushNotSentError && error.failure) current.failure = error.failure;
+        this.#putDelivery(current);
+        // oxlint-disable-next-line eslint/preserve-caught-error -- provider diagnostics must not escape the operational projection.
+        throw Error(current.effectStarted ? "GitHub delivery outcome is uncertain; reconcile the original operation." : "GitHub delivery failed before sending the mutation.");
+      }
+    } finally { this.#applyingDeliveries.delete(record.id); }
   }
 
   #pushRecord(key: string): PushOperationRecord | undefined {
@@ -2538,6 +2664,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     this.ctx.storage.transactionSync(() => {
       this.#retireActionRecord(action.approvalId, record);
+      if (action.deliveryKey) { const operation = this.#deliveryRecord(action.deliveryKey)!; operation.state = "applied"; delete operation.failure; this.#putDelivery(operation); }
       if (action.type === "push" && action.operationKey) {
         const operation = this.#pushRecord(action.operationKey)!;
         operation.state = "applied"; delete operation.failure; this.#putPush(operation);
@@ -2547,6 +2674,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   #assertPushDiscardable(action: GitHubAction): void {
+    if (action.deliveryKey) {
+      const operation = this.#deliveryRecord(action.deliveryKey);
+      if (operation?.effectStarted || operation?.state === "applying") throw Error("An in-flight or uncertain delivery cannot be discarded as unapplied.");
+    }
     if (action.type !== "push" || !action.operationKey) return;
     const operation = this.#pushRecord(action.operationKey);
     if (operation?.effectStarted && ["applying", "uncertain", "applied"].includes(operation.state)) throw new Error("An in-flight or uncertain push cannot be discarded as unapplied.");
@@ -2561,6 +2692,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     record.rejectedAt = Date.now();
     this.ctx.storage.transactionSync(() => {
       this.#retireActionRecord(action.approvalId, record);
+      if (action.deliveryKey) { const operation = this.#deliveryRecord(action.deliveryKey)!; operation.state = "rejected"; this.#putDelivery(operation); }
       if (action.type === "push" && action.operationKey) {
         const operation = this.#pushRecord(action.operationKey)!;
         operation.state = "rejected"; delete operation.failure; this.#putPush(operation);
@@ -2583,6 +2715,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action.targetKind === kind && action.targetId === provisionalId;
       case "postReview":
       case "replyToDiffComment":
+      case "markReady":
       case "mergePullRequest":
         return kind === "pull" && action.pullId === provisionalId;
       case "push":
@@ -2686,7 +2819,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return false;
       }
 
-      if (action.type === "postReview" || action.type === "replyToDiffComment" || action.type === "mergePullRequest") {
+      if (action.type === "postReview" || action.type === "replyToDiffComment" || action.type === "mergePullRequest" || action.type === "markReady") {
         if (kind !== "pull") return false;
         return this.#entityIdMatches(action.pullId, logicalId);
       }
@@ -4144,6 +4277,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {
     const record = this.#requireActionRecord(actionId);
     if (record.state === "approved") {
+      if (record.action.deliveryKey) {
+        const operation = this.#deliveryRecord(record.action.deliveryKey), context = await this.#pushContext(cache);
+        if (!operation || !samePushContinuity(operation.expected, context.continuity)) throw Error(PUSH_SCOPE_CHANGED);
+      }
       // Already applied: the overseer persists its own completion record only after this method
       // returns, so a crash or lost reply in that window re-delivers the apply. Only this durable
       // record can answer it -- the world may have legitimately moved on since -- and throwing
@@ -4158,6 +4295,11 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
 
     const action = record.action;
+    if (action.deliveryKey) return this.#applyDelivery(action, cache);
+    return this.#performAction(action, cache);
+  }
+
+  async #performAction(action: GitHubAction, cache: RpcStub<GitCache>): Promise<void> {
     switch (action.type) {
       case "createIssue": {
         const response = await this.#withApi(api => api.createIssue(action.owner, action.repo, {
@@ -4174,7 +4316,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "createPullRequest": {
         let response;
         try {
-          response = await this.#withApi(api => api.createPullRequest(action.owner, action.repo, {
+          response = await this.#withDeliveryApi(action, api => api.createPullRequest(action.owner, action.repo, {
             title: action.options.title,
             body: action.options.bodyMarkdown ? this.#rewriteKnownReferences(action.options.bodyMarkdown, true) : undefined,
             head: action.options.head,
@@ -4195,6 +4337,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           }
           throw error;
         }
+        this.#deliveryResource(action, { pullRequestId: String(response.number) });
         this.#setProvisionalResource(action.provisionalId, { kind: "pull", realId: String(response.number) });
         this.#markActionApproved(action);
         this.#clearCaches();
@@ -4249,12 +4392,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "postComment": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
         if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
-        const response = await this.#withApi(api => api.createIssueComment(
+        const response = await this.#withDeliveryApi(action, api => api.createIssueComment(
           action.owner,
           action.repo,
           Number(realId),
           this.#rewriteKnownReferences(action.bodyMarkdown, true),
         ));
+        this.#deliveryResource(action, { pullRequestId: realId, commentId: String(response.id) });
         const revertInfo: GitHubRevertInfo = {
           type: "issueComment",
           commentId: response.id,
@@ -4266,7 +4410,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "postReview": {
         const realId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
         if (!realId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
-        await this.#withApi(api => api.createPullRequestReview(action.owner, action.repo, Number(realId), {
+        const response = await this.#withDeliveryApi(action, api => api.createPullRequestReview(action.owner, action.repo, Number(realId), {
           commit_id: action.review.revision.headSha,
           body: action.review.bodyMarkdown ? this.#rewriteKnownReferences(action.review.bodyMarkdown, true) : undefined,
           event: action.review.decision === "approve"
@@ -4286,9 +4430,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             subject_type: comment.target.subjectType,
           })),
         }));
+        this.#deliveryResource(action, { pullRequestId: realId, reviewId: String(response.id) });
         this.#markActionApproved(action);
         this.#clearCaches();
         return;
+      }
+      case "markReady": {
+        const nodeId = await this.#withDeliveryApi(action, api => api.markPullRequestReady(action.owner, action.repo, Number(action.pullId)));
+        this.#deliveryResource(action, { pullRequestId: action.pullId, readyNodeId: nodeId });
+        this.#markActionApproved(action); this.#clearCaches(); return;
       }
       case "replyToDiffComment": {
         const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
@@ -4626,6 +4776,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "createIssue":
       case "createPullRequest":
       case "postReview":
+      case "markReady":
       case "mergePullRequest":
         return {
           message: "This GitHub action cannot be automatically reverted.",
@@ -5833,6 +5984,17 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
     this.#gatekeeper = gatekeeper;
     this.#approvalQueue = approvalQueue;
     this.#gitCache = new SessionGitCache(approvalQueue, { withhold: id => gatekeeper.isSimulatedCommitId(id) });
+  }
+
+  async submitDelivery(requestKey: string, command: GitHubDeliveryCommand, expected: GitHubPushContinuity): Promise<GitHubDeliveryReceipt> {
+    await this.#approvalQueue.authorizeObservation({ title: "Reconcile native GitHub delivery", description: "Read only original native delivery approval and application progress." });
+    return this.#gatekeeper.submitDelivery(this.#approvalQueue, requestKey, command, expected);
+  }
+
+  async deliveryOperation(requestKey: string): Promise<GitHubDeliveryReceipt | null> {
+    await this.#approvalQueue.authorizeObservation({ title: "Inspect native GitHub delivery", description: "Read only original native delivery approval and application progress." });
+    try { return await this.#gatekeeper.deliveryOperation(this.#approvalQueue, requestKey); }
+    catch { throw Error("GitHub delivery operation is unavailable for this continuity."); }
   }
 
   async pushContinuity(): Promise<GitHubPushContinuity> {
